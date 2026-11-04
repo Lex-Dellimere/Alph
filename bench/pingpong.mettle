@@ -1,0 +1,142 @@
+// pingpong: two actors, on different schedulers, exchange a message K times.
+// Each round trip is timed on its own, from just before the ping is sent to
+// the moment the pong is handled. Metrics: rtt_p50_ns, rtt_p99_ns,
+// round_trips_per_s (K over the sum of the round trips). See bench/README.md.
+//
+// The two actors are spawned one after the other from outside the node, and
+// the node places actors on schedulers round robin, so they land on
+// different schedulers (there is always more than one scheduler when the
+// machine has more than one CPU).
+
+import "std/io";
+import "alph/alph";
+
+const K: int64 = 200000;
+
+const TAG_PING: int64 = ALPH_TAG_USER;
+const TAG_PONG: int64 = ALPH_TAG_USER + 1;
+
+struct Pinger {
+  peer: int64;
+  done: int64;    // round trips finished
+  sent_ns: int64; // when the ping in flight was sent
+}
+
+struct Ponger {
+  nothing: int64;
+}
+
+var g_node: AlphNode;
+var g_rtt: int64[200000];  // K samples; written by the pinger only
+
+fn ponger(ctx: AlphCtx*, m: AlphMsg*) -> int64 {
+  if (m->tag == TAG_PING) {
+    if (alph_send(ctx, m->from, TAG_PONG, m->arg) != ALPH_SENT) {
+      println("FAIL pong was refused");
+      alph_halt(ctx, 1);
+    }
+  }
+  return ALPH_CONTINUE;
+}
+
+fn ping(ctx: AlphCtx*, s: Pinger*) {
+  s->sent_ns = alph_now_ns();
+  if (alph_send(ctx, s->peer, TAG_PING, s->done) != ALPH_SENT) {
+    println("FAIL ping was refused");
+    alph_halt(ctx, 1);
+  }
+}
+
+fn pinger(ctx: AlphCtx*, m: AlphMsg*) -> int64 {
+  var s: Pinger* = (Pinger*)ctx->state;
+  if (m->tag == ALPH_TAG_INIT) {
+    ping(ctx, s);
+    return ALPH_CONTINUE;
+  }
+  if (m->tag != TAG_PONG) {
+    return ALPH_CONTINUE;
+  }
+  var now: int64 = alph_now_ns();
+  if (m->arg != s->done) {
+    println("FAIL pong {m->arg} answers ping {s->done}");
+    alph_halt(ctx, 1);
+    return ALPH_CONTINUE;
+  }
+  g_rtt[s->done] = now - s->sent_ns;
+  s->done = s->done + 1;
+  if (s->done == K) {
+    alph_halt(ctx, 0);
+    return ALPH_CONTINUE;
+  }
+  ping(ctx, s);
+  return ALPH_CONTINUE;
+}
+
+// Heap sort of a[0..n), in place.
+fn sift_down(a: int64*, start: int64, end: int64) {
+  var root: int64 = start;
+  while (true) {
+    var child: int64 = 2 * root + 1;
+    if (child >= end) {
+      return;
+    }
+    if (child + 1 < end && a[child] < a[child + 1]) {
+      child = child + 1;
+    }
+    if (a[root] >= a[child]) {
+      return;
+    }
+    var t: int64 = a[root];
+    a[root] = a[child];
+    a[child] = t;
+    root = child;
+  }
+}
+
+fn heap_sort(a: int64*, n: int64) {
+  var i: int64 = n / 2 - 1;
+  while (i >= 0) {
+    sift_down(a, i, n);
+    i = i - 1;
+  }
+  var end: int64 = n - 1;
+  while (end > 0) {
+    var t: int64 = a[0];
+    a[0] = a[end];
+    a[end] = t;
+    sift_down(a, 0, end);
+    end = end - 1;
+  }
+}
+
+fn main() -> int32 {
+  var cfg: AlphConfig;
+  alph_config(&cfg);
+  cfg.max_actors = 64;
+  if (!alph_node_start(&g_node, &cfg)) {
+    println("FAIL node did not start");
+    return 1;
+  }
+  var q: Ponger;
+  q.nothing = 0;
+  var peer: int64 = alph_node_spawn_value<Ponger>(&g_node, 0, &q, &ponger);
+  var p: Pinger;
+  p.peer = peer;
+  p.done = 0;
+  p.sent_ns = 0;
+  alph_node_spawn_value<Pinger>(&g_node, 0, &p, &pinger);
+  var code: int64 = alph_node_wait(&g_node);
+  if (code != 0) {
+    return 1;
+  }
+  var total: int64 = 0;
+  for i: int64 in 0..K {
+    total = total + g_rtt[i];
+  }
+  heap_sort(&g_rtt[0], K);
+  var p50: int64 = g_rtt[K / 2];
+  var p99: int64 = g_rtt[K * 99 / 100];
+  var per_s: int64 = K * 1000000000 / total;
+  println("RESULT pingpong rtt_p50_ns={p50} rtt_p99_ns={p99} round_trips_per_s={per_s}");
+  return 0;
+}

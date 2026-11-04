@@ -134,6 +134,7 @@ export struct AlphConfig {
   heap_limit: int64;
   max_handles: int64;
   signals: int64;
+  spin_us: int64;
 }
 ```
 
@@ -152,6 +153,9 @@ heap_limit    bytes one actor's heap may hold, state included; past it
 max_handles   IO handles open at once; default 65536
 signals       OS signals the node takes over, as bits (1 << ALPH_SIGINT)
               and so on; default 0. See alph_node_signals
+spin_us       how long an idle scheduler keeps checking for work before
+              it sleeps; default 50. Work that arrives meanwhile starts
+              without a wake-up system call. 0 sleeps at once
 ```
 
 ### `AlphStats`
@@ -214,6 +218,8 @@ export struct AlphNode {
   sigfd: int64;         // signalfd for cfg.signals, on scheduler 0, or -1
   sig_pid: int64;       // who gets OS signals, or 0 to shut down
   sig_tag: int64;
+  spin_ns: int64;       // AlphConfig.spin_us, in nanoseconds
+  hungry: int64;        // schedulers with hungry set
 }
 ```
 

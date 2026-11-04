@@ -1,0 +1,111 @@
+// spawn: a parent spawns N actors; each sends the parent one message in
+// INIT and stops. Done when the parent has all N messages.
+// Metrics: spawns_per_s, ns_per_spawn. See bench/README.md.
+//
+// The parent's mailbox is bounded, so it keeps at most WINDOW children in
+// flight (spawned, message not yet handled) instead of spawning all N in one
+// go: WINDOW is below the mailbox size, so no child's send can find it full.
+// A child still retries on its next turn if the send is refused.
+
+import "std/io";
+import "alph/alph";
+
+const N: int64 = 200000;       // children
+const WINDOW: int64 = 256;     // children in flight at most
+const REFILL: int64 = 128;     // spawn more once this many fewer are in flight
+const MAILBOX: int64 = 512;
+
+const TAG_HELLO: int64 = ALPH_TAG_USER;      // child to parent
+const TAG_AGAIN: int64 = ALPH_TAG_USER + 1;  // child to itself: retry the hello
+
+struct Parent {
+  spawned: int64;
+  received: int64;
+}
+
+struct Child {
+  parent: int64;
+}
+
+var g_node: AlphNode;
+var g_start_ns: int64 = 0;
+var g_end_ns: int64 = 0;
+
+fn child(ctx: AlphCtx*, m: AlphMsg*) -> int64 {
+  var c: Child* = (Child*)ctx->state;
+  if (m->tag == ALPH_TAG_INIT || m->tag == TAG_AGAIN) {
+    var r: int64 = alph_send(ctx, c->parent, TAG_HELLO, 0);
+    if (r == ALPH_FULL) {
+      alph_send(ctx, ctx->self, TAG_AGAIN, 0);
+      return ALPH_CONTINUE;
+    }
+    return alph_stop(ctx, ALPH_NORMAL);
+  }
+  return ALPH_CONTINUE;
+}
+
+// Spawns children until WINDOW are in flight or N have been spawned.
+fn spawn_more(ctx: AlphCtx*, p: Parent*) -> bool {
+  var c: Child;
+  c.parent = ctx->self;
+  while (p->spawned < N && p->spawned - p->received < WINDOW) {
+    if (alph_spawn_value<Child>(ctx, 0, &c, &child) == 0) {
+      println("FAIL spawn {p->spawned} failed");
+      alph_halt(ctx, 1);
+      return false;
+    }
+    p->spawned = p->spawned + 1;
+  }
+  return true;
+}
+
+fn parent(ctx: AlphCtx*, m: AlphMsg*) -> int64 {
+  var p: Parent* = (Parent*)ctx->state;
+  if (m->tag == ALPH_TAG_INIT) {
+    g_start_ns = alph_now_ns();
+    spawn_more(ctx, p);
+    return ALPH_CONTINUE;
+  }
+  if (m->tag != TAG_HELLO) {
+    return ALPH_CONTINUE;
+  }
+  p->received = p->received + 1;
+  if (p->received == N) {
+    g_end_ns = alph_now_ns();
+    if (p->spawned != N) {
+      println("FAIL spawned {p->spawned}, wanted {N}");
+      alph_halt(ctx, 1);
+      return ALPH_CONTINUE;
+    }
+    alph_halt(ctx, 0);
+    return ALPH_CONTINUE;
+  }
+  if (p->spawned - p->received <= WINDOW - REFILL) {
+    spawn_more(ctx, p);
+  }
+  return ALPH_CONTINUE;
+}
+
+fn main() -> int32 {
+  var cfg: AlphConfig;
+  alph_config(&cfg);
+  cfg.max_actors = 262144;
+  cfg.mailbox_size = MAILBOX;
+  if (!alph_node_start(&g_node, &cfg)) {
+    println("FAIL node did not start");
+    return 1;
+  }
+  var p: Parent;
+  p.spawned = 0;
+  p.received = 0;
+  alph_node_spawn_value<Parent>(&g_node, 0, &p, &parent);
+  var code: int64 = alph_node_wait(&g_node);
+  if (code != 0) {
+    return 1;
+  }
+  var elapsed: int64 = g_end_ns - g_start_ns;
+  var per_s: int64 = N * 1000000000 / elapsed;
+  var ns_per: int64 = elapsed / N;
+  println("RESULT spawn spawns_per_s={per_s} ns_per_spawn={ns_per}");
+  return 0;
+}
