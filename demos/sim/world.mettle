@@ -1,0 +1,343 @@
+// world: the actors of the sim demo.
+//
+//   world (top level, traps exits)
+//     |- dynamic supervisor, permanent restart: one child per grid cell
+//     |    `- 640 cells, each a plain actor holding an energy value
+//     `- chaos actor: crashes random cells at an adjustable rate
+//
+// Shared state is a set of global arrays and counters. Every access goes
+// through alph_atomic_load / store / add, so the UI thread can read them
+// while the schedulers write them:
+//
+//   sim_pid[i]      the pid of cell i. A cell writes it in INIT, so after a
+//                   restart its neighbours find the new pid by index
+//   sim_energy[i]   the energy cell i published on its last tick
+//   sim_born[i]     alph_now_ms() when cell i was last restarted, 0 if never
+//   sim_msgs, sim_crashes, sim_restarts, sim_sup_restarts   counters
+//   sim_paused      1 makes cells skip their tick work
+//   sim_chaos_pid   the chaos actor, so the UI can message it
+
+import "std/mem";
+import "alph/sys/atomic";
+import "alph/sys/clock";
+import "alph/alph";
+
+export const SIM_W: int64 = 32;
+export const SIM_H: int64 = 20;
+export const SIM_CELLS: int64 = 640;
+export const SIM_ONE: int64 = 1000000;          // energy 1.0, fixed point
+
+// Messages from outside the world, to the chaos actor.
+export const SIM_TAG_RATE: int64 = ALPH_TAG_USER + 10;   // arg: crashes per second
+export const SIM_TAG_STORM: int64 = ALPH_TAG_USER + 11;  // crash SIM_STORM_SIZE cells now
+export const SIM_STORM_SIZE: int64 = 100;
+export const SIM_DEFAULT_RATE: int64 = 25;
+
+const TAG_TICK: int64 = ALPH_TAG_USER;           // a cell's timer
+const TAG_SHARE: int64 = ALPH_TAG_USER + 1;      // arg: energy handed over
+const TAG_CRASH: int64 = ALPH_TAG_USER + 2;      // arg 0 makes the cell divide by it
+const TAG_SPAWN: int64 = ALPH_TAG_USER + 3;      // the world starting the next batch of cells
+const TAG_CHAOS_TICK: int64 = ALPH_TAG_USER + 4;
+
+const TICK_MS: int64 = 40;
+const CHAOS_TICK_MS: int64 = 10;
+const SPAWN_BATCH: int64 = 16;
+const SHARE_DIV: int64 = 40;      // each neighbour gets 1/40 of the energy per tick
+const GROWTH_PCT: int64 = 9;      // logistic growth per tick, in percent
+const SEED_ENERGY: int64 = 3000;  // a little growth even from 0, or logistic growth never leaves 0
+
+export var sim_node: AlphNode;
+export var sim_pid: int64[640];
+export var sim_energy: int64[640];
+export var sim_born: int64[640];
+export var sim_msgs: int64 = 0;
+export var sim_crashes: int64 = 0;
+export var sim_restarts: int64 = 0;
+export var sim_sup_restarts: int64 = 0;
+export var sim_paused: int64 = 0;
+export var sim_chaos_pid: int64 = 0;
+export var sim_chaos_rate: int64 = 0;
+export var sim_cells_started: int64 = 0;
+
+// ---------------------------------------------------------------- cells
+
+struct SimCell {
+  idx: int64;
+  cap: int64;      // carrying capacity of this cell's logistic growth
+  energy: int64;   // 0 at start; INIT seeds the first life only
+}
+
+// The cell on the grid next to idx: d 0..3 is east, west, south, north,
+// wrapping at the edges, so every cell has four neighbours.
+fn sim_neighbor(idx: int64, d: int64) -> int64 {
+  var x: int64 = idx % SIM_W;
+  var y: int64 = idx / SIM_W;
+  if (d == 0) {
+    x = (x + 1) % SIM_W;
+  } else if (d == 1) {
+    x = (x + SIM_W - 1) % SIM_W;
+  } else if (d == 2) {
+    y = (y + 1) % SIM_H;
+  } else {
+    y = (y + SIM_H - 1) % SIM_H;
+  }
+  return y * SIM_W + x;
+}
+
+// The strength of hill (cx, cy) of radius r at cell (x, y), 0 to 1000.
+fn sim_hill(x: int64, y: int64, cx: int64, cy: int64, r: int64) -> int64 {
+  var dx: int64 = x - cx;
+  var dy: int64 = y - cy;
+  var d2: int64 = dx * dx + dy * dy;
+  var r2: int64 = r * r;
+  if (d2 >= r2) {
+    return 0;
+  }
+  return 1000 * (r2 - d2) / r2;
+}
+
+// Carrying capacity of cell idx: a low plain with three hills, so the
+// heatmap has a landscape for the crashes to cut holes in.
+fn sim_capacity(idx: int64) -> int64 {
+  var x: int64 = idx % SIM_W;
+  var y: int64 = idx / SIM_W;
+  var best: int64 = sim_hill(x, y, 8, 6, 8);
+  var b: int64 = sim_hill(x, y, 24, 13, 9);
+  if (b > best) {
+    best = b;
+  }
+  b = sim_hill(x, y, 13, 16, 5);
+  if (b > best) {
+    best = b;
+  }
+  return SIM_ONE * (150 + best * 85 / 100) / 1000;
+}
+
+fn sim_cell_tick(ctx: AlphCtx*, c: SimCell*) {
+  alph_send_after(ctx, TICK_MS, ctx->self, TAG_TICK, 0);
+  if (alph_atomic_load(&sim_paused) != 0) {
+    return;
+  }
+  // Hand a share to each neighbour. Energy leaves only when the message was
+  // delivered, so a neighbour that is down or full costs nothing.
+  var share: int64 = c->energy / SHARE_DIV;
+  var sent: int64 = 0;
+  if (share > 0) {
+    for d: int64 in 0..4 {
+      var pid: int64 = alph_atomic_load(&sim_pid[sim_neighbor(c->idx, d)]);
+      if (pid != 0 && alph_send(ctx, pid, TAG_SHARE, share) == ALPH_SENT) {
+        c->energy = c->energy - share;
+        sent = sent + 1;
+      }
+    }
+  }
+  // Logistic growth toward this cell's capacity; above it the energy decays.
+  var e: int64 = c->energy;
+  e = e + (e + SEED_ENERGY) * (c->cap - e) / c->cap * GROWTH_PCT / 100;
+  if (e < 0) {
+    e = 0;
+  }
+  c->energy = e;
+  alph_atomic_store(&sim_energy[c->idx], e);
+  if (sent > 0) {
+    alph_atomic_add(&sim_msgs, sent);
+  }
+}
+
+fn sim_cell(ctx: AlphCtx*, m: AlphMsg*) -> int64 {
+  var c: SimCell* = (SimCell*)ctx->state;
+  if (m->tag == TAG_SHARE) {
+    c->energy = c->energy + m->arg;
+  } else if (m->tag == TAG_TICK) {
+    sim_cell_tick(ctx, c);
+  } else if (m->tag == TAG_CRASH) {
+    alph_atomic_add(&sim_crashes, 1);
+    var zero: int64 = m->arg;
+    c->energy = c->energy / zero;   // m->arg is 0: the check traps and this actor crashes
+  } else if (m->tag == ALPH_TAG_INIT) {
+    if (alph_atomic_load(&sim_pid[c->idx]) == 0) {
+      // First life: start with some energy, spread over the cells.
+      c->energy = c->cap * (20 + (c->idx * 7919 + c->idx / SIM_W * 104729) % 61) / 100;
+    } else {
+      // A restart: the pid in the table is the dead cell's. Energy stays 0
+      // and the cell regrows from its neighbours' shares.
+      alph_atomic_add(&sim_restarts, 1);
+      alph_atomic_store(&sim_born[c->idx], alph_now_ms());
+    }
+    alph_atomic_store(&sim_energy[c->idx], c->energy);
+    alph_atomic_store(&sim_pid[c->idx], ctx->self);
+    alph_atomic_add(&sim_cells_started, 1);
+    alph_send_after(ctx, 1 + c->idx % TICK_MS, ctx->self, TAG_TICK, 0);
+  }
+  return ALPH_CONTINUE;
+}
+
+// ---------------------------------------------------------------- chaos
+
+struct SimChaos {
+  rate: int64;     // crashes per second
+  rng: int64;
+  owed: int64;     // crashes owed, times 1000
+  last_ms: int64;
+}
+
+fn sim_chaos_pick(ch: SimChaos*) -> int64 {
+  ch->rng = (ch->rng * 1103515245 + 12345) & 2147483647;
+  return (ch->rng >> 8) % SIM_CELLS;
+}
+
+fn sim_chaos_hit(ctx: AlphCtx*, ch: SimChaos*, n: int64) {
+  for i: int64 in 0..n {
+    var pid: int64 = alph_atomic_load(&sim_pid[sim_chaos_pick(ch)]);
+    if (pid != 0) {
+      alph_send(ctx, pid, TAG_CRASH, 0);
+    }
+  }
+}
+
+fn sim_chaos(ctx: AlphCtx*, m: AlphMsg*) -> int64 {
+  var ch: SimChaos* = (SimChaos*)ctx->state;
+  if (m->tag == ALPH_TAG_INIT) {
+    ch->last_ms = alph_now_ms();
+    alph_atomic_store(&sim_chaos_rate, ch->rate);
+    alph_atomic_store(&sim_chaos_pid, ctx->self);
+    alph_send_after(ctx, CHAOS_TICK_MS, ctx->self, TAG_CHAOS_TICK, 0);
+  } else if (m->tag == SIM_TAG_RATE) {
+    ch->rate = m->arg;
+    if (ch->rate < 0) {
+      ch->rate = 0;
+    }
+    alph_atomic_store(&sim_chaos_rate, ch->rate);
+  } else if (m->tag == SIM_TAG_STORM) {
+    sim_chaos_hit(ctx, ch, SIM_STORM_SIZE);
+  } else if (m->tag == TAG_CHAOS_TICK) {
+    // Crashes owed since the last tick, with the remainder carried over.
+    var now: int64 = alph_now_ms();
+    ch->owed = ch->owed + (now - ch->last_ms) * ch->rate;
+    ch->last_ms = now;
+    var n: int64 = ch->owed / 1000;
+    ch->owed = ch->owed - n * 1000;
+    if (n > 0) {
+      sim_chaos_hit(ctx, ch, n);
+    }
+    alph_send_after(ctx, CHAOS_TICK_MS, ctx->self, TAG_CHAOS_TICK, 0);
+  }
+  return ALPH_CONTINUE;
+}
+
+// ---------------------------------------------------------------- world
+
+struct SimWorld {
+  sup: int64;      // the dynamic supervisor
+  chaos: int64;
+  next: int64;     // the next cell to start
+}
+
+fn sim_world_spawn_chaos(ctx: AlphCtx*, w: SimWorld*) {
+  var ch: SimChaos;
+  memset((rawptr)&ch, 0, (int64)sizeof(SimChaos));
+  ch.rate = alph_atomic_load(&sim_chaos_rate);   // sim_start's rate, or the last one the UI set
+  ch.rng = 12345 + alph_now_ms() % 1000;
+  w->chaos = alph_spawn_value<SimChaos>(ctx, ALPH_LINK, &ch, &sim_chaos);
+}
+
+fn sim_world_boot(ctx: AlphCtx*, w: SimWorld*) {
+  var spec: AlphDynSpec;
+  alph_dyn_init(&spec, &sim_cell);
+  spec.restart = ALPH_PERMANENT;
+  // A restart is allowed to be as frequent as the chaos asks. max_restarts
+  // tops out at 63 and a storm restarts 100 cells within a millisecond or
+  // two, so the period is 0: no restart ever counts as recent, and the
+  // supervisor never gives up.
+  spec.max_restarts = 63;
+  spec.period_ms = 0;
+  spec.shutdown_ms = 200;
+  w->sup = alph_spawn_dyn(ctx, &spec);
+  w->next = 0;
+  alph_send(ctx, ctx->self, TAG_SPAWN, 0);
+}
+
+fn sim_world(ctx: AlphCtx*, m: AlphMsg*) -> int64 {
+  var w: SimWorld* = (SimWorld*)ctx->state;
+  if (m->tag == ALPH_TAG_INIT) {
+    alph_trap_exits(ctx, true);
+    sim_world_boot(ctx, w);
+  } else if (m->tag == TAG_SPAWN) {
+    // Start the cells in small batches, so the supervisor's mailbox and our
+    // own (for the STARTED replies) never hold more than a batch.
+    var n: int64 = 0;
+    while (n < SPAWN_BATCH && w->next < SIM_CELLS) {
+      var cell: SimCell;
+      cell.idx = w->next;
+      cell.cap = sim_capacity(w->next);
+      cell.energy = 0;
+      alph_dyn_start_value<SimCell>(ctx, w->sup, &cell, 10000);
+      w->next = w->next + 1;
+      n = n + 1;
+    }
+    if (w->next < SIM_CELLS) {
+      alph_send_after(ctx, 2, ctx->self, TAG_SPAWN, 0);
+    } else if (w->chaos == 0) {
+      sim_world_spawn_chaos(ctx, w);
+    }
+  } else if (m->tag == ALPH_TAG_EXIT) {
+    if (m->from == w->sup) {
+      // The supervisor gave up (it should not): count it and build the grid again.
+      alph_atomic_add(&sim_sup_restarts, 1);
+      sim_world_boot(ctx, w);
+    } else if (m->from == w->chaos) {
+      sim_world_spawn_chaos(ctx, w);
+    }
+  }
+  return ALPH_CONTINUE;
+}
+
+// Starts the node and the world, with the chaos actor at `rate` crashes per
+// second. schedulers 0 is one per CPU. Returns false when the node would not
+// start.
+export fn sim_start(schedulers: int64, rate: int64) -> bool {
+  var cfg: AlphConfig;
+  alph_config(&cfg);
+  if (schedulers > 0) {
+    cfg.schedulers = schedulers;
+  }
+  cfg.max_actors = 4096;
+  cfg.mailbox_size = 512;   // a cell gets four shares a tick, a crash storm adds more
+  if (!alph_node_start(&sim_node, &cfg)) {
+    return false;
+  }
+  alph_atomic_store(&sim_chaos_rate, rate);
+  var w: SimWorld;
+  memset((rawptr)&w, 0, (int64)sizeof(SimWorld));
+  return alph_node_spawn_value<SimWorld>(&sim_node, 0, &w, &sim_world) != 0;
+}
+
+// Stops the node and waits for it.
+export fn sim_stop() {
+  alph_node_shutdown(&sim_node, 1000, 0);
+  alph_node_wait(&sim_node);
+}
+
+// Asks the chaos actor, if it is up, to crash n cells per second.
+export fn sim_set_rate(n: int64) {
+  var pid: int64 = alph_atomic_load(&sim_chaos_pid);
+  if (pid != 0) {
+    alph_node_send(&sim_node, pid, SIM_TAG_RATE, n);
+  }
+}
+
+// Asks the chaos actor to crash SIM_STORM_SIZE cells at once.
+export fn sim_storm() {
+  var pid: int64 = alph_atomic_load(&sim_chaos_pid);
+  if (pid != 0) {
+    alph_node_send(&sim_node, pid, SIM_TAG_STORM, 0);
+  }
+}
+
+export fn sim_set_paused(on: bool) {
+  if (on) {
+    alph_atomic_store(&sim_paused, 1);
+  } else {
+    alph_atomic_store(&sim_paused, 0);
+  }
+}

@@ -1574,7 +1574,7 @@ alph_sup_add, change these if needed, then spawn it:
 strategy          ALPH_ONE_FOR_ONE, ALPH_ONE_FOR_ALL or ALPH_REST_FOR_ONE
 max_restarts      restarts allowed within period_ms before giving up;
                   default 1, as OTP (at most 63)
-period_ms         default 5000
+period_ms         default 5000; 0 means no limit, never give up
 backoff_ms        wait before the first of consecutive restarts; 0
                   (default) restarts at once
 backoff_max_ms    cap on the doubling backoff; 0 means no cap
@@ -1851,7 +1851,8 @@ shutdown_ms   how long children get to stop before they are killed; 0
               kills them at once. Default 5000
 max_restarts  restarts allowed within period_ms before giving up;
               default 3 (at most 63)
-period_ms     default 5000
+period_ms     default 5000; 0 means no limit: no restart ever counts as
+              recent, so the supervisor never gives up
 max_children  children at once; 0 (default) is no limit
 handler       the children's handler, set by alph_dyn_init
 ```

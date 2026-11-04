@@ -1,0 +1,4 @@
+# Libraries the demo builds against, relative to this file.
+alph=../../src
+mythic=../../../mythic_ui/src
+mistplot=../../../mistplot/src
