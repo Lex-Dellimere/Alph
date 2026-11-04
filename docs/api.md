@@ -147,8 +147,9 @@ How to run a node. Fill it with alph_config, then change what you need.
 ```text
 schedulers    scheduler threads; default: one per CPU
 max_actors    actors alive at once; default 65536
-mailbox_size  messages a mailbox holds before senders get ALPH_FULL;
-              rounded up to a power of two; default 64
+mailbox_size  messages a mailbox holds before senders get ALPH_FULL,
+              unless the actor sets its own with alph_mailbox_limit;
+              default 64. Memory grows with what is queued, not with this
 stack_size    bytes of stack per scheduler, which is how deep a handler
               may call; default 1 MiB
 heap_limit    bytes one actor's heap may hold, state included; past it
@@ -226,6 +227,12 @@ export struct AlphNode {
   hungry: int64;        // schedulers with hungry set
   spinners: int64;      // schedulers spinning now
   max_spinners: int64;  // at most this many spin at once
+  active: int64;        // schedulers 0..active-1 take new work; the rest drain and sleep
+  balance_at: int64;    // when the next look at the load is due (ns)
+  balance_lock: int64;
+  balanced: int64;      // when the last look was (ns)
+  low_streak: int64;    // looks in a row that asked for fewer active schedulers
+  low_max: int64;       //   and the most any of them asked for
 }
 ```
 
@@ -550,6 +557,23 @@ export fn alph_parent(ctx: AlphCtx*) -> int64
 ```
 
 The pid of the actor that spawned this one, or 0 when the node did.
+Thread: a handler.
+
+### `alph_mailbox_limit`
+
+```mettle
+export fn alph_mailbox_limit(ctx: AlphCtx*, limit: int64)
+```
+
+Sets how many messages this actor's mailbox holds before senders get
+ALPH_FULL, in place of AlphConfig.mailbox_size. An actor many others talk
+to, such as one that owns a store, raises it; memory grows only with what
+is actually queued. Messages already queued stay.
+
+```text
+limit  at least 1
+```
+
 Thread: a handler.
 
 ### `alph_send_after`
@@ -1339,11 +1363,13 @@ are read one by one, so they may be a moment apart. Thread: any.
 
 Messages, and the bounded mailbox that holds them.
 
-The mailbox is Vyukov's bounded queue: each cell carries a sequence number,
-producers claim a position with one CAS, and the single consumer reads in
-order. Messages from one sender arrive in the order they were sent. A full
-mailbox refuses the message instead of growing, so overload shows up at
-the sender as ALPH_FULL rather than as memory growth.
+The mailbox is a chain of small segments, as in crossbeam's SegQueue:
+senders claim a position with one CAS, the single receiver reads in order,
+and a segment is linked when the last one fills. An idle actor holds one
+segment of ALPH_SEG cells; a busy one reuses a spare instead of allocating.
+Messages from one sender arrive in the order they were sent. A mailbox
+holding its limit refuses the message instead of growing, so overload
+shows up at the sender as ALPH_FULL rather than as memory growth.
 
 Payloads up to this many bytes travel inside the message. Larger ones cost
 one allocation and are freed after the handler returns.
@@ -1414,15 +1440,17 @@ Thread: the handler that received m.
 
 ```mettle
 export struct AlphMailbox {
-  cells: int64;  // AlphCell array, allocated once and kept for reuse
-  mask: int64;
-  // enq is written by every sender, deq by the receiver for every message.
-  // On one cache line, each write would take the line from the other side;
-  // the padding keeps them 64 bytes apart.
+  head: int64;   // the segment the receiver reads
+  limit: int64;  // messages it holds before senders are refused
+  spare: int64;  // an emptied segment kept for reuse, or 0
+  // enq and tail are written by every sender, deq by the receiver for every
+  // message. On one cache line, each write would take the line from the
+  // other side; the padding keeps them 64 bytes apart.
   pad_a: int64[8];
-  enq: int64;    // next position to claim; producers
+  enq: int64;    // next position to claim; senders
+  tail: int64;   // the segment holding position enq; senders
   pad_b: int64[8];
-  deq: int64;    // next position to read; the consumer
+  deq: int64;    // next position to read; the receiver
   pad_c: int64[8];
 }
 ```
@@ -1430,14 +1458,36 @@ export struct AlphMailbox {
 A bounded multi-producer, single-consumer queue of messages. Internal to
 the runtime; actors never touch it.
 
+Positions only grow. Position pos is cell pos % ALPH_LAP of its segment;
+the last position of each lap is an end mark no message uses: a sender
+that finds enq there waits until the segment that claimed the last cell
+has linked the next one.
+
 ### `alph_mailbox_init`
 
 ```mettle
-export fn alph_mailbox_init(mb: AlphMailbox*, capacity: int64) -> bool
+export fn alph_mailbox_init(mb: AlphMailbox*, limit: int64) -> bool
 ```
 
-Allocates room for capacity messages, which must be a power of two.
-Returns false when out of memory. Thread: any, before the mailbox is used.
+Prepares an empty mailbox that holds up to limit messages. Returns false
+when out of memory. Thread: any, before the mailbox is used.
+
+### `alph_mailbox_set_limit`
+
+```mettle
+export fn alph_mailbox_set_limit(mb: AlphMailbox*, limit: int64)
+```
+
+Sets how many messages the mailbox holds before senders are refused.
+Messages already in it stay. Thread: any.
+
+### `alph_mailbox_count`
+
+```mettle
+export fn alph_mailbox_count(mb: AlphMailbox*) -> int64
+```
+
+Messages waiting, roughly: senders may be mid-way. Thread: any.
 
 ### `alph_mailbox_push`
 
@@ -1445,8 +1495,8 @@ Returns false when out of memory. Thread: any, before the mailbox is used.
 export fn alph_mailbox_push(mb: AlphMailbox*, m: AlphMsg*) -> bool
 ```
 
-Copies *m into the mailbox. Returns false when it is full.
-Thread: any.
+Copies *m into the mailbox. Returns false when it holds its limit, or
+when a new segment was needed and memory ran out. Thread: any.
 
 ### `alph_mailbox_pop`
 

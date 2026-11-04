@@ -127,6 +127,14 @@ const ALPH_BUDGET: int64 = 64;
 const ALPH_SHARE_WAKE: int64 = 8;
 const ALPH_IO_POLL_NS: int64 = 100000;  // a busy scheduler looks at its sockets at least this often
 
+// Compaction. Every ALPH_BALANCE_NS the node sums how long its schedulers
+// were busy and keeps just enough of them active that each is busy about
+// ALPH_BUSY_PCT percent of the time. More are activated at once; fewer only
+// after ALPH_SHRINK_AFTER looks in a row asked for fewer.
+const ALPH_BALANCE_NS: int64 = 10000000;
+const ALPH_BUSY_PCT: int64 = 50;
+const ALPH_SHRINK_AFTER: int64 = 5;
+
 const ALPH_NS_PER_MS: int64 = 1000000;
 
 // ---- public types ----------------------------------------------------------
@@ -135,8 +143,9 @@ const ALPH_NS_PER_MS: int64 = 1000000;
 //
 //   schedulers    scheduler threads; default: one per CPU
 //   max_actors    actors alive at once; default 65536
-//   mailbox_size  messages a mailbox holds before senders get ALPH_FULL;
-//                 rounded up to a power of two; default 64
+//   mailbox_size  messages a mailbox holds before senders get ALPH_FULL,
+//                 unless the actor sets its own with alph_mailbox_limit;
+//                 default 64. Memory grows with what is queued, not with this
 //   stack_size    bytes of stack per scheduler, which is how deep a handler
 //                 may call; default 1 MiB
 //   heap_limit    bytes one actor's heap may hold, state included; past it
@@ -215,6 +224,12 @@ export struct AlphNode {
   hungry: int64;        // schedulers with hungry set
   spinners: int64;      // schedulers spinning now
   max_spinners: int64;  // at most this many spin at once
+  active: int64;        // schedulers 0..active-1 take new work; the rest drain and sleep
+  balance_at: int64;    // when the next look at the load is due (ns)
+  balance_lock: int64;
+  balanced: int64;      // when the last look was (ns)
+  low_streak: int64;    // looks in a row that asked for fewer active schedulers
+  low_max: int64;       //   and the most any of them asked for
 }
 
 // What a handler gets besides the message. Read these fields:
@@ -315,6 +330,9 @@ struct AlphSched {
   pop_lock: int64;      // taken to pop runq: the owner and thieves are its consumers
   polled_at: int64;     // when a busy scheduler last looked at its sockets (ns)
   hungry: int64;        // 1 while it has no work and may be handed some
+  work_at: int64;       // when its current stretch of work began (ns), 0 while idle
+  busy_ns: int64;       // time spent working, over finished stretches
+  busy_seen: int64;     // busy time the last look at the load counted
 }
 
 // One IO handle: a file descriptor with an owner. A handle's id carries a
@@ -329,6 +347,7 @@ struct AlphIoSlot {
   pollable: int64;  // epoll accepted it (regular files are not)
   child: int64;     // a process handle: the child's OS pid until it is reaped
   kill_to: int64;   // what kill() targets for it: -pid (its group) or pid
+  armed: int64;     // events asked for and not yet delivered, to re-arm on a move
 }
 
 // A registered name, or a process group and its members. The name is a
@@ -570,6 +589,129 @@ fn alph_sched_steal(s: AlphSched*, node: AlphNode*) -> int64 {
   return 0;
 }
 
+// Whether s takes new work. A bound scheduler always runs its one actor.
+fn alph_sched_active(node: AlphNode*, s: AlphSched*) -> bool {
+  return s->bound != 0 || s->index < alph_atomic_load(&node->active);
+}
+
+// An active scheduler for p, spread by its slot.
+fn alph_sched_pick(node: AlphNode*, p: AlphProc*) -> AlphSched* {
+  var n: int64 = alph_atomic_load(&node->active);
+  if (n < 1) {
+    n = 1;
+  }
+  return alph_sched_at(node, p->index % n);
+}
+
+// Moves p's handles to the epoll set of to, armed as they were. The caller
+// holds p (QUEUED and on no queue) on the thread of p's old home, the one
+// thread that polls those handles, so no event is lost: one that fired and
+// was not yet read is dropped with the old registration and, the handle
+// still being ready, fires again on the new one.
+fn alph_io_move(node: AlphNode*, p: AlphProc*, to: AlphSched*) {
+  for i: int64 in 0..p->io_handles.len {
+    var slot: AlphIoSlot* = alph_io_slot(node, alph_vec_get(&p->io_handles, i));
+    if (slot != 0 && slot->pollable != 0 && slot->sched != (int64)to) {
+      var old: AlphSched* = (AlphSched*)slot->sched;
+      alph_sys_epoll_ctl(old->epfd, ALPH_EPOLL_CTL_DEL, slot->fd, 0, 0);
+      alph_atomic_add(&old->io_count, -1);
+      slot->sched = (int64)to;
+      if (alph_sys_epoll_ctl(to->epfd, ALPH_EPOLL_CTL_ADD, slot->fd,
+                             slot->armed | ALPH_EPOLLONESHOT, slot->handle) == 0) {
+        alph_atomic_add(&to->io_count, 1);
+      } else {
+        slot->pollable = 0;
+      }
+    }
+  }
+}
+
+// Gives p, which s popped, to another scheduler and wakes it.
+fn alph_sched_give(s: AlphSched*, node: AlphNode*, p: AlphProc*, to: AlphSched*) {
+  alph_io_move(node, p, to);
+  // QUEUED and off every queue: nobody else touches its home now. Set it
+  // before the push makes it visible to the new home.
+  p->sched = (int64)to;
+  alph_runq_push(to, p);
+  alph_sched_notify(to);
+}
+
+// Busy-time accounting for compaction: a stretch of work starts when a
+// scheduler finds work after being idle, and ends when it runs out.
+fn alph_sched_working(s: AlphSched*) {
+  if (s->work_at == 0) {
+    alph_atomic_store(&s->work_at, alph_now_ns());
+  }
+}
+
+fn alph_sched_resting(s: AlphSched*, node: AlphNode*) {
+  var w: int64 = s->work_at;
+  if (w == 0) {
+    return;
+  }
+  var t: int64 = alph_now_ns();
+  // Clear work_at before adding, so a look at the load never counts the
+  // stretch twice; at worst it counts it one look late.
+  alph_atomic_store_sc(&s->work_at, 0);
+  alph_atomic_add(&s->busy_ns, t - w);
+  alph_balance(node, t);
+}
+
+// Looks at the load when one is due, and sets how many schedulers are
+// active. Any scheduler may call it; one at a time does the work.
+fn alph_balance(node: AlphNode*, t: int64) {
+  if (t < alph_atomic_load(&node->balance_at) || alph_atomic_cas(&node->balance_lock, 0, 1) != 0) {
+    return;
+  }
+  if (t >= node->balance_at) {
+    var busy: int64 = 0;
+    for i: int64 in 0..node->sched_count {
+      var s: AlphSched* = alph_sched_at(node, i);
+      var total: int64 = alph_atomic_load(&s->busy_ns);
+      var w: int64 = alph_atomic_load(&s->work_at);
+      if (w != 0 && t > w) {
+        total = total + (t - w);  // the stretch under way, so far
+      }
+      if (total > s->busy_seen) {
+        busy = busy + (total - s->busy_seen);
+      }
+      s->busy_seen = total;
+    }
+    var span: int64 = t - node->balanced;
+    if (node->balanced != 0 && span > 0) {
+      var target: int64 = busy * 100 / (span * ALPH_BUSY_PCT) + 1;
+      if (target > node->sched_count) {
+        target = node->sched_count;
+      }
+      var active: int64 = node->active;
+      if (target > active) {
+        alph_atomic_store_sc(&node->active, target);
+        node->low_streak = 0;
+        node->low_max = 0;
+        for i: int64 in active..target {
+          alph_sched_notify(alph_sched_at(node, i));  // so it looks for work to steal
+        }
+      } else if (target < active) {
+        node->low_streak = node->low_streak + 1;
+        if (target > node->low_max) {
+          node->low_max = target;
+        }
+        if (node->low_streak >= ALPH_SHRINK_AFTER) {
+          alph_atomic_store_sc(&node->active, node->low_max);
+          node->low_streak = 0;
+          node->low_max = 0;
+        }
+      } else {
+        node->low_streak = 0;
+        node->low_max = 0;
+      }
+    }
+    node->balanced = t;
+    alph_atomic_store(&node->balance_at, t + ALPH_BALANCE_NS);
+  }
+  alph_atomic_store(&node->balance_lock, 0);
+}
+
 fn alph_wake(node: AlphNode*, p: AlphProc*) {
   alph_atomic_fence();
   while (true) {
@@ -577,6 +719,13 @@ fn alph_wake(node: AlphNode*, p: AlphProc*) {
     if (status == ALPH_P_IDLE) {
       if (alph_atomic_cas(&p->status, ALPH_P_IDLE, ALPH_P_QUEUED) == ALPH_P_IDLE) {
         var s: AlphSched* = (AlphSched*)p->sched;
+        if (!alph_sched_active(node, s) && p->io_handles.len == 0) {
+          // Its home is draining: give it an active one. It is QUEUED and
+          // on no queue, so only this thread touches its home now. Socket
+          // owners move on their old home's thread, with their sockets.
+          s = alph_sched_pick(node, p);
+          p->sched = (int64)s;
+        }
         alph_runq_push(s, p);
         alph_sched_notify(s);
         return;
@@ -1061,6 +1210,20 @@ fn alph_timers_fire(node: AlphNode*, h: AlphVec*) -> int64 {
   return -1;
 }
 
+// Sets how many messages this actor's mailbox holds before senders get
+// ALPH_FULL, in place of AlphConfig.mailbox_size. An actor many others talk
+// to, such as one that owns a store, raises it; memory grows only with what
+// is actually queued. Messages already queued stay.
+//
+//   limit  at least 1
+//
+// Thread: a handler.
+export fn alph_mailbox_limit(ctx: AlphCtx*, limit: int64) {
+  if (limit >= 1) {
+    alph_mailbox_set_limit(&alph_me(ctx)->mailbox, limit);
+  }
+}
+
 // Sends a tag and one word to `to` after ms milliseconds. It cannot be
 // cancelled; use alph_start_timer for that. Like every signal it is never
 // dropped for a full mailbox. Thread: a handler.
@@ -1184,6 +1347,7 @@ fn alph_spawn_raw(node: AlphNode*, parent: int64, flags: int64, monitor_ref: int
     p->index = index;
     p->inited = 1;
   }
+  alph_mailbox_set_limit(&p->mailbox, node->mailbox_size);
   // Leftovers sent to the previous owner of the slot are dropped.
   var stale: AlphMsg;
   while (alph_mailbox_pop(&p->mailbox, &stale)) {
@@ -1206,7 +1370,11 @@ fn alph_spawn_raw(node: AlphNode*, parent: int64, flags: int64, monitor_ref: int
     if (home != 0 && ((AlphSched*)home->sched)->bound == 0) {
       p->sched = home->sched;
     } else {
-      var next: int64 = alph_atomic_add(&node->next_sched, 1) % node->sched_count;
+      var n: int64 = alph_atomic_load(&node->active);
+      if (n < 1) {
+        n = 1;
+      }
+      var next: int64 = alph_atomic_add(&node->next_sched, 1) % n;
       p->sched = (int64)alph_sched_at(node, next);
     }
   }
@@ -2034,6 +2202,7 @@ fn alph_io_drop(node: AlphNode*, h: int64, owner: int64) {
 fn alph_io_register(slot: AlphIoSlot*, s: AlphSched*) {
   slot->sched = (int64)s;
   slot->pollable = 0;
+  slot->armed = 0;
   if (alph_sys_epoll_ctl(s->epfd, ALPH_EPOLL_CTL_ADD, slot->fd, ALPH_EPOLLONESHOT, slot->handle) == 0) {
     slot->pollable = 1;
     alph_atomic_add(&s->io_count, 1);
@@ -2096,6 +2265,7 @@ export fn alph_io_arm(ctx: AlphCtx*, h: int64, events: int64) -> int64 {
     return -1;
   }
   var s: AlphSched* = (AlphSched*)slot->sched;
+  slot->armed = events & (ALPH_IO_IN | ALPH_IO_OUT);
   return alph_sys_epoll_ctl(s->epfd, ALPH_EPOLL_CTL_MOD, slot->fd,
                             (events & (ALPH_IO_IN | ALPH_IO_OUT)) | ALPH_EPOLLONESHOT, h);
 }
@@ -3230,6 +3400,7 @@ fn alph_sched_poll(s: AlphSched*, timeout_ms: int64) {
       if (slot != 0) {
         var mask: int64 = alph_sys_event_mask((rawptr)s->events, i) &
                           (ALPH_IO_IN | ALPH_IO_OUT | ALPH_IO_ERR | ALPH_IO_HUP);
+        slot->armed = 0;  // one-shot: it fired, and is disarmed until armed again
         alph_signal(node, ALPH_SIG_IO, 0, slot->owner, data, mask, 0);
       }
     }
@@ -3265,7 +3436,7 @@ fn alph_sched_share(s: AlphSched*, node: AlphNode*) {
   var wake_sleepers: bool = qlen >= ALPH_SHARE_WAKE;
   for i: int64 in 0..node->sched_count {
     var h: AlphSched* = alph_sched_at(node, (s->index + 1 + i) % node->sched_count);
-    if (h != s && alph_atomic_load(&h->hungry) != 0 &&
+    if (h != s && alph_atomic_load(&h->hungry) != 0 && alph_sched_active(node, h) &&
         (wake_sleepers || alph_atomic_load(&h->sleeping) == 0) &&
         alph_atomic_cas(&h->hungry, 1, 0) == 1) {
       alph_atomic_add(&node->hungry, -1);
@@ -3274,18 +3445,9 @@ fn alph_sched_share(s: AlphSched*, node: AlphNode*) {
         alph_sched_hungry(h, node);  // nothing to give after all
         return;
       }
-      if (((AlphProc*)p)->io_handles.len > 0) {
-        // Actors that own sockets stay where their sockets are watched:
-        // moved, every event would wake their old scheduler and then hop.
-        alph_runq_push(s, (AlphProc*)p);
-        alph_sched_hungry(h, node);
-        return;
-      }
-      // The actor is QUEUED and off every queue: nobody else touches its
-      // home now. Set it before the push makes it visible to h.
-      ((AlphProc*)p)->sched = (int64)h;
-      alph_runq_push(h, (AlphProc*)p);
-      alph_sched_notify(h);
+      // Socket owners take their sockets along, so events reach the new
+      // home directly.
+      alph_sched_give(s, node, (AlphProc*)p, h);
       return;
     }
   }
@@ -3343,6 +3505,19 @@ fn alph_sched_spin_for(s: AlphSched*, node: AlphNode*, wait: int64, budget: int6
   return 0;
 }
 
+// s found p to run. An active scheduler runs it; a draining one gives it
+// to an active one, sockets and all. Returns whether it ran.
+fn alph_sched_take(s: AlphSched*, node: AlphNode*, p: AlphProc*) -> bool {
+  alph_sched_fed(s, node);
+  if (!alph_sched_active(node, s)) {
+    alph_sched_give(s, node, p, alph_sched_pick(node, p));
+    return false;
+  }
+  alph_sched_working(s);
+  alph_run_proc(s, p);
+  return true;
+}
+
 fn alph_sched_main(arg: int64) -> int64 {
   var s: AlphSched* = (AlphSched*)arg;
   var node: AlphNode* = (AlphNode*)s->node;
@@ -3350,32 +3525,39 @@ fn alph_sched_main(arg: int64) -> int64 {
     var wait: int64 = alph_timers_fire(node, &s->timers);
     var p: int64 = alph_runq_pop(s);
     if (p != 0) {
-      alph_sched_fed(s, node);
-      alph_run_proc(s, (AlphProc*)p);
+      if (!alph_sched_take(s, node, (AlphProc*)p)) {
+        continue;
+      }
       alph_sched_share(s, node);
-      // A busy scheduler still looks at its handles now and then.
+      // A busy scheduler still looks at its handles, and at the load, now
+      // and then.
       s->runs = s->runs + 1;
-      if (alph_atomic_load(&s->io_count) > 0) {
+      if (alph_atomic_load(&s->io_count) > 0 || s->runs % 64 == 0) {
         var t: int64 = alph_now_ns();
-        if (t - s->polled_at > ALPH_IO_POLL_NS) {
+        if (alph_atomic_load(&s->io_count) > 0 && t - s->polled_at > ALPH_IO_POLL_NS) {
           s->polled_at = t;
           alph_sched_poll(s, 0);
         }
+        alph_balance(node, t);
       }
       continue;
     }
     // Out of work: offer to take some, and before sleeping keep checking
     // for a while, so work sent meanwhile is picked up with no eventfd
-    // write and no epoll wake-up.
-    alph_sched_hungry(s, node);
-    p = alph_sched_steal(s, node);
-    if (p == 0) {
-      p = alph_sched_spin(s, node, wait);
-    }
-    if (p != 0) {
+    // write and no epoll wake-up. A draining scheduler does neither.
+    alph_sched_resting(s, node);
+    if (alph_sched_active(node, s)) {
+      alph_sched_hungry(s, node);
+      p = alph_sched_steal(s, node);
+      if (p == 0) {
+        p = alph_sched_spin(s, node, wait);
+      }
+      if (p != 0) {
+        alph_sched_take(s, node, (AlphProc*)p);
+        continue;
+      }
+    } else {
       alph_sched_fed(s, node);
-      alph_run_proc(s, (AlphProc*)p);
-      continue;
     }
     // Park in epoll. A pusher bumps wake after its push, then writes the
     // eventfd if sleeping is set; setting sleeping first and popping once
@@ -3384,8 +3566,7 @@ fn alph_sched_main(arg: int64) -> int64 {
     p = alph_runq_pop(s);
     if (p != 0) {
       alph_atomic_store(&s->sleeping, 0);
-      alph_sched_fed(s, node);
-      alph_run_proc(s, (AlphProc*)p);
+      alph_sched_take(s, node, (AlphProc*)p);
       continue;
     }
     if (alph_atomic_load(&node->halted) == 0 && alph_atomic_load(&s->done) == 0) {
@@ -3430,14 +3611,6 @@ export fn alph_config(cfg: AlphConfig*) {
   cfg->spin_us = 50;
 }
 
-fn alph_round_pow2(n: int64) -> int64 {
-  var p: int64 = 2;
-  while (p < n) {
-    p = p * 2;
-  }
-  return p;
-}
-
 // Starts a node: its schedulers begin running and actors can be spawned.
 //
 //   node  storage for the node; keep it in place until alph_node_wait returns
@@ -3447,13 +3620,13 @@ fn alph_round_pow2(n: int64) -> int64 {
 // memory or threads run out.
 // Thread: any, once per node.
 export fn alph_node_start(node: AlphNode*, cfg: AlphConfig*) -> bool {
-  if (cfg->schedulers < 1 || cfg->max_actors < 1 || cfg->max_actors > 2147483647 ||
+  if (cfg->schedulers < 1 || cfg->max_actors < 1 || cfg->max_actors > 2147483647 || cfg->mailbox_size < 1 ||
       cfg->max_handles < 1 || cfg->max_handles > 2147483647) {
     return false;
   }
   memset((rawptr)node, 0, (int64)sizeof(AlphNode));
   node->capacity = cfg->max_actors;
-  node->mailbox_size = alph_round_pow2(cfg->mailbox_size);
+  node->mailbox_size = cfg->mailbox_size;
   node->heap_limit = cfg->heap_limit;
   node->stack_size = cfg->stack_size;
   node->spin_ns = cfg->spin_us * 1000;
@@ -3496,6 +3669,7 @@ export fn alph_node_start(node: AlphNode*, cfg: AlphConfig*) -> bool {
     return false;
   }
   node->sched_count = cfg->schedulers;
+  node->active = cfg->schedulers;  // compaction trims it to the load
   for i: int64 in 0..node->sched_count {
     var s: AlphSched* = alph_sched_at(node, i);
     alph_queue_init(&s->runq);
