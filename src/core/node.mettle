@@ -124,6 +124,7 @@ const ALPH_MSG_REPLY: int64 = 2;    // answers the request with the same ref
 
 // Messages handled before the scheduler moves on to another actor.
 const ALPH_BUDGET: int64 = 64;
+const ALPH_SHARE_WAKE: int64 = 8;  // actors queued before a sleeping scheduler is woken for them
 
 const ALPH_NS_PER_MS: int64 = 1000000;
 
@@ -211,6 +212,8 @@ export struct AlphNode {
   sig_tag: int64;
   spin_ns: int64;       // AlphConfig.spin_us, in nanoseconds
   hungry: int64;        // schedulers with hungry set
+  spinners: int64;      // schedulers spinning now
+  max_spinners: int64;  // at most this many spin at once
 }
 
 // What a handler gets besides the message. Read these fields:
@@ -308,6 +311,7 @@ struct AlphSched {
   io_count: int64;      // handles registered here
   runs: int64;          // actor runs, to poll IO now and then while busy
   qlen: int64;          // actors in runq, roughly: pushes counted after, pops after
+  pop_lock: int64;      // taken to pop runq: the owner and thieves are its consumers
   hungry: int64;        // 1 while it has no work and may be handed some
 }
 
@@ -521,12 +525,43 @@ fn alph_runq_push(s: AlphSched*, p: AlphProc*) {
   alph_atomic_add(&s->qlen, 1);
 }
 
+// Pops s's run queue. The queue is multi-producer, single-consumer; the pop
+// lock makes the owner and stealing schedulers take turns as its consumer.
+// Uncontended, it is one compare-and-swap.
 fn alph_runq_pop(s: AlphSched*) -> int64 {
+  while (alph_atomic_cas(&s->pop_lock, 0, 1) != 0) {
+    alph_cpu_relax();
+  }
   var p: int64 = alph_queue_pop(&s->runq);
+  alph_atomic_store(&s->pop_lock, 0);
   if (p != 0) {
     alph_atomic_add(&s->qlen, -1);
   }
   return p;
+}
+
+// Work stealing: takes one queued actor from another scheduler that has
+// work waiting, and makes s its home. Used by idle schedulers, so a thread
+// the OS has paused cannot hold queued actors hostage, as on BEAM. Returns
+// the actor to run, or 0.
+fn alph_sched_steal(s: AlphSched*, node: AlphNode*) -> int64 {
+  if (s->bound != 0) {
+    return 0;
+  }
+  for i: int64 in 1..node->sched_count {
+    var v: AlphSched* = alph_sched_at(node, (s->index + i) % node->sched_count);
+    if (alph_atomic_load(&v->qlen) > 0 && alph_atomic_cas(&v->pop_lock, 0, 1) == 0) {
+      var p: int64 = alph_queue_pop(&v->runq);
+      alph_atomic_store(&v->pop_lock, 0);
+      if (p != 0) {
+        alph_atomic_add(&v->qlen, -1);
+        // QUEUED and off every queue: nobody else touches its home now.
+        ((AlphProc*)p)->sched = (int64)s;
+        return p;
+      }
+    }
+  }
+  return 0;
 }
 
 fn alph_wake(node: AlphNode*, p: AlphProc*) {
@@ -3215,13 +3250,18 @@ fn alph_sched_fed(s: AlphSched*, node: AlphNode*) {
 }
 
 fn alph_sched_share(s: AlphSched*, node: AlphNode*) {
-  if (s->bound != 0 || alph_atomic_load(&node->hungry) == 0 ||
-      alph_atomic_load(&s->qlen) < 2) {
+  var qlen: int64 = alph_atomic_load(&s->qlen);
+  if (s->bound != 0 || alph_atomic_load(&node->hungry) == 0 || qlen < 2) {
     return;
   }
+  // Compaction, as BEAM does: hand work to a scheduler that is awake and
+  // spinning; wake a sleeping one only when work is really piling up.
+  var wake_sleepers: bool = qlen >= ALPH_SHARE_WAKE;
   for i: int64 in 0..node->sched_count {
     var h: AlphSched* = alph_sched_at(node, (s->index + 1 + i) % node->sched_count);
-    if (h != s && alph_atomic_load(&h->hungry) != 0 && alph_atomic_cas(&h->hungry, 1, 0) == 1) {
+    if (h != s && alph_atomic_load(&h->hungry) != 0 &&
+        (wake_sleepers || alph_atomic_load(&h->sleeping) == 0) &&
+        alph_atomic_cas(&h->hungry, 1, 0) == 1) {
       alph_atomic_add(&node->hungry, -1);
       var p: int64 = alph_runq_pop(s);
       if (p == 0) {
@@ -3248,6 +3288,16 @@ fn alph_sched_spin(s: AlphSched*, node: AlphNode*, wait: int64) -> int64 {
   if (s->bound != 0 || budget <= 0) {
     return 0;
   }
+  if (alph_atomic_add(&node->spinners, 1) >= node->max_spinners) {
+    alph_atomic_add(&node->spinners, -1);
+    return 0;  // enough schedulers spin already: sleep
+  }
+  var p: int64 = alph_sched_spin_for(s, node, wait, budget);
+  alph_atomic_add(&node->spinners, -1);
+  return p;
+}
+
+fn alph_sched_spin_for(s: AlphSched*, node: AlphNode*, wait: int64, budget: int64) -> int64 {
   if (wait >= 0 && wait < budget) {
     budget = wait;
   }
@@ -3260,6 +3310,12 @@ fn alph_sched_spin(s: AlphSched*, node: AlphNode*, wait: int64) -> int64 {
     }
     alph_cpu_relax();
     spins = spins + 1;
+    if (spins % 32 == 0) {
+      p = alph_sched_steal(s, node);
+      if (p != 0) {
+        return p;
+      }
+    }
     // Sockets are watched through this scheduler's epoll set, so look at it
     // too, or a reply waits out the whole spin.
     if (spins % 16 == 0 && alph_atomic_load(&s->io_count) > 0) {
@@ -3295,7 +3351,10 @@ fn alph_sched_main(arg: int64) -> int64 {
     // for a while, so work sent meanwhile is picked up with no eventfd
     // write and no epoll wake-up.
     alph_sched_hungry(s, node);
-    p = alph_sched_spin(s, node, wait);
+    p = alph_sched_steal(s, node);
+    if (p == 0) {
+      p = alph_sched_spin(s, node, wait);
+    }
     if (p != 0) {
       alph_sched_fed(s, node);
       alph_run_proc(s, (AlphProc*)p);
@@ -3381,6 +3440,12 @@ export fn alph_node_start(node: AlphNode*, cfg: AlphConfig*) -> bool {
   node->heap_limit = cfg->heap_limit;
   node->stack_size = cfg->stack_size;
   node->spin_ns = cfg->spin_us * 1000;
+  // Like Go's runtime, only a few idle schedulers spin; the others sleep at
+  // once, so light load stays on few threads and costs little CPU.
+  node->max_spinners = cfg->schedulers / 8;
+  if (node->max_spinners < 1) {
+    node->max_spinners = 1;
+  }
   node->procs = (int64)calloc(node->capacity, (int64)sizeof(AlphProc));
   node->free_stack = (int64)malloc(node->capacity * 8);
   node->scheds = (int64)calloc(cfg->schedulers, (int64)sizeof(AlphSched));

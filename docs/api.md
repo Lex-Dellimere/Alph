@@ -224,6 +224,8 @@ export struct AlphNode {
   sig_tag: int64;
   spin_ns: int64;       // AlphConfig.spin_us, in nanoseconds
   hungry: int64;        // schedulers with hungry set
+  spinners: int64;      // schedulers spinning now
+  max_spinners: int64;  // at most this many spin at once
 }
 ```
 

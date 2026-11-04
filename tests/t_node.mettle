@@ -119,7 +119,17 @@ fn worker(ctx: AlphCtx*, m: AlphMsg*) -> int64 {
   return ALPH_CONTINUE;
 }
 
+var g_release: int64 = 0;
+
+// Blocks its own thread on its first message until released, so its
+// mailbox is really not read. A handler that returned would be stolen by an
+// idle scheduler and drain its mailbox.
 fn sleeper(ctx: AlphCtx*, m: AlphMsg*) -> int64 {
+  var waited: int64 = 0;
+  while (alph_atomic_load(&g_release) == 0 && waited < 10000) {
+    alph_futex_wait(&g_release, 0, 1000000);
+    waited = waited + 1;
+  }
   return ALPH_CONTINUE;
 }
 
@@ -220,7 +230,7 @@ fn boss(ctx: AlphCtx*, m: AlphMsg*) -> int64 {
     }
     if (b->workers_done == WORKERS) {
       // a mailbox that is never read fills up and refuses
-      var stuck: int64 = alph_spawn(ctx, 0, &sleeper);
+      var stuck: int64 = alph_spawn(ctx, ALPH_BOUND, &sleeper);
       var full: bool = false;
       for i: int64 in 0..1000 {
         if (alph_send(ctx, stuck, TAG_IGNORE, 0) == ALPH_FULL) {
@@ -228,6 +238,8 @@ fn boss(ctx: AlphCtx*, m: AlphMsg*) -> int64 {
         }
       }
       expect(full, "an unread mailbox becomes full");
+      alph_atomic_store_sc(&g_release, 1);
+      alph_futex_wake(&g_release, 1);
       b->step = 8;
       alph_halt(ctx, 0);
     }
