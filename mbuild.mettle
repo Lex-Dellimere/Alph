@@ -1,0 +1,18 @@
+// alph's build for mbuild. alph is a library; the examples are its bins.
+// Every profile builds with -s (stack-trace; debug has it by default):
+// alph catches failed checks only in -s builds.
+
+import "mbuild/api";
+
+fn project() {
+  mb_package("alph", "0.1.0");
+  mb_targets("linux");
+  mb_bin("counter", "examples/counter.mettle");
+  mb_bin("request", "examples/request.mettle");
+  mb_bin("supervised", "examples/supervised.mettle");
+  mb_bin("medic", "examples/medic.mettle");
+  mb_bin("echo", "examples/echo.mettle");
+  mb_bin("jobs", "examples/jobs.mettle");
+  mb_profile("release");
+  mb_set("stack-trace", "true");
+}
