@@ -348,7 +348,13 @@ fn alph_conn_seal(ctx: AlphCtx*, c: AlphDistConn*, data: int64, size: int64) -> 
   if (c->secure == 0) {
     return false;
   }
-  var ct: uint8* = (uint8*)alph_scratch(ctx, ALPH_NOISE_MAX);
+  // Sized to the message: a full 64 KiB would not fit a scratch chunk, and
+  // would cost a map and an unmap per send.
+  var room: int64 = size;
+  if (room > ALPH_NOISE_PLAIN_MAX) {
+    room = ALPH_NOISE_PLAIN_MAX;
+  }
+  var ct: uint8* = (uint8*)alph_scratch(ctx, room + 16);
   if (ct == 0) {
     return false;
   }

@@ -8,6 +8,11 @@
 #                                  shows the median of each metric
 #   METTLE=/path/to/mettle bash bench/run.sh
 #
+# distping needs two BEAM nodes. For each BEAM run this script starts a server
+# node (erl -sname, serving the registered names), runs the client node
+# against it, and stops the server node afterwards. An epmd this script
+# started is stopped at the end too.
+#
 # Exit status: 0 when every build and run succeeded, 1 otherwise. A run
 # fails when the program exits nonzero, prints FAIL, does not print exactly
 # one RESULT line with the expected name, or runs over TIMEOUT seconds
@@ -26,7 +31,7 @@ METTLE="${METTLE:-$ROOT/../Mettle/bin/mettle}"
 RUNS="${RUNS:-3}"
 TIMEOUT="${TIMEOUT:-120}"
 OUT="build/bench"
-ALL=(spawn ring pingpong fanin pairs restart)
+ALL=(spawn ring pingpong fanin pairs restart distping)
 
 if [ $# -gt 0 ]; then
   names=("$@")
@@ -54,6 +59,58 @@ export ERL_CRASH_DUMP_SECONDS=0   # a failed Erlang run must not drop erl_crash.
 fails=0
 rows=()   # "workload|metric|alph|beam|ratio"
 
+SRV_PID=""      # the BEAM server node of a distping run, while one runs
+EPMD_STARTED=0  # 1 when no epmd was running before this script
+
+stop_server() {
+  if [ -n "$SRV_PID" ]; then
+    kill "$SRV_PID" 2> /dev/null
+    for _ in 1 2 3 4 5 6 7 8 9 10; do
+      kill -0 "$SRV_PID" 2> /dev/null || break
+      sleep 0.2
+    done
+    kill -9 "$SRV_PID" 2> /dev/null
+    wait "$SRV_PID" 2> /dev/null
+    SRV_PID=""
+  fi
+}
+
+cleanup() {
+  stop_server
+  if [ "$EPMD_STARTED" -eq 1 ]; then
+    epmd -kill > /dev/null 2>&1
+  fi
+}
+trap cleanup EXIT
+
+for n in "${names[@]}"; do
+  if [ "$n" = distping ] && command -v epmd > /dev/null && ! epmd -names > /dev/null 2>&1; then
+    EPMD_STARTED=1
+  fi
+done
+
+# beam_once NAME: runs the BEAM side of one workload once, output on this
+# function's stdout and stderr. distping runs as two nodes: a server node in
+# the background and the client node in the foreground, then the server node
+# is stopped.
+beam_once() {
+  local name="$1"
+  if [ "$name" != distping ]; then
+    timeout "$TIMEOUT" erl -noshell -pa "$OUT/erl" -eval "$name:main(), halt()."
+    return
+  fi
+  local tag="${name}_$$_$RANDOM" host status
+  host="$(hostname -s 2> /dev/null || hostname)"
+  erl -noshell -sname "srv_$tag" -setcookie distping_bench -pa "$OUT/erl" \
+      -eval "distping:serve(), halt()." > /dev/null 2>&1 &
+  SRV_PID=$!
+  DISTPING_PEER="srv_$tag@$host" timeout "$TIMEOUT" \
+    erl -noshell -sname "cli_$tag" -setcookie distping_bench -pa "$OUT/erl" -eval "$name:main(), halt()."
+  status=$?
+  stop_server
+  return $status
+}
+
 # median of the numbers on stdin
 median() {
   sort -g | awk '{ v[NR] = $1 } END { if (NR == 0) exit 1; print v[int((NR + 1) / 2)] }'
@@ -78,7 +135,7 @@ run_side() {
     if [ "$side" = alph ]; then
       timeout "$TIMEOUT" "$OUT/$name" > "$dir/out.$i" 2> /dev/null
     else
-      timeout "$TIMEOUT" erl -noshell -pa "$OUT/erl" -eval "$name:main(), halt()." > "$dir/out.$i" 2> /dev/null
+      beam_once "$name" > "$dir/out.$i" 2> /dev/null
     fi
     status=$?
     out="$(cat "$dir/out.$i")"
@@ -91,7 +148,7 @@ run_side() {
       if [ "$side" = alph ]; then
         timeout "$TIMEOUT" "$OUT/$name" 2>&1 > /dev/null | head -20 | sed 's/^/    | /' >&2
       else
-        timeout "$TIMEOUT" erl -noshell -pa "$OUT/erl" -eval "$name:main(), halt()." 2>&1 > /dev/null | head -20 | sed 's/^/    | /' >&2
+        beam_once "$name" 2>&1 > /dev/null | head -20 | sed 's/^/    | /' >&2
       fi
       return 1
     fi

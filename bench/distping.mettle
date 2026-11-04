@@ -1,0 +1,366 @@
+// distping: two nodes on one machine, over TCP on 127.0.0.1.
+//
+//   1. Round trip: the client sends one message to a remote echo actor and
+//      waits for the reply, K times; each round trip is timed on its own.
+//      Metrics: rtt_p50_ns, rtt_p99_ns.
+//   2. One way: the client sends N one-word messages to a remote sink, which
+//      acks every ACK_EVERY messages, so the client keeps at most WINDOW in
+//      flight. Done when the client has the sink's ack for all N (the sink
+//      has then counted all N). Metric: msgs_per_s.
+//
+// See bench/README.md.
+//
+// The two nodes run in this one process (as tests/t_dist.mettle does), each
+// with its own schedulers, and talk through the dist manager over real
+// sockets. The traffic is Noise encrypted and authenticated
+// (Noise_XXpsk3_25519_ChaChaPoly_SHA256); alph cannot turn that off. The
+// Erlang twin uses BEAM's distribution in its default cleartext mode, so
+// this compares encrypted alph against cleartext BEAM.
+//
+// A send goes to a proxy actor on the client's node, which frames it for the
+// connection actor, which seals it and writes it to the socket; on the other
+// node the connection actor reads, opens, and delivers to the target. The
+// timed round trip therefore crosses four proxy and connection hops.
+//
+// Before timing, the connect and the name lookups are done, and WARM round
+// trips are made that are not timed (the Erlang twin does the same).
+
+import "std/io";
+import "std/mem";
+import "alph/sys/atomic";
+import "alph/sys/clock";
+import "alph/alph";
+import "alph/net/dist";
+
+const K: int64 = 50000;          // timed round trips
+const WARM: int64 = 1000;        // round trips before timing starts
+const N: int64 = 500000;         // one-way messages
+const WINDOW: int64 = 10000;     // most unacknowledged one-way messages
+const ACK_EVERY: int64 = 1000;   // the sink acks every this many
+const BURST: int64 = 256;        // most sends in one turn
+const MAILBOX: int64 = 16384;    // holds the window, with room for the proxy's queue
+const COOKIE: string = "alph distping bench cookie";
+const WATCHDOG_MS: int64 = 90000;
+
+const TAG_PING: int64 = ALPH_TAG_USER;
+const TAG_PONG: int64 = ALPH_TAG_USER + 1;
+const TAG_DATA: int64 = ALPH_TAG_USER + 2;      // client to sink; arg = sequence number
+const TAG_ACK: int64 = ALPH_TAG_USER + 3;       // sink to client; arg = messages counted, -1 if out of order
+const TAG_MORE: int64 = ALPH_TAG_USER + 4;      // client to itself: send more
+const TAG_WATCHDOG: int64 = ALPH_TAG_USER + 5;
+const TAG_REGISTERED: int64 = ALPH_TAG_USER + 6; // an actor on node B to its boss
+
+var g_node_a: AlphNode;   // the client
+var g_node_b: AlphNode;   // the echo actor and the sink
+var g_port: int64 = 0;    // node B's dist port, once it listens and its actors are named
+var g_rtt: int64[50000];  // K samples; written by the client only
+var g_start_ns: int64 = 0;
+var g_end_ns: int64 = 0;
+
+fn fail(ctx: AlphCtx*, why: string) {
+  println("FAIL {why}");
+  alph_halt(ctx, 1);
+}
+
+// ---- node B ----
+
+struct Named {
+  which: int64;   // 1 echo, 2 sink
+  count: int64;
+  bad: int64;
+}
+
+// "echo" answers each ping to its sender; "sink" counts data messages and
+// acks every ACK_EVERY of them.
+fn named(ctx: AlphCtx*, m: AlphMsg*) -> int64 {
+  var s: Named* = (Named*)ctx->state;
+  if (m->tag == ALPH_TAG_INIT) {
+    if (s->which == 1) {
+      alph_register(ctx, "echo");
+    } else {
+      alph_register(ctx, "sink");
+    }
+    alph_send(ctx, alph_parent(ctx), TAG_REGISTERED, 0);
+    return ALPH_CONTINUE;
+  }
+  if (m->tag == TAG_PING) {
+    if (alph_send(ctx, m->from, TAG_PONG, m->arg) != ALPH_SENT) {
+      println("FAIL pong was refused");
+      alph_halt(ctx, 1);
+    }
+    return ALPH_CONTINUE;
+  }
+  if (m->tag == TAG_DATA) {
+    if (m->arg != s->count) {
+      s->bad = 1;  // messages must arrive in order
+    }
+    s->count = s->count + 1;
+    if (s->count % ACK_EVERY == 0) {
+      var arg: int64 = s->count;
+      if (s->bad != 0) {
+        arg = -1;
+      }
+      if (alph_send(ctx, m->from, TAG_ACK, arg) != ALPH_SENT) {
+        println("FAIL ack was refused");
+        alph_halt(ctx, 1);
+      }
+    }
+  }
+  return ALPH_CONTINUE;
+}
+
+struct BossB {
+  registered: int64;
+  port: int64;
+}
+
+fn boss_b(ctx: AlphCtx*, m: AlphMsg*) -> int64 {
+  var b: BossB* = (BossB*)ctx->state;
+  if (m->tag == ALPH_TAG_INIT) {
+    alph_trap_exits(ctx, true);  // the manager is linked; its death must not end node B
+    if (alph_dist_start(ctx, alph_ip4(127, 0, 0, 1), 0, COOKIE) == 0) {
+      println("FAIL B's manager did not start");
+      alph_halt(ctx, 1);
+      return ALPH_CONTINUE;
+    }
+    for i: int64 in 1..3 {
+      var s: Named;
+      s.which = i;
+      s.count = 0;
+      s.bad = 0;
+      alph_spawn_value<Named>(ctx, ALPH_LINK, &s, &named);
+    }
+    return ALPH_CONTINUE;
+  }
+  if (m->tag == ALPH_TAG_DIST_READY) {
+    b->port = m->arg;
+  } else if (m->tag == TAG_REGISTERED) {
+    b->registered = b->registered + 1;
+  }
+  // The client may connect once B listens and both names are registered.
+  if (b->port != 0 && b->registered == 2) {
+    alph_atomic_store_sc(&g_port, b->port);
+    b->port = 0;
+  }
+  return ALPH_CONTINUE;
+}
+
+// ---- node A: the client ----
+
+struct Client {
+  step: int64;       // 0 starting, 1 connecting, 2 looking up, 3 round trips, 4 one way
+  conn: int64;
+  ref_echo: int64;
+  ref_sink: int64;
+  echo: int64;       // proxies for the remote actors
+  sink: int64;
+  found: int64;
+  pings: int64;      // round trips finished, warm-up included
+  sent_ns: int64;    // when the ping in flight was sent
+  sent: int64;       // one-way messages sent
+  acked: int64;      // one-way messages the sink has acked
+  more_pending: bool;
+}
+
+fn ping(ctx: AlphCtx*, c: Client*) {
+  c->sent_ns = alph_now_ns();
+  if (alph_send(ctx, c->echo, TAG_PING, c->pings) != ALPH_SENT) {
+    fail(ctx, "ping was refused");
+  }
+}
+
+// Sends one-way messages while the window has room, at most BURST per turn.
+fn pump(ctx: AlphCtx*, c: Client*) {
+  var burst: int64 = 0;
+  while (c->sent < N && c->sent - c->acked < WINDOW && burst < BURST) {
+    var r: int64 = alph_send(ctx, c->sink, TAG_DATA, c->sent);
+    if (r == ALPH_SENT) {
+      c->sent = c->sent + 1;
+      burst = burst + 1;
+    } else if (r == ALPH_FULL) {
+      burst = BURST;   // the proxy's mailbox is full: retry next turn, drop nothing
+    } else {
+      fail(ctx, "sink send failed");
+      return;
+    }
+  }
+  // Out of window: the next ack continues. Otherwise carry on next turn.
+  if (c->sent < N && c->sent - c->acked < WINDOW && !c->more_pending) {
+    c->more_pending = true;
+    alph_send(ctx, ctx->self, TAG_MORE, 0);
+  }
+}
+
+fn client(ctx: AlphCtx*, m: AlphMsg*) -> int64 {
+  var c: Client* = (Client*)ctx->state;
+  if (m->tag == TAG_WATCHDOG) {
+    fail(ctx, "stuck at step {c->step}, {c->pings} round trips, {c->sent} sent, {c->acked} acked");
+    return ALPH_CONTINUE;
+  }
+  if (m->tag == ALPH_TAG_INIT) {
+    alph_trap_exits(ctx, true);  // alph_dist_start links the manager to this actor
+    alph_send_after(ctx, WATCHDOG_MS, ctx->self, TAG_WATCHDOG, 0);
+    if (alph_dist_start(ctx, alph_ip4(127, 0, 0, 1), 0, COOKIE) == 0) {
+      fail(ctx, "A's manager did not start");
+    }
+    return ALPH_CONTINUE;
+  }
+  if (c->step == 0 && m->tag == ALPH_TAG_DIST_READY) {
+    c->step = 1;
+    if (alph_dist_connect(ctx, alph_ip4(127, 0, 0, 1), alph_atomic_load(&g_port), 5000) <= 0) {
+      fail(ctx, "connect was not sent");
+    }
+    return ALPH_CONTINUE;
+  }
+  if (c->step == 1 && m->tag == ALPH_TAG_DIST_UP) {
+    c->conn = m->arg;
+    if (c->conn == 0) {
+      fail(ctx, "could not connect to B");
+      return ALPH_CONTINUE;
+    }
+    c->step = 2;
+    c->ref_echo = alph_dist_whereis(ctx, c->conn, "echo", 5000);
+    c->ref_sink = alph_dist_whereis(ctx, c->conn, "sink", 5000);
+    return ALPH_CONTINUE;
+  }
+  if (c->step == 2 && m->tag == ALPH_TAG_DIST_FOUND) {
+    if (m->arg == 0) {
+      fail(ctx, "a remote name was not found");
+      return ALPH_CONTINUE;
+    }
+    if (m->ref == c->ref_echo) {
+      c->echo = m->arg;
+    } else if (m->ref == c->ref_sink) {
+      c->sink = m->arg;
+    }
+    c->found = c->found + 1;
+    if (c->found == 2) {
+      c->step = 3;
+      ping(ctx, c);
+    }
+    return ALPH_CONTINUE;
+  }
+  if (c->step == 3 && m->tag == TAG_PONG) {
+    var now: int64 = alph_now_ns();
+    if (m->arg != c->pings) {
+      fail(ctx, "pong {m->arg} answers ping {c->pings}");
+      return ALPH_CONTINUE;
+    }
+    if (c->pings >= WARM) {
+      g_rtt[c->pings - WARM] = now - c->sent_ns;
+    }
+    c->pings = c->pings + 1;
+    if (c->pings == WARM + K) {
+      c->step = 4;
+      g_start_ns = alph_now_ns();
+      pump(ctx, c);
+      return ALPH_CONTINUE;
+    }
+    ping(ctx, c);
+    return ALPH_CONTINUE;
+  }
+  if (c->step == 4 && m->tag == TAG_ACK) {
+    if (m->arg < 0) {
+      fail(ctx, "the sink saw messages out of order");
+      return ALPH_CONTINUE;
+    }
+    c->acked = m->arg;
+    if (c->acked == N) {
+      g_end_ns = alph_now_ns();
+      alph_halt(ctx, 0);
+      return ALPH_CONTINUE;
+    }
+    pump(ctx, c);
+    return ALPH_CONTINUE;
+  }
+  if (c->step == 4 && m->tag == TAG_MORE) {
+    c->more_pending = false;
+    pump(ctx, c);
+    return ALPH_CONTINUE;
+  }
+  if (m->tag == ALPH_TAG_DOWN) {
+    fail(ctx, "a remote actor or the connection went down ({m->arg})");
+  }
+  return ALPH_CONTINUE;
+}
+
+// ---- results ----
+
+// Heap sort of a[0..n), in place.
+fn sift_down(a: int64*, start: int64, end: int64) {
+  var root: int64 = start;
+  while (true) {
+    var child: int64 = 2 * root + 1;
+    if (child >= end) {
+      return;
+    }
+    if (child + 1 < end && a[child] < a[child + 1]) {
+      child = child + 1;
+    }
+    if (a[root] >= a[child]) {
+      return;
+    }
+    var t: int64 = a[root];
+    a[root] = a[child];
+    a[child] = t;
+    root = child;
+  }
+}
+
+fn heap_sort(a: int64*, n: int64) {
+  var i: int64 = n / 2 - 1;
+  while (i >= 0) {
+    sift_down(a, i, n);
+    i = i - 1;
+  }
+  var end: int64 = n - 1;
+  while (end > 0) {
+    var t: int64 = a[0];
+    a[0] = a[end];
+    a[end] = t;
+    sift_down(a, 0, end);
+    end = end - 1;
+  }
+}
+
+fn main() -> int32 {
+  var cfg: AlphConfig;
+  alph_config(&cfg);
+  cfg.max_actors = 64;
+  cfg.mailbox_size = MAILBOX;
+  if (!alph_node_start(&g_node_b, &cfg)) {
+    println("FAIL node B did not start");
+    return 1;
+  }
+  var bb: BossB;
+  memset((rawptr)&bb, 0, (int64)sizeof(BossB));
+  alph_node_spawn_value<BossB>(&g_node_b, 0, &bb, &boss_b);
+  var waited: int64 = 0;
+  while (alph_atomic_load(&g_port) == 0 && waited < 5000) {
+    alph_futex_wait(&waited, waited, 1000000);   // sleeps 1 ms
+    waited = waited + 1;
+  }
+  if (alph_atomic_load(&g_port) == 0) {
+    println("FAIL node B did not listen");
+    return 1;
+  }
+  if (!alph_node_start(&g_node_a, &cfg)) {
+    println("FAIL node A did not start");
+    return 1;
+  }
+  var c: Client;
+  memset((rawptr)&c, 0, (int64)sizeof(Client));
+  alph_node_spawn_value<Client>(&g_node_a, 0, &c, &client);
+  var code: int64 = alph_node_wait(&g_node_a);
+  alph_node_halt(&g_node_b, 0);
+  alph_node_wait(&g_node_b);
+  if (code != 0) {
+    return 1;
+  }
+  heap_sort(&g_rtt[0], K);
+  var p50: int64 = g_rtt[K / 2];
+  var p99: int64 = g_rtt[K * 99 / 100];
+  var per_s: int64 = N * 1000000000 / (g_end_ns - g_start_ns);
+  println("RESULT distping rtt_p50_ns={p50} rtt_p99_ns={p99} msgs_per_s={per_s}");
+  return 0;
+}

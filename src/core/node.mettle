@@ -3238,8 +3238,9 @@ fn alph_sched_share(s: AlphSched*, node: AlphNode*) {
   }
 }
 
-// Checks the run queue until work arrives or node->spin_ns passes, but not
-// past the next timer (wait, in ns, or -1). Returns the actor to run, or 0.
+// Checks the run queue, and the scheduler's sockets, until work arrives or
+// node->spin_ns passes, but not past the next timer (wait, in ns, or -1).
+// Returns the actor to run, or 0.
 // Bound schedulers do not spin: their one actor may block, and nobody else
 // sends them work.
 fn alph_sched_spin(s: AlphSched*, node: AlphNode*, wait: int64) -> int64 {
@@ -3259,6 +3260,11 @@ fn alph_sched_spin(s: AlphSched*, node: AlphNode*, wait: int64) -> int64 {
     }
     alph_cpu_relax();
     spins = spins + 1;
+    // Sockets are watched through this scheduler's epoll set, so look at it
+    // too, or a reply waits out the whole spin.
+    if (spins % 16 == 0 && alph_atomic_load(&s->io_count) > 0) {
+      alph_sched_poll(s, 0);
+    }
     if (spins % 64 == 0) {
       if (alph_now_ns() >= until || alph_atomic_load(&node->halted) != 0) {
         return 0;
