@@ -23,18 +23,19 @@ Not yet: `http`, memory per actor (needs a matching measure on both sides).
 
 ## Latest results
 
-2026-11-05, 16 CPUs, Erlang/OTP 27, median of 3 runs of `bash bench/run.sh`. A ratio above 1 means alph is better.
+2026-11-05, 16 CPUs, Erlang/OTP 27, median of 5 runs. A ratio above 1 means alph is better.
 
 | Workload | Metric | alph | BEAM | Ratio |
 |---|---|---|---|---|
-| spawn | ns_per_spawn | 755 | 1360 | 1.80 |
-| ring | ns_per_hop | 412 | 335 | 0.81 |
-| pingpong | rtt_p50_ns | 791 | 1603 | 2.03 |
-| pingpong | rtt_p99_ns | 1042 | 5751 | 5.52 |
-| fanin | msgs_per_s | 10.2 M | 14.2 M | 0.71 |
-| pairs | msgs_per_s | 84.3 M | 28.0 M | 3.01 |
-| restart | restart_p50_us | 55 | 11 | 0.20 |
+| spawn | ns_per_spawn | 693 | 907 | 1.31 |
+| ring | ns_per_hop | 406 | 265 | 0.65 |
+| pingpong | rtt_p50_ns | 611 | 1412 | 2.31 |
+| pingpong | rtt_p99_ns | 921 | 4919 | 5.34 |
+| fanin | msgs_per_s | 7.9 M | 13.8 M | 0.57 |
+| pairs | msgs_per_s | 66.7 M | 25.8 M | 2.59 |
+| restart | restart_p50_us | 57 | 12 | 0.21 |
 
 - **pingpong:** alph spawns a child on its parent's scheduler, so both actors share one scheduler here, while the Erlang pair is pinned to two. alph has no pinning API.
-- **restart:** most of alph's time is the Mettle runtime printing a crash report and stack trace for every fault before alph's recovery runs. A child that exits with `alph_stop(ctx, ALPH_CRASHED)` instead restarts in about 17 µs at p50.
-- **Machine:** a busy desktop. BEAM's numbers in particular vary between runs.
+- **fanin:** 16 producers into one mailbox contend on its enqueue counter; with 2 producers alph does 14 to 15 M/s. Per-sender lanes are the planned fix (alph/reports/010).
+- **restart:** most of alph's time is the Mettle runtime printing a crash report for every fault before alph's recovery runs; without it, about 17 µs.
+- **Machine:** a busy desktop. BEAM's numbers vary between runs; this run's BEAM ring was faster than the previous one.

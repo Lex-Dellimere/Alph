@@ -78,8 +78,14 @@ struct AlphCell {
 export struct AlphMailbox {
   cells: int64;  // AlphCell array, allocated once and kept for reuse
   mask: int64;
+  // enq is written by every sender, deq by the receiver for every message.
+  // On one cache line, each write would take the line from the other side;
+  // the padding keeps them 64 bytes apart.
+  pad_a: int64[8];
   enq: int64;    // next position to claim; producers
+  pad_b: int64[8];
   deq: int64;    // next position to read; the consumer
+  pad_c: int64[8];
 }
 
 fn alph_cell(mb: AlphMailbox*, pos: int64) -> AlphCell* {
