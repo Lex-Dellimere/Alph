@@ -254,6 +254,7 @@ Not built yet:
 
 ### Decisions from the user (2026-11-05)
 
+- **Scope:** alph is meant for the lowest level and for many servers at once; its goal shifts with where it runs. So the core (`alph/alph`: actors, schedulers, healing, IO, processes, pools) stays small and needs nothing beyond the Mettle stdlib, and the cross-server layers are opt-in imports: `alph/net/dist` and `alph/net/noise`, which bring in the crypto package. A program that never imports them carries none of it.
 - **C:** fine soon, not yet. Once allowed, C may extend alph past what Mettle permits.
 - **Crypto:** pure Mettle, taking techniques, correct usage and implementation from proven C and Rust libraries.
 - **Benchmarks to beat BEAM:** spawn rate, message latency and throughput, ring test, many-connection HTTP requests per second, p99 latency under load, and crash-to-restart time. The goal is the most performance for the least size.

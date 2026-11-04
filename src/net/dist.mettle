@@ -32,13 +32,18 @@
 //
 // Monitor the connection pid to hear when the other node goes away.
 //
-// The cookie only keeps nodes of different clusters apart. It is sent in
-// the clear: today's transport is unencrypted TCP, so use it on trusted
-// networks only. An encrypted transport (Noise) is planned.
+// Connections are encrypted and authenticated with Noise
+// (Noise_XXpsk3_25519_ChaChaPoly_SHA256, alph/net/noise). The pre-shared key
+// is the SHA-256 of the cluster cookie, which never crosses the network: a
+// node without the same cookie cannot complete the handshake or read or
+// change any traffic. Each node makes a new static key when its manager
+// starts. Treat the cookie as a secret, and make it long and random.
 
 import "std/mem";
+import "crypto/crypto";
 import "alph/core/mailbox";
 import "alph/core/node";
+import "alph/net/noise";
 
 // The answer to alph_dist_connect: arg is the connection's pid, or 0.
 export const ALPH_TAG_DIST_UP: int64 = 30;
@@ -62,14 +67,13 @@ const ALPH_TAG_DIST_RETRY: int64 = 39;    // a connection to itself: deliver aga
 const ALPH_TAG_DIST_PORTQ: int64 = 40;    // to the manager: which port?
 
 const ALPH_DIST_VERSION: int64 = 1;
-const ALPH_DIST_COOKIE_MAX: int64 = 64;
 const ALPH_DIST_FRAME_MAX: int64 = 16777216;  // 16 MiB
 const ALPH_DIST_OUTQ: int64 = 67108864;       // 64 MiB queued for the socket
 const ALPH_DIST_READ: int64 = 65536;
 
 // Frame kinds. A frame is little-endian int64 words: the frame's length in
 // bytes, its kind, its fields, then the payload bytes.
-const ALPH_F_HELLO: int64 = 1;    // version, cookie length; payload cookie
+const ALPH_F_HELLO: int64 = 1;    // version, 0: the first frame each way once encrypted
 const ALPH_F_SEND: int64 = 2;     // to, from, tag, arg, ref, flags; payload
 const ALPH_F_WATCH: int64 = 3;    // pid: tell me when it exits
 const ALPH_F_GONE: int64 = 4;     // pid, reason
@@ -91,8 +95,8 @@ struct AlphDistManager {
   ip4: int64;
   port: int64;
   listener: int64;
-  cookie: uint8[64];
-  cookie_len: int64;
+  s_sk: CrX25519Secret;  // this node's static Noise key
+  psk: uint8[32];        // SHA-256 of the cookie
 }
 
 // A pair in a connection's tables: a remote pid and its local proxy, a
@@ -108,8 +112,14 @@ struct AlphDistConn {
   role: int64;
   h: int64;
   up: int64;
-  cookie: uint8[64];
-  cookie_len: int64;
+  hs: AlphNoise;      // the handshake, then only the peer's key
+  tx: AlphNoiseCipher;
+  rx: AlphNoiseCipher;
+  secure: int64;     // the handshake is done; everything is encrypted
+  started: int64;    // a client has sent its first handshake message
+  raw_data: int64;   // bytes from the socket not yet made into records
+  raw_len: int64;
+  raw_cap: int64;
   asker: int64;      // who called alph_dist_connect, and the request's ref
   asker_ref: int64;
   out: AlphOutq;
@@ -322,8 +332,43 @@ fn alph_proxy_handle(ctx: AlphCtx*, m: AlphMsg*) -> int64 {
 
 // ---- the connection --------------------------------------------------------
 
+// Queues len bytes at data as one record: a 4-byte little-endian length,
+// then the bytes.
+fn alph_conn_record_out(ctx: AlphCtx*, c: AlphDistConn*, data: uint8*, len: int64) -> bool {
+  var head: uint8[4];
+  for i: int64 in 0..4 {
+    head[i] = (uint8)((len >> (i * 8)) & 255);
+  }
+  return alph_outq_push(ctx, &c->out, (rawptr)&head[0], 4) == ALPH_SENT &&
+         alph_outq_push(ctx, &c->out, (rawptr)data, len) == ALPH_SENT;
+}
+
+// Encrypts size bytes of frames at data into records and queues them.
+fn alph_conn_seal(ctx: AlphCtx*, c: AlphDistConn*, data: int64, size: int64) -> bool {
+  if (c->secure == 0) {
+    return false;
+  }
+  var ct: uint8* = (uint8*)alph_scratch(ctx, ALPH_NOISE_MAX);
+  if (ct == 0) {
+    return false;
+  }
+  var at: int64 = 0;
+  while (at < size) {
+    var n: int64 = size - at;
+    if (n > ALPH_NOISE_PLAIN_MAX) {
+      n = ALPH_NOISE_PLAIN_MAX;
+    }
+    if (!alph_noise_seal(&c->tx, ct, (uint8*)(data + at), n) ||
+        !alph_conn_record_out(ctx, c, ct, n + 16)) {
+      return false;
+    }
+    at = at + n;
+  }
+  return true;
+}
+
 fn alph_conn_send(ctx: AlphCtx*, c: AlphDistConn*, frame: int64, size: int64) -> bool {
-  if (frame == 0 || alph_outq_push(ctx, &c->out, (rawptr)frame, size) != ALPH_SENT) {
+  if (frame == 0 || !alph_conn_seal(ctx, c, frame, size)) {
     return false;
   }
   return alph_outq_flush(ctx, &c->out, c->h) >= 0;
@@ -399,9 +444,30 @@ fn alph_conn_note_links(ctx: AlphCtx*, c: AlphDistConn*, frame: int64, size: int
 
 fn alph_conn_hello(ctx: AlphCtx*, c: AlphDistConn*) -> bool {
   var size: int64 = 0;
-  var f: int64 = alph_dist_frame(ctx, ALPH_F_HELLO, 2, ALPH_DIST_VERSION, c->cookie_len, 0, 0, 0, 0,
-                                 (rawptr)&c->cookie[0], c->cookie_len, &size);
+  var f: int64 = alph_dist_frame(ctx, ALPH_F_HELLO, 2, ALPH_DIST_VERSION, 0, 0, 0, 0, 0,
+                                 (rawptr)0, 0, &size);
   return alph_conn_send(ctx, c, f, size);
+}
+
+// Writes this side's next handshake message if it is its turn, and switches
+// to encrypted traffic once the handshake is done.
+fn alph_conn_handshake_next(ctx: AlphCtx*, c: AlphDistConn*) -> bool {
+  var turn: bool = (c->hs.step % 2 == 0) == (c->role == ALPH_DIST_CLIENT);
+  if (!alph_noise_done(&c->hs) && turn) {
+    var msg: uint8[96];
+    var len: int64 = 0;
+    if (!alph_noise_write(&c->hs, &msg[0], 96, &len) || !alph_conn_record_out(ctx, c, &msg[0], len)) {
+      return false;
+    }
+  }
+  if (alph_noise_done(&c->hs) && c->secure == 0) {
+    if (!alph_noise_split(&c->hs, &c->tx, &c->rx)) {
+      return false;
+    }
+    c->secure = 1;
+    return alph_conn_hello(ctx, c);
+  }
+  return alph_outq_flush(ctx, &c->out, c->h) >= 0;
 }
 
 fn alph_conn_answer(ctx: AlphCtx*, to: int64, ref: int64, tag: int64, arg: int64) {
@@ -420,15 +486,8 @@ fn alph_conn_frame(ctx: AlphCtx*, c: AlphDistConn*, frame: int64, total: int64,
   var kind: int64 = alph_dist_word(frame, 1);
   var size: int64 = 0;
   if (c->up == 0) {
-    if (kind != ALPH_F_HELLO || total < 32 || alph_dist_word(frame, 2) != ALPH_DIST_VERSION) {
-      return false;
-    }
-    var len: int64 = alph_dist_word(frame, 3);
-    if (len != c->cookie_len || total != 32 + len ||
-        memcmp((rawptr)(frame + 32), (rawptr)&c->cookie[0], len) != 0) {
-      return false;
-    }
-    if (c->role == ALPH_DIST_SERVER && !alph_conn_hello(ctx, c)) {
+    // The first frame that decrypts proves the other side has the key.
+    if (kind != ALPH_F_HELLO || total != 32 || alph_dist_word(frame, 2) != ALPH_DIST_VERSION) {
       return false;
     }
     c->up = 1;
@@ -552,29 +611,72 @@ fn alph_conn_parse(ctx: AlphCtx*, c: AlphDistConn*) -> bool {
   return true;
 }
 
-fn alph_conn_read(ctx: AlphCtx*, c: AlphDistConn*) -> bool {
-  while (true) {
-    if (c->in_cap - c->in_len < ALPH_DIST_READ) {
-      var cap: int64 = c->in_cap * 2;
-      if (cap < c->in_len + ALPH_DIST_READ) {
-        cap = c->in_len + ALPH_DIST_READ;
-      }
-      var block: rawptr = alph_realloc(ctx, (rawptr)c->in_data, cap);
-      if (block == 0) {
+// Makes room for need more bytes in a buffer in the actor's heap.
+fn alph_conn_room(ctx: AlphCtx*, data: int64*, len: int64, cap: int64*, need: int64) -> bool {
+  if (*cap - len >= need) {
+    return true;
+  }
+  var grown: int64 = *cap * 2;
+  if (grown < len + need) {
+    grown = len + need;
+  }
+  var block: rawptr = alph_realloc(ctx, (rawptr)*data, grown);
+  if (block == 0) {
+    return false;
+  }
+  *data = (int64)block;
+  *cap = grown;
+  return true;
+}
+
+// Takes every whole record out of the raw bytes: handshake messages until
+// the handshake is done, then encrypted frames, decrypted into in_data.
+fn alph_conn_records(ctx: AlphCtx*, c: AlphDistConn*) -> bool {
+  var at: int64 = 0;
+  while (c->raw_len - at >= 4) {
+    var p: uint8* = (uint8*)(c->raw_data + at);
+    var len: int64 = (int64)p[0] | ((int64)p[1] << 8) | ((int64)p[2] << 16) | ((int64)p[3] << 24);
+    if (len < 16 || len > ALPH_NOISE_MAX) {
+      return false;
+    }
+    if (c->raw_len - at - 4 < len) {
+      break;
+    }
+    var rec: uint8* = (uint8*)(c->raw_data + at + 4);
+    if (c->secure == 0) {
+      if (!alph_noise_read(&c->hs, rec, len) || !alph_conn_handshake_next(ctx, c)) {
         return false;
       }
-      c->in_data = (int64)block;
-      c->in_cap = cap;
+    } else {
+      if (!alph_conn_room(ctx, &c->in_data, c->in_len, &c->in_cap, len) ||
+          !alph_noise_open(&c->rx, (uint8*)(c->in_data + c->in_len), rec, len)) {
+        return false;
+      }
+      c->in_len = c->in_len + len - 16;
     }
-    var n: int64 = alph_io_read(ctx, c->h, (rawptr)(c->in_data + c->in_len), c->in_cap - c->in_len);
+    at = at + 4 + len;
+  }
+  if (at > 0) {
+    memmove((rawptr)c->raw_data, (rawptr)(c->raw_data + at), c->raw_len - at);
+    c->raw_len = c->raw_len - at;
+  }
+  return true;
+}
+
+fn alph_conn_read(ctx: AlphCtx*, c: AlphDistConn*) -> bool {
+  while (true) {
+    if (!alph_conn_room(ctx, &c->raw_data, c->raw_len, &c->raw_cap, ALPH_DIST_READ)) {
+      return false;
+    }
+    var n: int64 = alph_io_read(ctx, c->h, (rawptr)(c->raw_data + c->raw_len), c->raw_cap - c->raw_len);
     if (n == ALPH_IO_AGAIN) {
       return true;
     }
     if (n <= 0) {
       return false;  // closed by the other side, or an error
     }
-    c->in_len = c->in_len + n;
-    if (!alph_conn_parse(ctx, c)) {
+    c->raw_len = c->raw_len + n;
+    if (!alph_conn_records(ctx, c) || !alph_conn_parse(ctx, c)) {
       return false;
     }
     if (c->held != 0) {
@@ -613,9 +715,10 @@ fn alph_conn_handle(ctx: AlphCtx*, m: AlphMsg*) -> int64 {
     return ALPH_CONTINUE;
   }
   if (m->tag == ALPH_TAG_IO && m->ref == c->h) {
-    if (c->role == ALPH_DIST_CLIENT && c->up == 0 && alph_outq_pending(&c->out) == 0 &&
-        c->in_len == 0 && (m->arg & ALPH_IO_OUT) != 0) {
-      if (alph_io_error(ctx, c->h) != 0 || !alph_conn_hello(ctx, c)) {
+    if (c->role == ALPH_DIST_CLIENT && c->started == 0 && (m->arg & ALPH_IO_OUT) != 0) {
+      // The connect finished: the handshake's first message.
+      c->started = 1;
+      if (alph_io_error(ctx, c->h) != 0 || !alph_conn_handshake_next(ctx, c)) {
         return alph_conn_end(ctx, c);
       }
       alph_conn_arm(ctx, c);
@@ -655,7 +758,7 @@ fn alph_conn_handle(ctx: AlphCtx*, m: AlphMsg*) -> int64 {
   if (m->tag == ALPH_TAG_DIST_OUT) {
     var data: rawptr = alph_msg_bytes(m, &size);
     alph_conn_note_links(ctx, c, (int64)data, size);
-    if (alph_outq_push(ctx, &c->out, data, size) != ALPH_SENT ||
+    if (!alph_conn_seal(ctx, c, (int64)data, size) ||
         alph_outq_flush(ctx, &c->out, c->h) < 0) {
       return alph_conn_end(ctx, c);
     }
@@ -707,11 +810,10 @@ fn alph_conn_handle(ctx: AlphCtx*, m: AlphMsg*) -> int64 {
 
 // ---- the manager ------------------------------------------------------------
 
-fn alph_dist_conn_state(c: AlphDistConn*, mgr: AlphDistManager*, role: int64) {
+fn alph_dist_conn_state(c: AlphDistConn*, mgr: AlphDistManager*, role: int64) -> bool {
   memset((rawptr)c, 0, (int64)sizeof(AlphDistConn));
   c->role = role;
-  memcpy((rawptr)&c->cookie[0], (rawptr)&mgr->cookie[0], mgr->cookie_len);
-  c->cookie_len = mgr->cookie_len;
+  return alph_noise_init(&c->hs, role == ALPH_DIST_CLIENT, &mgr->s_sk, &mgr->psk[0]);
 }
 
 fn alph_dist_manage(ctx: AlphCtx*, m: AlphMsg*) -> int64 {
@@ -731,8 +833,10 @@ fn alph_dist_manage(ctx: AlphCtx*, m: AlphMsg*) -> int64 {
     var h: int64 = alph_tcp_accept(ctx, mgr->listener);
     while (h > 0) {
       var c: AlphDistConn;
-      alph_dist_conn_state(&c, mgr, ALPH_DIST_SERVER);
-      var conn: int64 = alph_spawn_value<AlphDistConn>(ctx, ALPH_LINK, &c, &alph_conn_handle);
+      var conn: int64 = 0;
+      if (alph_dist_conn_state(&c, mgr, ALPH_DIST_SERVER)) {
+        conn = alph_spawn_value<AlphDistConn>(ctx, ALPH_LINK, &c, &alph_conn_handle);
+      }
       if (conn == 0 || alph_io_give(ctx, h, conn) != 0) {
         alph_io_close(ctx, h);
       }
@@ -753,10 +857,12 @@ fn alph_dist_manage(ctx: AlphCtx*, m: AlphMsg*) -> int64 {
       return ALPH_CONTINUE;
     }
     var c: AlphDistConn;
-    alph_dist_conn_state(&c, mgr, ALPH_DIST_CLIENT);
-    c.asker = m->from;
-    c.asker_ref = m->ref;
-    var conn: int64 = alph_spawn_value<AlphDistConn>(ctx, ALPH_LINK, &c, &alph_conn_handle);
+    var conn: int64 = 0;
+    if (alph_dist_conn_state(&c, mgr, ALPH_DIST_CLIENT)) {
+      c.asker = m->from;
+      c.asker_ref = m->ref;
+      conn = alph_spawn_value<AlphDistConn>(ctx, ALPH_LINK, &c, &alph_conn_handle);
+    }
     if (conn == 0 || alph_io_give(ctx, h, conn) != 0) {
       alph_io_close(ctx, h);
       alph_reply(ctx, m, ALPH_TAG_DIST_UP, 0);
@@ -777,27 +883,33 @@ fn alph_dist_manage(ctx: AlphCtx*, m: AlphMsg*) -> int64 {
 // ip4:port (port 0 picks a free port). It registers itself as "alph.dist"
 // and then sends the caller ALPH_TAG_DIST_READY with the port it listens
 // on; connect and look up names only after that. Only nodes started with
-// the same cookie (at most 64 bytes) can connect.
+// the same cookie can connect.
 //
-// Returns the manager's pid, or 0 when the cookie is too long or the node
-// is full. If listening fails, the manager exits at once with
+// Returns the manager's pid, or 0 when the cookie is empty, the system has
+// no randomness for the node's key, or the node is full. If listening fails, the manager exits at once with
 // ALPH_SHUTDOWN, which the caller sees through the link. Thread: a handler.
 export fn alph_dist_start(ctx: AlphCtx*, ip4: int64, port: int64, cookie: string) -> int64 {
-  if ((int64)cookie.length > ALPH_DIST_COOKIE_MAX) {
+  if (cookie.length == 0) {
     return 0;
   }
   var mgr: AlphDistManager;
   memset((rawptr)&mgr, 0, (int64)sizeof(AlphDistManager));
   mgr.ip4 = ip4;
   mgr.port = port;
-  mgr.cookie_len = (int64)cookie.length;
-  memcpy((rawptr)&mgr.cookie[0], (rawptr)cookie.chars, mgr.cookie_len);
-  return alph_spawn_value<AlphDistManager>(ctx, ALPH_LINK, &mgr, &alph_dist_manage);
+  var digest: CrSha256;
+  if (cr_sha256(&digest, cookie.chars, (int64)cookie.length) != CR_OK ||
+      cr_random_bytes(&mgr.s_sk.b[0], 32) != CR_OK) {
+    return 0;
+  }
+  memcpy((rawptr)&mgr.psk[0], (rawptr)&digest.b[0], 32);
+  var pid: int64 = alph_spawn_value<AlphDistManager>(ctx, ALPH_LINK, &mgr, &alph_dist_manage);
+  memset((rawptr)&mgr, 0, (int64)sizeof(AlphDistManager));
+  return pid;
 }
 
 // Connects to the node listening on ip4:port. The answer is
 // ALPH_TAG_DIST_UP with arg = the connection's pid, or 0 when the node
-// could not be reached or has another cookie; or, as for any request,
+// could not be reached or holds another cookie; or, as for any request,
 // ALPH_TAG_DOWN or ALPH_TAG_TIMEOUT. Each carries the returned ref.
 //
 // Returns the ref, or ALPH_GONE when no dist manager runs, or ALPH_FULL.

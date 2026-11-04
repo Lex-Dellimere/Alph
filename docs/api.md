@@ -2169,9 +2169,12 @@ var ref2: int64 = alph_dist_whereis(ctx, conn, "store", 5000);
 
 Monitor the connection pid to hear when the other node goes away.
 
-The cookie only keeps nodes of different clusters apart. It is sent in
-the clear: today's transport is unencrypted TCP, so use it on trusted
-networks only. An encrypted transport (Noise) is planned.
+Connections are encrypted and authenticated with Noise
+(Noise_XXpsk3_25519_ChaChaPoly_SHA256, alph/net/noise). The pre-shared key
+is the SHA-256 of the cluster cookie, which never crosses the network: a
+node without the same cookie cannot complete the handshake or read or
+change any traffic. Each node makes a new static key when its manager
+starts. Treat the cookie as a secret, and make it long and random.
 
 The answer to alph_dist_connect: arg is the connection's pid, or 0.
 
@@ -2192,10 +2195,10 @@ Starts this node's dist manager, linked to the caller, listening on
 ip4:port (port 0 picks a free port). It registers itself as "alph.dist"
 and then sends the caller ALPH_TAG_DIST_READY with the port it listens
 on; connect and look up names only after that. Only nodes started with
-the same cookie (at most 64 bytes) can connect.
+the same cookie can connect.
 
-Returns the manager's pid, or 0 when the cookie is too long or the node
-is full. If listening fails, the manager exits at once with
+Returns the manager's pid, or 0 when the cookie is empty, the system has
+no randomness for the node's key, or the node is full. If listening fails, the manager exits at once with
 ALPH_SHUTDOWN, which the caller sees through the link. Thread: a handler.
 
 ### `alph_dist_connect`
@@ -2206,7 +2209,7 @@ export fn alph_dist_connect(ctx: AlphCtx*, ip4: int64, port: int64, timeout_ms: 
 
 Connects to the node listening on ip4:port. The answer is
 ALPH_TAG_DIST_UP with arg = the connection's pid, or 0 when the node
-could not be reached or has another cookie; or, as for any request,
+could not be reached or holds another cookie; or, as for any request,
 ALPH_TAG_DOWN or ALPH_TAG_TIMEOUT. Each carries the returned ref.
 
 Returns the ref, or ALPH_GONE when no dist manager runs, or ALPH_FULL.

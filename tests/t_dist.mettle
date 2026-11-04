@@ -3,7 +3,9 @@
 // answers through the same proxy every time; a remote crash reaches a local
 // monitor; a kill sent to a proxy kills the remote actor and its link takes
 // down a local actor; a local crash reaches a remote actor linked to it;
-// and losing the connection ends every proxy with ALPH_NOCONNECTION.
+// a 300 KB message crosses the encrypted transport intact; a node with
+// another cookie cannot connect; and losing the connection ends every proxy
+// with ALPH_NOCONNECTION.
 
 import "std/io";
 import "std/mem";
@@ -19,10 +21,14 @@ const TAG_CRASH: int64 = ALPH_TAG_USER + 3;
 const TAG_POLL: int64 = ALPH_TAG_USER + 4;
 const TAG_LINK_TO: int64 = ALPH_TAG_USER + 5;  // to a local helper: link to arg, then wait
 const TAG_WATCHDOG: int64 = ALPH_TAG_USER + 6;
+const TAG_BIG: int64 = ALPH_TAG_USER + 7;  // request: reply with the payload's byte sum
+const BIG: int64 = 300000;
 const COOKIE: string = "t_dist cookie";
 
 var g_node_a: AlphNode;
 var g_node_b: AlphNode;
+var g_node_c: AlphNode;
+var g_wrong_cookie: int64 = -1;  // what node C's connect got: 0 means refused
 var g_failures: int64 = 0;
 var g_port: int64 = 0;          // node B's dist port, once it listens
 var g_watcher_saw: int64 = -1;  // the exit reason B's watcher got from A's crashed actor
@@ -43,6 +49,14 @@ fn echo(ctx: AlphCtx*, m: AlphMsg*) -> int64 {
     alph_reply(ctx, m, TAG_ADD, m->arg + 1);
   } else if (m->tag == TAG_PING) {
     alph_send(ctx, m->from, TAG_PONG, m->arg);
+  } else if (m->tag == TAG_BIG) {
+    var size: int64 = 0;
+    var data: uint8* = (uint8*)alph_msg_bytes(m, &size);
+    var sum: int64 = size;
+    for i: int64 in 0..size {
+      sum = sum + (int64)data[i];
+    }
+    alph_reply(ctx, m, TAG_BIG, sum);
   } else if (m->tag == TAG_CRASH) {
     var zero: int64 = m->arg;
     alph_send(ctx, m->from, 100 / zero, 0);
@@ -93,6 +107,24 @@ fn boss_b(ctx: AlphCtx*, m: AlphMsg*) -> int64 {
   }
   if (m->tag == ALPH_TAG_DIST_PORT) {
     alph_atomic_store_sc(&g_port, m->arg);
+  }
+  return ALPH_CONTINUE;
+}
+
+// ---- node C: another cookie ----
+
+fn boss_c(ctx: AlphCtx*, m: AlphMsg*) -> int64 {
+  if (m->tag == ALPH_TAG_INIT) {
+    alph_trap_exits(ctx, true);
+    alph_dist_start(ctx, alph_ip4(127, 0, 0, 1), 0, "not the cluster's cookie");
+  } else if (m->tag == ALPH_TAG_DIST_READY) {
+    alph_dist_connect(ctx, alph_ip4(127, 0, 0, 1), alph_atomic_load(&g_port), 2000);
+  } else if (m->tag == ALPH_TAG_DIST_UP) {
+    alph_atomic_store_sc(&g_wrong_cookie, m->arg);
+    alph_halt(ctx, 0);
+  } else if (m->tag == ALPH_TAG_TIMEOUT) {
+    alph_atomic_store_sc(&g_wrong_cookie, -2);
+    alph_halt(ctx, 0);
   }
   return ALPH_CONTINUE;
 }
@@ -188,10 +220,25 @@ fn boss_a(ctx: AlphCtx*, m: AlphMsg*) -> int64 {
     expect(m->arg == b->pongs, "messages keep their order across nodes");
     b->pongs = b->pongs + 1;
     if (b->pongs == 10) {
-      alph_monitor(ctx, b->echo);
-      alph_send(ctx, b->echo, TAG_CRASH, 0);
-      b->step = 4;
+      var big: uint8* = (uint8*)alph_alloc(ctx, BIG);
+      for i: int64 in 0..BIG {
+        big[i] = (uint8)(i % 251);
+      }
+      expect(alph_request_bytes(ctx, b->echo, TAG_BIG, (rawptr)big, BIG, 5000) > 0, "big request sent");
+      alph_free(ctx, (rawptr)big);
+      b->step = 31;
     }
+    return ALPH_CONTINUE;
+  }
+  if (b->step == 31 && m->tag == TAG_BIG) {
+    var want: int64 = BIG;
+    for i: int64 in 0..BIG {
+      want = want + i % 251;
+    }
+    expect(m->arg == want, "a 300 KB message crossed intact");
+    alph_monitor(ctx, b->echo);
+    alph_send(ctx, b->echo, TAG_CRASH, 0);
+    b->step = 4;
     return ALPH_CONTINUE;
   }
   if (b->step == 4 && m->tag == ALPH_TAG_DOWN && m->from == b->echo) {
@@ -273,6 +320,10 @@ fn main() -> int32 {
     waited = waited + 1;
   }
   expect(alph_atomic_load(&g_port) > 0, "node B listens");
+  expect(alph_node_start(&g_node_c, &cfg), "node C started");
+  alph_node_spawn(&g_node_c, 0, &boss_c);
+  alph_node_wait(&g_node_c);
+  expect(alph_atomic_load(&g_wrong_cookie) == 0, "a node with another cookie cannot connect");
   expect(alph_node_start(&g_node_a, &cfg), "node A started");
   var b: BossA;
   memset((rawptr)&b, 0, (int64)sizeof(BossA));
