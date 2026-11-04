@@ -1,7 +1,7 @@
 // Noise_XXpsk3_25519_ChaChaPoly_SHA256: with fixed keys, every handshake
-// message and the first transport message each way match the reference in
-// tools/noise_ref.py byte for byte; a wrong pre-shared key, a changed byte
-// and an out-of-turn message are all refused; random keys complete a
+// message and the first transport message each way match an independent
+// reference implementation byte for byte; a wrong pre-shared key, a changed
+// byte and an out-of-turn message are all refused; random keys complete a
 // handshake and carry data both ways.
 
 import "std/io";

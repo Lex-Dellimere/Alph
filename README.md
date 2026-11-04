@@ -78,7 +78,6 @@ To use distribution, also `import "alph/net/dist"` and map the crypto package in
 
 - [Guide](docs/guide.md): how to use the runtime, from starting a node to healing, IO, child processes, pools, shutdown and distribution.
 - [API reference](docs/api.md): every function, type and constant, with its inputs, outputs and which thread may call it.
-- [Design](DESIGN.md): how it works, what was taken from BEAM and OTP, and what comes next.
 
 ## Test
 

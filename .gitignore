@@ -6,3 +6,7 @@ reports/
 HANDOFF.md
 /mettle.deps
 /bench/erl/
+/DESIGN.md
+/tools/noise_ref.py
+/bench/
+/demos/
