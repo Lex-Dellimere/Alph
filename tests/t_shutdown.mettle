@@ -180,7 +180,19 @@ fn node_signals() {
   alph_config(&cfg);
   cfg.schedulers = 2;
   cfg.signals = ((int64)1 << ALPH_SIGTERM) | ((int64)1 << ALPH_SIGHUP);
+  // Start with SIGHUP ignored, as a shell does for `cmd &`. The node must
+  // reset it to the default, or child processes would inherit the ignore.
+  var ignore: int64[4];
+  ignore[0] = 1;  // SIG_IGN
+  ignore[1] = 0;
+  ignore[2] = 0;
+  ignore[3] = 0;
+  syscall(ALPH_SYS_RT_SIGACTION, ALPH_SIGHUP, (int64)&ignore[0], 0, 8);
   expect(alph_node_start(&g_node3, &cfg), "node 3 started");
+  var now: int64[4];
+  now[0] = 1;
+  syscall(ALPH_SYS_RT_SIGACTION, ALPH_SIGHUP, 0, (int64)&now[0], 8);
+  expect(now[0] == 0, "a taken signal is reset to its default action");
   var w: Who;
   w.id = 0;
   alph_node_spawn_value<Who>(&g_node3, 0, &w, &catcher);

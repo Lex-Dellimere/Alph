@@ -1228,8 +1228,10 @@ ALPH_SIGHUP, ...). They are never dropped. pid 0, the default, or a pid
 that has exited, means the node handles them: the first starts
 alph_node_shutdown(node, 5000, 128 + signal), a second halts at once.
 
-A node that takes over signals blocks them in the thread that calls
-alph_node_start, so call that from main before starting other threads.
+A node that takes over signals resets each to its default action (a
+shell may start a program with SIGINT ignored) and blocks them in the
+thread that calls alph_node_start, so call that from main before
+starting other threads.
 Child processes start with every signal unblocked. Thread: any.
 
 ### `alph_config`
@@ -2640,6 +2642,7 @@ export const ALPH_SYS_EVENTFD2: int64 = 290;
 export const ALPH_SYS_EPOLL_CREATE1: int64 = 291;
 export const ALPH_SYS_OPEN: int64 = 2;
 export const ALPH_SYS_RT_SIGPROCMASK: int64 = 14;
+export const ALPH_SYS_RT_SIGACTION: int64 = 13;
 export const ALPH_SYS_ACCESS: int64 = 21;
 export const ALPH_SYS_DUP2: int64 = 33;
 export const ALPH_SYS_CLONE: int64 = 56;

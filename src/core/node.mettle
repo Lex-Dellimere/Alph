@@ -3001,12 +3001,24 @@ export fn alph_shutdown(ctx: AlphCtx*, deadline_ms: int64, code: int64) -> bool 
   return alph_node_shutdown(ctx->node, deadline_ms, code);
 }
 
-// Takes over the signals in mask (bits 1 << signo) for the node: blocks
-// them in the calling thread, which the schedulers then inherit, and opens
-// a signalfd for them. Returns false on failure.
+// Takes over the signals in mask (bits 1 << signo) for the node: resets
+// each to its default action, blocks them in the calling thread, which the
+// schedulers then inherit, and opens a signalfd for them. Returns false on
+// failure.
 fn alph_signals_take(node: AlphNode*, mask: int64) -> bool {
   if (mask == 0) {
     return true;
+  }
+  // An ignored signal is discarded even while blocked, so the signalfd
+  // would never see it; a shell starts `cmd &` with SIGINT ignored.
+  var action: int64[4];  // handler (0 = SIG_DFL), flags, restorer, mask
+  for i: int64 in 0..4 {
+    action[i] = 0;
+  }
+  for signo: int64 in 1..64 {
+    if ((mask & ((int64)1 << signo)) != 0) {
+      syscall(ALPH_SYS_RT_SIGACTION, signo, (int64)&action[0], 0, 8);
+    }
   }
   var set: int64 = mask >> 1;  // the kernel's bit for signal n is n - 1
   if (syscall(ALPH_SYS_RT_SIGPROCMASK, ALPH_SIG_BLOCK, (int64)&set, 0, 8) != 0) {
@@ -3038,8 +3050,10 @@ fn alph_signals_read(node: AlphNode*) {
 // that has exited, means the node handles them: the first starts
 // alph_node_shutdown(node, 5000, 128 + signal), a second halts at once.
 //
-// A node that takes over signals blocks them in the thread that calls
-// alph_node_start, so call that from main before starting other threads.
+// A node that takes over signals resets each to its default action (a
+// shell may start a program with SIGINT ignored) and blocks them in the
+// thread that calls alph_node_start, so call that from main before
+// starting other threads.
 // Child processes start with every signal unblocked. Thread: any.
 export fn alph_node_signals(node: AlphNode*, pid: int64, tag: int64) {
   alph_atomic_store(&node->sig_tag, tag);
