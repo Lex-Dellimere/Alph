@@ -1,0 +1,247 @@
+// Child processes: output through a pipe, exit codes, a program that is
+// not found, stdin through a pipe, an explicit environment and working
+// directory, a kill by signal, output to a log file, and a child killed and reaped when the actor
+// that owns it crashes.
+
+import "std/io";
+import "std/mem";
+import "alph/sys/atomic";
+import "alph/alph";
+
+const TAG_DONE: int64 = ALPH_TAG_USER;
+const TAG_CHILD: int64 = ALPH_TAG_USER + 1;  // arg: the OS pid of an orphan-to-be
+const TAG_CRASH: int64 = ALPH_TAG_USER + 2;
+
+const KIND_ECHO: int64 = 0;   // echo hello: stdout "hello\n", exit 0
+const KIND_EXIT: int64 = 1;   // sh -c 'exit 3'
+const KIND_CAT: int64 = 2;    // cat: stdin back on stdout
+const KIND_ENV: int64 = 3;    // /bin/sh with its own environment and cwd
+const KIND_KILL: int64 = 4;   // sleep, killed with SIGKILL
+const KIND_MERGE: int64 = 5;  // stderr merged into stdout
+const KIND_LOG: int64 = 6;    // stdout and stderr into a log file
+const KINDS: int64 = 7;
+
+var g_node: AlphNode;
+var g_failures: int64 = 0;
+
+fn expect(ok: bool, what: string) {
+  if (!ok) {
+    println("FAIL {what}");
+    alph_atomic_add(&g_failures, 1);
+  }
+}
+
+struct Job {
+  kind: int64;
+  proc: int64;
+  out: int64;
+  code: int64;
+  ended: int64;
+  eof: int64;
+  len: int64;
+  buf: uint8[128];
+}
+
+fn job_output_is(j: Job*, want: string) -> bool {
+  if (j->len != (int64)want.length) {
+    return false;
+  }
+  return memcmp((rawptr)&j->buf[0], (rawptr)want.chars, j->len) == 0;
+}
+
+fn job_check(ctx: AlphCtx*, j: Job*) -> int64 {
+  if (j->ended == 0 || j->eof == 0) {
+    return ALPH_CONTINUE;
+  }
+  if (j->kind == KIND_ECHO) {
+    expect(j->code == 0 && job_output_is(j, "hello\n"), "echo prints and exits 0");
+  } else if (j->kind == KIND_EXIT) {
+    expect(j->code == 3, "the exit code arrives");
+  } else if (j->kind == KIND_CAT) {
+    expect(j->code == 0 && job_output_is(j, "abc"), "stdin reaches the child");
+  } else if (j->kind == KIND_ENV) {
+    expect(j->code == 0 && job_output_is(j, "xyz /tmp\n"), "environment and cwd are the child's");
+  } else if (j->kind == KIND_KILL) {
+    expect(j->code == 128 + 9, "a killed child reports 128 + the signal");
+  } else if (j->kind == KIND_MERGE) {
+    expect(j->code == 0 && job_output_is(j, "e\n"), "stderr goes into the stdout pipe");
+  } else if (j->kind == KIND_LOG) {
+    var path: cstring = "build/check/t_proc.log";
+    var fd: int64 = syscall(ALPH_SYS_OPEN, (int64)path, ALPH_O_RDONLY, 0);
+    j->len = alph_sys_read(fd, (rawptr)&j->buf[0], 128);
+    alph_sys_close(fd);
+    expect(j->code == 0 && job_output_is(j, "out\nerr\n"), "stdout and stderr go to the log");
+  }
+  alph_send(ctx, alph_parent(ctx), TAG_DONE, j->kind);
+  return alph_stop(ctx, ALPH_NORMAL);
+}
+
+fn job(ctx: AlphCtx*, m: AlphMsg*) -> int64 {
+  var j: Job* = (Job*)ctx->state;
+  if (m->tag == ALPH_TAG_INIT) {
+    var argv: cstring[4];
+    var envp: cstring[2];
+    var spec: AlphProcSpec;
+    memset((rawptr)&spec, 0, (int64)sizeof(AlphProcSpec));
+    spec.argv = &argv[0];
+    spec.flags = ALPH_PROC_OUT;
+    argv[1] = (cstring)0;
+    argv[2] = (cstring)0;
+    argv[3] = (cstring)0;
+    if (j->kind == KIND_ECHO) {
+      argv[0] = "echo";
+      argv[1] = "hello";
+    } else if (j->kind == KIND_EXIT) {
+      argv[0] = "sh";
+      argv[1] = "-c";
+      argv[2] = "exit 3";
+    } else if (j->kind == KIND_CAT) {
+      argv[0] = "cat";
+      spec.flags = ALPH_PROC_IN | ALPH_PROC_OUT;
+    } else if (j->kind == KIND_ENV) {
+      argv[0] = "/bin/sh";
+      argv[1] = "-c";
+      argv[2] = "echo $ALPH_T $(pwd)";
+      envp[0] = "ALPH_T=xyz";
+      envp[1] = (cstring)0;
+      spec.envp = &envp[0];
+      spec.cwd = "/tmp";
+    } else if (j->kind == KIND_KILL) {
+      argv[0] = "sleep";
+      argv[1] = "30";
+      spec.flags = ALPH_PROC_QUIET;
+    } else if (j->kind == KIND_MERGE) {
+      argv[0] = "sh";
+      argv[1] = "-c";
+      argv[2] = "echo e >&2";
+      spec.flags = ALPH_PROC_OUT | ALPH_PROC_MERGE;
+    } else if (j->kind == KIND_LOG) {
+      argv[0] = "sh";
+      argv[1] = "-c";
+      argv[2] = "echo out; echo err >&2";
+      spec.log = "build/check/t_proc.log";
+      spec.flags = 0;
+    }
+    j->proc = alph_proc_spawn(ctx, &spec);
+    expect(j->proc > 0, "the child started");
+    j->out = spec.stdout_h;
+    if (j->out == 0) {
+      j->eof = 1;
+    } else {
+      alph_io_arm(ctx, j->out, ALPH_IO_IN);
+    }
+    if (j->kind == KIND_CAT) {
+      expect(alph_io_write(ctx, spec.stdin_h, (rawptr)"abc", 3) == 3, "wrote to stdin");
+      alph_io_close(ctx, spec.stdin_h);
+    } else if (j->kind == KIND_KILL) {
+      expect(alph_proc_os_pid(ctx, j->proc) > 0, "the child has an OS pid");
+      expect(alph_proc_kill(ctx, j->proc, 9) == 0, "the kill was sent");
+    }
+    return ALPH_CONTINUE;
+  }
+  if (m->tag == ALPH_TAG_IO && m->ref == j->out) {
+    var room: int64 = 128 - j->len;
+    var got: int64 = alph_io_read(ctx, j->out, (rawptr)&j->buf[j->len], room);
+    if (got > 0) {
+      j->len = j->len + got;
+      alph_io_arm(ctx, j->out, ALPH_IO_IN);
+    } else if (got == ALPH_IO_AGAIN) {
+      alph_io_arm(ctx, j->out, ALPH_IO_IN);
+    } else {
+      alph_io_close(ctx, j->out);
+      j->eof = 1;
+    }
+    return job_check(ctx, j);
+  }
+  if (m->tag == ALPH_TAG_PROC_EXIT) {
+    expect(m->ref == j->proc, "the exit names the process handle");
+    expect(alph_proc_kill(ctx, j->proc, 9) < 0, "the handle is closed after the exit");
+    j->code = m->arg;
+    j->ended = 1;
+    return job_check(ctx, j);
+  }
+  return ALPH_CONTINUE;
+}
+
+// Owns a long-running child, tells its parent the child's OS pid, then
+// crashes on command.
+fn owner(ctx: AlphCtx*, m: AlphMsg*) -> int64 {
+  if (m->tag == ALPH_TAG_INIT) {
+    var argv: cstring[3];
+    argv[0] = "sleep";
+    argv[1] = "30";
+    argv[2] = (cstring)0;
+    var spec: AlphProcSpec;
+    memset((rawptr)&spec, 0, (int64)sizeof(AlphProcSpec));
+    spec.argv = &argv[0];
+    var h: int64 = alph_proc_spawn(ctx, &spec);
+    alph_send(ctx, m->from, TAG_CHILD, alph_proc_os_pid(ctx, h));
+  } else if (m->tag == TAG_CRASH) {
+    var zero: int64 = m->arg;
+    alph_send(ctx, m->from, 100 / zero, 0);
+  }
+  return ALPH_CONTINUE;
+}
+
+struct Boss {
+  done: int64;
+  owner: int64;
+  child: int64;
+}
+
+fn boss(ctx: AlphCtx*, m: AlphMsg*) -> int64 {
+  var b: Boss* = (Boss*)ctx->state;
+  if (m->tag == ALPH_TAG_INIT) {
+    var argv: cstring[2];
+    argv[0] = "alph-no-such-program";
+    argv[1] = (cstring)0;
+    var spec: AlphProcSpec;
+    memset((rawptr)&spec, 0, (int64)sizeof(AlphProcSpec));
+    spec.argv = &argv[0];
+    expect(alph_proc_spawn(ctx, &spec) == -2, "a missing program is not started");
+    for k: int64 in 0..KINDS {
+      var j: Job;
+      memset((rawptr)&j, 0, (int64)sizeof(Job));
+      j.kind = k;
+      alph_spawn_value<Job>(ctx, 0, &j, &job);
+    }
+    b->owner = alph_spawn(ctx, ALPH_MONITOR, &owner);
+    return ALPH_CONTINUE;
+  }
+  if (m->tag == TAG_CHILD) {
+    b->child = m->arg;
+    expect(b->child > 0, "the owner's child started");
+    expect(syscall(ALPH_SYS_KILL, b->child, 0) == 0, "the owner's child runs");
+    alph_send(ctx, b->owner, TAG_CRASH, 0);
+    return ALPH_CONTINUE;
+  }
+  if (m->tag == ALPH_TAG_DOWN) {
+    expect(m->arg == ALPH_CRASHED, "the owner crashed");
+    // Reaped before the DOWN was sent, so the pid no longer exists.
+    expect(syscall(ALPH_SYS_KILL, b->child, 0) == -3, "the crash killed and reaped the child");
+    b->done = b->done + 1;
+  } else if (m->tag == TAG_DONE) {
+    b->done = b->done + 1;
+  }
+  if (b->done == KINDS + 1) {
+    alph_halt(ctx, 0);
+  }
+  return ALPH_CONTINUE;
+}
+
+fn main() -> int32 {
+  var cfg: AlphConfig;
+  alph_config(&cfg);
+  cfg.schedulers = 2;
+  cfg.max_actors = 64;
+  expect(alph_node_start(&g_node, &cfg), "node started");
+  var b: Boss;
+  memset((rawptr)&b, 0, (int64)sizeof(Boss));
+  alph_node_spawn_value<Boss>(&g_node, 0, &b, &boss);
+  alph_node_wait(&g_node);
+  if (g_failures != 0) {
+    return 1;
+  }
+  println("proc ok");
+  return 0;
+}

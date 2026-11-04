@@ -1,0 +1,221 @@
+// Limiter: a counting semaphore as an actor. Permits are granted first come
+// first served; a holder that releases, crashes or is killed gives its permit
+// back; a waiter that gives up is never granted and its place goes to the
+// next one.
+
+import "std/io";
+import "std/mem";
+import "alph/sys/atomic";
+import "alph/alph";
+
+const TAG_ASKED: int64 = ALPH_TAG_USER;        // holder -> boss: request sent; arg: its number
+const TAG_HELD: int64 = ALPH_TAG_USER + 1;     // holder -> boss: granted; arg: its number
+const TAG_RELEASE: int64 = ALPH_TAG_USER + 2;  // boss -> holder: give the permit back
+const TAG_RELEASED: int64 = ALPH_TAG_USER + 3; // holder -> boss: release sent; arg: its number
+const TAG_CRASH: int64 = ALPH_TAG_USER + 4;
+const TAG_CHECK: int64 = ALPH_TAG_USER + 5;
+const PERMITS: int64 = 2;
+
+var g_node: AlphNode;
+var g_failures: int64 = 0;
+
+fn expect(ok: bool, what: string) {
+  if (!ok) {
+    println("FAIL {what}");
+    alph_atomic_add(&g_failures, 1);
+  }
+}
+
+struct Holder {
+  limiter: int64;
+  boss: int64;
+  id: int64;
+  ref: int64;
+}
+
+// Asks for a permit in INIT and reports each stage to the boss.
+fn holder(ctx: AlphCtx*, m: AlphMsg*) -> int64 {
+  var h: Holder* = (Holder*)ctx->state;
+  if (m->tag == ALPH_TAG_INIT) {
+    h->ref = alph_acquire(ctx, h->limiter);
+    expect(h->ref > 0, "request sent");
+    alph_send(ctx, h->boss, TAG_ASKED, h->id);
+  } else if (m->tag == ALPH_TAG_GRANTED) {
+    expect(m->ref == h->ref, "the grant has the acquire's ref");
+    alph_send(ctx, h->boss, TAG_HELD, h->id);
+  } else if (m->tag == TAG_RELEASE) {
+    alph_release(ctx, h->limiter, h->ref);
+    alph_send(ctx, h->boss, TAG_RELEASED, h->id);
+  } else if (m->tag == TAG_CRASH) {
+    var zero: int64 = m->arg;
+    alph_send(ctx, m->from, 100 / zero, 0);
+  }
+  return ALPH_CONTINUE;
+}
+
+struct Boss {
+  step: int64;
+  limiter: int64;
+  spawned: int64;
+  held_count: int64;
+  k: int64;
+  got_down: int64;
+  got_held: int64;
+  held: int64[8];
+  pids: int64[8];
+}
+
+fn spawn_holder(ctx: AlphCtx*, b: Boss*) {
+  var h: Holder;
+  h.limiter = b->limiter;
+  h.boss = ctx->self;
+  h.id = b->spawned;
+  h.ref = 0;
+  b->pids[b->spawned] = alph_spawn_value<Holder>(ctx, ALPH_MONITOR, &h, &holder);
+  b->spawned = b->spawned + 1;
+}
+
+fn boss(ctx: AlphCtx*, m: AlphMsg*) -> int64 {
+  var b: Boss* = (Boss*)ctx->state;
+  if (m->tag == ALPH_TAG_INIT) {
+    alph_trap_exits(ctx, true);  // the limiter is linked; its exit must not end the boss
+    b->limiter = alph_spawn_limiter(ctx, PERMITS);
+    expect(b->limiter != 0, "limiter spawned");
+    spawn_holder(ctx, b);
+    return ALPH_CONTINUE;
+  }
+  if (m->tag == ALPH_TAG_EXIT) {
+    expect(false, "the limiter exited");
+    alph_halt(ctx, 0);
+    return ALPH_CONTINUE;
+  }
+  if (m->tag == TAG_HELD) {
+    b->held[m->arg] = b->held[m->arg] + 1;
+    b->held_count = b->held_count + 1;
+  }
+
+  // holders 0 to 4 ask in turn: two are granted, three wait in order
+  if (b->step == 0 && m->tag == TAG_ASKED) {
+    if (b->spawned < 5) {
+      spawn_holder(ctx, b);
+    } else {
+      alph_send_after(ctx, 60, ctx->self, TAG_CHECK, 0);
+      b->step = 1;
+    }
+    return ALPH_CONTINUE;
+  }
+  if (b->step == 1 && m->tag == TAG_CHECK) {
+    expect(b->held_count == PERMITS, "exactly two are granted at first");
+    expect(b->held[0] == 1 && b->held[1] == 1, "the first two to ask are granted");
+    alph_send(ctx, b->pids[0], TAG_RELEASE, 0);
+    b->k = 0;
+    b->step = 2;
+    return ALPH_CONTINUE;
+  }
+
+  // each release grants the oldest waiter: 2, then 3, then 4
+  if (b->step == 2 && m->tag == TAG_HELD) {
+    expect(m->arg == b->k + 2, "waiters are granted in the order they asked");
+    b->k = b->k + 1;
+    if (b->k < 3) {
+      alph_send(ctx, b->pids[b->k], TAG_RELEASE, 0);
+    } else {
+      spawn_holder(ctx, b);  // holders 3 and 4 hold both permits; 5 to 7 wait
+      b->step = 3;
+    }
+    return ALPH_CONTINUE;
+  }
+  if (b->step == 3 && m->tag == TAG_ASKED) {
+    if (b->spawned < 8) {
+      spawn_holder(ctx, b);
+    } else {
+      alph_send_after(ctx, 60, ctx->self, TAG_CHECK, 0);
+      b->step = 4;
+    }
+    return ALPH_CONTINUE;
+  }
+
+  // a holder crashes: its permit goes to waiter 5
+  if (b->step == 4 && m->tag == TAG_CHECK) {
+    expect(b->held_count == 5, "nothing is granted while no permit is free");
+    alph_send(ctx, b->pids[3], TAG_CRASH, 0);
+    b->got_down = 0;
+    b->got_held = 0;
+    b->step = 5;
+    return ALPH_CONTINUE;
+  }
+  if (b->step == 5) {
+    if (m->tag == ALPH_TAG_DOWN) {
+      expect(m->from == b->pids[3] && m->arg == ALPH_CRASHED, "the holder crashed");
+      b->got_down = 1;
+    } else if (m->tag == TAG_HELD) {
+      expect(m->arg == 5, "a crashed holder's permit goes to the next waiter");
+      b->got_held = 1;
+    }
+    if (b->got_down == 1 && b->got_held == 1) {
+      alph_send(ctx, b->pids[6], TAG_RELEASE, 0);  // waiter 6 gives up
+      b->step = 6;
+    }
+    return ALPH_CONTINUE;
+  }
+
+  // waiter 6 withdraws; a killed holder's permit then skips it for waiter 7
+  if (b->step == 6 && m->tag == TAG_RELEASED) {
+    expect(m->arg == 6, "waiter 6 withdrew its request");
+    alph_send_after(ctx, 40, ctx->self, TAG_CHECK, 0);
+    b->step = 7;
+    return ALPH_CONTINUE;
+  }
+  if (b->step == 7 && m->tag == TAG_CHECK) {
+    expect(b->held_count == 6, "a waiter that gave up is not granted");
+    alph_exit_signal(ctx, b->pids[4], ALPH_KILL);
+    b->got_down = 0;
+    b->got_held = 0;
+    b->step = 8;
+    return ALPH_CONTINUE;
+  }
+  if (b->step == 8) {
+    if (m->tag == ALPH_TAG_DOWN) {
+      expect(m->from == b->pids[4] && m->arg == ALPH_KILLED, "the holder was killed");
+      b->got_down = 1;
+    } else if (m->tag == TAG_HELD) {
+      expect(m->arg == 7, "a killed holder's permit goes to the next waiter in line");
+      b->got_held = 1;
+    }
+    if (b->got_down == 1 && b->got_held == 1) {
+      alph_send_after(ctx, 60, ctx->self, TAG_CHECK, 0);
+      b->step = 9;
+    }
+    return ALPH_CONTINUE;
+  }
+  if (b->step == 9 && m->tag == TAG_CHECK) {
+    expect(b->held_count == 7, "seven grants in all");
+    expect(b->held[6] == 0, "the waiter that gave up never got a grant");
+    var once: bool = true;
+    for i: int64 in 0..6 {
+      if (b->held[i] != 1) {
+        once = false;
+      }
+    }
+    expect(once && b->held[7] == 1, "every other holder was granted exactly once");
+    alph_halt(ctx, 0);
+  }
+  return ALPH_CONTINUE;
+}
+
+fn main() -> int32 {
+  var cfg: AlphConfig;
+  alph_config(&cfg);
+  cfg.schedulers = 2;
+  cfg.max_actors = 64;
+  expect(alph_node_start(&g_node, &cfg), "node started");
+  var b: Boss;
+  memset((rawptr)&b, 0, (int64)sizeof(Boss));
+  alph_node_spawn_value<Boss>(&g_node, 0, &b, &boss);
+  alph_node_wait(&g_node);
+  if (g_failures != 0) {
+    return 1;
+  }
+  println("limiter ok");
+  return 0;
+}

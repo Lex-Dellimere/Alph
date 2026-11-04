@@ -1,0 +1,185 @@
+// Dynamic supervisors: children started on request up to max_children;
+// transient children restarted after a crash but not after a normal exit;
+// too many restarts end the supervisor and every child; a supervisor whose
+// parent dies stops its children, killing one that ignores the shutdown.
+
+import "std/io";
+import "std/mem";
+import "alph/sys/atomic";
+import "alph/alph";
+
+const TAG_HELLO: int64 = ALPH_TAG_USER;  // arg: the child's number
+const TAG_CRASH: int64 = ALPH_TAG_USER + 1;
+const TAG_QUIT: int64 = ALPH_TAG_USER + 2;
+const TAG_MID: int64 = ALPH_TAG_USER + 3;  // arg: the second supervisor
+const CHILDREN: int64 = 40;
+const STUBBORN: int64 = 3;
+
+var g_node: AlphNode;
+var g_failures: int64 = 0;
+
+fn expect(ok: bool, what: string) {
+  if (!ok) {
+    println("FAIL {what}");
+    alph_atomic_add(&g_failures, 1);
+  }
+}
+
+struct Kid {
+  boss: int64;
+  n: int64;
+  stubborn: int64;
+}
+
+fn kid(ctx: AlphCtx*, m: AlphMsg*) -> int64 {
+  var k: Kid* = (Kid*)ctx->state;
+  if (m->tag == ALPH_TAG_INIT) {
+    if (k->stubborn != 0) {
+      alph_trap_exits(ctx, true);  // ignores ALPH_SHUTDOWN, so it is killed
+    }
+    alph_send(ctx, k->boss, TAG_HELLO, k->n);
+  } else if (m->tag == TAG_CRASH) {
+    var zero: int64 = m->arg;
+    alph_send(ctx, m->from, 100 / zero, 0);
+  } else if (m->tag == TAG_QUIT) {
+    return alph_stop(ctx, ALPH_NORMAL);
+  }
+  return ALPH_CONTINUE;
+}
+
+// Owns the second supervisor and starts its stubborn children.
+fn mid(ctx: AlphCtx*, m: AlphMsg*) -> int64 {
+  if (m->tag == ALPH_TAG_INIT) {
+    var spec: AlphDynSpec;
+    alph_dyn_init(&spec, &kid);
+    spec.restart = ALPH_TEMPORARY;
+    spec.shutdown_ms = 50;
+    var sup: int64 = alph_spawn_dyn(ctx, &spec);
+    for i: int64 in 0..STUBBORN {
+      var k: Kid;
+      k.boss = m->from;
+      k.n = 1000 + i;
+      k.stubborn = 1;
+      alph_dyn_start_value<Kid>(ctx, sup, &k, 1000);
+    }
+    alph_send(ctx, m->from, TAG_MID, sup);
+  }
+  return ALPH_CONTINUE;
+}
+
+struct Boss {
+  step: int64;
+  sup: int64;
+  mid: int64;
+  sup2: int64;
+  started: int64;
+  hellos: int64;
+  downs: int64;
+  pids: int64[40];
+}
+
+fn boss(ctx: AlphCtx*, m: AlphMsg*) -> int64 {
+  var b: Boss* = (Boss*)ctx->state;
+  if (m->tag == ALPH_TAG_INIT) {
+    alph_trap_exits(ctx, true);  // the supervisor is linked; its exit must not end the boss
+    var spec: AlphDynSpec;
+    alph_dyn_init(&spec, &kid);
+    spec.restart = ALPH_TRANSIENT;
+    spec.max_restarts = 2;
+    spec.max_children = CHILDREN;
+    b->sup = alph_spawn_dyn(ctx, &spec);
+    alph_monitor(ctx, b->sup);
+    for i: int64 in 0..CHILDREN + 1 {
+      var k: Kid;
+      k.boss = ctx->self;
+      k.n = i;
+      k.stubborn = 0;
+      expect(alph_dyn_start_value<Kid>(ctx, b->sup, &k, 1000) > 0, "start request sent");
+    }
+    return ALPH_CONTINUE;
+  }
+  if (b->step == 0) {
+    if (m->tag == ALPH_TAG_STARTED) {
+      if (m->arg == 0) {
+        expect(b->started == CHILDREN, "only the start past max_children is refused");
+      } else {
+        b->started = b->started + 1;
+      }
+    } else if (m->tag == TAG_HELLO) {
+      b->pids[m->arg] = m->from;
+      b->hellos = b->hellos + 1;
+    }
+    if (b->hellos == CHILDREN && b->started == CHILDREN) {
+      alph_send(ctx, b->pids[1], TAG_QUIT, 0);
+      alph_send(ctx, b->pids[0], TAG_CRASH, 0);
+      b->step = 1;
+    }
+    return ALPH_CONTINUE;
+  }
+  if (b->step == 1 && m->tag == TAG_HELLO) {
+    expect(m->arg == 0 && m->from != b->pids[0], "a crashed transient child restarts with a new pid");
+    // One crash at a time: two at the same moment end the node
+    // (alph/reports/001).
+    alph_send(ctx, b->pids[2], TAG_CRASH, 0);
+    b->step = 2;
+    return ALPH_CONTINUE;
+  }
+  if (b->step == 2 && m->tag == TAG_HELLO) {
+    expect(m->arg == 2, "only crashed children restart");
+    alph_send(ctx, b->pids[3], TAG_CRASH, 0);  // the third restart is one too many
+    return ALPH_CONTINUE;
+  }
+  if (b->step == 2 && m->tag == ALPH_TAG_DOWN) {
+    expect(m->from == b->sup && m->arg == ALPH_SHUTDOWN, "too many restarts end the supervisor");
+    var stats: AlphStats;
+    alph_node_stats(ctx->node, &stats);
+    expect(stats.live <= 2, "every child stopped before the supervisor exited");
+    b->mid = alph_spawn(ctx, 0, &mid);
+    b->hellos = 0;
+    b->step = 3;
+    return ALPH_CONTINUE;
+  }
+  if (b->step == 3) {
+    if (m->tag == TAG_MID) {
+      b->sup2 = m->arg;
+      alph_monitor(ctx, b->sup2);
+    } else if (m->tag == TAG_HELLO) {
+      alph_monitor(ctx, m->from);
+      b->hellos = b->hellos + 1;
+    }
+    if (b->sup2 != 0 && b->hellos == STUBBORN) {
+      alph_exit_signal(ctx, b->mid, ALPH_KILL);
+      b->step = 4;
+    }
+    return ALPH_CONTINUE;
+  }
+  if (b->step == 4 && m->tag == ALPH_TAG_DOWN) {
+    if (m->from == b->sup2) {
+      expect(b->downs == STUBBORN, "the children stopped before their supervisor");
+      expect(m->arg == ALPH_KILLED, "the supervisor exits with its parent's reason");
+      alph_halt(ctx, 0);
+    } else {
+      expect(m->arg == ALPH_KILLED, "a child that ignores the shutdown is killed");
+      b->downs = b->downs + 1;
+    }
+  }
+  return ALPH_CONTINUE;
+}
+
+fn main() -> int32 {
+  var cfg: AlphConfig;
+  alph_config(&cfg);
+  cfg.schedulers = 2;
+  cfg.max_actors = 256;
+  cfg.mailbox_size = 256;  // the boss gets 81 replies and greetings at once
+  expect(alph_node_start(&g_node, &cfg), "node started");
+  var b: Boss;
+  memset((rawptr)&b, 0, (int64)sizeof(Boss));
+  alph_node_spawn_value<Boss>(&g_node, 0, &b, &boss);
+  alph_node_wait(&g_node);
+  if (g_failures != 0) {
+    return 1;
+  }
+  println("dynamic ok");
+  return 0;
+}

@@ -1,0 +1,114 @@
+// alph/core/heap on its own: every size class, reuse after free, blocks
+// mapped on their own, the byte limit, release back to the pool, and scratch.
+
+import "std/io";
+import "std/mem";
+import "alph/core/heap";
+
+var g_failures: int64 = 0;
+
+fn expect(ok: bool, what: string) {
+  if (!ok) {
+    println("FAIL {what}");
+    g_failures = g_failures + 1;
+  }
+}
+
+fn aligned(p: rawptr) -> bool {
+  return ((int64)p & 15) == 0;
+}
+
+fn check_classes(pool: AlphPool*) {
+  var heap: AlphHeap;
+  alph_heap_init(&heap, 0);
+  var sizes: int64[8];
+  sizes[0] = 1;
+  sizes[1] = 16;
+  sizes[2] = 17;
+  sizes[3] = 100;
+  sizes[4] = 1000;
+  sizes[5] = 4000;
+  sizes[6] = 30000;
+  sizes[7] = 200000;  // mapped on its own
+  var blocks: int64[8];
+  for i: int64 in 0..8 {
+    var p: rawptr = alph_heap_alloc(&heap, pool, sizes[i]);
+    expect(p != 0, "allocation succeeds");
+    expect(aligned(p), "blocks are 16-byte aligned");
+    expect(alph_heap_size(p) >= sizes[i], "a block holds what was asked");
+    memset(p, (int32)i + 1, sizes[i]);
+    blocks[i] = (int64)p;
+  }
+  // Writing every byte of every block must not have touched another block.
+  for i: int64 in 0..8 {
+    var bytes: uint8* = (uint8*)blocks[i];
+    expect((int64)bytes[0] == i + 1 && (int64)bytes[sizes[i] - 1] == i + 1, "blocks do not overlap");
+  }
+  var used: int64 = heap.used;
+  alph_heap_free(&heap, (rawptr)blocks[3]);
+  alph_heap_free(&heap, (rawptr)blocks[7]);
+  expect(heap.used < used, "freeing lowers the count");
+  var again: rawptr = alph_heap_alloc(&heap, pool, 100);
+  expect((int64)again == blocks[3], "a freed block is reused for its class");
+  alph_heap_release(&heap, pool);
+  expect(heap.used == 0 && heap.chunks == 0, "release empties the heap");
+}
+
+fn check_limit(pool: AlphPool*) {
+  var heap: AlphHeap;
+  alph_heap_init(&heap, 4096);
+  var count: int64 = 0;
+  while (alph_heap_alloc(&heap, pool, 100) != 0 && count < 1000) {
+    count = count + 1;
+  }
+  expect(count > 0 && count < 1000, "the limit stops allocation");
+  expect(heap.used <= 4096, "the count stays under the limit");
+  expect(alph_heap_alloc(&heap, pool, 100000) == 0, "a mapped block also respects the limit");
+  alph_heap_release(&heap, pool);
+}
+
+fn check_reuse(pool: AlphPool*) {
+  // Many heaps come and go; their chunks cycle through the pool.
+  for round: int64 in 0..2000 {
+    var heap: AlphHeap;
+    alph_heap_init(&heap, 0);
+    for i: int64 in 0..20 {
+      alph_heap_alloc(&heap, pool, 64 + i * 8);
+    }
+    alph_heap_release(&heap, pool);
+  }
+  expect(pool->free[0] != 0 || pool->free[1] != 0, "released chunks wait in the pool");
+}
+
+fn check_scratch(pool: AlphPool*) {
+  var s: AlphScratch;
+  memset((rawptr)&s, 0, (int64)sizeof(AlphScratch));
+  var a: rawptr = alph_scratch_alloc(&s, pool, 24);
+  var b: rawptr = alph_scratch_alloc(&s, pool, 24);
+  expect(a != 0 && b != 0 && aligned(a) && aligned(b), "scratch hands out aligned memory");
+  expect((int64)b - (int64)a == 32, "scratch is a bump allocator");
+  var big: rawptr = alph_scratch_alloc(&s, pool, 300000);
+  expect(big != 0, "a large scratch block is mapped");
+  memset(big, 7, 300000);
+  for i: int64 in 0..100 {
+    expect(alph_scratch_alloc(&s, pool, 1000) != 0, "scratch grows across chunks");
+  }
+  alph_scratch_reset(&s, pool);
+  var c: rawptr = alph_scratch_alloc(&s, pool, 24);
+  expect((int64)c == (int64)a, "reset starts over in the first chunk");
+  expect(s.extra == 0, "reset returns the extra chunks");
+}
+
+fn main() -> int32 {
+  var pool: AlphPool;
+  memset((rawptr)&pool, 0, (int64)sizeof(AlphPool));
+  check_classes(&pool);
+  check_limit(&pool);
+  check_reuse(&pool);
+  check_scratch(&pool);
+  if (g_failures != 0) {
+    return 1;
+  }
+  println("heap ok");
+  return 0;
+}

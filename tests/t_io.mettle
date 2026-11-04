@@ -1,0 +1,279 @@
+// The IO layer over real TCP sockets: an acceptor hands each connection to
+// its own echo actor; many clients make round trips at once; one client
+// pushes 1 MB through output queues (partial writes on both sides); a
+// connection actor that crashes has its socket closed by the runtime, so its
+// client sees the end of the stream instead of hanging.
+
+import "std/io";
+import "std/mem";
+import "alph/sys/atomic";
+import "alph/alph";
+
+const TAG_PORT: int64 = ALPH_TAG_USER;
+const TAG_DONE: int64 = ALPH_TAG_USER + 1;
+
+const CLIENTS: int64 = 200;
+const ROUNDS: int64 = 20;
+const MSG: int64 = 64;
+const BIG: int64 = 1048576;
+
+const KIND_ECHO: int64 = 0;
+const KIND_BIG: int64 = 1;
+const KIND_CRASH: int64 = 2;
+
+var g_node: AlphNode;
+var g_failures: int64 = 0;
+
+fn expect(ok: bool, what: string) {
+  if (!ok) {
+    println("FAIL {what}");
+    alph_atomic_add(&g_failures, 1);
+  }
+}
+
+// ---- server ----
+
+struct Conn {
+  h: int64;
+  out: AlphOutq;
+}
+
+fn conn(ctx: AlphCtx*, m: AlphMsg*) -> int64 {
+  var c: Conn* = (Conn*)ctx->state;
+  if (m->tag == ALPH_TAG_IO_GIVEN) {
+    c->h = m->ref;
+    alph_outq_init(&c->out, 4 * BIG);
+    alph_io_arm(ctx, c->h, ALPH_IO_IN);
+    return ALPH_CONTINUE;
+  }
+  if (m->tag != ALPH_TAG_IO) {
+    return ALPH_CONTINUE;
+  }
+  var buf: uint8* = (uint8*)alph_scratch(ctx, 65536);
+  while (true) {
+    var n: int64 = alph_io_read(ctx, c->h, (rawptr)buf, 65536);
+    if (n == ALPH_IO_AGAIN) {
+      break;
+    }
+    if (n <= 0) {
+      return alph_stop(ctx, ALPH_NORMAL);  // the client closed; the runtime closes h
+    }
+    if (buf[0] == (uint8)88) {  // 'X': crash with the socket open
+      var zero: int64 = (int64)buf[1] - 88;
+      alph_send(ctx, 0, 1 / zero, 0);
+    }
+    expect(alph_outq_push(ctx, &c->out, (rawptr)buf, n) == ALPH_SENT, "echo fits the queue");
+  }
+  if (alph_outq_flush(ctx, &c->out, c->h) < 0) {
+    return alph_stop(ctx, ALPH_NORMAL);
+  }
+  var events: int64 = ALPH_IO_IN;
+  if (alph_outq_pending(&c->out) > 0) {
+    events = events | ALPH_IO_OUT;
+  }
+  alph_io_arm(ctx, c->h, events);
+  return ALPH_CONTINUE;
+}
+
+struct Acceptor {
+  lh: int64;
+  boss: int64;
+}
+
+fn acceptor(ctx: AlphCtx*, m: AlphMsg*) -> int64 {
+  var a: Acceptor* = (Acceptor*)ctx->state;
+  if (m->tag == ALPH_TAG_INIT) {
+    a->lh = alph_tcp_listen(ctx, alph_ip4(127, 0, 0, 1), 0, 512, 0);
+    expect(a->lh > 0, "listener opened");
+    alph_send(ctx, a->boss, TAG_PORT, alph_tcp_port(ctx, a->lh));
+    alph_io_arm(ctx, a->lh, ALPH_IO_IN);
+    return ALPH_CONTINUE;
+  }
+  if (m->tag == ALPH_TAG_IO) {
+    while (true) {
+      var h: int64 = alph_tcp_accept(ctx, a->lh);
+      if (h == ALPH_IO_AGAIN) {
+        break;
+      }
+      expect(h > 0, "accept succeeds");
+      var c: Conn;
+      memset((rawptr)&c, 0, (int64)sizeof(Conn));
+      var pid: int64 = alph_spawn_value<Conn>(ctx, 0, &c, &conn);
+      expect(alph_io_give(ctx, h, pid) == ALPH_SENT, "connection handed over");
+      expect(alph_io_read(ctx, h, (rawptr)&c, 1) == -9, "a handle given away is no longer ours");
+    }
+    alph_io_arm(ctx, a->lh, ALPH_IO_IN);
+  }
+  return ALPH_CONTINUE;
+}
+
+// ---- clients ----
+
+struct Client {
+  kind: int64;
+  port: int64;
+  boss: int64;
+  h: int64;
+  connected: int64;
+  rounds: int64;
+  received: int64;
+  sum_in: int64;
+  out: AlphOutq;
+}
+
+fn client_send(ctx: AlphCtx*, c: Client*) {
+  if (c->kind == KIND_BIG) {
+    var chunk: uint8* = (uint8*)alph_scratch(ctx, 65536);
+    var at: int64 = 0;
+    while (at < BIG) {
+      for i: int64 in 0..65536 {
+        chunk[i] = (uint8)((at + i) % 251);
+      }
+      alph_outq_push(ctx, &c->out, (rawptr)chunk, 65536);
+      at = at + 65536;
+    }
+  } else {
+    var msg: uint8[64];
+    for i: int64 in 0..MSG {
+      msg[i] = (uint8)(65 + (c->rounds + i) % 26);
+    }
+    if (c->kind == KIND_CRASH) {
+      msg[0] = (uint8)88;
+      msg[1] = (uint8)88;
+    }
+    alph_outq_push(ctx, &c->out, (rawptr)&msg[0], MSG);
+  }
+  alph_outq_flush(ctx, &c->out, c->h);
+}
+
+fn client_done(ctx: AlphCtx*, c: Client*) -> int64 {
+  alph_send(ctx, c->boss, TAG_DONE, c->kind);
+  return alph_stop(ctx, ALPH_NORMAL);
+}
+
+fn client(ctx: AlphCtx*, m: AlphMsg*) -> int64 {
+  var c: Client* = (Client*)ctx->state;
+  if (m->tag == ALPH_TAG_INIT) {
+    alph_outq_init(&c->out, 2 * BIG);
+    c->h = alph_tcp_connect(ctx, alph_ip4(127, 0, 0, 1), c->port);
+    expect(c->h > 0, "connect started");
+    alph_io_arm(ctx, c->h, ALPH_IO_OUT);
+    return ALPH_CONTINUE;
+  }
+  if (m->tag != ALPH_TAG_IO) {
+    return ALPH_CONTINUE;
+  }
+  if (c->connected == 0) {
+    expect(alph_io_error(ctx, c->h) == 0, "connected");
+    c->connected = 1;
+    client_send(ctx, c);
+  } else if (alph_outq_pending(&c->out) > 0) {
+    alph_outq_flush(ctx, &c->out, c->h);
+  }
+  var buf: uint8* = (uint8*)alph_scratch(ctx, 65536);
+  while (true) {
+    var n: int64 = alph_io_read(ctx, c->h, (rawptr)buf, 65536);
+    if (n == ALPH_IO_AGAIN) {
+      break;
+    }
+    if (n <= 0) {
+      expect(c->kind == KIND_CRASH, "only the crash client sees its connection end");
+      return client_done(ctx, c);
+    }
+    for i: int64 in 0..n {
+      if (c->kind == KIND_BIG && buf[i] != (uint8)((c->received + i) % 251)) {
+        expect(false, "big echo bytes arrive intact and in order");
+        return client_done(ctx, c);
+      }
+    }
+    c->received = c->received + n;
+  }
+  if (c->kind == KIND_BIG && c->received == BIG) {
+    return client_done(ctx, c);
+  }
+  if (c->kind == KIND_ECHO && c->received == (c->rounds + 1) * MSG) {
+    c->rounds = c->rounds + 1;
+    if (c->rounds == ROUNDS) {
+      return client_done(ctx, c);
+    }
+    client_send(ctx, c);
+  }
+  var events: int64 = ALPH_IO_IN;
+  if (alph_outq_pending(&c->out) > 0) {
+    events = events | ALPH_IO_OUT;
+  }
+  alph_io_arm(ctx, c->h, events);
+  return ALPH_CONTINUE;
+}
+
+// ---- driver ----
+
+struct Boss {
+  done: int64;
+  big_done: int64;
+  crash_done: int64;
+}
+
+fn spawn_client(ctx: AlphCtx*, kind: int64, port: int64) {
+  var c: Client;
+  memset((rawptr)&c, 0, (int64)sizeof(Client));
+  c.kind = kind;
+  c.port = port;
+  c.boss = ctx->self;
+  expect(alph_spawn_value<Client>(ctx, 0, &c, &client) != 0, "client spawned");
+}
+
+fn boss(ctx: AlphCtx*, m: AlphMsg*) -> int64 {
+  var b: Boss* = (Boss*)ctx->state;
+  if (m->tag == ALPH_TAG_INIT) {
+    var a: Acceptor;
+    a.lh = 0;
+    a.boss = ctx->self;
+    alph_spawn_value<Acceptor>(ctx, 0, &a, &acceptor);
+    return ALPH_CONTINUE;
+  }
+  if (m->tag == TAG_PORT) {
+    expect(m->arg > 0, "the listener has a port");
+    for i: int64 in 0..CLIENTS {
+      spawn_client(ctx, KIND_ECHO, m->arg);
+    }
+    spawn_client(ctx, KIND_BIG, m->arg);
+    spawn_client(ctx, KIND_CRASH, m->arg);
+    return ALPH_CONTINUE;
+  }
+  if (m->tag == TAG_DONE) {
+    b->done = b->done + 1;
+    if (m->arg == KIND_BIG) {
+      b->big_done = 1;
+    }
+    if (m->arg == KIND_CRASH) {
+      b->crash_done = 1;
+    }
+    if (b->done == CLIENTS + 2) {
+      expect(b->big_done == 1 && b->crash_done == 1, "every kind of client finished");
+      alph_halt(ctx, 0);
+    }
+  }
+  return ALPH_CONTINUE;
+}
+
+fn main() -> int32 {
+  var cfg: AlphConfig;
+  alph_config(&cfg);
+  cfg.schedulers = 4;
+  cfg.max_actors = 4096;
+  cfg.mailbox_size = 512;
+  expect(alph_node_start(&g_node, &cfg), "node started");
+  var b: Boss;
+  memset((rawptr)&b, 0, (int64)sizeof(Boss));
+  alph_node_spawn_value<Boss>(&g_node, 0, &b, &boss);
+  alph_node_wait(&g_node);
+  var stats: AlphStats;
+  alph_node_stats(&g_node, &stats);
+  expect(stats.crashed == 1, "only the crashing connection crashed");
+  if (g_failures != 0) {
+    return 1;
+  }
+  println("io ok: {CLIENTS} clients x {ROUNDS} rounds, 1 MB echoed, 1 crash contained");
+  return 0;
+}

@@ -491,7 +491,7 @@ export fn alph_node_spawn_sup(node: AlphNode*, spec: AlphSupSpec*) -> int64 {
   if (block == 0) {
     return 0;
   }
-  var pid: int64 = alph_node_spawn_bytes(node, block, size, &alph_sup_handle);
+  var pid: int64 = alph_node_spawn_bytes(node, 0, block, size, &alph_sup_handle);
   free(block);
   return pid;
 }

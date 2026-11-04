@@ -2,3 +2,5 @@ build/
 .mbuild/
 *.o
 reference_model/
+reports/
+HANDOFF.md

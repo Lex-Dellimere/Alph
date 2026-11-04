@@ -11,3 +11,6 @@ import "alph/core/mailbox";
 import "alph/core/node";
 import "alph/heal/supervisor";
 import "alph/heal/medic";
+import "alph/heal/dynamic";
+import "alph/work/pool";
+import "alph/work/limiter";

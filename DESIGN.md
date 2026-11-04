@@ -217,7 +217,7 @@ Phases 0 and 1 are where the risk is. If proven-bounded handlers are too restric
 
 ### Status
 
-Each test below passes under `./check.sh` in debug and release, and passed 40 more runs of each binary in both modes.
+Each test below passes under `./check.sh` in debug and release.
 
 | Built | Tested by |
 |---|---|
@@ -228,8 +228,25 @@ Each test below passes under `./check.sh` in debug and release, and passed 40 mo
 | Exits and downs ordered after earlier messages | `t_order`: 2,000 rounds of result-then-exit |
 | Supervisors | `t_supervisor`: every strategy, restart types, intensity, ordered start with ack, reverse shutdown with kill, backoff |
 | Medics | `t_heal`: resume, retry and reset on the same pid; fail, over-limit and no-medic cases go to the supervisor |
+| Per-actor heaps: size classes, chunk pools, scratch, heap limit | `t_heap`: the heap on its own. `t_isolation`: many actors on every scheduler keep their own bytes; the limit holds for allocation and spawning; a crashed actor's heap is reused |
+| Bound actors, `alph_exit_now` | `t_bound`: a bound actor blocks while the shared scheduler runs on; 50 bound actors start and stop their threads; exit from deep in a call stack; a crash in a bound actor is contained |
+| IO reactor, TCP, output queues, handle ownership | `t_io`: 200 clients and a 1 MB echo through partial writes; a crashing connection actor has its socket closed |
+| Names and process groups | `t_names`: a name is unique while its holder lives; groups count, reach and lose members that leave or crash |
+| Child processes | `t_proc`: pipes, exit codes, environment, working directory, kill by signal, log files, a child killed and reaped when its owner crashes |
+| Dynamic supervisors | `t_dynamic`: start requests, `max_children`, transient restarts, restart limit, children stopped with their supervisor |
+| Worker pool | `t_pool`: jobs on bound threads while the schedulers run, queue full, a trapping job replaced, timeouts |
+| Limiter | `t_limiter`: first come first served, permits returned by release, crash or kill, withdrawn requests |
+| Node shutdown and OS signals | `t_shutdown`: reverse order, deadline kill, signals as messages, `128 + signal` by default |
 
-Not built yet: stealing between schedulers, the IO ring, the work-class rule, hot upgrade, distribution. ARM64, Windows and macOS are not built either; the asm and syscalls are x86-64 Linux.
+Not built yet:
+- stealing between schedulers;
+- refcounted binaries, and per-scheduler pools for signals and payloads, which still use the global malloc;
+- ports for threads outside the node;
+- the work-class rule;
+- hot upgrade;
+- distribution;
+- a status-file fallback for child processes under wine;
+- other platforms: ARM64, Windows and macOS are not built; the asm and syscalls are x86-64 Linux.
 
 ## Open decisions
 

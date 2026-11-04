@@ -31,6 +31,7 @@ const ALPH_RECOVER_MAX: int64 = 256;
 // then save into regs with alph_recover_save.
 //
 //   crashes  how many crashes resumed this point so far
+//   owner    free for the registrant: the node keeps its scheduler here
 export struct AlphRecover {
   // rbx, rbp, (unused), (unused), r12, r13, r14, r15, rsp, rip: the layout
   // the runtime's signal path restores (crash_handler.c).
@@ -39,6 +40,7 @@ export struct AlphRecover {
   stack_hi: int64;
   armed: int64;
   crashes: int64;
+  owner: int64;
 }
 
 var g_alph_recover_table: int64[256];
@@ -98,6 +100,14 @@ export fn alph_recover_hook_point(stack: int64) -> int64 {
     }
   }
   return 0;
+}
+
+// The armed recovery point of the calling thread, or 0 when the thread has
+// none armed. Thread: any.
+export fn alph_recover_current() -> AlphRecover* {
+  var here: int64 = 0;
+  var point: int64 = alph_recover_hook_point((int64)&here);
+  return (AlphRecover*)point;
 }
 
 // Called by the Mettle runtime, not by programs: decides to resume. alph

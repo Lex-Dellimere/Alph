@@ -83,7 +83,7 @@ fn main() -> int32 {
   start_node(4, 1024, 16);
   var s: Parent;
   memset((rawptr)&s, 0, (int64)sizeof(Parent));
-  alph_node_spawn_value<Parent>(&g_node, &s, &parent);
+  alph_node_spawn_value<Parent>(&g_node, 0, &s, &parent);
   alph_node_wait(&g_node);
   if (g_failures != 0) {
     return 1;

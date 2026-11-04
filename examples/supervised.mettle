@@ -64,6 +64,6 @@ fn main() -> int32 {
   }
   var r: Root;
   r.starts = 0;
-  alph_node_spawn_value<Root>(&g_node, &r, &root);
+  alph_node_spawn_value<Root>(&g_node, 0, &r, &root);
   return (int32)alph_node_wait(&g_node);
 }

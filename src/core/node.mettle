@@ -31,8 +31,11 @@ import "alph/sys/atomic";
 import "alph/sys/clock";
 import "alph/sys/recover";
 import "alph/sys/thread";
+import "alph/sys/linux";
+import "alph/sys/fd";
 import "alph/core/queue";
 import "alph/core/mailbox";
+import "alph/core/heap";
 
 // ---- constants -------------------------------------------------------------
 
@@ -53,6 +56,9 @@ export const ALPH_TAG_EXIT: int64 = 2;     // a linked actor exited; only with a
 export const ALPH_TAG_DOWN: int64 = 3;     // a monitored actor exited. from = it, ref = the monitor, arg = reason
 export const ALPH_TAG_TIMEOUT: int64 = 4;  // a request got no reply in time. ref = the request, arg = the server
 export const ALPH_TAG_CRASHED: int64 = 6;  // to a medic: its patient crashed. from = it, arg = reason
+export const ALPH_TAG_IO: int64 = 7;       // an armed handle is ready. ref = the handle, arg = ALPH_IO_ bits
+export const ALPH_TAG_IO_GIVEN: int64 = 8; // a handle was handed to this actor. ref = the handle, from = the giver
+export const ALPH_TAG_PROC_EXIT: int64 = 9; // a child process ended. ref = its handle, arg = exit code, or 128 + signal
 export const ALPH_TAG_USER: int64 = 100;
 
 // What a handler returns.
@@ -65,9 +71,23 @@ export const ALPH_FULL: int64 = -1;  // the receiver's mailbox is full; nothing 
 export const ALPH_GONE: int64 = -2;  // the receiver has exited; nothing was sent
 export const ALPH_NOMEM: int64 = -3; // no memory for a large payload; nothing was sent
 
+// What a handle is ready for, in alph_io_arm and in m->arg of ALPH_TAG_IO.
+export const ALPH_IO_IN: int64 = 1;    // readable, or a listener has a connection waiting
+export const ALPH_IO_OUT: int64 = 4;   // writable, or a connect finished (check alph_io_error)
+export const ALPH_IO_ERR: int64 = 8;   // an error is pending; only reported, never armed
+export const ALPH_IO_HUP: int64 = 16;  // the other end hung up; only reported, never armed
+
+// What alph_io_read, alph_io_write and alph_tcp_accept return when they
+// would have to wait: arm the handle and try again on ALPH_TAG_IO.
+export const ALPH_IO_AGAIN: int64 = -11;
+
+// Flags for alph_tcp_listen.
+export const ALPH_TCP_REUSEPORT: int64 = 1;  // several listeners share the port; the kernel spreads connections
+
 // Spawn flags; combine with |.
 export const ALPH_LINK: int64 = 1;     // link the new actor to the caller
 export const ALPH_MONITOR: int64 = 2;  // the caller monitors the new actor
+export const ALPH_BOUND: int64 = 4;    // the new actor gets a thread of its own and may block
 
 // Actor status.
 const ALPH_P_FREE: int64 = 0;
@@ -88,6 +108,8 @@ const ALPH_SIG_DEMONITOR: int64 = 6;
 const ALPH_SIG_DOWN: int64 = 7;
 const ALPH_SIG_TIMER: int64 = 8;
 const ALPH_SIG_CRASHED: int64 = 9;    // to a medic
+const ALPH_SIG_IO: int64 = 10;        // a handle became ready
+const ALPH_SIG_IO_GIVEN: int64 = 11;  // a handle changed owner to this actor
 
 // Message flags.
 const ALPH_MSG_REQUEST: int64 = 1;  // ref names the reply the sender waits for
@@ -108,11 +130,20 @@ const ALPH_NS_PER_MS: int64 = 1000000;
 //                 rounded up to a power of two; default 64
 //   stack_size    bytes of stack per scheduler, which is how deep a handler
 //                 may call; default 1 MiB
+//   heap_limit    bytes one actor's heap may hold, state included; past it
+//                 alph_alloc returns 0 and spawning fails. 0 (default) is
+//                 no limit
+//   max_handles   IO handles open at once; default 65536
+//   signals       OS signals the node takes over, as bits (1 << ALPH_SIGINT)
+//                 and so on; default 0. See alph_node_signals
 export struct AlphConfig {
   schedulers: int64;
   max_actors: int64;
   mailbox_size: int64;
   stack_size: int64;
+  heap_limit: int64;
+  max_handles: int64;
+  signals: int64;
 }
 
 // Counters from alph_node_stats.
@@ -147,6 +178,26 @@ export struct AlphNode {
   healed: int64;
   halted: int64;
   halt_code: int64;
+  heap_limit: int64;
+  stack_size: int64;
+  bound_list: int64;    // every bound scheduler, for alph_node_wait
+  bound_lock: int64;
+  ios: int64;           // AlphIoSlot table
+  io_capacity: int64;
+  io_free_stack: int64;
+  io_free_top: int64;
+  io_lock: int64;
+  names: int64;         // AlphVec of AlphEntry*: registered names
+  groups: int64;        // AlphVec of AlphEntry*: process groups
+  names_lock: int64;    // guards names, groups and every group's members
+  env: int64;           // the environment the process started with, for children
+  env_lock: int64;
+  roots: int64;         // AlphVec of top-level pids, in spawn order
+  roots_lock: int64;
+  shutting: int64;      // alph_node_shutdown has begun
+  sigfd: int64;         // signalfd for cfg.signals, on scheduler 0, or -1
+  sig_pid: int64;       // who gets OS signals, or 0 to shut down
+  sig_tag: int64;
 }
 
 // What a handler gets besides the message. Read these fields:
@@ -193,14 +244,14 @@ struct AlphProc {
   pid: int64;      // 0 while the slot is free
   serial: int64;
   index: int64;
-  sched: int64;    // home scheduler
+  sched: int64;    // home scheduler (an AlphSched*)
   inited: int64;
   parent: int64;
   state: int64;
   state_size: int64;
   trap_exit: int64;
-  chunks: int64;   // alph_alloc blocks, freed on exit
   handled: int64;
+  heap: AlphHeap;  // the state and everything alph_alloc gave out
   handler: fn(AlphCtx*, AlphMsg*) -> int64 with alloc, syscall, asm;
   mailbox: AlphMailbox;
   signals: AlphQueue;
@@ -210,6 +261,9 @@ struct AlphProc {
   ref_ids: AlphVec;       // refs this actor waits on: monitors, requests, timers
   ref_pids: AlphVec;      //   and the actor each one watches, or 0
   deferred: AlphVec;      // exits and downs waiting for earlier messages
+  io_handles: AlphVec;    // handles this actor owns, closed when it exits
+  named: int64;           // names registered to this actor
+  groups: AlphVec;        // groups this actor joined (AlphEntry*)
   medic: int64;           // pid of the medic watching this actor, or 0
   patient: int64;         // for a medic: the actor it watches
   poison_heap: int64;     // payload of the message being handled, freed after
@@ -225,8 +279,42 @@ struct AlphSched {
   node: int64;
   current: int64;   // actor being run; read back from memory after a crash
   timers: AlphVec;  // binary heap of AlphSignal, by deadline
+  pool: AlphPool;   // chunks for the heaps of actors that live here
+  scratch: AlphScratch;  // alph_scratch memory, reset after every handler call
   thread: AlphThread;
   handle: int64;
+  bound: int64;         // runs a single ALPH_BOUND actor, and stops after it
+  done: int64;          // a bound scheduler's actor has exited
+  next_bound: int64;    // the node's list of bound schedulers
+  exit_request: int64;  // alph_exit_now asked the current actor to exit
+  exit_reason: int64;
+  epfd: int64;          // epoll set of this scheduler's handles and its wake eventfd
+  evfd: int64;          // written to wake the scheduler while it waits in epoll
+  events: int64;        // buffer for epoll_wait
+  io_count: int64;      // handles registered here
+  runs: int64;          // actor runs, to poll IO now and then while busy
+}
+
+// One IO handle: a file descriptor with an owner. A handle's id carries a
+// serial, like a pid, so an event for a closed handle is recognized.
+struct AlphIoSlot {
+  fd: int64;
+  handle: int64;    // 0 while free
+  serial: int64;
+  index: int64;
+  owner: int64;
+  sched: int64;     // the scheduler whose epoll set holds it
+  pollable: int64;  // epoll accepted it (regular files are not)
+  child: int64;     // a process handle: the child's OS pid until it is reaped
+}
+
+// A registered name, or a process group and its members. The name is a
+// copy owned by the entry.
+struct AlphEntry {
+  chars: int64;
+  len: int64;
+  pid: int64;        // a name's holder
+  members: AlphVec;  // a group's members, in the order they joined
 }
 
 // ---- small helpers ---------------------------------------------------------
@@ -368,29 +456,31 @@ fn alph_msg_release(m: AlphMsg*) {
   }
 }
 
-// Frees what an actor allocated with alph_alloc.
-fn alph_free_chunks(p: AlphProc*) {
-  var chunk: int64 = p->chunks;
-  while (chunk != 0) {
-    var link: int64* = (int64*)chunk;
-    var next: int64 = *link;
-    free((rawptr)chunk);
-    chunk = next;
-  }
-  p->chunks = 0;
+// The pool that feeds an actor's heap: its home scheduler's.
+fn alph_pool_of(node: AlphNode*, p: AlphProc*) -> AlphPool* {
+  return &((AlphSched*)p->sched)->pool;
 }
 
-// Replaces an actor's state with a copy of size bytes at state.
-fn alph_set_state(p: AlphProc*, state: rawptr, size: int64) {
-  if (p->state != 0) {
-    free((rawptr)p->state);
-    p->state = 0;
-  }
+// Frees everything an actor's heap holds, its state included.
+fn alph_heap_clear(node: AlphNode*, p: AlphProc*) {
+  alph_heap_release(&p->heap, alph_pool_of(node, p));
+  p->state = 0;
+}
+
+// Gives an empty heap a copy of size bytes at state as the actor's state.
+// Returns false when the heap limit or memory does not allow it.
+fn alph_set_state(node: AlphNode*, p: AlphProc*, state: rawptr, size: int64) -> bool {
+  p->state = 0;
   p->state_size = size;
   if (size > 0) {
-    p->state = (int64)malloc(size);
-    memcpy((rawptr)p->state, state, size);
+    var block: rawptr = alph_heap_alloc(&p->heap, alph_pool_of(node, p), size);
+    if (block == 0) {
+      return false;
+    }
+    memcpy(block, state, size);
+    p->state = (int64)block;
   }
+  return true;
 }
 
 // ---- scheduling ------------------------------------------------------------
@@ -398,7 +488,8 @@ fn alph_set_state(p: AlphProc*, state: rawptr, size: int64) {
 fn alph_sched_notify(s: AlphSched*) {
   alph_atomic_add(&s->wake, 1);
   if (alph_atomic_load(&s->sleeping) != 0) {
-    alph_futex_wake(&s->wake, 1);
+    var one: int64 = 1;
+    alph_sys_write(s->evfd, (rawptr)&one, 8);
   }
 }
 
@@ -414,7 +505,7 @@ fn alph_wake(node: AlphNode*, p: AlphProc*) {
     var status: int64 = alph_atomic_load(&p->status);
     if (status == ALPH_P_IDLE) {
       if (alph_atomic_cas(&p->status, ALPH_P_IDLE, ALPH_P_QUEUED) == ALPH_P_IDLE) {
-        var s: AlphSched* = alph_sched_at(node, p->sched);
+        var s: AlphSched* = (AlphSched*)p->sched;
         alph_queue_push(&s->runq, (rawptr)p);
         alph_sched_notify(s);
         return;
@@ -439,16 +530,17 @@ fn alph_signal_ordered(kind: int64, arg: int64) -> bool {
   return kind == ALPH_SIG_LINK_EXIT || kind == ALPH_SIG_DOWN;
 }
 
-// Queues a signal for the actor `to`, if it is alive.
+// Queues a signal for the actor `to`, if it is alive. Returns false when it
+// is not, or memory ran out.
 fn alph_signal(node: AlphNode*, kind: int64, from: int64, to: int64, ref: int64,
-               arg: int64, tag: int64) {
+               arg: int64, tag: int64) -> bool {
   var p: AlphProc* = alph_resolve(node, to);
   if (p == 0) {
-    return;
+    return false;
   }
   var sig: AlphSignal* = (AlphSignal*)malloc((int64)sizeof(AlphSignal));
   if (sig == 0) {
-    return;
+    return false;
   }
   sig->kind = kind;
   sig->from = from;
@@ -462,6 +554,7 @@ fn alph_signal(node: AlphNode*, kind: int64, from: int64, to: int64, ref: int64,
   }
   alph_queue_push(&p->signals, (rawptr)sig);
   alph_wake(node, p);
+  return true;
 }
 
 fn alph_signal_plain(node: AlphNode*, kind: int64, from: int64, to: int64, ref: int64) {
@@ -606,7 +699,8 @@ fn alph_request_raw(ctx: AlphCtx*, to: int64, tag: int64, arg: int64, data: rawp
 //   ALPH_TAG_TIMEOUT    no reply within timeout_ms; arg = the server
 //
 // Anything later for that ref is dropped, so a late reply never surprises
-// the requester. The server answers with alph_reply.
+// the requester. alph_demonitor(ctx, ref) gives up on a request: nothing
+// for that ref arrives after it. The server answers with alph_reply.
 // Thread: a handler.
 export fn alph_request(ctx: AlphCtx*, to: int64, tag: int64, arg: int64, timeout_ms: int64) -> int64 {
   return alph_request_raw(ctx, to, tag, arg, (rawptr)0, 0, timeout_ms);
@@ -657,6 +751,14 @@ export fn alph_reply_value<T>(ctx: AlphCtx*, request: AlphMsg*, tag: int64, valu
 export fn alph_reply_bytes(ctx: AlphCtx*, request: AlphMsg*, tag: int64, data: rawptr,
                            size: int64) -> int64 {
   return alph_reply_raw(ctx, request, tag, 0, data, size);
+}
+
+// Answers a request with a tag, one word and size bytes, for replies that
+// carry both a result code and data. Otherwise as alph_reply.
+// Thread: a handler.
+export fn alph_reply_full(ctx: AlphCtx*, request: AlphMsg*, tag: int64, arg: int64, data: rawptr,
+                          size: int64) -> int64 {
+  return alph_reply_raw(ctx, request, tag, arg, data, size);
 }
 
 // ---- links, monitors, exit signals -----------------------------------------
@@ -748,6 +850,24 @@ export fn alph_node_exit_signal(node: AlphNode*, pid: int64, reason: int64) {
 export fn alph_stop(ctx: AlphCtx*, reason: int64) -> int64 {
   ctx->stop_reason = reason;
   return ALPH_STOP;
+}
+
+// Ends the running actor at once, from any call depth inside its handler,
+// as if the handler had returned alph_stop(reason). Frames between here and
+// the handler are abandoned: their defers do not run. The actor's heap is
+// freed as on any exit. Use it for errors found deep in a call chain; a
+// handler can just return alph_stop. Does nothing, and returns, when called
+// outside a handler. Thread: a handler, at any depth.
+export fn alph_exit_now(reason: int64) {
+  var r: AlphRecover* = alph_recover_current();
+  if (r == 0 || r->owner == 0) {
+    return;
+  }
+  var s: AlphSched* = (AlphSched*)r->owner;
+  s->exit_reason = reason;
+  s->exit_request = 1;
+  alph_recover_disarm(r);
+  alph_recover_resume((int64)&r->regs[0]);
 }
 
 // The pid of the actor that spawned this one, or 0 when the node did.
@@ -877,18 +997,56 @@ export fn alph_cancel_timer(ctx: AlphCtx*, ref: int64) {
 
 // ---- per-actor memory ------------------------------------------------------
 
-// Allocates size bytes that live until this actor exits, then are freed for
-// it. Use it for anything the state points to. Returns 0 when out of memory.
-// The memory is not zeroed. Thread: a handler.
+// Allocates size bytes from this actor's own heap: 16-byte aligned, not
+// zeroed, and only this actor's to use. No other actor shares the heap, so
+// no lock is taken. Free it with alph_free, or leave it: everything is freed
+// when the actor exits, even by a crash. Returns 0 when the heap limit
+// (AlphConfig.heap_limit) would be passed or memory ran out.
+// Thread: a handler.
 export fn alph_alloc(ctx: AlphCtx*, size: int64) -> rawptr {
-  var block: int64* = (int64*)malloc(size + 16);
-  if (block == 0) {
+  return alph_heap_alloc(&alph_me(ctx)->heap, &alph_here(ctx)->pool, size);
+}
+
+// Frees memory from alph_alloc or alph_realloc on this actor's heap.
+// Freeing 0 does nothing. Thread: a handler.
+export fn alph_free(ctx: AlphCtx*, ptr: rawptr) {
+  alph_heap_free(&alph_me(ctx)->heap, ptr);
+}
+
+// Resizes memory from alph_alloc, keeping its contents up to the smaller of
+// the two sizes. ptr 0 allocates. Returns the new address, which may differ,
+// or 0 when there is no room, in which case ptr is left as it was.
+// Thread: a handler.
+export fn alph_realloc(ctx: AlphCtx*, ptr: rawptr, size: int64) -> rawptr {
+  if (ptr == 0) {
+    return alph_alloc(ctx, size);
+  }
+  var have: int64 = alph_heap_size(ptr);
+  if (size <= have) {
+    return ptr;
+  }
+  var grown: rawptr = alph_alloc(ctx, size);
+  if (grown == 0) {
     return (rawptr)0;
   }
-  var p: AlphProc* = alph_me(ctx);
-  block[0] = p->chunks;
-  p->chunks = (int64)block;
-  return (rawptr)((int64)block + 16);
+  memcpy(grown, ptr, have);
+  alph_free(ctx, ptr);
+  return grown;
+}
+
+// Allocates size bytes that are valid until this handler call returns, then
+// freed all at once at no cost. Use it for temporaries: parsing a request,
+// building a reply. Do not keep the address. Returns 0 when memory ran out.
+// Thread: a handler.
+export fn alph_scratch(ctx: AlphCtx*, size: int64) -> rawptr {
+  var s: AlphSched* = alph_here(ctx);
+  return alph_scratch_alloc(&s->scratch, &s->pool, size);
+}
+
+// Bytes this actor's heap holds now, its state included.
+// Thread: a handler.
+export fn alph_heap_used(ctx: AlphCtx*) -> int64 {
+  return alph_me(ctx)->heap.used;
 }
 
 // ---- spawning --------------------------------------------------------------
@@ -918,7 +1076,7 @@ fn alph_slot_give(node: AlphNode*, index: int64) {
 // a monitor by it (monitor_ref non-zero) are in place before the actor can
 // run, so even a crash in INIT reaches them. patient is set for a medic.
 // Returns the pid, or 0 when the node is full or out of memory.
-fn alph_spawn_raw(node: AlphNode*, parent: int64, link: bool, monitor_ref: int64,
+fn alph_spawn_raw(node: AlphNode*, parent: int64, flags: int64, monitor_ref: int64,
                   patient: int64, state: rawptr, size: int64,
                   handler: fn(AlphCtx*, AlphMsg*) -> int64 with alloc, syscall, asm) -> int64 {
   var index: int64 = alph_slot_take(node);
@@ -940,12 +1098,28 @@ fn alph_spawn_raw(node: AlphNode*, parent: int64, link: bool, monitor_ref: int64
   while (alph_mailbox_pop(&p->mailbox, &stale)) {
     alph_msg_release(&stale);
   }
-  p->state = 0;
-  alph_set_state(p, state, size);
+  var link: bool = (flags & ALPH_LINK) != 0 && parent != 0;
+  if ((flags & ALPH_BOUND) != 0) {
+    var own: AlphSched* = alph_sched_bound(node);
+    if (own == 0) {
+      alph_slot_give(node, index);
+      return 0;
+    }
+    p->sched = (int64)own;
+  } else {
+    var next: int64 = alph_atomic_add(&node->next_sched, 1) % node->sched_count;
+    p->sched = (int64)alph_sched_at(node, next);
+  }
+  alph_heap_init(&p->heap, node->heap_limit);
+  if (!alph_set_state(node, p, state, size)) {
+    alph_heap_clear(node, p);
+    alph_sched_finish(p);
+    alph_slot_give(node, index);
+    return 0;
+  }
   p->serial = p->serial + 1;
   p->parent = parent;
   p->trap_exit = 0;
-  p->chunks = 0;
   p->handled = 0;
   p->handler = handler;
   p->links.len = 0;
@@ -954,18 +1128,20 @@ fn alph_spawn_raw(node: AlphNode*, parent: int64, link: bool, monitor_ref: int64
   p->ref_ids.len = 0;
   p->ref_pids.len = 0;
   p->deferred.len = 0;
+  p->io_handles.len = 0;
+  p->named = 0;
+  p->groups.len = 0;
   p->medic = 0;
   p->patient = patient;
   p->poison_heap = 0;
   p->retry = 0;
-  if (link && parent != 0) {
+  if (link) {
     alph_vec_push(&p->links, parent);
   }
   if (monitor_ref != 0) {
     alph_vec_push(&p->mon_refs, monitor_ref);
     alph_vec_push(&p->mon_watchers, parent);
   }
-  p->sched = alph_atomic_add(&node->next_sched, 1) % node->sched_count;
   var pid: int64 = (p->serial << 32) | (index + 1);
   alph_atomic_add(&node->live, 1);
   alph_atomic_add(&node->spawned, 1);
@@ -982,7 +1158,7 @@ fn alph_spawn_from(ctx: AlphCtx*, flags: int64, state: rawptr, size: int64,
   if ((flags & ALPH_MONITOR) != 0) {
     ref = alph_new_ref(ctx->node);
   }
-  var pid: int64 = alph_spawn_raw(ctx->node, ctx->self, link, ref, 0, state, size, handler);
+  var pid: int64 = alph_spawn_raw(ctx->node, ctx->self, flags, ref, 0, state, size, handler);
   if (pid == 0) {
     return 0;
   }
@@ -998,9 +1174,12 @@ fn alph_spawn_from(ctx: AlphCtx*, flags: int64, state: rawptr, size: int64,
 
 // Spawns an actor with no state.
 //
-//   flags    0, or ALPH_LINK and/or ALPH_MONITOR. Both are set up before the
-//            new actor runs, so even a crash in its INIT reaches the caller.
-//            With ALPH_MONITOR, its DOWN arrives with from = the new pid.
+//   flags    0, or any of ALPH_LINK, ALPH_MONITOR and ALPH_BOUND. A link
+//            and a monitor are set up before the new actor runs, so even a
+//            crash in its INIT reaches the caller; with ALPH_MONITOR its
+//            DOWN arrives with from = the new pid. ALPH_BOUND gives the new
+//            actor a thread of its own, so its handler may block (file IO,
+//            fsync, a long computation) without holding up other actors.
 //   handler  the new actor's handler; its first message is ALPH_TAG_INIT
 //
 // Returns the new pid, or 0 when the node is full (max_actors) or out of
@@ -1025,25 +1204,28 @@ export fn alph_spawn_bytes(ctx: AlphCtx*, flags: int64, state: rawptr, size: int
 }
 
 // Spawns an actor with no state from outside the node. It has no parent: its
-// INIT comes from 0 and nothing is linked to it. Returns the new pid, or 0.
-// Thread: any.
-export fn alph_node_spawn(node: AlphNode*,
+// INIT comes from 0 and nothing is linked to it.
+//
+//   flags  0, or ALPH_BOUND for an actor with a thread of its own
+//
+// Returns the new pid, or 0. Thread: any.
+export fn alph_node_spawn(node: AlphNode*, flags: int64,
                           handler: fn(AlphCtx*, AlphMsg*) -> int64 with alloc, syscall, asm) -> int64 {
-  return alph_spawn_raw(node, 0, false, 0, 0, (rawptr)0, 0, handler);
+  return alph_root_add(node, alph_spawn_raw(node, 0, flags & ALPH_BOUND, 0, 0, (rawptr)0, 0, handler));
 }
 
 // Spawns an actor whose state starts as a copy of *state, from outside the
 // node. Otherwise as alph_node_spawn. Thread: any.
-export fn alph_node_spawn_value<T>(node: AlphNode*, state: T*,
+export fn alph_node_spawn_value<T>(node: AlphNode*, flags: int64, state: T*,
                                    handler: fn(AlphCtx*, AlphMsg*) -> int64 with alloc, syscall, asm) -> int64 {
-  return alph_spawn_raw(node, 0, false, 0, 0, (rawptr)state, (int64)sizeof(T), handler);
+  return alph_root_add(node, alph_spawn_raw(node, 0, flags & ALPH_BOUND, 0, 0, (rawptr)state, (int64)sizeof(T), handler));
 }
 
 // Spawns an actor whose state starts as a copy of size bytes at state, from
 // outside the node. Otherwise as alph_node_spawn. Thread: any.
-export fn alph_node_spawn_bytes(node: AlphNode*, state: rawptr, size: int64,
+export fn alph_node_spawn_bytes(node: AlphNode*, flags: int64, state: rawptr, size: int64,
                                 handler: fn(AlphCtx*, AlphMsg*) -> int64 with alloc, syscall, asm) -> int64 {
-  return alph_spawn_raw(node, 0, false, 0, 0, state, size, handler);
+  return alph_root_add(node, alph_spawn_raw(node, 0, flags & ALPH_BOUND, 0, 0, state, size, handler));
 }
 
 // ---- exiting ---------------------------------------------------------------
@@ -1057,6 +1239,10 @@ fn alph_proc_exit(node: AlphNode*, p: AlphProc*, reason: int64) {
     alph_atomic_add(&node->crashed, 1);
   }
 
+  // Handles close (children are killed and reaped) before anyone is told.
+  for i: int64 in 0..p->io_handles.len {
+    alph_io_drop(node, alph_vec_get(&p->io_handles, i), pid);
+  }
   for i: int64 in 0..p->links.len {
     alph_signal_link_exit(node, pid, alph_vec_get(&p->links, i), reason);
   }
@@ -1071,10 +1257,13 @@ fn alph_proc_exit(node: AlphNode*, p: AlphProc*, reason: int64) {
       alph_signal_link_exit(node, pid, s->from, ALPH_NOPROC);
     } else if (s->kind == ALPH_SIG_MONITOR) {
       alph_signal_down(node, pid, s->from, s->ref, ALPH_NOPROC);
+    } else if (s->kind == ALPH_SIG_IO_GIVEN) {
+      alph_io_drop(node, s->ref, pid);
     }
     free((rawptr)sig);
     sig = alph_queue_pop(&p->signals);
   }
+  alph_names_drop(node, p, pid);
   for i: int64 in 0..p->deferred.len {
     free((rawptr)alph_vec_get(&p->deferred, i));
   }
@@ -1096,17 +1285,310 @@ fn alph_proc_exit(node: AlphNode*, p: AlphProc*, reason: int64) {
   while (alph_mailbox_pop(&p->mailbox, &m)) {
     alph_msg_release(&m);
   }
-  alph_free_chunks(p);
-  alph_set_state(p, (rawptr)0, 0);
+  alph_heap_clear(node, p);
   alph_vec_release(&p->links);
   alph_vec_release(&p->mon_refs);
   alph_vec_release(&p->mon_watchers);
   alph_vec_release(&p->ref_ids);
   alph_vec_release(&p->ref_pids);
   alph_vec_release(&p->deferred);
+  alph_vec_release(&p->io_handles);
+  alph_vec_release(&p->groups);
+  alph_sched_finish(p);
   alph_atomic_store(&p->status, ALPH_P_FREE);
   alph_slot_give(node, p->index);
   alph_atomic_add(&node->live, -1);
+}
+
+// ---- names and groups ------------------------------------------------------
+
+fn alph_entry_is(e: AlphEntry*, name: string) -> bool {
+  if (e->len != (int64)name.length) {
+    return false;
+  }
+  return memcmp((rawptr)e->chars, (rawptr)name.chars, e->len) == 0;
+}
+
+// The index in list of the entry called name, or -1.
+fn alph_entry_find(list: AlphVec*, name: string) -> int64 {
+  for i: int64 in 0..list->len {
+    if (alph_entry_is((AlphEntry*)alph_vec_get(list, i), name)) {
+      return i;
+    }
+  }
+  return -1;
+}
+
+// A new entry holding a copy of name, or 0 when memory runs out.
+fn alph_entry_new(name: string) -> AlphEntry* {
+  var e: AlphEntry* = (AlphEntry*)calloc(1, (int64)sizeof(AlphEntry));
+  if (e == 0) {
+    return e;
+  }
+  e->len = (int64)name.length;
+  e->chars = (int64)malloc(e->len + 1);
+  if (e->chars == 0) {
+    free((rawptr)e);
+    return (AlphEntry*)0;
+  }
+  memcpy((rawptr)e->chars, (rawptr)name.chars, e->len);
+  return e;
+}
+
+fn alph_entry_free(e: AlphEntry*) {
+  free((rawptr)e->chars);
+  alph_vec_release(&e->members);
+  free((rawptr)e);
+}
+
+// Removes pid from group g, and g from the node once nobody is left in it.
+// Called with names_lock held.
+fn alph_group_remove(node: AlphNode*, g: AlphEntry*, pid: int64) {
+  var at: int64 = alph_vec_find(&g->members, pid);
+  if (at >= 0) {
+    alph_vec_remove_at(&g->members, at);
+  }
+  if (g->members.len == 0) {
+    var list: AlphVec* = (AlphVec*)node->groups;
+    var gi: int64 = alph_vec_find(list, (int64)g);
+    if (gi >= 0) {
+      alph_vec_remove_at(list, gi);
+    }
+    alph_entry_free(g);
+  }
+}
+
+// Drops the names and group places of an exiting actor.
+fn alph_names_drop(node: AlphNode*, p: AlphProc*, pid: int64) {
+  if (p->named == 0 && p->groups.len == 0) {
+    return;
+  }
+  alph_spin_lock(&node->names_lock);
+  if (p->named > 0) {
+    var list: AlphVec* = (AlphVec*)node->names;
+    var i: int64 = list->len;
+    while (i > 0) {
+      i = i - 1;
+      var e: AlphEntry* = (AlphEntry*)alph_vec_get(list, i);
+      if (e->pid == pid) {
+        alph_vec_remove_at(list, i);
+        alph_entry_free(e);
+      }
+    }
+    p->named = 0;
+  }
+  for i: int64 in 0..p->groups.len {
+    alph_group_remove(node, (AlphEntry*)alph_vec_get(&p->groups, i), pid);
+  }
+  p->groups.len = 0;
+  alph_spin_unlock(&node->names_lock);
+}
+
+// Registers name for the calling actor, so others can find it with
+// alph_whereis. An actor may hold several names. The name is copied; it is
+// dropped when the actor exits, crash included, or by alph_unregister.
+//
+// Returns true when the name is now the caller's (also when it already
+// was), false when another live actor holds it, name is empty, or memory
+// runs out. Thread: a handler.
+export fn alph_register(ctx: AlphCtx*, name: string) -> bool {
+  if (name.length == 0) {
+    return false;
+  }
+  var node: AlphNode* = ctx->node;
+  var list: AlphVec* = (AlphVec*)node->names;
+  var ok: bool = true;
+  alph_spin_lock(&node->names_lock);
+  var at: int64 = alph_entry_find(list, name);
+  if (at >= 0) {
+    var e: AlphEntry* = (AlphEntry*)alph_vec_get(list, at);
+    if (e->pid != ctx->self) {
+      // A holder that is exiting still has its entry for a moment.
+      if (alph_resolve(node, e->pid) != 0) {
+        ok = false;
+      } else {
+        e->pid = ctx->self;
+        alph_me(ctx)->named = alph_me(ctx)->named + 1;
+      }
+    }
+  } else {
+    var e: AlphEntry* = alph_entry_new(name);
+    if (e == 0) {
+      ok = false;
+    } else if (!alph_vec_push(list, (int64)e)) {
+      alph_entry_free(e);
+      ok = false;
+    } else {
+      e->pid = ctx->self;
+      alph_me(ctx)->named = alph_me(ctx)->named + 1;
+    }
+  }
+  alph_spin_unlock(&node->names_lock);
+  return ok;
+}
+
+// Drops name if the calling actor holds it; otherwise does nothing.
+// Thread: a handler.
+export fn alph_unregister(ctx: AlphCtx*, name: string) {
+  var node: AlphNode* = ctx->node;
+  var list: AlphVec* = (AlphVec*)node->names;
+  alph_spin_lock(&node->names_lock);
+  var at: int64 = alph_entry_find(list, name);
+  if (at >= 0) {
+    var e: AlphEntry* = (AlphEntry*)alph_vec_get(list, at);
+    if (e->pid == ctx->self) {
+      alph_vec_remove_at(list, at);
+      alph_entry_free(e);
+      alph_me(ctx)->named = alph_me(ctx)->named - 1;
+    }
+  }
+  alph_spin_unlock(&node->names_lock);
+}
+
+// The pid registered as name, or 0 when there is none. The actor may exit
+// at any time after, so a send to the pid can still return ALPH_GONE.
+// Thread: any.
+export fn alph_node_whereis(node: AlphNode*, name: string) -> int64 {
+  var list: AlphVec* = (AlphVec*)node->names;
+  var pid: int64 = 0;
+  alph_spin_lock(&node->names_lock);
+  var at: int64 = alph_entry_find(list, name);
+  if (at >= 0) {
+    pid = ((AlphEntry*)alph_vec_get(list, at))->pid;
+  }
+  alph_spin_unlock(&node->names_lock);
+  if (alph_resolve(node, pid) == 0) {
+    return 0;
+  }
+  return pid;
+}
+
+// The pid registered as name, or 0; as alph_node_whereis.
+// Thread: a handler.
+export fn alph_whereis(ctx: AlphCtx*, name: string) -> int64 {
+  return alph_node_whereis(ctx->node, name);
+}
+
+// Adds the calling actor to the process group called group, creating the
+// group if needed. The name is copied. The actor leaves when it exits,
+// crash included, or by alph_group_leave; a group with no members is gone.
+//
+// Returns true when the caller is a member (also when it already was),
+// false when group is empty or memory runs out. Thread: a handler.
+export fn alph_group_join(ctx: AlphCtx*, group: string) -> bool {
+  if (group.length == 0) {
+    return false;
+  }
+  var node: AlphNode* = ctx->node;
+  var p: AlphProc* = alph_me(ctx);
+  var list: AlphVec* = (AlphVec*)node->groups;
+  var ok: bool = true;
+  alph_spin_lock(&node->names_lock);
+  var g: AlphEntry* = (AlphEntry*)0;
+  var at: int64 = alph_entry_find(list, group);
+  if (at >= 0) {
+    g = (AlphEntry*)alph_vec_get(list, at);
+  } else {
+    g = alph_entry_new(group);
+    if (g != 0 && !alph_vec_push(list, (int64)g)) {
+      alph_entry_free(g);
+      g = (AlphEntry*)0;
+    }
+  }
+  if (g == 0) {
+    ok = false;
+  } else if (alph_vec_find(&p->groups, (int64)g) < 0) {
+    if (!alph_vec_push(&g->members, ctx->self)) {
+      ok = false;
+    } else if (!alph_vec_push(&p->groups, (int64)g)) {
+      alph_vec_remove_at(&g->members, g->members.len - 1);
+      ok = false;
+    }
+    if (!ok && g->members.len == 0) {
+      alph_group_remove(node, g, ctx->self);
+    }
+  }
+  alph_spin_unlock(&node->names_lock);
+  return ok;
+}
+
+// Takes the calling actor out of group; does nothing if it is not a
+// member. Thread: a handler.
+export fn alph_group_leave(ctx: AlphCtx*, group: string) {
+  var node: AlphNode* = ctx->node;
+  var p: AlphProc* = alph_me(ctx);
+  alph_spin_lock(&node->names_lock);
+  for i: int64 in 0..p->groups.len {
+    var g: AlphEntry* = (AlphEntry*)alph_vec_get(&p->groups, i);
+    if (alph_entry_is(g, group)) {
+      alph_vec_remove_at(&p->groups, i);
+      alph_group_remove(node, g, ctx->self);
+      break;
+    }
+  }
+  alph_spin_unlock(&node->names_lock);
+}
+
+// How many actors are in group now; 0 when there is no such group.
+// Thread: any.
+export fn alph_node_group_size(node: AlphNode*, group: string) -> int64 {
+  var list: AlphVec* = (AlphVec*)node->groups;
+  var n: int64 = 0;
+  alph_spin_lock(&node->names_lock);
+  var at: int64 = alph_entry_find(list, group);
+  if (at >= 0) {
+    n = ((AlphEntry*)alph_vec_get(list, at))->members.len;
+  }
+  alph_spin_unlock(&node->names_lock);
+  return n;
+}
+
+// Sends to every member of group, the caller too if it is one. The member
+// list is copied first, so the lock is not held while sending.
+fn alph_group_send_raw(ctx: AlphCtx*, group: string, tag: int64, arg: int64,
+                       data: rawptr, size: int64) -> int64 {
+  var node: AlphNode* = ctx->node;
+  var list: AlphVec* = (AlphVec*)node->groups;
+  var pids: int64* = (int64*)0;
+  var n: int64 = 0;
+  alph_spin_lock(&node->names_lock);
+  var at: int64 = alph_entry_find(list, group);
+  if (at >= 0) {
+    var g: AlphEntry* = (AlphEntry*)alph_vec_get(list, at);
+    pids = (int64*)alph_scratch(ctx, g->members.len * 8);
+    if (pids != 0) {
+      n = g->members.len;
+      memcpy((rawptr)pids, (rawptr)g->members.data, n * 8);
+    }
+  }
+  alph_spin_unlock(&node->names_lock);
+  var sent: int64 = 0;
+  for i: int64 in 0..n {
+    if (alph_send_raw(node, ctx->self, pids[i], tag, arg, data, size) == ALPH_SENT) {
+      sent = sent + 1;
+    }
+  }
+  return sent;
+}
+
+// Sends a tag and one word to every member of group, the caller too if it
+// is one, each as alph_send. Returns how many members got it; a full
+// mailbox or an exited member is skipped. Thread: a handler.
+export fn alph_group_send(ctx: AlphCtx*, group: string, tag: int64, arg: int64) -> int64 {
+  return alph_group_send_raw(ctx, group, tag, arg, (rawptr)0, 0);
+}
+
+// Sends one T, copied for each member, to every member of group, as
+// alph_send_value. Returns as alph_group_send. Thread: a handler.
+export fn alph_group_send_value<T>(ctx: AlphCtx*, group: string, tag: int64, value: T*) -> int64 {
+  return alph_group_send_raw(ctx, group, tag, 0, (rawptr)value, (int64)sizeof(T));
+}
+
+// Sends size bytes at data, copied for each member, to every member of
+// group, as alph_send_bytes. Returns as alph_group_send. Thread: a handler.
+export fn alph_group_send_bytes(ctx: AlphCtx*, group: string, tag: int64, data: rawptr,
+                                size: int64) -> int64 {
+  return alph_group_send_raw(ctx, group, tag, 0, data, size);
 }
 
 // ---- running an actor ------------------------------------------------------
@@ -1131,6 +1613,7 @@ fn alph_deliver(s: AlphSched*, p: AlphProc*, m: AlphMsg*) -> int64 {
   var result: int64 = p->handler(&ctx, m);
   p->poison_heap = 0;
   alph_msg_release(m);
+  alph_scratch_reset(&s->scratch, &s->pool);
   if (result == ALPH_STOP) {
     return ctx.stop_reason;
   }
@@ -1214,6 +1697,22 @@ fn alph_handle_signal(s: AlphSched*, p: AlphProc*, sig: AlphSignal*) -> int64 {
   }
   if (sig->kind == ALPH_SIG_CRASHED) {
     alph_runtime_message(&m, ALPH_TAG_CRASHED, sig->from, p->pid, 0, sig->arg);
+    return alph_deliver(s, p, &m);
+  }
+  if (sig->kind == ALPH_SIG_IO) {
+    var slot: AlphIoSlot* = alph_io_slot(node, sig->ref);
+    if (slot == 0 || slot->owner != p->pid) {
+      return -1;  // closed or given away since the event
+    }
+    if (slot->child != 0) {
+      return alph_child_ended(s, p, slot, sig->ref);
+    }
+    alph_runtime_message(&m, ALPH_TAG_IO, 0, p->pid, sig->ref, sig->arg);
+    return alph_deliver(s, p, &m);
+  }
+  if (sig->kind == ALPH_SIG_IO_GIVEN) {
+    alph_vec_push(&p->io_handles, sig->ref);
+    alph_runtime_message(&m, ALPH_TAG_IO_GIVEN, sig->from, p->pid, sig->ref, 0);
     return alph_deliver(s, p, &m);
   }
   if (sig->kind == ALPH_SIG_TIMER) {
@@ -1328,6 +1827,13 @@ fn alph_run_proc(s: AlphSched*, p: AlphProc*) {
     // the actor is read back from memory.
     var crashed: AlphProc* = (AlphProc*)s->current;
     s->current = 0;
+    alph_scratch_reset(&s->scratch, &s->pool);
+    if (s->exit_request != 0) {
+      // Not a crash: alph_exit_now jumped here to end the actor.
+      s->exit_request = 0;
+      alph_proc_exit((AlphNode*)s->node, crashed, s->exit_reason);
+      return;
+    }
     if (!alph_hold_for_medic((AlphNode*)s->node, crashed)) {
       alph_proc_exit((AlphNode*)s->node, crashed, ALPH_CRASHED);
     }
@@ -1346,6 +1852,844 @@ fn alph_run_proc(s: AlphSched*, p: AlphProc*) {
     alph_atomic_store(&p->status, ALPH_P_QUEUED);
     alph_queue_push(&s->runq, (rawptr)p);
   }
+}
+
+// ---- IO ----------------------------------------------------------------------
+//
+// A handle is a file descriptor owned by one actor and registered with the
+// epoll set of that actor's scheduler. Arming it asks for one ALPH_TAG_IO
+// message the next time it is ready; reading and writing never block. The
+// runtime closes every handle an actor owns when it exits, crash included.
+
+fn alph_io_slot_at(node: AlphNode*, index: int64) -> AlphIoSlot* {
+  return (AlphIoSlot*)(node->ios + index * (int64)sizeof(AlphIoSlot));
+}
+
+// The open handle h names, or 0.
+fn alph_io_slot(node: AlphNode*, h: int64) -> AlphIoSlot* {
+  var index: int64 = (h & (((int64)1 << 32) - 1)) - 1;
+  if (h <= 0 || index < 0 || index >= node->io_capacity) {
+    return (AlphIoSlot*)0;
+  }
+  var slot: AlphIoSlot* = alph_io_slot_at(node, index);
+  if (alph_atomic_load(&slot->handle) != h) {
+    return (AlphIoSlot*)0;
+  }
+  return slot;
+}
+
+// The handle h if the calling actor owns it, else 0.
+fn alph_io_mine(ctx: AlphCtx*, h: int64) -> AlphIoSlot* {
+  var slot: AlphIoSlot* = alph_io_slot(ctx->node, h);
+  if (slot == 0 || slot->owner != ctx->self) {
+    return (AlphIoSlot*)0;
+  }
+  return slot;
+}
+
+// Unregisters, closes and frees the handle, if `owner` still owns it.
+fn alph_io_drop(node: AlphNode*, h: int64, owner: int64) {
+  var slot: AlphIoSlot* = alph_io_slot(node, h);
+  if (slot == 0 || slot->owner != owner) {
+    return;
+  }
+  var s: AlphSched* = (AlphSched*)slot->sched;
+  if (slot->pollable != 0) {
+    alph_sys_epoll_ctl(s->epfd, ALPH_EPOLL_CTL_DEL, slot->fd, 0, 0);
+    alph_atomic_add(&s->io_count, -1);
+  }
+  if (slot->child != 0) {
+    // The owner is done with a child that still runs: end its process
+    // group and reap it, so nothing is orphaned or left a zombie.
+    syscall(ALPH_SYS_KILL, 0 - slot->child, ALPH_SIGKILL);
+    alph_child_wait(slot->child, false);
+    slot->child = 0;
+  }
+  alph_sys_close(slot->fd);
+  alph_atomic_store_sc(&slot->handle, 0);
+  alph_spin_lock(&node->io_lock);
+  var at: int64* = (int64*)(node->io_free_stack + node->io_free_top * 8);
+  *at = slot->index;
+  node->io_free_top = node->io_free_top + 1;
+  alph_spin_unlock(&node->io_lock);
+}
+
+// Puts fd on the scheduler s's epoll set, not yet armed.
+fn alph_io_register(slot: AlphIoSlot*, s: AlphSched*) {
+  slot->sched = (int64)s;
+  slot->pollable = 0;
+  if (alph_sys_epoll_ctl(s->epfd, ALPH_EPOLL_CTL_ADD, slot->fd, ALPH_EPOLLONESHOT, slot->handle) == 0) {
+    slot->pollable = 1;
+    alph_atomic_add(&s->io_count, 1);
+  }
+}
+
+// Makes the calling actor the owner of fd: it is made non-blocking, put on
+// this scheduler's epoll set, and closed when the actor exits, crash
+// included, unless it is closed or given away first. Any descriptor works;
+// one epoll cannot watch (a regular file) is still owned and closed, but
+// alph_io_arm refuses it.
+//
+//   fd  an open file descriptor; the handle owns it from now on
+//
+// Returns the handle (above 0), or a negative errno when fd is invalid, or
+// ALPH_NOMEM when max_handles are open. Thread: a handler.
+export fn alph_io_open(ctx: AlphCtx*, fd: int64) -> int64 {
+  if (fd < 0) {
+    return fd;
+  }
+  alph_sys_nonblock(fd);
+  var node: AlphNode* = ctx->node;
+  alph_spin_lock(&node->io_lock);
+  var index: int64 = -1;
+  if (node->io_free_top > 0) {
+    node->io_free_top = node->io_free_top - 1;
+    var at: int64* = (int64*)(node->io_free_stack + node->io_free_top * 8);
+    index = *at;
+  }
+  alph_spin_unlock(&node->io_lock);
+  if (index < 0) {
+    return ALPH_NOMEM;
+  }
+  var slot: AlphIoSlot* = alph_io_slot_at(node, index);
+  slot->index = index;
+  slot->serial = slot->serial + 1;
+  slot->fd = fd;
+  slot->child = 0;
+  slot->owner = ctx->self;
+  alph_atomic_store_sc(&slot->handle, (slot->serial << 32) | (index + 1));
+  alph_io_register(slot, (AlphSched*)alph_me(ctx)->sched);
+  alph_vec_push(&alph_me(ctx)->io_handles, slot->handle);
+  return slot->handle;
+}
+
+// Asks for one ALPH_TAG_IO message the next time handle h is ready for
+// events (ALPH_IO_IN, ALPH_IO_OUT, or both). The message's ref is h and its
+// arg says what is ready, which may include ALPH_IO_ERR or ALPH_IO_HUP. Arm
+// again after each message to hear about the next time.
+//
+// Returns 0, or a negative errno: -9 when this actor does not own h, -1
+// when h cannot be watched (a regular file). Thread: a handler.
+export fn alph_io_arm(ctx: AlphCtx*, h: int64, events: int64) -> int64 {
+  var slot: AlphIoSlot* = alph_io_mine(ctx, h);
+  if (slot == 0) {
+    return -9;
+  }
+  if (slot->pollable == 0) {
+    return -1;
+  }
+  var s: AlphSched* = (AlphSched*)slot->sched;
+  return alph_sys_epoll_ctl(s->epfd, ALPH_EPOLL_CTL_MOD, slot->fd,
+                            (events & (ALPH_IO_IN | ALPH_IO_OUT)) | ALPH_EPOLLONESHOT, h);
+}
+
+// Reads up to size bytes from handle h into buf, without blocking.
+// Returns the count, 0 at end of stream (the peer closed), ALPH_IO_AGAIN
+// when nothing is there yet (arm ALPH_IO_IN and try again), or a negative
+// errno (-9 when this actor does not own h). Thread: a handler.
+export fn alph_io_read(ctx: AlphCtx*, h: int64, buf: rawptr, size: int64) -> int64 {
+  var slot: AlphIoSlot* = alph_io_mine(ctx, h);
+  if (slot == 0) {
+    return -9;
+  }
+  return alph_sys_read(slot->fd, buf, size);
+}
+
+// Writes up to size bytes from buf to handle h, without blocking. Returns
+// the count written, which may be less than size, ALPH_IO_AGAIN when none
+// fit (arm ALPH_IO_OUT and try again), or a negative errno. For whole
+// messages, an AlphOutq does the bookkeeping. Thread: a handler.
+export fn alph_io_write(ctx: AlphCtx*, h: int64, buf: rawptr, size: int64) -> int64 {
+  var slot: AlphIoSlot* = alph_io_mine(ctx, h);
+  if (slot == 0) {
+    return -9;
+  }
+  return alph_sys_write(slot->fd, buf, size);
+}
+
+// Closes handle h and its descriptor now. Does nothing when this actor does
+// not own h. Thread: a handler.
+export fn alph_io_close(ctx: AlphCtx*, h: int64) {
+  var slot: AlphIoSlot* = alph_io_mine(ctx, h);
+  if (slot == 0) {
+    return;
+  }
+  var p: AlphProc* = alph_me(ctx);
+  var at: int64 = alph_vec_find(&p->io_handles, h);
+  if (at >= 0) {
+    alph_vec_remove_at(&p->io_handles, at);
+  }
+  alph_io_drop(ctx->node, h, ctx->self);
+}
+
+// The descriptor behind handle h, for calls alph has no wrapper for, or -9
+// when this actor does not own h. Do not close it yourself; use
+// alph_io_close. Thread: a handler.
+export fn alph_io_fd(ctx: AlphCtx*, h: int64) -> int64 {
+  var slot: AlphIoSlot* = alph_io_mine(ctx, h);
+  if (slot == 0) {
+    return -9;
+  }
+  return slot->fd;
+}
+
+// Hands handle h to the actor `to`, which becomes its owner and gets an
+// ALPH_TAG_IO_GIVEN message (ref = h, from = this actor). Any arming is
+// dropped; the new owner arms it. If `to` exits before taking it, it is
+// closed. Use it to pass an accepted connection to the actor that serves it.
+//
+// Returns ALPH_SENT, ALPH_GONE when `to` has exited (h stays with this
+// actor), or -9 when this actor does not own h. Thread: a handler.
+export fn alph_io_give(ctx: AlphCtx*, h: int64, to: int64) -> int64 {
+  var slot: AlphIoSlot* = alph_io_mine(ctx, h);
+  if (slot == 0) {
+    return -9;
+  }
+  var target: AlphProc* = alph_resolve(ctx->node, to);
+  if (target == 0) {
+    return ALPH_GONE;
+  }
+  var p: AlphProc* = alph_me(ctx);
+  var at: int64 = alph_vec_find(&p->io_handles, h);
+  if (at >= 0) {
+    alph_vec_remove_at(&p->io_handles, at);
+  }
+  if (slot->pollable != 0) {
+    var old: AlphSched* = (AlphSched*)slot->sched;
+    alph_sys_epoll_ctl(old->epfd, ALPH_EPOLL_CTL_DEL, slot->fd, 0, 0);
+    alph_atomic_add(&old->io_count, -1);
+  }
+  slot->owner = to;
+  alph_io_register(slot, (AlphSched*)target->sched);
+  if (!alph_signal(ctx->node, ALPH_SIG_IO_GIVEN, ctx->self, to, h, 0, 0)) {
+    alph_io_drop(ctx->node, h, to);  // it exited just now
+  }
+  return ALPH_SENT;
+}
+
+// The pending error on a socket handle, 0 when there is none: after a
+// connect reports ALPH_IO_OUT, 0 means it is connected. Returns a positive
+// errno, or -9 when this actor does not own h. Thread: a handler.
+export fn alph_io_error(ctx: AlphCtx*, h: int64) -> int64 {
+  var slot: AlphIoSlot* = alph_io_mine(ctx, h);
+  if (slot == 0) {
+    return -9;
+  }
+  var err: int32 = 0;
+  var len: int32 = 4;
+  syscall(ALPH_SYS_GETSOCKOPT, slot->fd, ALPH_SOL_SOCKET, ALPH_SO_ERROR, (int64)&err, (int64)&len);
+  return (int64)err;
+}
+
+// An IPv4 address in host order, for the alph_tcp_ functions:
+// alph_ip4(127, 0, 0, 1). Thread: any.
+export fn alph_ip4(a: int64, b: int64, c: int64, d: int64) -> int64 {
+  return ((a & 255) << 24) | ((b & 255) << 16) | ((c & 255) << 8) | (d & 255);
+}
+
+// Opens a TCP listener owned by the calling actor.
+//
+//   ip4      the address to listen on: alph_ip4(0, 0, 0, 0) for all
+//   port     the port, or 0 to let the system pick (see alph_tcp_port)
+//   backlog  connections the kernel queues before accept
+//   flags    0, or ALPH_TCP_REUSEPORT so several actors (one per
+//            scheduler) can each listen on the same port
+//
+// Arm it with ALPH_IO_IN; on ALPH_TAG_IO, call alph_tcp_accept until it
+// returns ALPH_IO_AGAIN, then arm again. Returns the handle, or a negative
+// errno (-98 when the address is in use). Thread: a handler.
+export fn alph_tcp_listen(ctx: AlphCtx*, ip4: int64, port: int64, backlog: int64, flags: int64) -> int64 {
+  var fd: int64 = alph_sys_tcp_socket();
+  if (fd < 0) {
+    return fd;
+  }
+  alph_sys_setsockopt(fd, ALPH_SOL_SOCKET, ALPH_SO_REUSEADDR, 1);
+  if ((flags & ALPH_TCP_REUSEPORT) != 0) {
+    alph_sys_setsockopt(fd, ALPH_SOL_SOCKET, ALPH_SO_REUSEPORT, 1);
+  }
+  var addr: uint8[16];
+  alph_sys_sockaddr(&addr[0], ip4, port);
+  var err: int64 = syscall(ALPH_SYS_BIND, fd, (int64)&addr[0], 16);
+  if (err == 0) {
+    err = syscall(ALPH_SYS_LISTEN, fd, backlog);
+  }
+  if (err != 0) {
+    alph_sys_close(fd);
+    return err;
+  }
+  return alph_io_open(ctx, fd);
+}
+
+// Accepts one waiting connection on a listener handle. The new connection
+// is a handle owned by the calling actor; give it to another actor with
+// alph_io_give. Returns the handle, ALPH_IO_AGAIN when none is waiting, or
+// a negative errno. Thread: a handler.
+export fn alph_tcp_accept(ctx: AlphCtx*, listener: int64) -> int64 {
+  var slot: AlphIoSlot* = alph_io_mine(ctx, listener);
+  if (slot == 0) {
+    return -9;
+  }
+  var fd: int64 = syscall(ALPH_SYS_ACCEPT4, slot->fd, 0, 0, ALPH_SOCK_NONBLOCK | ALPH_SOCK_CLOEXEC);
+  if (fd < 0) {
+    return fd;
+  }
+  return alph_io_open(ctx, fd);
+}
+
+// Starts connecting to ip4:port. Returns the handle at once, still
+// connecting: arm it with ALPH_IO_OUT, and on ALPH_TAG_IO check
+// alph_io_error, which is 0 once connected. Returns a negative errno when
+// it fails at once. Thread: a handler.
+export fn alph_tcp_connect(ctx: AlphCtx*, ip4: int64, port: int64) -> int64 {
+  var fd: int64 = alph_sys_tcp_socket();
+  if (fd < 0) {
+    return fd;
+  }
+  var addr: uint8[16];
+  alph_sys_sockaddr(&addr[0], ip4, port);
+  var err: int64 = syscall(ALPH_SYS_CONNECT, fd, (int64)&addr[0], 16);
+  if (err != 0 && err != -ALPH_EINPROGRESS) {
+    alph_sys_close(fd);
+    return err;
+  }
+  return alph_io_open(ctx, fd);
+}
+
+// The local port of a socket handle: the port a listener opened with port
+// 0 got. Returns a negative errno on failure. Thread: a handler.
+export fn alph_tcp_port(ctx: AlphCtx*, h: int64) -> int64 {
+  var slot: AlphIoSlot* = alph_io_mine(ctx, h);
+  if (slot == 0) {
+    return -9;
+  }
+  var addr: uint8[16];
+  var len: int32 = 16;
+  var err: int64 = syscall(ALPH_SYS_GETSOCKNAME, slot->fd, (int64)&addr[0], (int64)&len);
+  if (err != 0) {
+    return err;
+  }
+  return ((int64)addr[2] << 8) | (int64)addr[3];
+}
+
+// Turns Nagle's algorithm off (on true) for a TCP handle, so small writes
+// go out at once. Returns 0 or a negative errno. Thread: a handler.
+export fn alph_tcp_nodelay(ctx: AlphCtx*, h: int64, on: bool) -> int64 {
+  var slot: AlphIoSlot* = alph_io_mine(ctx, h);
+  if (slot == 0) {
+    return -9;
+  }
+  var value: int64 = 0;
+  if (on) {
+    value = 1;
+  }
+  return alph_sys_setsockopt(slot->fd, ALPH_IPPROTO_TCP, ALPH_TCP_NODELAY, value);
+}
+
+// An output queue: bytes waiting to be written to a handle, kept in the
+// actor's heap. It takes whole messages and writes what the socket accepts,
+// so a handler never has to track partial writes. Put it in the actor's
+// state and start it with alph_outq_init.
+//
+//   limit  bytes it may hold; past it alph_outq_push returns ALPH_FULL,
+//          which is the signal that the peer reads too slowly
+export struct AlphOutq {
+  data: rawptr;
+  len: int64;    // bytes in data
+  sent: int64;   // bytes of data already written
+  cap: int64;
+  limit: int64;
+}
+
+// Starts q empty, holding at most limit bytes. Thread: any.
+export fn alph_outq_init(q: AlphOutq*, limit: int64) {
+  q->data = (rawptr)0;
+  q->len = 0;
+  q->sent = 0;
+  q->cap = 0;
+  q->limit = limit;
+}
+
+// Bytes waiting in q. Thread: any.
+export fn alph_outq_pending(q: AlphOutq*) -> int64 {
+  return q->len - q->sent;
+}
+
+// Copies size bytes at data to the end of q. Returns ALPH_SENT, ALPH_FULL
+// when that would pass the limit (nothing is queued), or ALPH_NOMEM.
+// Thread: the handler of the actor whose state holds q.
+export fn alph_outq_push(ctx: AlphCtx*, q: AlphOutq*, data: rawptr, size: int64) -> int64 {
+  if (alph_outq_pending(q) + size > q->limit) {
+    return ALPH_FULL;
+  }
+  if (q->sent > 0 && q->len + size > q->cap) {
+    // Move what is left to the front before growing.
+    var left: int64 = alph_outq_pending(q);
+    memmove(q->data, (rawptr)((int64)q->data + q->sent), left);
+    q->len = left;
+    q->sent = 0;
+  }
+  if (q->len + size > q->cap) {
+    var cap: int64 = q->cap * 2;
+    if (cap < q->len + size) {
+      cap = q->len + size;
+    }
+    if (cap < 256) {
+      cap = 256;
+    }
+    var grown: rawptr = alph_realloc(ctx, q->data, cap);
+    if (grown == 0) {
+      return ALPH_NOMEM;
+    }
+    q->data = grown;
+    q->cap = alph_heap_size(grown);
+  }
+  memcpy((rawptr)((int64)q->data + q->len), data, size);
+  q->len = q->len + size;
+  return ALPH_SENT;
+}
+
+// Writes as much of q to handle h as the socket accepts now. When bytes are
+// left it arms h for ALPH_IO_OUT, so the next ALPH_TAG_IO with ALPH_IO_OUT
+// is the time to flush again. Returns the bytes still waiting (0 when all
+// went out), or a negative errno when the write failed (the connection is
+// broken). Thread: the handler of the actor whose state holds q.
+export fn alph_outq_flush(ctx: AlphCtx*, q: AlphOutq*, h: int64) -> int64 {
+  while (alph_outq_pending(q) > 0) {
+    var n: int64 = alph_io_write(ctx, h, (rawptr)((int64)q->data + q->sent), alph_outq_pending(q));
+    if (n == ALPH_IO_AGAIN) {
+      alph_io_arm(ctx, h, ALPH_IO_OUT);
+      return alph_outq_pending(q);
+    }
+    if (n < 0) {
+      return n;
+    }
+    q->sent = q->sent + n;
+  }
+  q->len = 0;
+  q->sent = 0;
+  return 0;
+}
+
+// Frees q's buffer; q is empty afterwards. Thread: the handler of the actor
+// whose state holds q.
+export fn alph_outq_free(ctx: AlphCtx*, q: AlphOutq*) {
+  alph_free(ctx, q->data);
+  alph_outq_init(q, q->limit);
+}
+
+// ---- child processes -------------------------------------------------------
+
+// Flags for AlphProcSpec.flags. A stream that is not piped goes to
+// AlphProcSpec.log when set, else to /dev/null with ALPH_PROC_QUIET, else it
+// is inherited from the node. stdin is never sent to the log.
+export const ALPH_PROC_IN: int64 = 1;     // pipe the child's stdin; write to spec.stdin_h
+export const ALPH_PROC_OUT: int64 = 2;    // pipe the child's stdout; read from spec.stdout_h
+export const ALPH_PROC_ERR: int64 = 4;    // pipe the child's stderr; read from spec.stderr_h
+export const ALPH_PROC_MERGE: int64 = 8;  // send stderr into the stdout pipe; needs ALPH_PROC_OUT
+export const ALPH_PROC_QUIET: int64 = 16; // streams that are not piped go to /dev/null
+
+// What to run, for alph_proc_spawn. Set the inputs; alph_proc_spawn fills
+// the three handles.
+//
+//   argv      the program and its arguments, ending with 0. A program
+//             name without a slash is looked up in PATH
+//   envp      the environment, ending with 0; 0 means the environment
+//             this process started with
+//   cwd       the working directory; 0 means the node's
+//   log       a file for stdout and stderr when they are not piped,
+//             created or emptied (mode 0644); 0 means none
+//   flags     ALPH_PROC_ bits
+//   stdin_h   out: a handle to write the child's stdin, or 0
+//   stdout_h  out: a handle to read the child's stdout, or 0
+//   stderr_h  out: a handle to read the child's stderr, or 0
+export struct AlphProcSpec {
+  argv: cstring*;
+  envp: cstring*;
+  cwd: cstring;
+  log: cstring;
+  flags: int64;
+  stdin_h: int64;
+  stdout_h: int64;
+  stderr_h: int64;
+}
+
+fn alph_cstr_len(at: int64) -> int64 {
+  var n: int64 = 0;
+  while (*(uint8*)(at + n) != 0) {
+    n = n + 1;
+  }
+  return n;
+}
+
+// The environment this process started with, read once from
+// /proc/self/environ, as a cstring array ending with 0; or 0 when it cannot
+// be read.
+fn alph_node_env(node: AlphNode*) -> int64 {
+  if (alph_atomic_load(&node->env) != 0) {
+    return node->env;
+  }
+  alph_spin_lock(&node->env_lock);
+  if (node->env == 0) {
+    var path: cstring = "/proc/self/environ";
+    var fd: int64 = syscall(ALPH_SYS_OPEN, (int64)path, ALPH_O_RDONLY | ALPH_O_CLOEXEC, 0);
+    var cap: int64 = 4096;
+    var len: int64 = 0;
+    var buf: int64 = (int64)malloc(cap + 1);
+    while (fd >= 0 && buf != 0) {
+      if (len == cap) {
+        cap = cap * 2;
+        var grown: int64 = (int64)malloc(cap + 1);
+        if (grown != 0) {
+          memcpy((rawptr)grown, (rawptr)buf, len);
+        }
+        free((rawptr)buf);
+        buf = grown;
+        if (buf == 0) {
+          break;
+        }
+      }
+      var got: int64 = alph_sys_read(fd, (rawptr)(buf + len), cap - len);
+      if (got <= 0) {
+        break;
+      }
+      len = len + got;
+    }
+    if (fd >= 0) {
+      alph_sys_close(fd);
+    }
+    if (buf != 0) {
+      *(uint8*)(buf + len) = 0;
+      var count: int64 = 0;
+      for i: int64 in 0..len {
+        if (*(uint8*)(buf + i) == 0) {
+          count = count + 1;
+        }
+      }
+      var list: int64 = (int64)malloc((count + 1) * 8);
+      if (list != 0) {
+        var at: int64 = 0;
+        var n: int64 = 0;
+        while (at < len && n < count) {
+          *(int64*)(list + n * 8) = buf + at;
+          n = n + 1;
+          at = at + alph_cstr_len(buf + at) + 1;
+        }
+        *(int64*)(list + n * 8) = 0;
+        alph_atomic_store_sc(&node->env, list);
+      } else {
+        free((rawptr)buf);
+      }
+    }
+  }
+  alph_spin_unlock(&node->env_lock);
+  return node->env;
+}
+
+// The file to execute for program name argv0, as a new block the caller
+// frees: argv0 itself when it holds a slash, else the first executable
+// match in the PATH of env. 0 when there is none.
+fn alph_child_path(argv0: int64, env: int64) -> int64 {
+  var name_len: int64 = alph_cstr_len(argv0);
+  var slash: bool = false;
+  for i: int64 in 0..name_len {
+    if (*(uint8*)(argv0 + i) == 47) {
+      slash = true;
+    }
+  }
+  if (slash) {
+    var copy: int64 = (int64)malloc(name_len + 1);
+    if (copy != 0) {
+      memcpy((rawptr)copy, (rawptr)argv0, name_len + 1);
+    }
+    return copy;
+  }
+  var dirs: int64 = 0;
+  var at: int64 = env;
+  while (at != 0 && *(int64*)at != 0) {
+    var e: int64 = *(int64*)at;
+    if (memcmp((rawptr)e, (rawptr)"PATH=", 5) == 0) {
+      dirs = e + 5;
+      break;
+    }
+    at = at + 8;
+  }
+  if (dirs == 0 || name_len == 0) {
+    return 0;
+  }
+  var dirs_len: int64 = alph_cstr_len(dirs);
+  var buf: int64 = (int64)malloc(dirs_len + name_len + 3);
+  if (buf == 0) {
+    return 0;
+  }
+  var start: int64 = 0;
+  while (start <= dirs_len) {
+    var end: int64 = start;
+    while (end < dirs_len && *(uint8*)(dirs + end) != 58) {
+      end = end + 1;
+    }
+    var n: int64 = end - start;
+    if (n == 0) {
+      *(uint8*)buf = 46;  // an empty entry means the working directory
+      n = 1;
+    } else {
+      memcpy((rawptr)buf, (rawptr)(dirs + start), n);
+    }
+    *(uint8*)(buf + n) = 47;
+    memcpy((rawptr)(buf + n + 1), (rawptr)argv0, name_len + 1);
+    if (syscall(ALPH_SYS_ACCESS, buf, ALPH_X_OK) == 0) {
+      return buf;
+    }
+    start = end + 1;
+  }
+  free((rawptr)buf);
+  return 0;
+}
+
+// Runs in the new child, between clone and execve. The child of a threaded
+// process may only make raw system calls here: no allocation, no checks
+// that could trap. It never returns; a failure exits with 127.
+fn alph_child_exec(path: int64, argv: int64, envp: int64, cwd: int64,
+                   in_fd: int64, out_fd: int64, err_fd: int64) {
+  var none: int64 = 0;
+  syscall(ALPH_SYS_RT_SIGPROCMASK, ALPH_SIG_SETMASK, (int64)&none, 0, 8);
+  syscall(ALPH_SYS_SETPGID, 0, 0);
+  if (cwd == 0 || syscall(ALPH_SYS_CHDIR, cwd) == 0) {
+    if (in_fd >= 0) {
+      syscall(ALPH_SYS_DUP2, in_fd, 0);
+    }
+    if (out_fd >= 0) {
+      syscall(ALPH_SYS_DUP2, out_fd, 1);
+    }
+    if (err_fd >= 0) {
+      syscall(ALPH_SYS_DUP2, err_fd, 2);
+    }
+    syscall(ALPH_SYS_EXECVE, path, argv, envp);
+  }
+  while (true) {
+    syscall(ALPH_SYS_EXIT_GROUP, 127);
+  }
+}
+
+// Reaps child, an OS pid this node started and has not reaped. Returns its
+// exit code, or 128 + the signal that ended it; -1 when nohang is set and
+// it still runs. Waits by pid, not pidfd: the pidfd is non-blocking.
+fn alph_child_wait(child: int64, nohang: bool) -> int64 {
+  var info: int32[32];
+  for i: int64 in 0..32 {
+    info[i] = 0;
+  }
+  var options: int64 = ALPH_WEXITED;
+  if (nohang) {
+    options = options | ALPH_WNOHANG;
+  }
+  if (syscall(ALPH_SYS_WAITID, ALPH_IDTYPE_PID, child, (int64)&info[0], options, 0) != 0 ||
+      info[4] == 0) {
+    return -1;
+  }
+  if ((int64)info[2] == ALPH_CLD_EXITED) {
+    return (int64)info[6];
+  }
+  return 128 + (int64)info[6];
+}
+
+// A process handle became readable: its child has ended. Reaps it, closes
+// the handle, and tells the owner.
+fn alph_child_ended(s: AlphSched*, p: AlphProc*, slot: AlphIoSlot*, h: int64) -> int64 {
+  var code: int64 = alph_child_wait(slot->child, true);
+  if (code < 0) {
+    var home: AlphSched* = (AlphSched*)slot->sched;
+    alph_sys_epoll_ctl(home->epfd, ALPH_EPOLL_CTL_MOD, slot->fd, ALPH_EPOLLIN | ALPH_EPOLLONESHOT, h);
+    return -1;
+  }
+  slot->child = 0;
+  var at: int64 = alph_vec_find(&p->io_handles, h);
+  if (at >= 0) {
+    alph_vec_remove_at(&p->io_handles, at);
+  }
+  alph_io_drop((AlphNode*)s->node, h, p->pid);
+  var m: AlphMsg;
+  alph_runtime_message(&m, ALPH_TAG_PROC_EXIT, 0, p->pid, h, code);
+  return alph_deliver(s, p, &m);
+}
+
+fn alph_close_if(fd: int64) {
+  if (fd >= 0) {
+    alph_sys_close(fd);
+  }
+}
+
+// An owned handle for the parent's end of a pipe, or 0 when the handle
+// table is full (the end is closed then).
+fn alph_pipe_handle(ctx: AlphCtx*, fd: int64) -> int64 {
+  if (fd < 0) {
+    return 0;
+  }
+  var h: int64 = alph_io_open(ctx, fd);
+  if (h < 0) {
+    alph_sys_close(fd);
+    return 0;
+  }
+  return h;
+}
+
+// Starts a child process owned by the calling actor, in a process group of
+// its own. The child's end is reported once as ALPH_TAG_PROC_EXIT, ref =
+// the returned handle, arg = its exit code or 128 + the signal that ended
+// it (127 when the program could not be run); the handle is closed then.
+// Piped streams are ordinary IO handles owned by the caller: arm and read
+// them like sockets, and close them when done.
+//
+// When the owner exits before the child ends (crash included) or closes the
+// handle with alph_io_close, the child's whole process group is killed and
+// the child reaped. The handle can be moved with alph_io_give.
+//
+// Returns the process handle, or a negative errno with nothing started:
+// -2 when the program is not found, -22 when argv is empty, -12 when
+// memory or handles run out, or the errno of opening the log.
+// Thread: a handler.
+export fn alph_proc_spawn(ctx: AlphCtx*, spec: AlphProcSpec*) -> int64 {
+  spec->stdin_h = 0;
+  spec->stdout_h = 0;
+  spec->stderr_h = 0;
+  if (spec->argv == 0 || *(int64*)spec->argv == 0) {
+    return -22;
+  }
+  var env: int64 = (int64)spec->envp;
+  if (env == 0) {
+    env = alph_node_env(ctx->node);
+    if (env == 0) {
+      return -12;
+    }
+  }
+  var path: int64 = alph_child_path(*(int64*)spec->argv, env);
+  if (path == 0) {
+    return 0 - ALPH_ENOENT;
+  }
+  // fds[0..1] stdin, [2..3] stdout, [4..5] stderr: read end, write end.
+  var fds: int32[6];
+  for i: int64 in 0..6 {
+    fds[i] = -1;
+  }
+  var err: int64 = 0;
+  if ((spec->flags & ALPH_PROC_IN) != 0) {
+    err = syscall(ALPH_SYS_PIPE2, (int64)&fds[0], ALPH_O_CLOEXEC);
+  }
+  if (err == 0 && (spec->flags & ALPH_PROC_OUT) != 0) {
+    err = syscall(ALPH_SYS_PIPE2, (int64)&fds[2], ALPH_O_CLOEXEC);
+  }
+  if (err == 0 && (spec->flags & ALPH_PROC_ERR) != 0 && (spec->flags & ALPH_PROC_MERGE) == 0) {
+    err = syscall(ALPH_SYS_PIPE2, (int64)&fds[4], ALPH_O_CLOEXEC);
+  }
+  var null_fd: int64 = -1;
+  if (err == 0 && (spec->flags & ALPH_PROC_QUIET) != 0) {
+    var dev_null: cstring = "/dev/null";
+    null_fd = syscall(ALPH_SYS_OPEN, (int64)dev_null, ALPH_O_RDWR | ALPH_O_CLOEXEC, 0);
+    if (null_fd < 0) {
+      err = null_fd;
+    }
+  }
+  var log_fd: int64 = -1;
+  if (err == 0 && spec->log != 0) {
+    log_fd = syscall(ALPH_SYS_OPEN, (int64)spec->log,
+                     ALPH_O_WRONLY | ALPH_O_CREAT | ALPH_O_TRUNC | ALPH_O_CLOEXEC, 420);
+    if (log_fd < 0) {
+      err = log_fd;
+    }
+  }
+  var in_fd: int64 = (int64)fds[0];
+  var out_fd: int64 = (int64)fds[3];
+  var err_fd: int64 = (int64)fds[5];
+  if ((spec->flags & ALPH_PROC_MERGE) != 0) {
+    err_fd = out_fd;
+  }
+  if (out_fd < 0) {
+    out_fd = log_fd;
+  }
+  if (err_fd < 0) {
+    err_fd = log_fd;
+  }
+  if (in_fd < 0) {
+    in_fd = null_fd;
+  }
+  if (out_fd < 0) {
+    out_fd = null_fd;
+  }
+  if (err_fd < 0) {
+    err_fd = null_fd;
+  }
+  var pid: int64 = err;
+  if (err == 0) {
+    pid = syscall(ALPH_SYS_CLONE, ALPH_SIGCHLD, 0, 0, 0, 0);
+    if (pid == 0) {
+      alph_child_exec(path, (int64)spec->argv, env, (int64)spec->cwd, in_fd, out_fd, err_fd);
+    }
+  }
+  // The child's ends belong to the child now.
+  free((rawptr)path);
+  alph_close_if((int64)fds[0]);
+  alph_close_if((int64)fds[3]);
+  alph_close_if((int64)fds[5]);
+  alph_close_if(null_fd);
+  alph_close_if(log_fd);
+  var h: int64 = pid;
+  if (pid > 0) {
+    syscall(ALPH_SYS_SETPGID, pid, pid);
+    var pidfd: int64 = syscall(ALPH_SYS_PIDFD_OPEN, pid, 0);
+    h = pidfd;
+    if (pidfd >= 0) {
+      h = alph_io_open(ctx, pidfd);
+      if (h < 0) {
+        alph_sys_close(pidfd);
+      }
+    }
+    if (h < 0) {
+      // No way to watch it: undo the start.
+      syscall(ALPH_SYS_KILL, 0 - pid, ALPH_SIGKILL);
+      var info: int32[32];
+      syscall(ALPH_SYS_WAITID, ALPH_IDTYPE_PID, pid, (int64)&info[0], ALPH_WEXITED, 0);
+    } else {
+      alph_io_slot(ctx->node, h)->child = pid;
+      alph_io_arm(ctx, h, ALPH_IO_IN);
+    }
+  }
+  if (h < 0) {
+    alph_close_if((int64)fds[1]);
+    alph_close_if((int64)fds[2]);
+    alph_close_if((int64)fds[4]);
+    return h;
+  }
+  spec->stdin_h = alph_pipe_handle(ctx, (int64)fds[1]);
+  spec->stdout_h = alph_pipe_handle(ctx, (int64)fds[2]);
+  spec->stderr_h = alph_pipe_handle(ctx, (int64)fds[4]);
+  return h;
+}
+
+// Sends OS signal sig (15 for SIGTERM, 9 for SIGKILL, ...) to the process
+// group of the child behind process handle h. The end still arrives as
+// ALPH_TAG_PROC_EXIT. A graceful stop is SIGTERM, then a timer, then
+// SIGKILL.
+//
+// Returns 0, -9 when the caller does not own h, -3 when the child has
+// already ended, or another negative errno. Thread: a handler.
+export fn alph_proc_kill(ctx: AlphCtx*, h: int64, sig: int64) -> int64 {
+  var slot: AlphIoSlot* = alph_io_mine(ctx, h);
+  if (slot == 0) {
+    return -9;
+  }
+  if (slot->child == 0) {
+    return -3;
+  }
+  return syscall(ALPH_SYS_KILL, 0 - slot->child, sig);
+}
+
+// The OS process id of the child behind process handle h, or 0 when the
+// caller does not own h or the child has been reaped. Thread: a handler.
+export fn alph_proc_os_pid(ctx: AlphCtx*, h: int64) -> int64 {
+  var slot: AlphIoSlot* = alph_io_mine(ctx, h);
+  if (slot == 0) {
+    return 0;
+  }
+  return slot->child;
 }
 
 // ---- proactive healing -----------------------------------------------------
@@ -1414,7 +2758,7 @@ export fn alph_spawn_medic(ctx: AlphCtx*, state: rawptr, size: int64,
   if (current != 0 && alph_resolve(ctx->node, current) != 0) {
     return current;
   }
-  var medic: int64 = alph_spawn_raw(ctx->node, ctx->self, false, 0, ctx->self, state, size, handler);
+  var medic: int64 = alph_spawn_raw(ctx->node, ctx->self, 0, 0, ctx->self, state, size, handler);
   if (medic != 0) {
     alph_atomic_store_sc(&p->medic, medic);
   }
@@ -1465,17 +2809,23 @@ export fn alph_patient_resume(ctx: AlphCtx*, pid: int64, retry: bool) -> bool {
 }
 
 // For a medic: starts the patient over from a copy of size bytes at state.
-// What it allocated is freed, exits are no longer trapped, and it gets INIT
-// again. Its pid, links, monitors and mailbox stay. Returns false when pid
-// is not this medic's crashed patient. Thread: the medic's handler.
+// Its heap is emptied, exits are no longer trapped, and it gets INIT again.
+// Its pid, links, monitors and mailbox stay. If even the fresh state does
+// not fit its heap limit, it exits with ALPH_CRASHED instead. Returns false
+// when pid is not this medic's crashed patient. Thread: the medic's handler.
 export fn alph_patient_reset(ctx: AlphCtx*, pid: int64, state: rawptr, size: int64) -> bool {
   var p: AlphProc* = alph_held_patient(ctx, pid);
   if (p == 0) {
     return false;
   }
   alph_drop_poison(p);
-  alph_free_chunks(p);
-  alph_set_state(p, state, size);
+  alph_heap_clear(ctx->node, p);
+  if (!alph_set_state(ctx->node, p, state, size)) {
+    // No room even for the fresh state: give up as fail would.
+    alph_atomic_store(&p->status, ALPH_P_EXITING);
+    alph_proc_exit(ctx->node, p, ALPH_CRASHED);
+    return true;
+  }
   p->trap_exit = 0;
   p->retry = 0;
   // INIT travels as a signal so it comes before anything already queued.
@@ -1496,21 +2846,270 @@ export fn alph_patient_fail(ctx: AlphCtx*, pid: int64, reason: int64) -> bool {
   return true;
 }
 
+// ---- shutdown and OS signals -----------------------------------------------
+
+const ALPH_TAG_SHUT_DEADLINE: int64 = 22;
+const ALPH_TAG_SHUT_POLL: int64 = 23;
+const ALPH_SHUT_POLL_MS: int64 = 10;
+const ALPH_SHUT_POLLS: int64 = 100;  // after the kill, wait at most this many polls
+
+// Records a top-level pid, dropping ones that have exited. Returns pid.
+fn alph_root_add(node: AlphNode*, pid: int64) -> int64 {
+  if (pid == 0) {
+    return pid;
+  }
+  var roots: AlphVec* = (AlphVec*)node->roots;
+  alph_spin_lock(&node->roots_lock);
+  var i: int64 = roots->len;
+  while (i > 0) {
+    i = i - 1;
+    if (alph_resolve(node, alph_vec_get(roots, i)) == 0) {
+      alph_vec_remove_at(roots, i);
+    }
+  }
+  alph_vec_push(roots, pid);
+  alph_spin_unlock(&node->roots_lock);
+  return pid;
+}
+
+// The state of the actor that runs a shutdown.
+struct AlphShutdown {
+  code: int64;
+  deadline_ms: int64;
+  next: int64;     // roots below this index are still to stop
+  monitor: int64;  // on the root being stopped
+  killing: int64;
+  polls: int64;
+}
+
+// Stops the next live root, newest first. Moves to the kill once none is left.
+fn alph_shutdown_next(ctx: AlphCtx*, st: AlphShutdown*) -> int64 {
+  var node: AlphNode* = ctx->node;
+  var roots: AlphVec* = (AlphVec*)node->roots;
+  while (st->next > 0) {
+    st->next = st->next - 1;
+    alph_spin_lock(&node->roots_lock);
+    var pid: int64 = 0;
+    if (st->next < roots->len) {
+      pid = alph_vec_get(roots, st->next);
+    }
+    alph_spin_unlock(&node->roots_lock);
+    if (pid != 0 && alph_resolve(node, pid) != 0) {
+      st->monitor = alph_monitor(ctx, pid);
+      // From 0, as from outside the node, so a supervisor obeys it.
+      alph_node_exit_signal(node, pid, ALPH_SHUTDOWN);
+      return ALPH_CONTINUE;
+    }
+  }
+  return alph_shutdown_kill(ctx, st);
+}
+
+// Kills every actor still alive, then halts once they are gone.
+fn alph_shutdown_kill(ctx: AlphCtx*, st: AlphShutdown*) -> int64 {
+  var node: AlphNode* = ctx->node;
+  if (st->killing == 0) {
+    st->killing = 1;
+    for i: int64 in 0..node->capacity {
+      var pid: int64 = alph_atomic_load(&alph_slot(node, i)->pid);
+      if (pid != 0 && pid != ctx->self) {
+        alph_node_exit_signal(node, pid, ALPH_KILL);
+      }
+    }
+  }
+  if (alph_atomic_load(&node->live) <= 1 || st->polls >= ALPH_SHUT_POLLS) {
+    alph_node_halt(node, st->code);
+    return alph_stop(ctx, ALPH_NORMAL);
+  }
+  st->polls = st->polls + 1;
+  alph_start_timer(ctx, ALPH_SHUT_POLL_MS, ALPH_TAG_SHUT_POLL, 0);
+  return ALPH_CONTINUE;
+}
+
+fn alph_shutdown_handle(ctx: AlphCtx*, m: AlphMsg*) -> int64 {
+  var st: AlphShutdown* = (AlphShutdown*)ctx->state;
+  if (m->tag == ALPH_TAG_INIT) {
+    var node: AlphNode* = ctx->node;
+    alph_spin_lock(&node->roots_lock);
+    st->next = ((AlphVec*)node->roots)->len;
+    alph_spin_unlock(&node->roots_lock);
+    if (st->deadline_ms > 0) {
+      alph_start_timer(ctx, st->deadline_ms, ALPH_TAG_SHUT_DEADLINE, 0);
+    }
+    return alph_shutdown_next(ctx, st);
+  }
+  if (st->killing != 0) {
+    if (m->tag == ALPH_TAG_SHUT_POLL) {
+      return alph_shutdown_kill(ctx, st);
+    }
+    return ALPH_CONTINUE;
+  }
+  if (m->tag == ALPH_TAG_DOWN && m->ref == st->monitor) {
+    return alph_shutdown_next(ctx, st);
+  }
+  if (m->tag == ALPH_TAG_SHUT_DEADLINE) {
+    return alph_shutdown_kill(ctx, st);
+  }
+  return ALPH_CONTINUE;
+}
+
+// Stops the node in order. Top-level actors (those from alph_node_spawn and
+// friends) get ALPH_SHUTDOWN one at a time, newest first, each after the
+// one before has exited, so a supervisor stops its children before an older
+// root goes. At deadline_ms, or once the roots are gone, every actor still
+// alive is killed; then the node halts and alph_node_wait returns code.
+// Killed actors that own child processes kill and reap them as they exit.
+// A bound actor blocked for ever in a system call cannot be killed and
+// keeps alph_node_wait waiting; give blocking calls timeouts.
+//
+//   deadline_ms  time for the orderly part; 0 means no limit
+//   code         what alph_node_wait returns
+//
+// Returns false when a shutdown has already begun. Thread: any.
+export fn alph_node_shutdown(node: AlphNode*, deadline_ms: int64, code: int64) -> bool {
+  if (alph_atomic_cas(&node->shutting, 0, 1) != 0) {
+    return false;
+  }
+  var st: AlphShutdown;
+  memset((rawptr)&st, 0, (int64)sizeof(AlphShutdown));
+  st.code = code;
+  st.deadline_ms = deadline_ms;
+  if (alph_spawn_raw(node, 0, 0, 0, 0, (rawptr)&st, (int64)sizeof(AlphShutdown),
+                     &alph_shutdown_handle) == 0) {
+    alph_node_halt(node, code);  // no room for the actor that would do it in order
+  }
+  return true;
+}
+
+// Stops the node in order, as alph_node_shutdown. Thread: a handler.
+export fn alph_shutdown(ctx: AlphCtx*, deadline_ms: int64, code: int64) -> bool {
+  return alph_node_shutdown(ctx->node, deadline_ms, code);
+}
+
+// Takes over the signals in mask (bits 1 << signo) for the node: blocks
+// them in the calling thread, which the schedulers then inherit, and opens
+// a signalfd for them. Returns false on failure.
+fn alph_signals_take(node: AlphNode*, mask: int64) -> bool {
+  if (mask == 0) {
+    return true;
+  }
+  var set: int64 = mask >> 1;  // the kernel's bit for signal n is n - 1
+  if (syscall(ALPH_SYS_RT_SIGPROCMASK, ALPH_SIG_BLOCK, (int64)&set, 0, 8) != 0) {
+    return false;
+  }
+  node->sigfd = syscall(ALPH_SYS_SIGNALFD4, -1, (int64)&set, 8, ALPH_O_NONBLOCK | ALPH_O_CLOEXEC);
+  return node->sigfd >= 0;
+}
+
+// Reads every pending OS signal and passes each on. Runs on scheduler 0.
+fn alph_signals_read(node: AlphNode*) {
+  var info: int64[16];  // one signalfd_siginfo, 128 bytes
+  while (alph_sys_read(node->sigfd, (rawptr)&info[0], 128) == 128) {
+    var signo: int64 = info[0] & (((int64)1 << 32) - 1);
+    var pid: int64 = alph_atomic_load(&node->sig_pid);
+    if (pid != 0 && alph_signal(node, ALPH_SIG_TIMER, 0, pid, 0, signo, alph_atomic_load(&node->sig_tag))) {
+      continue;
+    }
+    // Nobody takes them: the first starts a shutdown, a second halts.
+    if (!alph_node_shutdown(node, 5000, 128 + signo)) {
+      alph_node_halt(node, 128 + signo);
+    }
+  }
+}
+
+// Sends the OS signals the node took over (AlphConfig.signals) to actor
+// pid as messages: tag, arg = the signal number (ALPH_SIGINT, ALPH_SIGTERM,
+// ALPH_SIGHUP, ...). They are never dropped. pid 0, the default, or a pid
+// that has exited, means the node handles them: the first starts
+// alph_node_shutdown(node, 5000, 128 + signal), a second halts at once.
+//
+// A node that takes over signals blocks them in the thread that calls
+// alph_node_start, so call that from main before starting other threads.
+// Child processes start with every signal unblocked. Thread: any.
+export fn alph_node_signals(node: AlphNode*, pid: int64, tag: int64) {
+  alph_atomic_store(&node->sig_tag, tag);
+  alph_atomic_store_sc(&node->sig_pid, pid);
+}
+
 // ---- schedulers and the node -----------------------------------------------
+
+// Starts a scheduler of its own for one ALPH_BOUND actor. Returns 0 when
+// memory or threads ran out.
+fn alph_sched_bound(node: AlphNode*) -> AlphSched* {
+  var s: AlphSched* = (AlphSched*)calloc(1, (int64)sizeof(AlphSched));
+  if (s == 0) {
+    return (AlphSched*)0;
+  }
+  alph_queue_init(&s->runq);
+  s->index = -1;
+  s->node = (int64)node;
+  s->bound = 1;
+  if (!alph_sched_init_io(s)) {
+    free((rawptr)s);
+    return (AlphSched*)0;
+  }
+  s->thread.recover.owner = (int64)s;
+  s->handle = alph_thread_start(&s->thread, &alph_sched_main, (int64)s, node->stack_size);
+  if (s->handle == 0) {
+    free((rawptr)s);
+    return (AlphSched*)0;
+  }
+  alph_spin_lock(&node->bound_lock);
+  s->next_bound = node->bound_list;
+  node->bound_list = (int64)s;
+  alph_spin_unlock(&node->bound_lock);
+  return s;
+}
+
+// After an actor exits: a bound scheduler stops with it.
+fn alph_sched_finish(p: AlphProc*) {
+  var s: AlphSched* = (AlphSched*)p->sched;
+  if (s->bound != 0) {
+    alph_atomic_store_sc(&s->done, 1);
+    alph_sched_notify(s);
+  }
+}
+
+// Turns ready handles into signals for their owners; the eventfd entry
+// (data 0) only wakes the scheduler. timeout_ms 0 polls without waiting.
+fn alph_sched_poll(s: AlphSched*, timeout_ms: int64) {
+  var node: AlphNode* = (AlphNode*)s->node;
+  var n: int64 = alph_sys_epoll_wait(s->epfd, (rawptr)s->events, 64, timeout_ms);
+  for i: int64 in 0..n {
+    var data: int64 = alph_sys_event_data((rawptr)s->events, i);
+    if (data == 0) {
+      var drained: int64 = 0;
+      alph_sys_read(s->evfd, (rawptr)&drained, 8);
+    } else if (data == -1) {
+      alph_signals_read(node);
+    } else {
+      var slot: AlphIoSlot* = alph_io_slot(node, data);
+      if (slot != 0) {
+        var mask: int64 = alph_sys_event_mask((rawptr)s->events, i) &
+                          (ALPH_IO_IN | ALPH_IO_OUT | ALPH_IO_ERR | ALPH_IO_HUP);
+        alph_signal(node, ALPH_SIG_IO, 0, slot->owner, data, mask, 0);
+      }
+    }
+  }
+}
 
 fn alph_sched_main(arg: int64) -> int64 {
   var s: AlphSched* = (AlphSched*)arg;
   var node: AlphNode* = (AlphNode*)s->node;
-  while (alph_atomic_load(&node->halted) == 0) {
+  while (alph_atomic_load(&node->halted) == 0 && alph_atomic_load(&s->done) == 0) {
     var wait: int64 = alph_timers_fire(node, &s->timers);
     var p: int64 = alph_queue_pop(&s->runq);
     if (p != 0) {
       alph_run_proc(s, (AlphProc*)p);
+      // A busy scheduler still looks at its handles now and then.
+      s->runs = s->runs + 1;
+      if (s->runs % 64 == 0 && alph_atomic_load(&s->io_count) > 0) {
+        alph_sched_poll(s, 0);
+      }
       continue;
     }
-    // Park. A pusher bumps wake after its push, then wakes us if sleeping
-    // is set; reading wake first and popping once more closes the gap.
-    var seen: int64 = alph_atomic_load(&s->wake);
+    // Park in epoll. A pusher bumps wake after its push, then writes the
+    // eventfd if sleeping is set; setting sleeping first and popping once
+    // more closes the gap.
     alph_atomic_store_sc(&s->sleeping, 1);
     p = alph_queue_pop(&s->runq);
     if (p != 0) {
@@ -1518,21 +3117,45 @@ fn alph_sched_main(arg: int64) -> int64 {
       alph_run_proc(s, (AlphProc*)p);
       continue;
     }
-    if (alph_atomic_load(&node->halted) == 0) {
-      alph_futex_wait(&s->wake, seen, wait);
+    if (alph_atomic_load(&node->halted) == 0 && alph_atomic_load(&s->done) == 0) {
+      var timeout_ms: int64 = -1;
+      if (wait >= 0) {
+        timeout_ms = (wait + ALPH_NS_PER_MS - 1) / ALPH_NS_PER_MS;
+      }
+      alph_sched_poll(s, timeout_ms);
     }
     alph_atomic_store(&s->sleeping, 0);
+  }
+  if (s->bound != 0) {
+    alph_sys_close(s->epfd);
+    alph_sys_close(s->evfd);
   }
   return 0;
 }
 
+// Gives a scheduler its epoll set and wake eventfd. Returns false on failure.
+fn alph_sched_init_io(s: AlphSched*) -> bool {
+  s->epfd = alph_sys_epoll();
+  s->evfd = alph_sys_eventfd();
+  s->events = (int64)malloc(64 * 12);
+  if (s->epfd < 0 || s->evfd < 0 || s->events == 0) {
+    return false;
+  }
+  return alph_sys_epoll_ctl(s->epfd, ALPH_EPOLL_CTL_ADD, s->evfd, ALPH_EPOLLIN, 0) == 0;
+}
+
 // Fills cfg with the defaults: one scheduler per CPU, 65536 actors, 64
-// messages per mailbox, 1 MiB of stack per scheduler. Thread: any.
+// messages per mailbox, 1 MiB of stack per scheduler, no heap limit, 65536
+// IO handles.
+// Thread: any.
 export fn alph_config(cfg: AlphConfig*) {
   cfg->schedulers = alph_cpu_count();
   cfg->max_actors = 65536;
   cfg->mailbox_size = 64;
   cfg->stack_size = 1048576;
+  cfg->heap_limit = 0;
+  cfg->max_handles = 65536;
+  cfg->signals = 0;
 }
 
 fn alph_round_pow2(n: int64) -> int64 {
@@ -1552,12 +3175,15 @@ fn alph_round_pow2(n: int64) -> int64 {
 // memory or threads run out.
 // Thread: any, once per node.
 export fn alph_node_start(node: AlphNode*, cfg: AlphConfig*) -> bool {
-  if (cfg->schedulers < 1 || cfg->max_actors < 1 || cfg->max_actors > 2147483647) {
+  if (cfg->schedulers < 1 || cfg->max_actors < 1 || cfg->max_actors > 2147483647 ||
+      cfg->max_handles < 1 || cfg->max_handles > 2147483647) {
     return false;
   }
   memset((rawptr)node, 0, (int64)sizeof(AlphNode));
   node->capacity = cfg->max_actors;
   node->mailbox_size = alph_round_pow2(cfg->mailbox_size);
+  node->heap_limit = cfg->heap_limit;
+  node->stack_size = cfg->stack_size;
   node->procs = (int64)calloc(node->capacity, (int64)sizeof(AlphProc));
   node->free_stack = (int64)malloc(node->capacity * 8);
   node->scheds = (int64)calloc(cfg->schedulers, (int64)sizeof(AlphSched));
@@ -1569,15 +3195,44 @@ export fn alph_node_start(node: AlphNode*, cfg: AlphConfig*) -> bool {
     *at = node->capacity - 1 - i;
   }
   node->free_top = node->capacity;
+  node->io_capacity = cfg->max_handles;
+  node->ios = (int64)calloc(node->io_capacity, (int64)sizeof(AlphIoSlot));
+  node->io_free_stack = (int64)malloc(node->io_capacity * 8);
+  if (node->ios == 0 || node->io_free_stack == 0) {
+    return false;
+  }
+  for i: int64 in 0..node->io_capacity {
+    var at: int64* = (int64*)(node->io_free_stack + i * 8);
+    *at = node->io_capacity - 1 - i;
+  }
+  node->io_free_top = node->io_capacity;
+  node->roots = (int64)calloc(1, (int64)sizeof(AlphVec));
+  node->sigfd = -1;
+  if (node->roots == 0 || !alph_signals_take(node, cfg->signals)) {
+    return false;
+  }
+  node->names = (int64)calloc(1, (int64)sizeof(AlphVec));
+  node->groups = (int64)calloc(1, (int64)sizeof(AlphVec));
+  if (node->names == 0 || node->groups == 0) {
+    return false;
+  }
   node->sched_count = cfg->schedulers;
   for i: int64 in 0..node->sched_count {
     var s: AlphSched* = alph_sched_at(node, i);
     alph_queue_init(&s->runq);
     s->index = i;
     s->node = (int64)node;
+    if (!alph_sched_init_io(s)) {
+      return false;
+    }
+  }
+  if (node->sigfd >= 0 &&
+      alph_sys_epoll_ctl(alph_sched_at(node, 0)->epfd, ALPH_EPOLL_CTL_ADD, node->sigfd, ALPH_EPOLLIN, -1) != 0) {
+    return false;
   }
   for i: int64 in 0..node->sched_count {
     var s: AlphSched* = alph_sched_at(node, i);
+    s->thread.recover.owner = (int64)s;
     s->handle = alph_thread_start(&s->thread, &alph_sched_main, (int64)s, cfg->stack_size);
     if (s->handle == 0) {
       return false;
@@ -1595,6 +3250,14 @@ export fn alph_node_halt(node: AlphNode*, code: int64) {
   for i: int64 in 0..node->sched_count {
     alph_sched_notify(alph_sched_at(node, i));
   }
+  alph_spin_lock(&node->bound_lock);
+  var bound: int64 = node->bound_list;
+  while (bound != 0) {
+    var s: AlphSched* = (AlphSched*)bound;
+    alph_sched_notify(s);
+    bound = s->next_bound;
+  }
+  alph_spin_unlock(&node->bound_lock);
 }
 
 // Stops the node, as alph_node_halt. The calling handler still returns
@@ -1611,6 +3274,12 @@ export fn alph_node_wait(node: AlphNode*) -> int64 {
   for i: int64 in 0..node->sched_count {
     var s: AlphSched* = alph_sched_at(node, i);
     alph_thread_join(s->handle, &s->thread);
+  }
+  var bound: int64 = node->bound_list;
+  while (bound != 0) {
+    var s: AlphSched* = (AlphSched*)bound;
+    alph_thread_join(s->handle, &s->thread);
+    bound = s->next_bound;
   }
   return node->halt_code;
 }

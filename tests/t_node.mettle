@@ -262,7 +262,7 @@ fn main() -> int32 {
   start_node(4, 8192, 64);
   var b: Boss;
   memset((rawptr)&b, 0, (int64)sizeof(Boss));
-  expect(alph_node_spawn_value<Boss>(&g_node, &b, &boss) != 0, "boss spawned");
+  expect(alph_node_spawn_value<Boss>(&g_node, 0, &b, &boss) != 0, "boss spawned");
   var code: int64 = alph_node_wait(&g_node);
   expect(code == 0, "halted cleanly");
   var stats: AlphStats;

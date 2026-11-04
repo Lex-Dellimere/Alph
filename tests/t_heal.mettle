@@ -206,7 +206,7 @@ fn start_node(schedulers: int64, max_actors: int64, mailbox_size: int64) {
 
 fn main() -> int32 {
   start_node(4, 1024, 64);
-  g_observer = alph_node_spawn(&g_node, &observer);
+  g_observer = alph_node_spawn(&g_node, 0, &observer);
 
   // Passive healing: a supervisor around the account.
   memset((rawptr)&g_account, 0, (int64)sizeof(Account));

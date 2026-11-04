@@ -1,0 +1,142 @@
+// A limiter and child processes: five jobs each run `sh -c "echo job N"`,
+// but a limiter with two permits lets only two run at a time. Each job asks
+// for a permit and starts its process when one is granted. It reads the
+// output from the process's stdout pipe, gives the permit back when the
+// process has ended, and reports to the boss, which prints the results in
+// job order.
+
+import "std/io";
+import "std/mem";
+import "std/conv";
+import "alph/alph";
+
+const TAG_RESULT: int64 = ALPH_TAG_USER;  // job to boss: one JobResult
+const JOBS: int64 = 5;
+const PERMITS: int64 = 2;
+const TEXT: int64 = 32;
+
+struct JobResult {
+  n: int64;
+  code: int64;    // the process's exit code
+  len: int64;     // bytes of text
+  text: uint8[32];
+}
+
+struct Job {
+  limiter: int64;
+  boss: int64;
+  permit: int64;  // ref of the acquire
+  proc: int64;    // the process handle
+  out: int64;     // the stdout handle, 0 once closed
+  ended: bool;    // the process has ended
+  result: JobResult;
+}
+
+fn job(ctx: AlphCtx*, m: AlphMsg*) -> int64 {
+  var j: Job* = (Job*)ctx->state;
+  if (m->tag == ALPH_TAG_INIT) {
+    j->permit = alph_acquire(ctx, j->limiter);
+    return ALPH_CONTINUE;
+  }
+  if (m->tag == ALPH_TAG_GRANTED && m->ref == j->permit) {
+    var cmd: uint8[32];
+    format_i64(&cmd[0], 32, "echo job %d", j->result.n);
+    var argv: cstring[4];
+    argv[0] = "sh";
+    argv[1] = "-c";
+    argv[2] = (cstring)&cmd[0];
+    argv[3] = (cstring)0;
+    var spec: AlphProcSpec;
+    memset((rawptr)&spec, 0, (int64)sizeof(AlphProcSpec));
+    spec.argv = &argv[0];
+    spec.flags = ALPH_PROC_OUT;  // pipe stdout; stderr stays the node's
+    j->proc = alph_proc_spawn(ctx, &spec);
+    if (j->proc < 0) {
+      return alph_stop(ctx, ALPH_REASON_USER);
+    }
+    j->out = spec.stdout_h;
+    alph_io_arm(ctx, j->out, ALPH_IO_IN);
+    return ALPH_CONTINUE;
+  }
+  if (m->tag == ALPH_TAG_IO && m->ref == j->out) {
+    var got: int64 = alph_io_read(ctx, j->out, (rawptr)&j->result.text[j->result.len],
+                                  TEXT - j->result.len);
+    if (got > 0) {
+      j->result.len = j->result.len + got;
+    }
+    if (got == 0 || (got < 0 && got != ALPH_IO_AGAIN)) {
+      alph_io_close(ctx, j->out);  // end of output
+      j->out = 0;
+    } else {
+      alph_io_arm(ctx, j->out, ALPH_IO_IN);
+    }
+  } else if (m->tag == ALPH_TAG_PROC_EXIT && m->ref == j->proc) {
+    j->result.code = m->arg;
+    j->ended = true;
+  }
+  if (j->ended && j->out == 0) {
+    alph_release(ctx, j->limiter, j->permit);
+    alph_send_value<JobResult>(ctx, j->boss, TAG_RESULT, &j->result);
+    return alph_stop(ctx, ALPH_NORMAL);
+  }
+  return ALPH_CONTINUE;
+}
+
+struct Boss {
+  limiter: int64;
+  done: int64;
+  results: JobResult[5];
+}
+
+fn boss(ctx: AlphCtx*, m: AlphMsg*) -> int64 {
+  var b: Boss* = (Boss*)ctx->state;
+  if (m->tag == ALPH_TAG_INIT) {
+    alph_trap_exits(ctx, true);  // the limiter is linked: its exit must not end the boss
+    b->limiter = alph_spawn_limiter(ctx, PERMITS);
+    for n: int64 in 0..JOBS {
+      var j: Job;
+      memset((rawptr)&j, 0, (int64)sizeof(Job));
+      j.limiter = b->limiter;
+      j.boss = ctx->self;
+      j.result.n = n + 1;
+      alph_spawn_value<Job>(ctx, 0, &j, &job);
+    }
+    return ALPH_CONTINUE;
+  }
+  if (m->tag == ALPH_TAG_EXIT && m->arg != ALPH_NORMAL) {
+    println("jobs failed: actor {m->from} exited with reason {m->arg}");
+    alph_halt(ctx, 1);
+    return ALPH_CONTINUE;
+  }
+  if (m->tag == TAG_RESULT) {
+    var r: JobResult;
+    if (!alph_msg_value<JobResult>(m, &r) || r.n < 1 || r.n > JOBS) {
+      alph_halt(ctx, 1);
+      return ALPH_CONTINUE;
+    }
+    b->results[r.n - 1] = r;
+    b->done = b->done + 1;
+    if (b->done == JOBS) {
+      for i: int64 in 0..JOBS {
+        var text: string = str_from_bytes((cstring)&b->results[i].text[0], b->results[i].len);
+        println("job {b->results[i].n}: exit {b->results[i].code}, output {str_trim(text)}");
+      }
+      alph_halt(ctx, 0);
+    }
+  }
+  return ALPH_CONTINUE;
+}
+
+var g_node: AlphNode;
+
+fn main() -> int32 {
+  var cfg: AlphConfig;
+  alph_config(&cfg);
+  if (!alph_node_start(&g_node, &cfg)) {
+    return 1;
+  }
+  var b: Boss;
+  memset((rawptr)&b, 0, (int64)sizeof(Boss));
+  alph_node_spawn_value<Boss>(&g_node, 0, &b, &boss);
+  return (int32)alph_node_wait(&g_node);
+}

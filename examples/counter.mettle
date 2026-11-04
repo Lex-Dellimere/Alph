@@ -31,7 +31,7 @@ fn main() -> int32 {
   }
   var c: Counter;
   c.total = 0;
-  var pid: int64 = alph_node_spawn_value<Counter>(&g_node, &c, &counter);
+  var pid: int64 = alph_node_spawn_value<Counter>(&g_node, 0, &c, &counter);
   for i: int64 in 1..4 {
     alph_node_send(&g_node, pid, TAG_ADD, i);
   }

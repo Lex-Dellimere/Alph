@@ -1,0 +1,202 @@
+// Node shutdown and OS signals: an orderly shutdown stops top-level actors
+// newest first and a supervisor's children before the supervisor; an actor
+// that ignores ALPH_SHUTDOWN is killed at the deadline; OS signals reach a
+// registered actor as messages, and with nobody registered the node shuts
+// itself down with 128 + signal.
+
+import "std/io";
+import "alph/sys/atomic";
+import "alph/sys/clock";
+import "alph/alph";
+
+const TAG_GO: int64 = ALPH_TAG_USER;
+const TAG_OS: int64 = ALPH_TAG_USER + 1;
+const ID_A: int64 = 1;
+const ID_K1: int64 = 2;
+const ID_K2: int64 = 3;
+const ID_C: int64 = 4;
+
+var g_node1: AlphNode;
+var g_node2: AlphNode;
+var g_node3: AlphNode;
+var g_failures: int64 = 0;
+
+var g_order: int64[16];
+var g_order_n: int64 = 0;
+var g_started: int64 = 0;     // actors of node 1 that have run INIT
+var g_stubborn_up: int64 = 0;
+var g_stubborn_saw: int64 = 0;
+var g_sig_hup: int64 = 0;
+var g_sleep_word: int64 = 0;  // never changes; a futex wait on it is a sleep
+
+fn expect(ok: bool, what: string) {
+  if (!ok) {
+    println("FAIL {what}");
+    alph_atomic_add(&g_failures, 1);
+  }
+}
+
+fn log_exit(id: int64) {
+  var at: int64 = alph_atomic_add(&g_order_n, 1);
+  if (at < 16) {
+    alph_atomic_store(&g_order[at], id);
+  }
+}
+
+struct Who {
+  id: int64;
+}
+
+// A top-level actor (A) or a supervisor child (K1, K2): logs its id when it
+// is told to stop. A top-level actor gets the exit signal from 0, a
+// supervisor's child gets ALPH_SHUTDOWN from the supervisor.
+fn member(ctx: AlphCtx*, m: AlphMsg*) -> int64 {
+  var w: Who* = (Who*)ctx->state;
+  if (m->tag == ALPH_TAG_INIT) {
+    alph_trap_exits(ctx, true);
+    alph_atomic_add(&g_started, 1);
+  } else if (m->tag == ALPH_TAG_EXIT) {
+    if (m->from == 0 || m->arg == ALPH_SHUTDOWN) {
+      log_exit(w->id);
+      return alph_stop(ctx, m->arg);
+    }
+  }
+  return ALPH_CONTINUE;
+}
+
+// C starts the shutdown once the others are up, and is the first to go.
+fn last(ctx: AlphCtx*, m: AlphMsg*) -> int64 {
+  if (m->tag == ALPH_TAG_INIT) {
+    alph_trap_exits(ctx, true);
+    alph_atomic_add(&g_started, 1);
+    alph_send_after(ctx, 20, ctx->self, TAG_GO, 0);
+  } else if (m->tag == TAG_GO) {
+    if (alph_atomic_load(&g_started) < 4) {
+      alph_send_after(ctx, 5, ctx->self, TAG_GO, 0);  // the others are not up yet
+    } else {
+      expect(alph_shutdown(ctx, 2000, 7), "the first shutdown begins");
+    }
+  } else if (m->tag == ALPH_TAG_EXIT) {
+    if (m->from == 0) {
+      log_exit(ID_C);
+      return alph_stop(ctx, m->arg);
+    }
+  }
+  return ALPH_CONTINUE;
+}
+
+fn node_orderly() {
+  var cfg: AlphConfig;
+  alph_config(&cfg);
+  cfg.schedulers = 2;
+  cfg.signals = 0;
+  expect(alph_node_start(&g_node1, &cfg), "node 1 started");
+  var a: Who;
+  a.id = ID_A;
+  alph_node_spawn_value<Who>(&g_node1, 0, &a, &member);
+  var spec: AlphSupSpec;
+  alph_sup_init(&spec, ALPH_ONE_FOR_ONE);
+  var k1: Who;
+  k1.id = ID_K1;
+  alph_sup_add_value<Who>(&spec, &k1, &member);
+  var k2: Who;
+  k2.id = ID_K2;
+  alph_sup_add_value<Who>(&spec, &k2, &member);
+  expect(alph_node_spawn_sup(&g_node1, &spec) != 0, "the supervisor started");
+  var c: Who;
+  c.id = ID_C;
+  alph_node_spawn_value<Who>(&g_node1, 0, &c, &last);
+
+  var code: int64 = alph_node_wait(&g_node1);
+  expect(code == 7, "alph_node_wait returns the shutdown code");
+  expect(alph_atomic_load(&g_order_n) == 4, "every actor logged its exit once");
+  expect(alph_atomic_load(&g_order[0]) == ID_C, "the newest top-level actor stops first");
+  expect(alph_atomic_load(&g_order[1]) == ID_K2, "the supervisor's last child stops next");
+  expect(alph_atomic_load(&g_order[2]) == ID_K1, "then its first child");
+  expect(alph_atomic_load(&g_order[3]) == ID_A, "the oldest top-level actor stops last");
+  var stats: AlphStats;
+  alph_node_stats(&g_node1, &stats);
+  // The actor that ran the shutdown may still be counted when it halts.
+  expect(stats.live <= 1, "no actor is left alive after the shutdown");
+}
+
+// Traps exits and ignores ALPH_SHUTDOWN, so only the deadline stops it.
+fn stubborn(ctx: AlphCtx*, m: AlphMsg*) -> int64 {
+  if (m->tag == ALPH_TAG_INIT) {
+    alph_trap_exits(ctx, true);
+    alph_atomic_store(&g_stubborn_up, 1);
+  } else if (m->tag == ALPH_TAG_EXIT) {
+    if (m->arg == ALPH_SHUTDOWN) {
+      alph_atomic_store(&g_stubborn_saw, 1);
+    }
+  }
+  return ALPH_CONTINUE;
+}
+
+fn node_deadline() {
+  var cfg: AlphConfig;
+  alph_config(&cfg);
+  cfg.schedulers = 2;
+  cfg.signals = 0;
+  expect(alph_node_start(&g_node2, &cfg), "node 2 started");
+  var w: Who;
+  w.id = 0;
+  alph_node_spawn_value<Who>(&g_node2, 0, &w, &stubborn);
+  var waited: int64 = 0;
+  while (alph_atomic_load(&g_stubborn_up) == 0 && waited < 5000) {
+    alph_futex_wait(&g_sleep_word, 0, 1000000);  // 1 ms
+    waited = waited + 1;
+  }
+  expect(alph_atomic_load(&g_stubborn_up) == 1, "the stubborn actor started");
+
+  var t0: int64 = alph_now_ms();
+  expect(alph_node_shutdown(&g_node2, 100, 9), "the shutdown begins");
+  expect(!alph_node_shutdown(&g_node2, 100, 10), "a second shutdown is refused");
+  var code: int64 = alph_node_wait(&g_node2);
+  var took: int64 = alph_now_ms() - t0;
+  expect(code == 9, "alph_node_wait returns the first shutdown's code");
+  expect(alph_atomic_load(&g_stubborn_saw) == 1, "the actor was told ALPH_SHUTDOWN first");
+  expect(took >= 100, "the node waited for the deadline");
+  expect(took < 1500, "the node stopped soon after the deadline");
+}
+
+// Takes SIGHUP as a message, then gives signals back to the node.
+fn catcher(ctx: AlphCtx*, m: AlphMsg*) -> int64 {
+  if (m->tag == ALPH_TAG_INIT) {
+    alph_node_signals(ctx->node, ctx->self, TAG_OS);
+    syscall(ALPH_SYS_KILL, syscall(ALPH_SYS_GETPID), ALPH_SIGHUP);
+  } else if (m->tag == TAG_OS) {
+    if (m->arg == ALPH_SIGHUP) {
+      alph_atomic_store(&g_sig_hup, 1);
+      alph_node_signals(ctx->node, 0, 0);
+      syscall(ALPH_SYS_KILL, syscall(ALPH_SYS_GETPID), ALPH_SIGTERM);
+    }
+  }
+  return ALPH_CONTINUE;
+}
+
+fn node_signals() {
+  var cfg: AlphConfig;
+  alph_config(&cfg);
+  cfg.schedulers = 2;
+  cfg.signals = ((int64)1 << ALPH_SIGTERM) | ((int64)1 << ALPH_SIGHUP);
+  expect(alph_node_start(&g_node3, &cfg), "node 3 started");
+  var w: Who;
+  w.id = 0;
+  alph_node_spawn_value<Who>(&g_node3, 0, &w, &catcher);
+  var code: int64 = alph_node_wait(&g_node3);
+  // Reaching this line at all shows the signals did not kill the process.
+  expect(alph_atomic_load(&g_sig_hup) == 1, "SIGHUP arrived as a message");
+  expect(code == 128 + ALPH_SIGTERM, "an unclaimed SIGTERM shuts the node down with 143");
+}
+
+fn main() -> int32 {
+  node_orderly();
+  node_deadline();
+  node_signals();
+  if (g_failures != 0) {
+    return 1;
+  }
+  println("shutdown ok");
+  return 0;
+}

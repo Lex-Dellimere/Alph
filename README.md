@@ -8,6 +8,8 @@ Healing comes in two kinds:
 - **Passive:** supervisors restart failed actors the OTP way.
 - **Proactive:** a medic repairs a crashed actor in place, on the same pid, without anyone else seeing the crash.
 
+Around that: a heap per actor, bound actors that may block, non-blocking IO and TCP, names and groups, child processes, dynamic supervisors, a worker pool and a limiter, and an ordered shutdown that handles OS signals.
+
 It runs on one node, on x86-64 Linux. Distribution is next.
 
 ## Example
@@ -44,7 +46,7 @@ fn main() -> int32 {
   }
   var c: Counter;
   c.total = 0;
-  var pid: int64 = alph_node_spawn_value<Counter>(&g_node, &c, &counter);
+  var pid: int64 = alph_node_spawn_value<Counter>(&g_node, 0, &c, &counter);
   for i: int64 in 1..4 {
     alph_node_send(&g_node, pid, TAG_ADD, i);
   }
@@ -52,7 +54,7 @@ fn main() -> int32 {
 }
 ```
 
-This is [examples/counter.mettle](examples/counter.mettle). The other examples show [requests](examples/request.mettle), [a supervisor](examples/supervised.mettle) and [a medic](examples/medic.mettle).
+This is [examples/counter.mettle](examples/counter.mettle). The other examples show [requests](examples/request.mettle), [a supervisor](examples/supervised.mettle), [a medic](examples/medic.mettle), [a TCP echo server](examples/echo.mettle) and [a limiter with child processes](examples/jobs.mettle).
 
 ## Use
 
@@ -70,7 +72,7 @@ Build with the dev compiler from the Mettle repo, always with `-s`:
 
 Without `-s`, the compiler turns failed checks (bounds, divide) into an inline exit that alph cannot catch.
 
-- [Guide](docs/guide.md): how to use the runtime, from starting a node to both kinds of healing.
+- [Guide](docs/guide.md): how to use the runtime, from starting a node to healing, IO, child processes, pools and shutdown.
 - [API reference](docs/api.md): every function, type and constant, with its inputs, outputs and which thread may call it.
 - [Design](DESIGN.md): how it works, what was taken from BEAM and OTP, and what comes next.
 
@@ -85,12 +87,25 @@ It checks that `docs/api.md` matches the source, then builds every test and exam
 ## Layout
 
 ```text
-src/alph.mettle  the runtime in one import
-src/core/        the node, actors and messages
-src/heal/        supervisors and medics
-src/sys/         the x86-64 Linux layer: atomics, threads, crash recovery, clock
-docs/            guide and API reference
-examples/        small programs, run by check.sh
-tests/           self-checking test programs
-tools/           apidoc.sh, which builds docs/api.md
+src/alph.mettle             the runtime in one import
+src/core/node.mettle        the node: actors, schedulers, messages, links, monitors, requests, timers,
+                            names and groups, IO and TCP, child processes, shutdown and signals
+src/core/mailbox.mettle     messages and the bounded mailbox
+src/core/queue.mettle       intrusive multi-producer queue
+src/core/heap.mettle        per-actor heaps and scratch memory
+src/heal/supervisor.mettle  supervisors: passive healing
+src/heal/medic.mettle       medics: proactive healing
+src/heal/dynamic.mettle     dynamic supervisors: children started at run time
+src/work/pool.mettle        worker pool: blocking jobs on bound threads
+src/work/limiter.mettle     limiter: a counting semaphore as an actor
+src/sys/linux.mettle        syscall numbers and flags
+src/sys/atomic.mettle       64-bit atomics
+src/sys/clock.mettle        monotonic time and futex
+src/sys/thread.mettle       threads with a guard page and their own signal stack; CPU count
+src/sys/recover.mettle      recovery points over the runtime's crash hook
+src/sys/fd.mettle           read, write, close, epoll, eventfd and socket wrappers
+docs/                       guide and API reference
+examples/                   small programs, run by check.sh
+tests/                      self-checking test programs
+tools/                      apidoc.sh, which builds docs/api.md
 ```

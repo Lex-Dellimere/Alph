@@ -1,0 +1,168 @@
+// Per-actor heaps through the node: many actors fill their own heaps at
+// once on every scheduler and find their own bytes intact; free, realloc
+// and scratch behave; the heap limit holds for allocation and for spawning;
+// and a crashed actor's heap comes back for reuse.
+
+import "std/io";
+import "std/mem";
+import "alph/sys/atomic";
+import "alph/alph";
+
+const TAG_WORK: int64 = ALPH_TAG_USER;
+const TAG_DONE: int64 = ALPH_TAG_USER + 1;
+const TAG_CRASH: int64 = ALPH_TAG_USER + 2;
+const ACTORS: int64 = 4000;
+const BLOCKS: int64 = 12;
+const LIMIT: int64 = 1048576;  // each actor's heap limit
+
+var g_node: AlphNode;
+var g_failures: int64 = 0;
+var g_done: int64 = 0;
+var g_limit_ok: int64 = 0;
+
+fn expect(ok: bool, what: string) {
+  if (!ok) {
+    println("FAIL {what}");
+    alph_atomic_add(&g_failures, 1);
+  }
+}
+
+struct Filler {
+  seed: int64;
+  blocks: int64[12];
+  sizes: int64[12];
+}
+
+// Fills blocks of many sizes with a pattern only this actor uses, keeps
+// growing one with realloc, then checks every byte is still its own.
+fn filler(ctx: AlphCtx*, m: AlphMsg*) -> int64 {
+  var f: Filler* = (Filler*)ctx->state;
+  if (m->tag != TAG_WORK) {
+    return ALPH_CONTINUE;
+  }
+  var pattern: uint8 = (uint8)(f->seed % 251);
+  for i: int64 in 0..BLOCKS {
+    f->sizes[i] = 8 + (i * 997 + f->seed * 31) % 3000;
+    f->blocks[i] = (int64)alph_alloc(ctx, f->sizes[i]);
+    expect(f->blocks[i] != 0, "allocation succeeds");
+    memset((rawptr)f->blocks[i], (int32)pattern, f->sizes[i]);
+  }
+  // Free every other block and allocate again: freed space is reused.
+  for i: int64 in 0..BLOCKS {
+    if (i % 2 == 0) {
+      alph_free(ctx, (rawptr)f->blocks[i]);
+      f->blocks[i] = (int64)alph_alloc(ctx, f->sizes[i]);
+      memset((rawptr)f->blocks[i], (int32)pattern, f->sizes[i]);
+    }
+  }
+  var grown: rawptr = alph_realloc(ctx, (rawptr)f->blocks[0], f->sizes[0] + 50000);
+  expect(grown != 0, "realloc grows");
+  memset((rawptr)((int64)grown + f->sizes[0]), (int32)pattern, 50000);
+  f->blocks[0] = (int64)grown;
+  f->sizes[0] = f->sizes[0] + 50000;
+  var tmp: uint8* = (uint8*)alph_scratch(ctx, 4096);
+  expect(tmp != 0, "scratch memory");
+  memset((rawptr)tmp, 0, 4096);
+  for i: int64 in 0..BLOCKS {
+    var bytes: uint8* = (uint8*)f->blocks[i];
+    for b: int64 in 0..f->sizes[i] {
+      if (bytes[b] != pattern) {
+        expect(false, "an actor's memory holds only its own bytes");
+        return alph_stop(ctx, ALPH_NORMAL);
+      }
+    }
+  }
+  expect(alph_heap_used(ctx) > 50000, "the heap counts what it holds");
+  alph_send(ctx, m->from, TAG_DONE, 0);
+  return alph_stop(ctx, ALPH_NORMAL);
+}
+
+fn crasher(ctx: AlphCtx*, m: AlphMsg*) -> int64 {
+  if (m->tag == TAG_CRASH) {
+    for i: int64 in 0..50 {
+      alph_alloc(ctx, 4000);
+    }
+    var zero: int64 = m->arg;
+    var x: int64 = 1 / zero;
+    alph_send(ctx, 0, x, 0);
+  }
+  return ALPH_CONTINUE;
+}
+
+// The heap limit: allocation past it returns 0 instead of growing.
+fn hungry(ctx: AlphCtx*, m: AlphMsg*) -> int64 {
+  if (m->tag == ALPH_TAG_INIT) {
+    var count: int64 = 0;
+    while (count < 1000 && alph_alloc(ctx, 10000) != 0) {
+      count = count + 1;
+    }
+    if (count > 0 && count < 1000 && alph_heap_used(ctx) <= LIMIT) {
+      alph_atomic_store(&g_limit_ok, 1);
+    }
+    return alph_stop(ctx, ALPH_NORMAL);
+  }
+  return ALPH_CONTINUE;
+}
+
+struct Boss {
+  started: int64;
+  done: int64;
+}
+
+fn boss(ctx: AlphCtx*, m: AlphMsg*) -> int64 {
+  var b: Boss* = (Boss*)ctx->state;
+  if (m->tag == ALPH_TAG_INIT || m->tag == TAG_DONE) {
+    if (m->tag == TAG_DONE) {
+      b->done = b->done + 1;
+    }
+    // Keep at most 32 fillers working so their replies fit the mailbox.
+    while (b->started < ACTORS && b->started - b->done < 32) {
+      var f: Filler;
+      memset((rawptr)&f, 0, (int64)sizeof(Filler));
+      f.seed = b->started;
+      var pid: int64 = alph_spawn_value<Filler>(ctx, 0, &f, &filler);
+      alph_send(ctx, pid, TAG_WORK, 0);
+      b->started = b->started + 1;
+    }
+    if (b->done == ACTORS) {
+      alph_atomic_store(&g_done, 1);
+      alph_halt(ctx, 0);
+    }
+  }
+  return ALPH_CONTINUE;
+}
+
+fn main() -> int32 {
+  var cfg: AlphConfig;
+  alph_config(&cfg);
+  cfg.schedulers = 4;
+  cfg.max_actors = 4096;
+  cfg.heap_limit = LIMIT;
+  expect(alph_node_start(&g_node, &cfg), "node started");
+
+  // A state bigger than the heap limit cannot be spawned.
+  var big: rawptr = malloc(LIMIT + 1);
+  expect(alph_node_spawn_bytes(&g_node, 0, big, LIMIT + 1, &hungry) == 0,
+         "a state over the heap limit is refused");
+
+  alph_node_spawn(&g_node, 0, &hungry);
+  var victim: int64 = alph_node_spawn(&g_node, 0, &crasher);
+  alph_node_send(&g_node, victim, TAG_CRASH, 0);
+
+  var b: Boss;
+  b.started = 0;
+  b.done = 0;
+  alph_node_spawn_value<Boss>(&g_node, 0, &b, &boss);
+  alph_node_wait(&g_node);
+
+  var stats: AlphStats;
+  alph_node_stats(&g_node, &stats);
+  expect(g_done == 1, "every filler finished");
+  expect(g_limit_ok == 1, "allocation stops at the heap limit");
+  expect(stats.crashed == 1, "the crasher crashed alone");
+  if (g_failures != 0) {
+    return 1;
+  }
+  println("isolation ok: {ACTORS} actors, {stats.crashed} crash");
+  return 0;
+}

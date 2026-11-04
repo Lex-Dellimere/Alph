@@ -19,11 +19,16 @@ MODULES=(
   src/core/mailbox.mettle
   src/heal/supervisor.mettle
   src/heal/medic.mettle
+  src/heal/dynamic.mettle
+  src/work/pool.mettle
+  src/work/limiter.mettle
   src/sys/atomic.mettle
   src/sys/clock.mettle
   src/sys/thread.mettle
   src/sys/recover.mettle
+  src/sys/fd.mettle
   src/sys/linux.mettle
+  src/core/heap.mettle
   src/core/queue.mettle
 )
 

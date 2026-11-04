@@ -1,0 +1,156 @@
+// ALPH_BOUND and alph_exit_now: a bound actor blocks while the only shared
+// scheduler keeps running other actors; bound actors start and stop their
+// own threads; alph_exit_now ends an actor from deep in its call stack with
+// a chosen reason; a crash in a bound actor is contained.
+
+import "std/io";
+import "std/thread";
+import "alph/sys/atomic";
+import "alph/alph";
+
+const TAG_BLOCK: int64 = ALPH_TAG_USER;
+const TAG_TICK: int64 = ALPH_TAG_USER + 1;
+const TAG_DEEP: int64 = ALPH_TAG_USER + 2;
+const TAG_CRASH: int64 = ALPH_TAG_USER + 3;
+const TAG_DONE: int64 = ALPH_TAG_USER + 4;
+const REASON_DEEP: int64 = ALPH_REASON_USER + 5;
+const BOUND_ACTORS: int64 = 50;
+
+var g_node: AlphNode;
+var g_failures: int64 = 0;
+var g_ticks: int64 = 0;
+var g_ticks_while_blocked: int64 = -1;
+
+fn expect(ok: bool, what: string) {
+  if (!ok) {
+    println("FAIL {what}");
+    alph_atomic_add(&g_failures, 1);
+  }
+}
+
+// Runs on the shared scheduler and counts while the bound actor sleeps.
+fn ticker(ctx: AlphCtx*, m: AlphMsg*) -> int64 {
+  if (m->tag == ALPH_TAG_INIT || m->tag == TAG_TICK) {
+    alph_atomic_add(&g_ticks, 1);
+    alph_send_after(ctx, 1, ctx->self, TAG_TICK, 0);
+  }
+  return ALPH_CONTINUE;
+}
+
+// Blocks its own thread, as a storage engine's fsync would.
+fn sleeper(ctx: AlphCtx*, m: AlphMsg*) -> int64 {
+  if (m->tag == TAG_BLOCK) {
+    var before: int64 = alph_atomic_load(&g_ticks);
+    thread_sleep_ms(200);
+    alph_atomic_store(&g_ticks_while_blocked, alph_atomic_load(&g_ticks) - before);
+    alph_send(ctx, m->from, TAG_DONE, 0);
+  } else if (m->tag == TAG_CRASH) {
+    var zero: int64 = m->arg;
+    alph_send(ctx, m->from, 100 / zero, 0);
+  }
+  return ALPH_CONTINUE;
+}
+
+fn level3(reason: int64) -> int64 {
+  alph_exit_now(reason);
+  return 99;  // never reached
+}
+
+fn level2(reason: int64) -> int64 {
+  return level3(reason) + 1;
+}
+
+fn level1(reason: int64) -> int64 {
+  return level2(reason) + 1;
+}
+
+fn deep(ctx: AlphCtx*, m: AlphMsg*) -> int64 {
+  if (m->tag == TAG_DEEP) {
+    var x: int64 = level1(REASON_DEEP);
+    alph_send(ctx, m->from, x, 0);  // never reached
+  }
+  return ALPH_CONTINUE;
+}
+
+fn quick(ctx: AlphCtx*, m: AlphMsg*) -> int64 {
+  if (m->tag == ALPH_TAG_INIT) {
+    alph_send(ctx, m->from, TAG_DONE, 0);
+    return alph_stop(ctx, ALPH_NORMAL);
+  }
+  return ALPH_CONTINUE;
+}
+
+struct Boss {
+  step: int64;
+  target: int64;
+  count: int64;
+}
+
+fn boss(ctx: AlphCtx*, m: AlphMsg*) -> int64 {
+  var b: Boss* = (Boss*)ctx->state;
+  if (m->tag == ALPH_TAG_INIT) {
+    alph_trap_exits(ctx, true);
+    alph_spawn(ctx, 0, &ticker);
+    b->target = alph_spawn(ctx, ALPH_LINK | ALPH_BOUND, &sleeper);
+    alph_send(ctx, b->target, TAG_BLOCK, 0);
+    return ALPH_CONTINUE;
+  }
+  if (b->step == 0 && m->tag == TAG_DONE) {
+    expect(alph_atomic_load(&g_ticks_while_blocked) > 20,
+           "the shared scheduler ran while the bound actor blocked");
+    alph_send(ctx, b->target, TAG_CRASH, 0);
+    b->step = 1;
+    return ALPH_CONTINUE;
+  }
+  if (b->step == 1 && m->tag == ALPH_TAG_EXIT) {
+    expect(m->from == b->target && m->arg == ALPH_CRASHED, "a bound actor's crash is contained");
+    b->target = alph_spawn(ctx, ALPH_LINK, &deep);
+    alph_send(ctx, b->target, TAG_DEEP, 0);
+    b->step = 2;
+    return ALPH_CONTINUE;
+  }
+  if (b->step == 2 && m->tag == ALPH_TAG_EXIT) {
+    expect(m->from == b->target && m->arg == REASON_DEEP, "alph_exit_now ends the actor with its reason");
+    b->target = alph_spawn(ctx, ALPH_LINK | ALPH_BOUND, &deep);
+    alph_send(ctx, b->target, TAG_DEEP, 0);
+    b->step = 3;
+    return ALPH_CONTINUE;
+  }
+  if (b->step == 3 && m->tag == ALPH_TAG_EXIT) {
+    expect(m->from == b->target && m->arg == REASON_DEEP, "alph_exit_now works in a bound actor");
+    for i: int64 in 0..BOUND_ACTORS {
+      expect(alph_spawn(ctx, ALPH_BOUND, &quick) != 0, "bound actor spawned");
+    }
+    b->step = 4;
+    return ALPH_CONTINUE;
+  }
+  if (b->step == 4 && m->tag == TAG_DONE) {
+    b->count = b->count + 1;
+    if (b->count == BOUND_ACTORS) {
+      alph_halt(ctx, 0);
+    }
+  }
+  return ALPH_CONTINUE;
+}
+
+fn main() -> int32 {
+  var cfg: AlphConfig;
+  alph_config(&cfg);
+  cfg.schedulers = 1;
+  cfg.max_actors = 1024;
+  expect(alph_node_start(&g_node, &cfg), "node started");
+  var b: Boss;
+  b.step = 0;
+  b.target = 0;
+  b.count = 0;
+  alph_node_spawn_value<Boss>(&g_node, 0, &b, &boss);
+  alph_node_wait(&g_node);
+  var stats: AlphStats;
+  alph_node_stats(&g_node, &stats);
+  expect(stats.crashed == 1, "exit_now is not counted as a crash");
+  if (g_failures != 0) {
+    return 1;
+  }
+  println("bound ok: {g_ticks_while_blocked} ticks while blocked, crashes {stats.crashed}");
+  return 0;
+}

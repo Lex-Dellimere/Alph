@@ -1,0 +1,241 @@
+// A TCP echo server on 127.0.0.1 with a client that checks it. An acceptor
+// owns the listening socket. For each connection it asks a dynamic supervisor
+// to start a connection actor, then gives the accepted handle to that actor,
+// which echoes through an output queue. The client sends three lines, checks
+// the echoes, and shuts the node down.
+
+import "std/io";
+import "std/mem";
+import "alph/alph";
+
+const TAG_PORT: int64 = ALPH_TAG_USER;  // acceptor to boss: arg = the port it listens on
+const REASON_LISTEN: int64 = ALPH_REASON_USER;
+const LINES: int64 = 3;
+
+// The line the client sends as number i.
+fn line_at(i: int64) -> string {
+  if (i == 0) {
+    return "alpha\n";
+  }
+  if (i == 1) {
+    return "beta\n";
+  }
+  return "gamma\n";
+}
+
+// ---- server ----
+
+struct Conn {
+  h: int64;
+  out: AlphOutq;
+}
+
+// Echoes what it reads. The handle arrives by ALPH_TAG_IO_GIVEN. Bytes go
+// through the output queue, which keeps what the socket did not take yet.
+fn conn(ctx: AlphCtx*, m: AlphMsg*) -> int64 {
+  var c: Conn* = (Conn*)ctx->state;
+  if (m->tag == ALPH_TAG_IO_GIVEN) {
+    c->h = m->ref;
+    alph_outq_init(&c->out, 65536);
+    alph_io_arm(ctx, c->h, ALPH_IO_IN);
+    return ALPH_CONTINUE;
+  }
+  if (m->tag != ALPH_TAG_IO) {
+    return ALPH_CONTINUE;
+  }
+  var buf: rawptr = alph_scratch(ctx, 4096);
+  var n: int64 = alph_io_read(ctx, c->h, buf, 4096);
+  if (n == 0 || (n < 0 && n != ALPH_IO_AGAIN)) {
+    return alph_stop(ctx, ALPH_NORMAL);  // closed or broken; the runtime closes the handle
+  }
+  if (n > 0 && alph_outq_push(ctx, &c->out, buf, n) != ALPH_SENT) {
+    return alph_stop(ctx, ALPH_NORMAL);  // the peer reads too slowly
+  }
+  if (alph_outq_flush(ctx, &c->out, c->h) < 0) {
+    return alph_stop(ctx, ALPH_NORMAL);
+  }
+  var events: int64 = ALPH_IO_IN;
+  if (alph_outq_pending(&c->out) > 0) {
+    events = events | ALPH_IO_OUT;
+  }
+  alph_io_arm(ctx, c->h, events);
+  return ALPH_CONTINUE;
+}
+
+struct Acceptor {
+  boss: int64;
+  listener: int64;
+  sup: int64;
+  asking: int64;   // ref of the start request in flight, or 0
+  waiting: int64;  // the accepted connection that request is for
+}
+
+// Takes one waiting connection, if there is one, and asks for a child to
+// serve it. With none waiting, arms the listener for the next.
+fn accept_next(ctx: AlphCtx*, a: Acceptor*) {
+  var h: int64 = alph_tcp_accept(ctx, a->listener);
+  if (h > 0) {
+    var c: Conn;
+    memset((rawptr)&c, 0, (int64)sizeof(Conn));
+    a->asking = alph_dyn_start_value<Conn>(ctx, a->sup, &c, 1000);
+    if (a->asking > 0) {
+      a->waiting = h;
+      return;
+    }
+    alph_io_close(ctx, h);  // the request was not sent
+  }
+  alph_io_arm(ctx, a->listener, ALPH_IO_IN);
+}
+
+fn acceptor(ctx: AlphCtx*, m: AlphMsg*) -> int64 {
+  var a: Acceptor* = (Acceptor*)ctx->state;
+  if (m->tag == ALPH_TAG_INIT) {
+    a->boss = m->from;
+    a->listener = alph_tcp_listen(ctx, alph_ip4(127, 0, 0, 1), 0, 16, 0);
+    if (a->listener < 0) {
+      return alph_stop(ctx, REASON_LISTEN);
+    }
+    var spec: AlphDynSpec;
+    alph_dyn_init(&spec, &conn);
+    spec.restart = ALPH_TEMPORARY;  // a finished connection is not restarted
+    a->sup = alph_spawn_dyn(ctx, &spec);
+    alph_send(ctx, a->boss, TAG_PORT, alph_tcp_port(ctx, a->listener));
+    alph_io_arm(ctx, a->listener, ALPH_IO_IN);
+    return ALPH_CONTINUE;
+  }
+  if (m->tag == ALPH_TAG_IO && m->ref == a->listener) {
+    accept_next(ctx, a);
+    return ALPH_CONTINUE;
+  }
+  if (a->asking != 0 && m->ref == a->asking) {
+    // The start request is answered: STARTED with the new pid, or DOWN or
+    // TIMEOUT. Hand the connection over, or close it if no actor took it.
+    var given: int64 = ALPH_GONE;
+    if (m->tag == ALPH_TAG_STARTED && m->arg != 0) {
+      given = alph_io_give(ctx, a->waiting, m->arg);
+    }
+    if (given != ALPH_SENT) {
+      alph_io_close(ctx, a->waiting);
+    }
+    a->asking = 0;
+    a->waiting = 0;
+    accept_next(ctx, a);
+  }
+  return ALPH_CONTINUE;
+}
+
+// ---- client ----
+
+struct Client {
+  port: int64;
+  h: int64;
+  connected: bool;
+  line: int64;  // the line in flight
+  got: int64;   // bytes of its echo received so far
+  buf: uint8[16];
+  out: AlphOutq;
+}
+
+fn send_line(ctx: AlphCtx*, c: Client*) {
+  var line: string = line_at(c->line);
+  alph_outq_push(ctx, &c->out, (rawptr)line.chars, (int64)line.length);
+  alph_outq_flush(ctx, &c->out, c->h);
+}
+
+fn fail(ctx: AlphCtx*, what: string) -> int64 {
+  println("echo failed: {what}");
+  alph_shutdown(ctx, 1000, 1);
+  return alph_stop(ctx, ALPH_NORMAL);
+}
+
+fn client(ctx: AlphCtx*, m: AlphMsg*) -> int64 {
+  var c: Client* = (Client*)ctx->state;
+  if (m->tag == ALPH_TAG_INIT) {
+    alph_outq_init(&c->out, 4096);
+    c->h = alph_tcp_connect(ctx, alph_ip4(127, 0, 0, 1), c->port);
+    if (c->h < 0) {
+      return fail(ctx, "connect");
+    }
+    alph_io_arm(ctx, c->h, ALPH_IO_OUT);
+    return ALPH_CONTINUE;
+  }
+  if (m->tag != ALPH_TAG_IO) {
+    return ALPH_CONTINUE;
+  }
+  if (!c->connected) {
+    if (alph_io_error(ctx, c->h) != 0) {
+      return fail(ctx, "connect");
+    }
+    c->connected = true;
+    send_line(ctx, c);
+  } else if (alph_outq_pending(&c->out) > 0) {
+    alph_outq_flush(ctx, &c->out, c->h);
+  }
+  var line: string = line_at(c->line);
+  var want: int64 = (int64)line.length;
+  var n: int64 = alph_io_read(ctx, c->h, (rawptr)&c->buf[c->got], want - c->got);
+  if (n == 0 || (n < 0 && n != ALPH_IO_AGAIN)) {
+    return fail(ctx, "the connection closed early");
+  }
+  if (n > 0) {
+    c->got = c->got + n;
+    if (c->got == want) {
+      if (memcmp((rawptr)&c->buf[0], (rawptr)line.chars, want) != 0) {
+        return fail(ctx, "an echo differs from its line");
+      }
+      c->line = c->line + 1;
+      c->got = 0;
+      if (c->line == LINES) {
+        println("echo ok: {LINES} lines came back unchanged");
+        alph_shutdown(ctx, 1000, 0);
+        return alph_stop(ctx, ALPH_NORMAL);
+      }
+      send_line(ctx, c);
+    }
+  }
+  var events: int64 = ALPH_IO_IN;
+  if (alph_outq_pending(&c->out) > 0) {
+    events = events | ALPH_IO_OUT;
+  }
+  alph_io_arm(ctx, c->h, events);
+  return ALPH_CONTINUE;
+}
+
+// ---- boss ----
+
+// Starts the acceptor, then the client once the port is known. It traps exits
+// so that an actor that dies early ends the run instead of leaving it hanging.
+fn boss(ctx: AlphCtx*, m: AlphMsg*) -> int64 {
+  if (m->tag == ALPH_TAG_INIT) {
+    alph_trap_exits(ctx, true);
+    var a: Acceptor;
+    memset((rawptr)&a, 0, (int64)sizeof(Acceptor));
+    alph_spawn_value<Acceptor>(ctx, ALPH_LINK, &a, &acceptor);
+  } else if (m->tag == TAG_PORT) {
+    var c: Client;
+    memset((rawptr)&c, 0, (int64)sizeof(Client));
+    c.port = m->arg;
+    alph_spawn_value<Client>(ctx, ALPH_LINK, &c, &client);
+  } else if (m->tag == ALPH_TAG_EXIT) {
+    if (m->from == 0) {
+      return alph_stop(ctx, m->arg);  // the node is shutting down
+    }
+    if (m->arg != ALPH_NORMAL) {
+      println("echo failed: actor {m->from} exited with reason {m->arg}");
+      alph_shutdown(ctx, 1000, 1);
+    }
+  }
+  return ALPH_CONTINUE;
+}
+
+var g_node: AlphNode;
+
+fn main() -> int32 {
+  var cfg: AlphConfig;
+  alph_config(&cfg);
+  if (!alph_node_start(&g_node, &cfg)) {
+    return 1;
+  }
+  alph_node_spawn(&g_node, 0, &boss);
+  return (int32)alph_node_wait(&g_node);
+}

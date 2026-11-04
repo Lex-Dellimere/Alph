@@ -353,7 +353,7 @@ fn start_node(schedulers: int64, max_actors: int64, mailbox_size: int64) {
 
 fn main() -> int32 {
   start_node(4, 4096, 64);
-  g_observer = alph_node_spawn(&g_node, &observer);
+  g_observer = alph_node_spawn(&g_node, 0, &observer);
   check_strategy(ALPH_ONE_FOR_ONE, 1);
   check_strategy(ALPH_REST_FOR_ONE, 2);
   check_strategy(ALPH_ONE_FOR_ALL, 3);

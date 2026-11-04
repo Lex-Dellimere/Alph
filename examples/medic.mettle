@@ -65,6 +65,6 @@ fn main() -> int32 {
   if (!alph_node_start(&g_node, &cfg)) {
     return 1;
   }
-  alph_node_spawn(&g_node, &root);
+  alph_node_spawn(&g_node, 0, &root);
   return (int32)alph_node_wait(&g_node);
 }

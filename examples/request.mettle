@@ -57,6 +57,6 @@ fn main() -> int32 {
   var c: Client;
   c.server = 0;
   c.asking = 0;
-  alph_node_spawn_value<Client>(&g_node, &c, &client);
+  alph_node_spawn_value<Client>(&g_node, 0, &c, &client);
   return (int32)alph_node_wait(&g_node);
 }

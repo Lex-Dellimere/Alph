@@ -1,0 +1,166 @@
+// Names and process groups: a name is unique while its holder lives and is
+// dropped when the holder exits; groups count and reach their members, and
+// lose a member that leaves or crashes.
+
+import "std/io";
+import "alph/sys/atomic";
+import "alph/alph";
+
+const TAG_REG: int64 = ALPH_TAG_USER;      // arg: 1 when the name was taken
+const TAG_STOP: int64 = ALPH_TAG_USER + 1;
+const TAG_JOINED: int64 = ALPH_TAG_USER + 2;
+const TAG_PING: int64 = ALPH_TAG_USER + 3;
+const TAG_PONG: int64 = ALPH_TAG_USER + 4;
+const TAG_LEAVE: int64 = ALPH_TAG_USER + 5;
+const TAG_LEFT: int64 = ALPH_TAG_USER + 6;
+const TAG_CRASH: int64 = ALPH_TAG_USER + 7;
+const MEMBERS: int64 = 3;
+
+var g_node: AlphNode;
+var g_failures: int64 = 0;
+
+fn expect(ok: bool, what: string) {
+  if (!ok) {
+    println("FAIL {what}");
+    alph_atomic_add(&g_failures, 1);
+  }
+}
+
+// Tries to take the name "store" and tells its parent whether it did.
+fn namer(ctx: AlphCtx*, m: AlphMsg*) -> int64 {
+  if (m->tag == ALPH_TAG_INIT || m->tag == TAG_REG) {
+    var took: int64 = 0;
+    if (alph_register(ctx, "store") && alph_register(ctx, "store-2")) {
+      took = 1;
+    }
+    alph_send(ctx, alph_parent(ctx), TAG_REG, took);
+  } else if (m->tag == TAG_STOP) {
+    return alph_stop(ctx, ALPH_NORMAL);
+  }
+  return ALPH_CONTINUE;
+}
+
+fn member(ctx: AlphCtx*, m: AlphMsg*) -> int64 {
+  if (m->tag == ALPH_TAG_INIT) {
+    alph_group_join(ctx, "chat");
+    alph_group_join(ctx, "chat");  // a second join changes nothing
+    alph_send(ctx, m->from, TAG_JOINED, 0);
+  } else if (m->tag == TAG_PING) {
+    alph_send(ctx, m->from, TAG_PONG, m->arg);
+  } else if (m->tag == TAG_LEAVE) {
+    alph_group_leave(ctx, "chat");
+    alph_send(ctx, m->from, TAG_LEFT, 0);
+  } else if (m->tag == TAG_CRASH) {
+    var zero: int64 = m->arg;
+    alph_send(ctx, m->from, 100 / zero, 0);
+  }
+  return ALPH_CONTINUE;
+}
+
+struct Boss {
+  step: int64;
+  first: int64;
+  second: int64;
+  members: int64[3];
+  count: int64;
+}
+
+fn boss(ctx: AlphCtx*, m: AlphMsg*) -> int64 {
+  var b: Boss* = (Boss*)ctx->state;
+  if (m->tag == ALPH_TAG_INIT) {
+    expect(alph_whereis(ctx, "store") == 0, "no name before registering");
+    b->first = alph_spawn(ctx, ALPH_MONITOR, &namer);
+    return ALPH_CONTINUE;
+  }
+  if (b->step == 0 && m->tag == TAG_REG) {
+    expect(m->arg == 1, "the first actor takes the name");
+    expect(alph_whereis(ctx, "store") == b->first, "whereis finds the holder");
+    expect(alph_node_whereis(ctx->node, "store-2") == b->first, "an actor may hold two names");
+    b->second = alph_spawn(ctx, 0, &namer);
+    b->step = 1;
+    return ALPH_CONTINUE;
+  }
+  if (b->step == 1 && m->tag == TAG_REG) {
+    expect(m->arg == 0, "a taken name cannot be registered again");
+    alph_send(ctx, b->first, TAG_STOP, 0);
+    b->step = 2;
+    return ALPH_CONTINUE;
+  }
+  if (b->step == 2 && m->tag == ALPH_TAG_DOWN) {
+    expect(alph_whereis(ctx, "store") == 0, "the name is dropped at exit");
+    alph_send(ctx, b->second, TAG_REG, 0);
+    b->step = 3;
+    return ALPH_CONTINUE;
+  }
+  if (b->step == 3 && m->tag == TAG_REG) {
+    expect(m->arg == 1, "a dropped name can be taken");
+    expect(alph_whereis(ctx, "store") == b->second, "whereis finds the new holder");
+    expect(alph_node_group_size(ctx->node, "chat") == 0, "no group before joining");
+    expect(alph_group_send(ctx, "chat", TAG_PING, 0) == 0, "a send to no group reaches nobody");
+    for i: int64 in 0..MEMBERS {
+      b->members[i] = alph_spawn(ctx, ALPH_MONITOR, &member);
+    }
+    b->step = 4;
+    return ALPH_CONTINUE;
+  }
+  if (b->step == 4 && m->tag == TAG_JOINED) {
+    b->count = b->count + 1;
+    if (b->count == MEMBERS) {
+      expect(alph_node_group_size(ctx->node, "chat") == MEMBERS, "every member joined once");
+      expect(alph_group_send(ctx, "chat", TAG_PING, 7) == MEMBERS, "the send reaches every member");
+      b->count = 0;
+      b->step = 5;
+    }
+    return ALPH_CONTINUE;
+  }
+  if (b->step == 5 && m->tag == TAG_PONG) {
+    expect(m->arg == 7, "the members got the word");
+    b->count = b->count + 1;
+    if (b->count == MEMBERS) {
+      alph_send(ctx, b->members[0], TAG_LEAVE, 0);
+      b->step = 6;
+    }
+    return ALPH_CONTINUE;
+  }
+  if (b->step == 6 && m->tag == TAG_LEFT) {
+    expect(alph_node_group_size(ctx->node, "chat") == MEMBERS - 1, "a member left");
+    alph_send(ctx, b->members[1], TAG_CRASH, 0);
+    b->step = 7;
+    return ALPH_CONTINUE;
+  }
+  if (b->step == 7 && m->tag == ALPH_TAG_DOWN) {
+    expect(m->from == b->members[1] && m->arg == ALPH_CRASHED, "the member crashed");
+    expect(alph_node_group_size(ctx->node, "chat") == 1, "a crashed member is gone");
+    expect(alph_group_send(ctx, "chat", TAG_PING, 8) == 1, "the send reaches the last member");
+    b->step = 8;
+    return ALPH_CONTINUE;
+  }
+  if (b->step == 8 && m->tag == TAG_PONG) {
+    expect(m->from == b->members[2] && m->arg == 8, "the last member answered");
+    alph_exit_signal(ctx, b->members[2], ALPH_KILL);
+    b->step = 9;
+    return ALPH_CONTINUE;
+  }
+  if (b->step == 9 && m->tag == ALPH_TAG_DOWN) {
+    expect(alph_node_group_size(ctx->node, "chat") == 0, "an empty group is gone");
+    alph_halt(ctx, 0);
+  }
+  return ALPH_CONTINUE;
+}
+
+fn main() -> int32 {
+  var cfg: AlphConfig;
+  alph_config(&cfg);
+  cfg.schedulers = 2;
+  cfg.max_actors = 64;
+  expect(alph_node_start(&g_node, &cfg), "node started");
+  var b: Boss;
+  memset((rawptr)&b, 0, (int64)sizeof(Boss));
+  alph_node_spawn_value<Boss>(&g_node, 0, &b, &boss);
+  alph_node_wait(&g_node);
+  if (g_failures != 0) {
+    return 1;
+  }
+  println("names ok");
+  return 0;
+}
