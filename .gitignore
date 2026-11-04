@@ -5,3 +5,4 @@ reference_model/
 reports/
 HANDOFF.md
 /mettle.deps
+/bench/erl/
