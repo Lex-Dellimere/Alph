@@ -1,6 +1,6 @@
 // Child processes: output through a pipe, exit codes, a program that is
 // not found, stdin through a pipe, an explicit environment and working
-// directory, a kill by signal, output to a log file, and a child killed and reaped when the actor
+// directory, a kill by signal, output to a log file, process groups, and a child killed and reaped when the actor
 // that owns it crashes.
 
 import "std/io";
@@ -19,7 +19,9 @@ const KIND_ENV: int64 = 3;    // /bin/sh with its own environment and cwd
 const KIND_KILL: int64 = 4;   // sleep, killed with SIGKILL
 const KIND_MERGE: int64 = 5;  // stderr merged into stdout
 const KIND_LOG: int64 = 6;    // stdout and stderr into a log file
-const KINDS: int64 = 7;
+const KIND_GROUP: int64 = 7;  // ALPH_PROC_KEEP_GROUP: the child stays in our process group
+const KIND_OWN: int64 = 8;    // the default: the child gets a group of its own
+const KINDS: int64 = 9;
 
 var g_node: AlphNode;
 var g_failures: int64 = 0;
@@ -71,6 +73,14 @@ fn job_check(ctx: AlphCtx*, j: Job*) -> int64 {
     j->len = alph_sys_read(fd, (rawptr)&j->buf[0], 128);
     alph_sys_close(fd);
     expect(j->code == 0 && job_output_is(j, "out\nerr\n"), "stdout and stderr go to the log");
+  } else if (j->kind == KIND_GROUP || j->kind == KIND_OWN) {
+    var ours: int64 = syscall(ALPH_SYS_GETPGID, 0);
+    var want: string = "{ours}\n";
+    if (j->kind == KIND_GROUP) {
+      expect(j->code == 0 && job_output_is(j, want), "a KEEP_GROUP child stays in our group");
+    } else {
+      expect(j->code == 0 && j->len > 1 && !job_output_is(j, want), "a child gets a group of its own");
+    }
   }
   alph_send(ctx, alph_parent(ctx), TAG_DONE, j->kind);
   return alph_stop(ctx, ALPH_NORMAL);
@@ -121,6 +131,14 @@ fn job(ctx: AlphCtx*, m: AlphMsg*) -> int64 {
       argv[2] = "echo out; echo err >&2";
       spec.log = "build/check/t_proc.log";
       spec.flags = 0;
+    } else if (j->kind == KIND_GROUP || j->kind == KIND_OWN) {
+      // Field 5 of /proc/self/stat is the process group of cut, which is sh's.
+      argv[0] = "sh";
+      argv[1] = "-c";
+      argv[2] = "cut -d' ' -f5 /proc/self/stat";
+      if (j->kind == KIND_GROUP) {
+        spec.flags = ALPH_PROC_OUT | ALPH_PROC_KEEP_GROUP;
+      }
     }
     j->proc = alph_proc_spawn(ctx, &spec);
     expect(j->proc > 0, "the child started");

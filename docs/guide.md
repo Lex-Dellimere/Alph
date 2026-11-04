@@ -385,7 +385,7 @@ alph_io_arm(ctx, spec.stdout_h, ALPH_IO_IN);
 | `envp` | The environment, ending with 0. 0 means the one the node started with |
 | `cwd` | The working directory. 0 means the node's |
 | `log` | A file that gets stdout and stderr when they are not piped |
-| `flags` | `ALPH_PROC_IN`, `ALPH_PROC_OUT` and `ALPH_PROC_ERR` pipe a stream; `ALPH_PROC_MERGE` sends stderr into the stdout pipe; `ALPH_PROC_QUIET` sends streams that are not piped to /dev/null |
+| `flags` | `ALPH_PROC_IN`, `ALPH_PROC_OUT` and `ALPH_PROC_ERR` pipe a stream; `ALPH_PROC_MERGE` sends stderr into the stdout pipe; `ALPH_PROC_QUIET` sends streams that are not piped to /dev/null; `ALPH_PROC_KEEP_GROUP` keeps the child in the node's process group (see below) |
 | `stdin_h`, `stdout_h`, `stderr_h` | Out: handles for the piped streams, else 0 |
 
 `alph_proc_spawn` returns the process handle, or a negative errno with nothing started: -2 when the program is not found, -22 when `argv` is empty.
@@ -393,6 +393,7 @@ alph_io_arm(ctx, spec.stdout_h, ALPH_IO_IN);
 - **The end arrives once** as `ALPH_TAG_PROC_EXIT`, with `ref` the process handle and `arg` the exit code, or 128 plus the signal that ended it. The handle is closed then.
 - **Piped streams are ordinary IO handles,** owned by the caller. Read them until `alph_io_read` returns 0, then close them. Output and the exit message arrive in either order, so wait for both.
 - **The child's whole process group is killed and reaped** when its owner exits, a crash included, or closes the process handle first.
+- **Each child gets a process group of its own** unless started with `ALPH_PROC_KEEP_GROUP`. Use that flag for a program run in the terminal's foreground, so Ctrl-C reaches it and it may read the terminal; it is then signalled and killed alone, not with its own children.
 - **`alph_proc_kill(ctx, h, sig)`** sends a signal to the group. A graceful stop is `ALPH_SIGTERM`, a timer, then `ALPH_SIGKILL`. `alph_proc_os_pid` gives the OS process id.
 
 To wait for a started server to accept connections, spawn a port waiter. It tries to connect every `interval_ms`, at most `tries` times, and answers once with `ALPH_TAG_PORT_READY`: `arg` is 1 when a connection was accepted, 0 when it gave up.

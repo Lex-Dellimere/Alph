@@ -1028,6 +1028,7 @@ export const ALPH_PROC_OUT: int64 = 2;    // pipe the child's stdout; read from 
 export const ALPH_PROC_ERR: int64 = 4;    // pipe the child's stderr; read from spec.stderr_h
 export const ALPH_PROC_MERGE: int64 = 8;  // send stderr into the stdout pipe; needs ALPH_PROC_OUT
 export const ALPH_PROC_QUIET: int64 = 16; // streams that are not piped go to /dev/null
+export const ALPH_PROC_KEEP_GROUP: int64 = 32; // stay in the node's process group; see alph_proc_spawn
 ```
 
 ### `AlphProcSpec`
@@ -1069,7 +1070,10 @@ export fn alph_proc_spawn(ctx: AlphCtx*, spec: AlphProcSpec*) -> int64
 ```
 
 Starts a child process owned by the calling actor, in a process group of
-its own. The child's end is reported once as ALPH_TAG_PROC_EXIT, ref =
+its own; with ALPH_PROC_KEEP_GROUP it stays in the node's group instead,
+so a terminal's Ctrl-C and foreground reads reach it (for an app run in
+the foreground), and only the child itself, not its own children, is
+signalled and killed. The child's end is reported once as ALPH_TAG_PROC_EXIT, ref =
 the returned handle, arg = its exit code or 128 + the signal that ended
 it (127 when the program could not be run); the handle is closed then.
 Piped streams are ordinary IO handles owned by the caller: arm and read
@@ -1091,7 +1095,8 @@ export fn alph_proc_kill(ctx: AlphCtx*, h: int64, sig: int64) -> int64
 ```
 
 Sends OS signal sig (15 for SIGTERM, 9 for SIGKILL, ...) to the process
-group of the child behind process handle h. The end still arrives as
+group of the child behind process handle h, or to the child alone when it
+was started with ALPH_PROC_KEEP_GROUP. The end still arrives as
 ALPH_TAG_PROC_EXIT. A graceful stop is SIGTERM, then a timer, then
 SIGKILL.
 
@@ -2648,6 +2653,7 @@ export const ALPH_SYS_PIPE2: int64 = 293;
 export const ALPH_SYS_PIDFD_OPEN: int64 = 434;
 export const ALPH_SYS_SIGNALFD4: int64 = 289;
 export const ALPH_SYS_GETPID: int64 = 39;
+export const ALPH_SYS_GETPGID: int64 = 121;
 ```
 
 Flags for those calls.

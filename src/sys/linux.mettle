@@ -43,6 +43,7 @@ export const ALPH_SYS_PIPE2: int64 = 293;
 export const ALPH_SYS_PIDFD_OPEN: int64 = 434;
 export const ALPH_SYS_SIGNALFD4: int64 = 289;
 export const ALPH_SYS_GETPID: int64 = 39;
+export const ALPH_SYS_GETPGID: int64 = 121;
 
 // Flags for those calls.
 export const ALPH_PROT_NONE: int64 = 0;

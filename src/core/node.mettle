@@ -306,6 +306,7 @@ struct AlphIoSlot {
   sched: int64;     // the scheduler whose epoll set holds it
   pollable: int64;  // epoll accepted it (regular files are not)
   child: int64;     // a process handle: the child's OS pid until it is reaped
+  kill_to: int64;   // what kill() targets for it: -pid (its group) or pid
 }
 
 // A registered name, or a process group and its members. The name is a
@@ -1899,9 +1900,10 @@ fn alph_io_drop(node: AlphNode*, h: int64, owner: int64) {
     alph_atomic_add(&s->io_count, -1);
   }
   if (slot->child != 0) {
-    // The owner is done with a child that still runs: end its process
-    // group and reap it, so nothing is orphaned or left a zombie.
-    syscall(ALPH_SYS_KILL, 0 - slot->child, ALPH_SIGKILL);
+    // The owner is done with a child that still runs: end it (its process
+    // group, unless it kept the node's) and reap it, so nothing is
+    // orphaned or left a zombie.
+    syscall(ALPH_SYS_KILL, slot->kill_to, ALPH_SIGKILL);
     alph_child_wait(slot->child, false);
     slot->child = 0;
   }
@@ -1956,6 +1958,7 @@ export fn alph_io_open(ctx: AlphCtx*, fd: int64) -> int64 {
   slot->serial = slot->serial + 1;
   slot->fd = fd;
   slot->child = 0;
+  slot->kill_to = 0;
   slot->owner = ctx->self;
   alph_atomic_store_sc(&slot->handle, (slot->serial << 32) | (index + 1));
   alph_io_register(slot, (AlphSched*)alph_me(ctx)->sched);
@@ -2287,6 +2290,7 @@ export const ALPH_PROC_OUT: int64 = 2;    // pipe the child's stdout; read from 
 export const ALPH_PROC_ERR: int64 = 4;    // pipe the child's stderr; read from spec.stderr_h
 export const ALPH_PROC_MERGE: int64 = 8;  // send stderr into the stdout pipe; needs ALPH_PROC_OUT
 export const ALPH_PROC_QUIET: int64 = 16; // streams that are not piped go to /dev/null
+export const ALPH_PROC_KEEP_GROUP: int64 = 32; // stay in the node's process group; see alph_proc_spawn
 
 // What to run, for alph_proc_spawn. Set the inputs; alph_proc_spawn fills
 // the three handles.
@@ -2449,10 +2453,12 @@ fn alph_child_path(argv0: int64, env: int64) -> int64 {
 // process may only make raw system calls here: no allocation, no checks
 // that could trap. It never returns; a failure exits with 127.
 fn alph_child_exec(path: int64, argv: int64, envp: int64, cwd: int64,
-                   in_fd: int64, out_fd: int64, err_fd: int64) {
+                   in_fd: int64, out_fd: int64, err_fd: int64, own_group: bool) {
   var none: int64 = 0;
   syscall(ALPH_SYS_RT_SIGPROCMASK, ALPH_SIG_SETMASK, (int64)&none, 0, 8);
-  syscall(ALPH_SYS_SETPGID, 0, 0);
+  if (own_group) {
+    syscall(ALPH_SYS_SETPGID, 0, 0);
+  }
   if (cwd == 0 || syscall(ALPH_SYS_CHDIR, cwd) == 0) {
     if (in_fd >= 0) {
       syscall(ALPH_SYS_DUP2, in_fd, 0);
@@ -2533,7 +2539,10 @@ fn alph_pipe_handle(ctx: AlphCtx*, fd: int64) -> int64 {
 }
 
 // Starts a child process owned by the calling actor, in a process group of
-// its own. The child's end is reported once as ALPH_TAG_PROC_EXIT, ref =
+// its own; with ALPH_PROC_KEEP_GROUP it stays in the node's group instead,
+// so a terminal's Ctrl-C and foreground reads reach it (for an app run in
+// the foreground), and only the child itself, not its own children, is
+// signalled and killed. The child's end is reported once as ALPH_TAG_PROC_EXIT, ref =
 // the returned handle, arg = its exit code or 128 + the signal that ended
 // it (127 when the program could not be run); the handle is closed then.
 // Piped streams are ordinary IO handles owned by the caller: arm and read
@@ -2617,11 +2626,12 @@ export fn alph_proc_spawn(ctx: AlphCtx*, spec: AlphProcSpec*) -> int64 {
   if (err_fd < 0) {
     err_fd = null_fd;
   }
+  var own_group: bool = (spec->flags & ALPH_PROC_KEEP_GROUP) == 0;
   var pid: int64 = err;
   if (err == 0) {
     pid = syscall(ALPH_SYS_CLONE, ALPH_SIGCHLD, 0, 0, 0, 0);
     if (pid == 0) {
-      alph_child_exec(path, (int64)spec->argv, env, (int64)spec->cwd, in_fd, out_fd, err_fd);
+      alph_child_exec(path, (int64)spec->argv, env, (int64)spec->cwd, in_fd, out_fd, err_fd, own_group);
     }
   }
   // The child's ends belong to the child now.
@@ -2632,8 +2642,12 @@ export fn alph_proc_spawn(ctx: AlphCtx*, spec: AlphProcSpec*) -> int64 {
   alph_close_if(null_fd);
   alph_close_if(log_fd);
   var h: int64 = pid;
-  if (pid > 0) {
+  var kill_to: int64 = pid;
+  if (pid > 0 && own_group) {
     syscall(ALPH_SYS_SETPGID, pid, pid);
+    kill_to = 0 - pid;
+  }
+  if (pid > 0) {
     var pidfd: int64 = syscall(ALPH_SYS_PIDFD_OPEN, pid, 0);
     h = pidfd;
     if (pidfd >= 0) {
@@ -2644,11 +2658,12 @@ export fn alph_proc_spawn(ctx: AlphCtx*, spec: AlphProcSpec*) -> int64 {
     }
     if (h < 0) {
       // No way to watch it: undo the start.
-      syscall(ALPH_SYS_KILL, 0 - pid, ALPH_SIGKILL);
+      syscall(ALPH_SYS_KILL, kill_to, ALPH_SIGKILL);
       var info: int32[32];
       syscall(ALPH_SYS_WAITID, ALPH_IDTYPE_PID, pid, (int64)&info[0], ALPH_WEXITED, 0);
     } else {
       alph_io_slot(ctx->node, h)->child = pid;
+      alph_io_slot(ctx->node, h)->kill_to = kill_to;
       alph_io_arm(ctx, h, ALPH_IO_IN);
     }
   }
@@ -2665,7 +2680,8 @@ export fn alph_proc_spawn(ctx: AlphCtx*, spec: AlphProcSpec*) -> int64 {
 }
 
 // Sends OS signal sig (15 for SIGTERM, 9 for SIGKILL, ...) to the process
-// group of the child behind process handle h. The end still arrives as
+// group of the child behind process handle h, or to the child alone when it
+// was started with ALPH_PROC_KEEP_GROUP. The end still arrives as
 // ALPH_TAG_PROC_EXIT. A graceful stop is SIGTERM, then a timer, then
 // SIGKILL.
 //
@@ -2679,7 +2695,7 @@ export fn alph_proc_kill(ctx: AlphCtx*, h: int64, sig: int64) -> int64 {
   if (slot->child == 0) {
     return -3;
   }
-  return syscall(ALPH_SYS_KILL, 0 - slot->child, sig);
+  return syscall(ALPH_SYS_KILL, slot->kill_to, sig);
 }
 
 // The OS process id of the child behind process handle h, or 0 when the
