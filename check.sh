@@ -22,6 +22,14 @@ mkdir -p "$OUT"
 # mettle.deps is generated (mbuild writes it on every build). Without mbuild,
 # write the two mappings the compiler needs, in mbuild's own block so a later
 # mbuild run replaces them instead of warning.
+# alph is a Mettle project: no Erlang or Elixir sources may be tracked.
+foreign=$(git ls-files 2>/dev/null | grep -E '\.(erl|hrl|ex|exs)$')
+if [ -n "$foreign" ]; then
+  echo "FAIL  Erlang/Elixir sources are tracked in git:"
+  echo "$foreign"
+  exit 1
+fi
+
 if [ ! -f mettle.deps ]; then
   printf '# >>> mbuild: generated, edits inside this block are overwritten\nalph=./src\ncrypto=../cryptex/src\n# <<< mbuild\n' > mettle.deps
 fi
