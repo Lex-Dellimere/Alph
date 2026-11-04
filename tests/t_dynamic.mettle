@@ -118,8 +118,7 @@ fn boss(ctx: AlphCtx*, m: AlphMsg*) -> int64 {
   }
   if (b->step == 1 && m->tag == TAG_HELLO) {
     expect(m->arg == 0 && m->from != b->pids[0], "a crashed transient child restarts with a new pid");
-    // One crash at a time: two at the same moment end the node
-    // (alph/reports/001).
+    // One crash at a time, so the restart count is known at each step.
     alph_send(ctx, b->pids[2], TAG_CRASH, 0);
     b->step = 2;
     return ALPH_CONTINUE;

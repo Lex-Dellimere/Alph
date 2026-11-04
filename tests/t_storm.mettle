@@ -1,0 +1,102 @@
+// A crash storm: many actors on every scheduler crash at the same moment,
+// round after round, mixing trapped checks (divide by zero) and faults
+// (a write through a wild pointer). Every crash must end only its own
+// actor, reach its monitor, and leave the node running. Before the Mettle
+// runtime serialized crash reports (Mettle PR #150), two crashes at the
+// same moment ended the whole process (alph/reports/001).
+
+import "std/io";
+import "std/mem";
+import "alph/sys/atomic";
+import "alph/alph";
+
+const TAG_ARM: int64 = ALPH_TAG_USER;     // to a victim: wait for the go
+const TAG_GO: int64 = ALPH_TAG_USER + 1;  // to a victim: crash now; arg = how
+const VICTIMS: int64 = 64;
+const ROUNDS: int64 = 30;
+
+var g_node: AlphNode;
+var g_failures: int64 = 0;
+var g_go: int64 = 0;      // the round victims wait for, spinning on their own threads
+var g_wild: int64 = 16;
+
+fn expect(ok: bool, what: string) {
+  if (!ok) {
+    println("FAIL {what}");
+    alph_atomic_add(&g_failures, 1);
+  }
+}
+
+// Spins until the boss opens the round, so all victims crash together,
+// then crashes one of two ways. Bound, so each has its own thread and the
+// spin blocks nobody else.
+fn victim(ctx: AlphCtx*, m: AlphMsg*) -> int64 {
+  if (m->tag == TAG_GO) {
+    while (alph_atomic_load(&g_go) < m->arg) {
+      alph_cpu_relax();
+    }
+    if (m->arg % 2 == 0) {
+      var zero: int64 = m->arg - m->arg;
+      alph_send(ctx, m->from, 100 / zero, 0);
+    } else {
+      *(int64*)g_wild = 1;
+    }
+  }
+  return ALPH_CONTINUE;
+}
+
+struct Boss {
+  round: int64;
+  downs: int64;
+}
+
+fn boss_round(ctx: AlphCtx*, b: Boss*) {
+  b->round = b->round + 1;
+  b->downs = 0;
+  for i: int64 in 0..VICTIMS {
+    var pid: int64 = alph_spawn(ctx, ALPH_MONITOR | ALPH_BOUND, &victim);
+    expect(pid != 0, "victim spawned");
+    alph_send(ctx, pid, TAG_GO, b->round);
+  }
+  alph_atomic_store_sc(&g_go, b->round);
+}
+
+fn boss(ctx: AlphCtx*, m: AlphMsg*) -> int64 {
+  var b: Boss* = (Boss*)ctx->state;
+  if (m->tag == ALPH_TAG_INIT) {
+    boss_round(ctx, b);
+    return ALPH_CONTINUE;
+  }
+  if (m->tag == ALPH_TAG_DOWN) {
+    expect(m->arg == ALPH_CRASHED, "a victim crashed");
+    b->downs = b->downs + 1;
+    if (b->downs == VICTIMS) {
+      if (b->round == ROUNDS) {
+        alph_halt(ctx, 0);
+      } else {
+        boss_round(ctx, b);
+      }
+    }
+  }
+  return ALPH_CONTINUE;
+}
+
+fn main() -> int32 {
+  var cfg: AlphConfig;
+  alph_config(&cfg);
+  cfg.max_actors = 1024;
+  cfg.mailbox_size = 256;
+  expect(alph_node_start(&g_node, &cfg), "node started");
+  var b: Boss;
+  memset((rawptr)&b, 0, (int64)sizeof(Boss));
+  alph_node_spawn_value<Boss>(&g_node, 0, &b, &boss);
+  alph_node_wait(&g_node);
+  var stats: AlphStats;
+  alph_node_stats(&g_node, &stats);
+  expect(stats.crashed == VICTIMS * ROUNDS, "every crash was counted, none ended the node");
+  if (g_failures != 0) {
+    return 1;
+  }
+  println("storm ok: {stats.crashed} crashes survived");
+  return 0;
+}

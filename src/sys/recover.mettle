@@ -140,14 +140,22 @@ fn alph_recover_install() {
 //   r       stays registered until alph_recover_unregister; keep it in place
 //   lo, hi  the stack range, lowest and one past highest address
 //
-// Returns false when the table of 256 registrations is full. Slots are not
-// reused. Thread: any.
+// Returns false when 256 threads are registered at once. A slot freed by
+// alph_recover_unregister is reused, so threads may come and go for ever.
+// Thread: any.
 export fn alph_recover_register(r: AlphRecover*, lo: int64, hi: int64) -> bool {
   alph_recover_install();
   r->stack_lo = lo;
   r->stack_hi = hi;
   r->armed = 0;
   r->crashes = 0;
+  var used: int64 = alph_atomic_load(&g_alph_recover_count);
+  for i: int64 in 0..used {
+    if (alph_atomic_load(&g_alph_recover_table[i]) == 0 &&
+        alph_atomic_cas(&g_alph_recover_table[i], 0, (int64)r) == 0) {
+      return true;
+    }
+  }
   var at: int64 = alph_atomic_add(&g_alph_recover_count, 1);
   if (at >= ALPH_RECOVER_MAX) {
     alph_atomic_add(&g_alph_recover_count, -1);
@@ -170,11 +178,18 @@ export fn alph_recover_register_here(r: AlphRecover*, below: int64, above: int64
   return alph_recover_register(r, at - below, at + above);
 }
 
-// Stops the crash hook from matching r. Its table slot is not reused.
-// Thread: any.
+// Stops the crash hook from matching r and frees its table slot for the
+// next thread. Thread: any.
 export fn alph_recover_unregister(r: AlphRecover*) {
   r->armed = 0;
   alph_atomic_store(&r->stack_hi, 0);
+  var used: int64 = alph_atomic_load(&g_alph_recover_count);
+  for i: int64 in 0..used {
+    if (alph_atomic_load(&g_alph_recover_table[i]) == (int64)r) {
+      alph_atomic_store_sc(&g_alph_recover_table[i], 0);
+      return;
+    }
+  }
 }
 
 // Arms r: a crash on its thread now resumes at the last alph_recover_save.

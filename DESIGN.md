@@ -193,8 +193,7 @@ Rolling replacement is the default for zero downtime because it handles any chan
 | Nonblocking sockets, epoll, io_uring | Through the `syscall` builtin |
 | GPU completion polling | The library declares `cuEventQuery` itself |
 
-Upstream fixes that would help later but block nothing:
-- a per-thread "already in handler" flag, since today two simultaneous crashes on different threads end the node;
+Upstream fixes that would help later but block nothing (simultaneous crashes on different threads were fixed by Mettle PR #150):
 - host atomic intrinsics, so atomics inline;
 - `--safe` support for `std/alloc`, and a way to unwind its call stack;
 - recognizing a Mettle-bodied spawn as a task boundary, then extending M0122 to any use or free after a send. This is the ownership proof zero-copy moves need;
