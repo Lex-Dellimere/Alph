@@ -2435,8 +2435,9 @@ r       stays registered until alph_recover_unregister; keep it in place
 lo, hi  the stack range, lowest and one past highest address
 ```
 
-Returns false when the table of 256 registrations is full. Slots are not
-reused. Thread: any.
+Returns false when 256 threads are registered at once. A slot freed by
+alph_recover_unregister is reused, so threads may come and go for ever.
+Thread: any.
 
 ### `alph_recover_register_here`
 
@@ -2460,8 +2461,8 @@ Returns false when the table is full. Thread: the thread being registered.
 export fn alph_recover_unregister(r: AlphRecover*)
 ```
 
-Stops the crash hook from matching r. Its table slot is not reused.
-Thread: any.
+Stops the crash hook from matching r and frees its table slot for the
+next thread. Thread: any.
 
 ### `alph_recover_arm`
 
