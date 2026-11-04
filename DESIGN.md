@@ -236,6 +236,7 @@ Each test below passes under `./check.sh` in debug and release.
 | Worker pool | `t_pool`: jobs on bound threads while the schedulers run, queue full, a trapping job replaced, timeouts |
 | Limiter | `t_limiter`: first come first served, permits returned by release, crash or kill, withdrawn requests |
 | Node shutdown and OS signals | `t_shutdown`: reverse order, deadline kill, signals as messages, `128 + signal` by default |
+| Distribution: proxies, remote send, request and reply, links, monitors, exit signals, `noconnection`, remote `whereis`, Noise_XXpsk3 transport | `t_dist`: two nodes over TCP; a wrong cookie is refused. `t_noise`: the handshake against a reference |
 
 Not built yet:
 - stealing between schedulers;
@@ -243,7 +244,7 @@ Not built yet:
 - ports for threads outside the node;
 - the work-class rule;
 - hot upgrade;
-- distribution;
+- distribution beyond what is built above: global names and groups across nodes, `erpc`, flow-control credits, node names and a cluster view, wire versioning;
 - a status-file fallback for child processes under wine;
 - other platforms: ARM64, Windows and macOS are not built; the asm and syscalls are x86-64 Linux.
 

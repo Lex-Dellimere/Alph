@@ -502,6 +502,51 @@ alph_node_signals(&g_node, pid, TAG_SIGNAL);   // optional
 - **`alph_node_signals` hands them to an actor.** It then gets a message with the tag you gave and `arg` the signal number (`ALPH_SIGINT`, `ALPH_SIGTERM`, `ALPH_SIGHUP`). These are never dropped. Call it with pid 0 to give signals back to the node. If that actor exits, the node handles them again.
 - **Child processes start with every signal unblocked.**
 
+## Distribution
+
+Nodes connect over TCP, and an actor on one node can talk to an actor on another as if it were local. From [examples/cluster.mettle](../examples/cluster.mettle), which runs two nodes in one process:
+
+```mettle
+import "alph/net/dist";
+
+// in node B: start the manager, then use the port it reports
+alph_dist_start(ctx, alph_ip4(0, 0, 0, 0), 4370, COOKIE);
+...
+if (m->tag == ALPH_TAG_DIST_READY) { ... }       // m->arg is the port it listens on
+
+// in node A
+alph_dist_connect(ctx, alph_ip4(10, 0, 0, 2), 4370, 2000);
+...
+if (m->tag == ALPH_TAG_DIST_UP) {                // m->arg is the connection, or 0
+  alph_monitor(ctx, m->arg);                     // DOWN when the connection is lost
+  alph_dist_whereis(ctx, m->arg, "counter", 2000);
+}
+if (m->tag == ALPH_TAG_DIST_FOUND) {             // m->arg is a proxy, or 0
+  b->asking = alph_request(ctx, m->arg, TAG_ADD, 1, 2000);
+}
+```
+
+A **proxy** is a local actor that stands for an actor on another node. Send to it, and the message arrives at the remote actor. The remote actor sees the sender as a proxy for you, so it can answer, and a request and its reply keep their `ref` across the connection. Messages from one sender stay in order.
+
+- **Start a manager first.** `alph_dist_start(ctx, ip4, port, cookie)` starts this node's manager, linked to the caller, and returns its pid, or 0 when the cookie is empty or the node is full. Port 0 picks a free port. When the manager listens, the caller gets `ALPH_TAG_DIST_READY` with the port in `arg`; connect and look up names only after that. If it cannot listen it exits with `ALPH_SHUTDOWN`. `alph_dist_port` asks it for the port again. Trap exits in the caller, or the manager's exit takes it down.
+- **`alph_dist_connect(ctx, ip4, port, timeout_ms)`** returns a ref. The answer is `ALPH_TAG_DIST_UP` with `arg` the connection's pid, or 0 when the node could not be reached or holds another cookie. As for any request, `ALPH_TAG_DOWN` or `ALPH_TAG_TIMEOUT` can come instead. It returns `ALPH_GONE` when no manager is running.
+- **`alph_dist_whereis(ctx, conn, name, timeout_ms)`** looks up a name on the node at the other end of `conn`. The answer is `ALPH_TAG_DIST_FOUND` with `arg` a proxy, or 0 when the name is not registered there. The same proxy comes back for the same actor.
+- **Sending** works as at home: `alph_send`, `alph_request` and the `_value` and `_bytes` forms, with the proxy as the target. A message, payload included, may be up to 16 MiB; a larger one makes the receiving node close the connection.
+- **Links, monitors and exit signals** work through a proxy. A proxy lives exactly as long as its actor and exits with the same reason, so a monitor on it gets the remote actor's `DOWN`, and a link brings a remote crash to the linked actor (or an `ALPH_TAG_EXIT`, if it traps exits). Linking is two-way: the remote actor is linked to a proxy for yours, so your crash reaches it too. An exit signal sent to a proxy, `ALPH_KILL` included, goes to the remote actor.
+- **`ALPH_NOCONNECTION`** is the reason every proxy exits with when the connection is lost, and the reason the connection's own pid exits with. Monitor the connection pid from `ALPH_TAG_DIST_UP` to hear that the other node is gone. A monitor or link on a proxy sees the same reason.
+- **A connection is closed rather than losing a message.** If the receiving actor's mailbox is full, the connection stops reading until it has room, and TCP slows the sender. If a node sends faster than the connection carries and its queue (64 MiB) fills, the connection is closed, and everything over it sees `ALPH_NOCONNECTION`. A message is never dropped on a connection that stays up.
+
+The **cookie** names the cluster, and it is the Noise pre-shared key: its SHA-256 keys the handshake, and it is never sent. Connections are encrypted and authenticated (`Noise_XXpsk3_25519_ChaChaPoly_SHA256`). A node with another cookie cannot connect and cannot read or change traffic, so `alph_dist_connect` answers 0. Whoever has the cookie can join the cluster, so keep it secret, long and random. Each node makes a new static key when its manager starts.
+
+`alph/net/dist` and `alph/net/noise` are opt-in. They are not in `alph/alph`, and a program that never imports them carries no crypto. Import `alph/net/dist` yourself, and map the crypto package in your app's `mettle.deps` beside alph:
+
+```text
+alph=<path>/alph/src
+crypto=<path>/cryptex/src
+```
+
+Names and groups are still local to a node, so you find a remote actor with `alph_dist_whereis`, not `alph_whereis`.
+
 ## Building
 
 ```bash

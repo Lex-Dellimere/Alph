@@ -10,7 +10,9 @@ Healing comes in two kinds:
 
 Around that: a heap per actor, bound actors that may block, non-blocking IO and TCP, names and groups, child processes, dynamic supervisors, a worker pool and a limiter, and an ordered shutdown that handles OS signals.
 
-It runs on one node, on x86-64 Linux. Distribution is next.
+Nodes can also connect: an actor on another node is reached through a proxy, with remote requests, links, monitors and exit signals, over a Noise-encrypted connection. This is opt-in (`alph/net/dist`) and not part of `alph/alph`.
+
+It runs on x86-64 Linux.
 
 ## Example
 
@@ -54,7 +56,7 @@ fn main() -> int32 {
 }
 ```
 
-This is [examples/counter.mettle](examples/counter.mettle). The other examples show [requests](examples/request.mettle), [a supervisor](examples/supervised.mettle), [a medic](examples/medic.mettle), [a TCP echo server](examples/echo.mettle) and [a limiter with child processes](examples/jobs.mettle).
+This is [examples/counter.mettle](examples/counter.mettle). The other examples show [requests](examples/request.mettle), [a supervisor](examples/supervised.mettle), [a medic](examples/medic.mettle), [a TCP echo server](examples/echo.mettle), [a limiter with child processes](examples/jobs.mettle) and [two nodes in one process](examples/cluster.mettle).
 
 ## Use
 
@@ -72,7 +74,9 @@ Build with the dev compiler from the Mettle repo, always with `-s`:
 
 Without `-s`, the compiler turns failed checks (bounds, divide) into an inline exit that alph cannot catch.
 
-- [Guide](docs/guide.md): how to use the runtime, from starting a node to healing, IO, child processes, pools and shutdown.
+To use distribution, also `import "alph/net/dist"` and map the crypto package in `mettle.deps` (`crypto=<path>/cryptex/src`).
+
+- [Guide](docs/guide.md): how to use the runtime, from starting a node to healing, IO, child processes, pools, shutdown and distribution.
 - [API reference](docs/api.md): every function, type and constant, with its inputs, outputs and which thread may call it.
 - [Design](DESIGN.md): how it works, what was taken from BEAM and OTP, and what comes next.
 
@@ -99,6 +103,8 @@ src/heal/dynamic.mettle     dynamic supervisors: children started at run time
 src/work/pool.mettle        worker pool: blocking jobs on bound threads
 src/work/limiter.mettle     limiter: a counting semaphore as an actor
 src/net/port.mettle         port waiter: tells you when a TCP port accepts connections
+src/net/dist.mettle         distribution (opt-in): proxies for remote actors, remote send, links and monitors
+src/net/noise.mettle        the Noise_XXpsk3 handshake and transport ciphers dist uses (opt-in)
 src/sys/linux.mettle        syscall numbers and flags
 src/sys/atomic.mettle       64-bit atomics
 src/sys/clock.mettle        monotonic time and futex

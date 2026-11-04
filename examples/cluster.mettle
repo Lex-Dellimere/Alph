@@ -1,0 +1,157 @@
+// Distribution: two nodes in one process, joined over TCP on 127.0.0.1.
+// Node B runs a "counter" actor that answers each request with a running
+// total. Node A connects, finds "counter" with alph_dist_whereis, and sends
+// it three requests through the proxy it gets back. A watchdog fails the run
+// instead of letting it hang.
+//
+// alph/net/dist is not part of alph/alph. It needs the crypto package mapped
+// in mettle.deps (crypto=<path>/cryptex/src).
+
+import "std/io";
+import "std/mem";
+import "alph/sys/atomic";
+import "alph/sys/clock";
+import "alph/alph";
+import "alph/net/dist";
+
+const TAG_ADD: int64 = ALPH_TAG_USER;        // request: add arg, reply with the total
+const TAG_TOTAL: int64 = ALPH_TAG_USER + 1;  // the reply: arg = the running total
+const TAG_WATCHDOG: int64 = ALPH_TAG_USER + 2;
+const COOKIE: string = "cluster example cookie, use a long random one";
+
+var g_node_a: AlphNode;
+var g_node_b: AlphNode;
+var g_port: int64 = 0;  // node B's dist port, once it listens
+
+// ---- node B ----
+
+struct Counter {
+  total: int64;
+}
+
+// Registered as "counter" on node B.
+fn counter(ctx: AlphCtx*, m: AlphMsg*) -> int64 {
+  var c: Counter* = (Counter*)ctx->state;
+  if (m->tag == ALPH_TAG_INIT) {
+    alph_register(ctx, "counter");
+  } else if (m->tag == TAG_ADD) {
+    c->total = c->total + m->arg;
+    alph_reply(ctx, m, TAG_TOTAL, c->total);
+  }
+  return ALPH_CONTINUE;
+}
+
+fn boss_b(ctx: AlphCtx*, m: AlphMsg*) -> int64 {
+  if (m->tag == ALPH_TAG_INIT) {
+    alph_trap_exits(ctx, true);  // the manager is linked to this actor
+    if (alph_dist_start(ctx, alph_ip4(127, 0, 0, 1), 0, COOKIE) == 0) {
+      return alph_stop(ctx, ALPH_REASON_USER);
+    }
+    var c: Counter;
+    c.total = 0;
+    alph_spawn_value<Counter>(ctx, 0, &c, &counter);
+  } else if (m->tag == ALPH_TAG_DIST_READY) {
+    alph_atomic_store_sc(&g_port, m->arg);  // main is waiting for this
+  }
+  return ALPH_CONTINUE;
+}
+
+// ---- node A ----
+
+struct Boss {
+  conn: int64;    // the connection's pid
+  proxy: int64;   // a local proxy for B's "counter"
+  asking: int64;  // ref of the request in flight
+  sent: int64;    // requests answered so far
+}
+
+// Fails the run: prints why and halts node A with 1.
+fn fail(ctx: AlphCtx*, why: string) -> int64 {
+  println("cluster FAIL: {why}");
+  alph_halt(ctx, 1);
+  return ALPH_CONTINUE;
+}
+
+fn boss_a(ctx: AlphCtx*, m: AlphMsg*) -> int64 {
+  var b: Boss* = (Boss*)ctx->state;
+  if (m->tag == ALPH_TAG_INIT) {
+    alph_trap_exits(ctx, true);  // the manager is linked to this actor
+    alph_send_after(ctx, 10000, ctx->self, TAG_WATCHDOG, 0);
+    if (alph_dist_start(ctx, alph_ip4(127, 0, 0, 1), 0, COOKIE) == 0) {
+      return fail(ctx, "A's manager did not start");
+    }
+    return ALPH_CONTINUE;
+  }
+  if (m->tag == TAG_WATCHDOG) {
+    return fail(ctx, "no result in 10 seconds");
+  }
+  if (m->tag == ALPH_TAG_DIST_READY) {
+    // A's manager listens. Connect to B's, which main saw come up.
+    alph_dist_connect(ctx, alph_ip4(127, 0, 0, 1), alph_atomic_load(&g_port), 2000);
+    return ALPH_CONTINUE;
+  }
+  if (m->tag == ALPH_TAG_DIST_UP) {
+    b->conn = m->arg;
+    if (b->conn == 0) {
+      return fail(ctx, "could not connect to B");
+    }
+    alph_monitor(ctx, b->conn);  // a DOWN from it means the connection is lost
+    alph_dist_whereis(ctx, b->conn, "counter", 2000);
+    return ALPH_CONTINUE;
+  }
+  if (m->tag == ALPH_TAG_DIST_FOUND) {
+    b->proxy = m->arg;
+    if (b->proxy == 0) {
+      return fail(ctx, "B has no \"counter\"");
+    }
+    b->asking = alph_request(ctx, b->proxy, TAG_ADD, 1, 2000);
+    return ALPH_CONTINUE;
+  }
+  if (m->tag == TAG_TOTAL && m->ref == b->asking) {
+    b->sent = b->sent + 1;
+    // Adding 1, 2, 3 gives the totals 1, 3, 6.
+    var want: int64 = b->sent * (b->sent + 1) / 2;
+    if (m->arg != want) {
+      return fail(ctx, "total {m->arg}, wanted {want}");
+    }
+    if (b->sent == 3) {
+      println("cluster ok: {m->arg} from the other node");
+      alph_halt(ctx, 0);
+      return ALPH_CONTINUE;
+    }
+    b->asking = alph_request(ctx, b->proxy, TAG_ADD, b->sent + 1, 2000);
+    return ALPH_CONTINUE;
+  }
+  if (m->tag == ALPH_TAG_DOWN || m->tag == ALPH_TAG_TIMEOUT) {
+    return fail(ctx, "the connection or the counter went away");
+  }
+  return ALPH_CONTINUE;
+}
+
+fn main() -> int32 {
+  var cfg: AlphConfig;
+  alph_config(&cfg);
+  cfg.schedulers = 2;
+  cfg.max_actors = 256;
+  if (!alph_node_start(&g_node_b, &cfg) || !alph_node_start(&g_node_a, &cfg)) {
+    return 1;
+  }
+  alph_node_spawn(&g_node_b, 0, &boss_b);
+  // Wait for B's manager to listen, so A knows which port to connect to.
+  var waited: int64 = 0;
+  while (alph_atomic_load(&g_port) == 0 && waited < 5000) {
+    alph_futex_wait(&waited, waited, 1000000);
+    waited = waited + 1;
+  }
+  if (alph_atomic_load(&g_port) == 0) {
+    println("cluster FAIL: node B did not listen");
+    return 1;
+  }
+  var b: Boss;
+  memset((rawptr)&b, 0, (int64)sizeof(Boss));
+  alph_node_spawn_value<Boss>(&g_node_a, 0, &b, &boss_a);
+  var code: int64 = alph_node_wait(&g_node_a);
+  alph_node_halt(&g_node_b, 0);
+  alph_node_wait(&g_node_b);
+  return (int32)code;
+}
