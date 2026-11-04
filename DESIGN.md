@@ -251,7 +251,15 @@ Not built yet:
 ## Open decisions
 
 1. **Stackful processes.** These would allow blocking-style `receive` deep inside a call. The recommendation is to leave them out of the core. They cost a stack per process, need the missing stack bound, and break live mode's one-stack-per-thread tables. Revisit them after phase 3 if run-to-completion handlers prove awkward.
-2. **Crypto for Noise** is written in Mettle (X25519, ChaCha20-Poly1305, BLAKE2s), following the rule of no C unless Mettle cannot do it. It needs test vectors and constant-time review before it carries real traffic.
+2. **Crypto for Noise** is written in Mettle (X25519, ChaCha20-Poly1305, BLAKE2s). It needs test vectors and constant-time review before it carries real traffic.
+
+### Decisions from the user (2026-11-05)
+
+- **C:** fine soon, not yet. Once allowed, C may extend alph past what Mettle permits.
+- **Crypto:** pure Mettle, taking techniques, correct usage and implementation from proven C and Rust libraries.
+- **Benchmarks to beat BEAM:** spawn rate, message latency and throughput, ring test, many-connection HTTP requests per second, p99 latency under load, and crash-to-restart time. The goal is the most performance for the least size.
+- **Preemption:** whatever gives the best performance and reliability. Today's design (proven-bounded handlers, cooperative returns, bound actors for blocking work) follows Mettle's charter against injected yields. Once C is allowed, a C-based preemption mechanism may be measured against it, and the faster and more reliable one wins.
+- **Distribution:** what works today and is reliable, not what is fashionable, with Erlang/Elixir's model as the reference. The plan above follows it: BEAM semantics for remote pids, links and monitors, `pg` groups and `erpc`. The additions over BEAM (Noise, SWIM, a Raft registry) are proven designs, kept only where BEAM's own choices are weaker.
 
 ## Layout
 
