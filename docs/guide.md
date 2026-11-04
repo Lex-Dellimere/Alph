@@ -44,6 +44,7 @@ fn main() -> int32 {
 | `heap_limit` | Bytes one actor's heap may hold, state included | 0, no limit |
 | `max_handles` | IO handles open at once | 65536 |
 | `signals` | OS signals the node takes over (see Shutdown and OS signals) | 0, none |
+| `spin_us` | How long an idle scheduler keeps checking for work before it sleeps; work arriving meanwhile starts without a wake-up system call | 50 |
 
 `alph_node_wait` returns when a handler calls `alph_halt(ctx, code)`, or a shutdown finishes, and gives back the code.
 
