@@ -59,6 +59,7 @@ export const ALPH_KILLED: int64 = 2;    // how an actor that was killed exits
 export const ALPH_NOPROC: int64 = 3;    // the actor was already gone
 export const ALPH_CRASHED: int64 = 4;   // a trap or fault inside the handler
 export const ALPH_SHUTDOWN: int64 = 5;  // an orderly stop, from a supervisor
+export const ALPH_NOCONNECTION: int64 = 6;  // the actor was on another node, and the connection to it is gone
 export const ALPH_REASON_USER: int64 = 100;
 ```
 
@@ -74,6 +75,8 @@ export const ALPH_TAG_CRASHED: int64 = 6;  // to a medic: its patient crashed. f
 export const ALPH_TAG_IO: int64 = 7;       // an armed handle is ready. ref = the handle, arg = ALPH_IO_ bits
 export const ALPH_TAG_IO_GIVEN: int64 = 8; // a handle was handed to this actor. ref = the handle, from = the giver
 export const ALPH_TAG_PROC_EXIT: int64 = 9; // a child process ended. ref = its handle, arg = exit code, or 128 + signal
+export const ALPH_TAG_LINKED: int64 = 26;   // to a proxy: from linked to it
+export const ALPH_TAG_UNLINKED: int64 = 27; // to a proxy: from unlinked from it
 export const ALPH_TAG_USER: int64 = 100;
 ```
 
@@ -121,6 +124,7 @@ Spawn flags; combine with |.
 export const ALPH_LINK: int64 = 1;     // link the new actor to the caller
 export const ALPH_MONITOR: int64 = 2;  // the caller monitors the new actor
 export const ALPH_BOUND: int64 = 4;    // the new actor gets a thread of its own and may block
+export const ALPH_PROXY: int64 = 8;
 ```
 
 ### `AlphConfig`
@@ -415,6 +419,28 @@ export fn alph_reply_full(ctx: AlphCtx*, request: AlphMsg*, tag: int64, arg: int
 Answers a request with a tag, one word and size bytes, for replies that
 carry both a result code and data. Otherwise as alph_reply.
 Thread: a handler.
+
+### `alph_node_forward`
+
+```mettle
+export fn alph_node_forward(node: AlphNode*, to: int64, from: int64, tag: int64, arg: int64,
+                            ref: int64, flags: int64, data: rawptr, size: int64) -> int64
+```
+
+Posts a message as if from actor from, with the request or reply marks
+of another node's message: flags is ALPH_MSG_FLAG_REQUEST,
+ALPH_MSG_FLAG_REPLY or 0, and ref is that message's ref. For
+alph/net/dist, which delivers messages that crossed a connection; other
+code uses alph_send and friends. Returns as alph_send_bytes.
+Thread: any.
+
+The request and reply marks of a message, for m->flags and
+alph_node_forward.
+
+```mettle
+export const ALPH_MSG_FLAG_REQUEST: int64 = 1;
+export const ALPH_MSG_FLAG_REPLY: int64 = 2;
+```
 
 ### `alph_link`
 
@@ -2104,6 +2130,110 @@ reach the caller.
 
 Returns its pid, or 0 when an argument is out of range or the node is
 full. Thread: a handler.
+
+## alph/net/dist
+
+Actors on other nodes, as on BEAM.
+
+Nodes connect over TCP. An actor on another node is reached through a
+proxy: a local actor that stands for it. Send to the proxy and the
+message arrives at the remote actor, from a proxy that stands for you
+there, so it can answer. Requests and replies work across nodes, with
+their refs.
+
+A proxy lives exactly as long as the actor it stands for. When that actor
+exits, the proxy exits with the same reason, so a local link or monitor on
+the proxy sees the remote exit. When the connection is lost, every proxy
+over it exits with ALPH_NOCONNECTION, as on BEAM. Linking to a proxy links
+both ways: the remote actor is linked to a proxy for the local one, so an
+exit on either side reaches the other. An exit signal sent to a proxy, kill
+included, is passed to the remote actor.
+
+Messages are never dropped while the connection holds. When a receiver's
+mailbox is full, the connection stops reading until it has room, which
+slows the sender through TCP. When a node sends faster than its
+connection can carry and the connection's queue fills, the connection is
+closed rather than losing a message, and everything over it sees
+ALPH_NOCONNECTION.
+
+Each node runs one dist manager, started with alph_dist_start:
+
+```text
+alph_dist_start(ctx, alph_ip4(0, 0, 0, 0), 4370, "cookie");
+... ALPH_TAG_DIST_READY, arg = the port: the manager listens
+var ref: int64 = alph_dist_connect(ctx, alph_ip4(10, 0, 0, 2), 4370, 5000);
+... ALPH_TAG_DIST_UP, arg = the connection, or 0 when it failed
+var ref2: int64 = alph_dist_whereis(ctx, conn, "store", 5000);
+... ALPH_TAG_DIST_FOUND, arg = a proxy for the remote "store", or 0
+```
+
+Monitor the connection pid to hear when the other node goes away.
+
+The cookie only keeps nodes of different clusters apart. It is sent in
+the clear: today's transport is unencrypted TCP, so use it on trusted
+networks only. An encrypted transport (Noise) is planned.
+
+The answer to alph_dist_connect: arg is the connection's pid, or 0.
+
+```mettle
+export const ALPH_TAG_DIST_UP: int64 = 30;
+export const ALPH_TAG_DIST_FOUND: int64 = 31;
+export const ALPH_TAG_DIST_PORT: int64 = 41;
+export const ALPH_TAG_DIST_READY: int64 = 42;
+```
+
+### `alph_dist_start`
+
+```mettle
+export fn alph_dist_start(ctx: AlphCtx*, ip4: int64, port: int64, cookie: string) -> int64
+```
+
+Starts this node's dist manager, linked to the caller, listening on
+ip4:port (port 0 picks a free port). It registers itself as "alph.dist"
+and then sends the caller ALPH_TAG_DIST_READY with the port it listens
+on; connect and look up names only after that. Only nodes started with
+the same cookie (at most 64 bytes) can connect.
+
+Returns the manager's pid, or 0 when the cookie is too long or the node
+is full. If listening fails, the manager exits at once with
+ALPH_SHUTDOWN, which the caller sees through the link. Thread: a handler.
+
+### `alph_dist_connect`
+
+```mettle
+export fn alph_dist_connect(ctx: AlphCtx*, ip4: int64, port: int64, timeout_ms: int64) -> int64
+```
+
+Connects to the node listening on ip4:port. The answer is
+ALPH_TAG_DIST_UP with arg = the connection's pid, or 0 when the node
+could not be reached or has another cookie; or, as for any request,
+ALPH_TAG_DOWN or ALPH_TAG_TIMEOUT. Each carries the returned ref.
+
+Returns the ref, or ALPH_GONE when no dist manager runs, or ALPH_FULL.
+Thread: a handler.
+
+### `alph_dist_whereis`
+
+```mettle
+export fn alph_dist_whereis(ctx: AlphCtx*, conn: int64, name: string, timeout_ms: int64) -> int64
+```
+
+Looks up name in the registry of the node at the other end of conn. The
+answer is ALPH_TAG_DIST_FOUND with arg = a local proxy for that actor,
+or 0 when the name is not registered there; or ALPH_TAG_DOWN or
+ALPH_TAG_TIMEOUT. Returns the request's ref, or as alph_request.
+Thread: a handler.
+
+### `alph_dist_port`
+
+```mettle
+export fn alph_dist_port(ctx: AlphCtx*, timeout_ms: int64) -> int64
+```
+
+Asks this node's dist manager which port it listens on, for a manager
+started with port 0. The answer is ALPH_TAG_DIST_PORT with arg = the
+port. Returns the request's ref, or ALPH_GONE when no manager runs.
+Thread: a handler.
 
 ## alph/sys/atomic
 

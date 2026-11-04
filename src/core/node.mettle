@@ -47,6 +47,7 @@ export const ALPH_KILLED: int64 = 2;    // how an actor that was killed exits
 export const ALPH_NOPROC: int64 = 3;    // the actor was already gone
 export const ALPH_CRASHED: int64 = 4;   // a trap or fault inside the handler
 export const ALPH_SHUTDOWN: int64 = 5;  // an orderly stop, from a supervisor
+export const ALPH_NOCONNECTION: int64 = 6;  // the actor was on another node, and the connection to it is gone
 export const ALPH_REASON_USER: int64 = 100;
 
 // Tags the runtime delivers. Tags below ALPH_TAG_USER belong to the runtime;
@@ -59,6 +60,8 @@ export const ALPH_TAG_CRASHED: int64 = 6;  // to a medic: its patient crashed. f
 export const ALPH_TAG_IO: int64 = 7;       // an armed handle is ready. ref = the handle, arg = ALPH_IO_ bits
 export const ALPH_TAG_IO_GIVEN: int64 = 8; // a handle was handed to this actor. ref = the handle, from = the giver
 export const ALPH_TAG_PROC_EXIT: int64 = 9; // a child process ended. ref = its handle, arg = exit code, or 128 + signal
+export const ALPH_TAG_LINKED: int64 = 26;   // to a proxy: from linked to it
+export const ALPH_TAG_UNLINKED: int64 = 27; // to a proxy: from unlinked from it
 export const ALPH_TAG_USER: int64 = 100;
 
 // What a handler returns.
@@ -88,6 +91,10 @@ export const ALPH_TCP_REUSEPORT: int64 = 1;  // several listeners share the port
 export const ALPH_LINK: int64 = 1;     // link the new actor to the caller
 export const ALPH_MONITOR: int64 = 2;  // the caller monitors the new actor
 export const ALPH_BOUND: int64 = 4;    // the new actor gets a thread of its own and may block
+// The new actor stands for an actor on another node (alph/net/dist): it may
+// trap ALPH_KILL, hears ALPH_TAG_LINKED and ALPH_TAG_UNLINKED, and gets
+// replies whatever their ref, so it can pass them on.
+export const ALPH_PROXY: int64 = 8;
 
 // Actor status.
 const ALPH_P_FREE: int64 = 0;
@@ -275,6 +282,7 @@ struct AlphProc {
   poison_heap: int64;     // payload of the message being handled, freed after
   last_msg: AlphMsg;      // with a medic: the message being handled
   retry: int64;           // handle last_msg again when resumed
+  proxy: int64;           // spawned with ALPH_PROXY
 }
 
 struct AlphSched {
@@ -783,6 +791,26 @@ export fn alph_reply_full(ctx: AlphCtx*, request: AlphMsg*, tag: int64, arg: int
   return alph_reply_raw(ctx, request, tag, arg, data, size);
 }
 
+// Posts a message as if from actor from, with the request or reply marks
+// of another node's message: flags is ALPH_MSG_FLAG_REQUEST,
+// ALPH_MSG_FLAG_REPLY or 0, and ref is that message's ref. For
+// alph/net/dist, which delivers messages that crossed a connection; other
+// code uses alph_send and friends. Returns as alph_send_bytes.
+// Thread: any.
+export fn alph_node_forward(node: AlphNode*, to: int64, from: int64, tag: int64, arg: int64,
+                            ref: int64, flags: int64, data: rawptr, size: int64) -> int64 {
+  var m: AlphMsg;
+  alph_message(&m, from, to, tag, arg, size);
+  m.ref = ref;
+  m.flags = flags & (ALPH_MSG_REQUEST | ALPH_MSG_REPLY);
+  return alph_post(node, &m, data);
+}
+
+// The request and reply marks of a message, for m->flags and
+// alph_node_forward.
+export const ALPH_MSG_FLAG_REQUEST: int64 = 1;
+export const ALPH_MSG_FLAG_REPLY: int64 = 2;
+
 // ---- links, monitors, exit signals -----------------------------------------
 
 // Links this actor with pid, both ways: when either exits with a reason
@@ -1166,6 +1194,13 @@ fn alph_spawn_raw(node: AlphNode*, parent: int64, flags: int64, monitor_ref: int
   p->patient = patient;
   p->poison_heap = 0;
   p->retry = 0;
+  p->proxy = 0;
+  if ((flags & ALPH_PROXY) != 0) {
+    // A proxy traps exits from birth: a kill sent before its INIT runs
+    // must still be passed on, not end it.
+    p->proxy = 1;
+    p->trap_exit = 1;
+  }
   if (link) {
     alph_vec_push(&p->links, parent);
   }
@@ -1666,8 +1701,8 @@ fn alph_handle_exit(s: AlphSched*, p: AlphProc*, sig: AlphSignal*) -> int64 {
       return -1;  // unlinked meanwhile
     }
     alph_vec_remove_at(&p->links, at);
-  } else if (reason == ALPH_KILL) {
-    return ALPH_KILLED;
+  } else if (reason == ALPH_KILL && p->proxy == 0) {
+    return ALPH_KILLED;  // a proxy passes the kill on instead
   }
   if (p->trap_exit != 0) {
     var m: AlphMsg;
@@ -1696,6 +1731,10 @@ fn alph_handle_signal(s: AlphSched*, p: AlphProc*, sig: AlphSignal*) -> int64 {
   if (sig->kind == ALPH_SIG_LINK) {
     if (alph_vec_find(&p->links, sig->from) < 0) {
       alph_vec_push(&p->links, sig->from);
+      if (p->proxy != 0) {
+        alph_runtime_message(&m, ALPH_TAG_LINKED, sig->from, p->pid, 0, 0);
+        return alph_deliver(s, p, &m);
+      }
     }
     return -1;
   }
@@ -1703,6 +1742,10 @@ fn alph_handle_signal(s: AlphSched*, p: AlphProc*, sig: AlphSignal*) -> int64 {
     var at: int64 = alph_vec_find(&p->links, sig->from);
     if (at >= 0) {
       alph_vec_remove_at(&p->links, at);
+      if (p->proxy != 0) {
+        alph_runtime_message(&m, ALPH_TAG_UNLINKED, sig->from, p->pid, 0, 0);
+        return alph_deliver(s, p, &m);
+      }
     }
     return -1;
   }
@@ -1784,7 +1827,7 @@ fn alph_handle_message(s: AlphSched*, p: AlphProc*, m: AlphMsg*) -> int64 {
     alph_msg_release(m);  // meant for an earlier owner of this slot
     return -1;
   }
-  if ((m->flags & ALPH_MSG_REPLY) != 0) {
+  if ((m->flags & ALPH_MSG_REPLY) != 0 && p->proxy == 0) {
     var server: int64 = alph_take_ref(p, m->ref);
     if (server < 0) {
       alph_msg_release(m);  // lost to a timeout or a DOWN

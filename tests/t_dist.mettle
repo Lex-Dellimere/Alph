@@ -1,0 +1,289 @@
+// Distribution between two nodes in one process, over real TCP on
+// 127.0.0.1: a request and its reply cross the connection; a remote actor
+// answers through the same proxy every time; a remote crash reaches a local
+// monitor; a kill sent to a proxy kills the remote actor and its link takes
+// down a local actor; a local crash reaches a remote actor linked to it;
+// and losing the connection ends every proxy with ALPH_NOCONNECTION.
+
+import "std/io";
+import "std/mem";
+import "alph/sys/atomic";
+import "alph/sys/clock";
+import "alph/alph";
+import "alph/net/dist";
+
+const TAG_ADD: int64 = ALPH_TAG_USER;        // request: reply with arg + 1
+const TAG_PING: int64 = ALPH_TAG_USER + 1;
+const TAG_PONG: int64 = ALPH_TAG_USER + 2;
+const TAG_CRASH: int64 = ALPH_TAG_USER + 3;
+const TAG_POLL: int64 = ALPH_TAG_USER + 4;
+const TAG_LINK_TO: int64 = ALPH_TAG_USER + 5;  // to a local helper: link to arg, then wait
+const TAG_WATCHDOG: int64 = ALPH_TAG_USER + 6;
+const COOKIE: string = "t_dist cookie";
+
+var g_node_a: AlphNode;
+var g_node_b: AlphNode;
+var g_failures: int64 = 0;
+var g_port: int64 = 0;          // node B's dist port, once it listens
+var g_watcher_saw: int64 = -1;  // the exit reason B's watcher got from A's crashed actor
+
+fn expect(ok: bool, what: string) {
+  if (!ok) {
+    println("FAIL {what}");
+    alph_atomic_add(&g_failures, 1);
+  }
+}
+
+// ---- node B ----
+
+// Registered as "echo" and "echo2": adds one to requests, answers pings to
+// the sender, crashes on request.
+fn echo(ctx: AlphCtx*, m: AlphMsg*) -> int64 {
+  if (m->tag == TAG_ADD) {
+    alph_reply(ctx, m, TAG_ADD, m->arg + 1);
+  } else if (m->tag == TAG_PING) {
+    alph_send(ctx, m->from, TAG_PONG, m->arg);
+  } else if (m->tag == TAG_CRASH) {
+    var zero: int64 = m->arg;
+    alph_send(ctx, m->from, 100 / zero, 0);
+  }
+  return ALPH_CONTINUE;
+}
+
+fn named_echo(ctx: AlphCtx*, m: AlphMsg*) -> int64 {
+  if (m->tag == ALPH_TAG_INIT) {
+    var which: int64 = *(int64*)ctx->state;
+    if (which == 1) {
+      alph_register(ctx, "echo");
+    } else if (which == 2) {
+      alph_register(ctx, "echo2");
+    } else {
+      alph_register(ctx, "victim");
+    }
+    return ALPH_CONTINUE;
+  }
+  return echo(ctx, m);
+}
+
+// Registered as "watcher": traps exits and records the reason of one.
+fn watcher(ctx: AlphCtx*, m: AlphMsg*) -> int64 {
+  if (m->tag == ALPH_TAG_INIT) {
+    alph_trap_exits(ctx, true);
+    alph_register(ctx, "watcher");
+  } else if (m->tag == ALPH_TAG_EXIT) {
+    alph_atomic_store_sc(&g_watcher_saw, m->arg);
+  }
+  return ALPH_CONTINUE;
+}
+
+fn boss_b(ctx: AlphCtx*, m: AlphMsg*) -> int64 {
+  if (m->tag == ALPH_TAG_INIT) {
+    alph_trap_exits(ctx, true);  // the manager is linked; its death must not end this test's node B
+    expect(alph_dist_start(ctx, alph_ip4(127, 0, 0, 1), 0, COOKIE) != 0, "B's manager started");
+    for i: int64 in 1..4 {
+      var which: int64 = i;
+      alph_spawn_value<int64>(ctx, 0, &which, &named_echo);
+    }
+    alph_spawn(ctx, 0, &watcher);
+    return ALPH_CONTINUE;
+  }
+  if (m->tag == ALPH_TAG_DIST_READY) {
+    alph_dist_port(ctx, 2000);  // asks again, to check the request too
+    return ALPH_CONTINUE;
+  }
+  if (m->tag == ALPH_TAG_DIST_PORT) {
+    alph_atomic_store_sc(&g_port, m->arg);
+  }
+  return ALPH_CONTINUE;
+}
+
+// ---- node A ----
+
+// Links to arg on request, then waits; crashes on TAG_CRASH.
+fn helper(ctx: AlphCtx*, m: AlphMsg*) -> int64 {
+  if (m->tag == TAG_LINK_TO) {
+    alph_link(ctx, m->arg);
+    alph_send(ctx, m->from, TAG_LINK_TO, 0);
+  } else if (m->tag == TAG_CRASH) {
+    var zero: int64 = m->arg;
+    alph_send(ctx, m->from, 100 / zero, 0);
+  }
+  return ALPH_CONTINUE;
+}
+
+struct BossA {
+  step: int64;
+  conn: int64;
+  echo: int64;
+  echo2: int64;
+  victim: int64;
+  watcher: int64;
+  helper: int64;
+  pongs: int64;
+  started: int64;
+}
+
+fn boss_a(ctx: AlphCtx*, m: AlphMsg*) -> int64 {
+  var b: BossA* = (BossA*)ctx->state;
+  if (m->tag == TAG_WATCHDOG) {
+    println("FAIL stuck at step {b->step} pongs {b->pongs}");
+    alph_atomic_add(&g_failures, 1);
+    alph_halt(ctx, 1);
+    return ALPH_CONTINUE;
+  }
+  if (m->tag == ALPH_TAG_INIT) {
+    alph_trap_exits(ctx, true);
+    alph_send_after(ctx, 8000, ctx->self, TAG_WATCHDOG, 0);
+    expect(alph_dist_start(ctx, alph_ip4(127, 0, 0, 1), 0, COOKIE) != 0, "A's manager started");
+    return ALPH_CONTINUE;
+  }
+  if (b->step == 0 && m->tag == ALPH_TAG_DIST_READY) {
+    expect(alph_dist_connect(ctx, alph_ip4(127, 0, 0, 1), alph_atomic_load(&g_port), 2000) > 0,
+           "connect sent");
+    return ALPH_CONTINUE;
+  }
+  if (b->step == 0 && m->tag == ALPH_TAG_DIST_UP) {
+    b->conn = m->arg;
+    expect(b->conn != 0, "connected to B");
+    if (b->conn == 0) {
+      alph_halt(ctx, 1);
+      return ALPH_CONTINUE;
+    }
+    alph_monitor(ctx, b->conn);
+    alph_dist_whereis(ctx, b->conn, "echo", 2000);
+    alph_dist_whereis(ctx, b->conn, "echo2", 2000);
+    alph_dist_whereis(ctx, b->conn, "victim", 2000);
+    alph_dist_whereis(ctx, b->conn, "watcher", 2000);
+    b->step = 1;
+    return ALPH_CONTINUE;
+  }
+  if (b->step == 1 && m->tag == ALPH_TAG_DIST_FOUND) {
+    expect(m->arg != 0, "a remote name was found");
+    // Answers come back in the order asked.
+    b->pongs = b->pongs + 1;
+    if (b->pongs == 1) {
+      b->echo = m->arg;
+    } else if (b->pongs == 2) {
+      b->echo2 = m->arg;
+    } else if (b->pongs == 3) {
+      b->victim = m->arg;
+    } else {
+      b->watcher = m->arg;
+      expect(alph_request(ctx, b->echo, TAG_ADD, 41, 2000) > 0, "request sent");
+      b->step = 2;
+    }
+    return ALPH_CONTINUE;
+  }
+  if (b->step == 2 && m->tag == TAG_ADD) {
+    expect(m->arg == 42, "the reply crossed back");
+    b->pongs = 0;
+    for i: int64 in 0..10 {
+      alph_send(ctx, b->echo, TAG_PING, i);
+    }
+    b->step = 3;
+    return ALPH_CONTINUE;
+  }
+  if (b->step == 3 && m->tag == TAG_PONG) {
+    expect(m->from == b->echo, "the remote actor answers through the same proxy");
+    expect(m->arg == b->pongs, "messages keep their order across nodes");
+    b->pongs = b->pongs + 1;
+    if (b->pongs == 10) {
+      alph_monitor(ctx, b->echo);
+      alph_send(ctx, b->echo, TAG_CRASH, 0);
+      b->step = 4;
+    }
+    return ALPH_CONTINUE;
+  }
+  if (b->step == 4 && m->tag == ALPH_TAG_DOWN && m->from == b->echo) {
+    expect(m->arg == ALPH_CRASHED, "a remote crash reaches a local monitor");
+    b->helper = alph_spawn(ctx, ALPH_MONITOR, &helper);
+    alph_send(ctx, b->helper, TAG_LINK_TO, b->victim);
+    b->step = 5;
+    return ALPH_CONTINUE;
+  }
+  if (b->step == 5 && m->tag == TAG_LINK_TO) {
+    // The helper is linked to the victim's proxy, and so to the victim.
+    alph_exit_signal(ctx, b->victim, ALPH_KILL);
+    b->step = 6;
+    return ALPH_CONTINUE;
+  }
+  if (b->step == 6 && m->tag == ALPH_TAG_DOWN && m->from == b->helper) {
+    expect(m->arg == ALPH_KILLED, "a kill through a proxy killed the remote actor and its link");
+    b->helper = alph_spawn(ctx, 0, &helper);
+    alph_send(ctx, b->helper, TAG_LINK_TO, b->watcher);
+    b->step = 7;
+    return ALPH_CONTINUE;
+  }
+  if (b->step == 7 && m->tag == TAG_LINK_TO) {
+    alph_send(ctx, b->helper, TAG_CRASH, 0);
+    alph_send_after(ctx, 5, ctx->self, TAG_POLL, 0);
+    b->step = 8;
+    return ALPH_CONTINUE;
+  }
+  if (b->step == 8 && m->tag == TAG_POLL) {
+    var saw: int64 = alph_atomic_load(&g_watcher_saw);
+    if (saw < 0) {
+      b->started = b->started + 1;
+      expect(b->started < 400, "the remote watcher heard of the local crash in time");
+      if (b->started < 400) {
+        alph_send_after(ctx, 5, ctx->self, TAG_POLL, 0);
+      }
+      return ALPH_CONTINUE;
+    }
+    expect(saw == ALPH_CRASHED, "a local crash reaches a linked remote actor");
+    // Now lose the connection: kill B's dist manager through its proxy.
+    alph_monitor(ctx, b->echo2);
+    alph_dist_whereis(ctx, b->conn, "alph.dist", 2000);
+    b->step = 9;
+    return ALPH_CONTINUE;
+  }
+  if (b->step == 9 && m->tag == ALPH_TAG_DIST_FOUND) {
+    expect(m->arg != 0, "B's manager found");
+    alph_exit_signal(ctx, m->arg, ALPH_KILL);
+    b->pongs = 0;
+    b->step = 10;
+    return ALPH_CONTINUE;
+  }
+  if (b->step == 10 && m->tag == ALPH_TAG_DOWN) {
+    if (m->from == b->echo2) {
+      expect(m->arg == ALPH_NOCONNECTION, "a lost connection ends the proxies");
+      b->pongs = b->pongs + 1;
+    } else if (m->from == b->conn) {
+      expect(m->arg == ALPH_NOCONNECTION, "the connection ends with ALPH_NOCONNECTION");
+      b->pongs = b->pongs + 1;
+    }
+    if (b->pongs == 2) {
+      alph_halt(ctx, 0);
+    }
+  }
+  return ALPH_CONTINUE;
+}
+
+fn main() -> int32 {
+  var cfg: AlphConfig;
+  alph_config(&cfg);
+  cfg.schedulers = 2;
+  cfg.max_actors = 256;
+  cfg.mailbox_size = 256;
+  expect(alph_node_start(&g_node_b, &cfg), "node B started");
+  alph_node_spawn(&g_node_b, 0, &boss_b);
+  var waited: int64 = 0;
+  while (alph_atomic_load(&g_port) == 0 && waited < 5000) {
+    alph_futex_wait(&waited, waited, 1000000);
+    waited = waited + 1;
+  }
+  expect(alph_atomic_load(&g_port) > 0, "node B listens");
+  expect(alph_node_start(&g_node_a, &cfg), "node A started");
+  var b: BossA;
+  memset((rawptr)&b, 0, (int64)sizeof(BossA));
+  alph_node_spawn_value<BossA>(&g_node_a, 0, &b, &boss_a);
+  var code: int64 = alph_node_wait(&g_node_a);
+  alph_node_halt(&g_node_b, 0);
+  alph_node_wait(&g_node_b);
+  expect(code == 0, "node A finished");
+  if (g_failures != 0) {
+    return 1;
+  }
+  println("dist ok");
+  return 0;
+}
