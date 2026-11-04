@@ -114,7 +114,7 @@ fn sim_ui_new(rate: int64, requests: int64) -> SimUi* {
   var s: SimUi* = (SimUi*)malloc((int64)sizeof(SimUi));
   memset((rawptr)s, 0, (int64)sizeof(SimUi));
   s->lv_energy = sim_chart_live("Total energy", 1, "");
-  s->lv_msgs = sim_chart_live("Messages per second", 1, "");
+  s->lv_msgs = sim_chart_live("Neighbour messages per second (the world itself)", 1, "");
   s->lv_reqs = sim_chart_live("Requests per second", 3, "");
   s->lv_lat = sim_chart_live("Request latency (us)", 2, "");
   s->lv_faults = sim_chart_live("Crashes and restarts per second", 2, "");
@@ -396,7 +396,7 @@ fn sim_controls(ui: MythicUi*, s: SimUi*) {
     }
     mythic_separator(ui);
     mythic_row_begin(ui, { width: mythic_grow(), gap: 20 });
-      sim_stat(ui, "Messages", alph_atomic_load(&sim_msgs));
+      sim_stat(ui, "Neighbour msgs", alph_atomic_load(&sim_msgs));
       sim_stat(ui, "Crashes", alph_atomic_load(&sim_crashes));
       sim_stat(ui, "Restarts", alph_atomic_load(&sim_restarts));
       sim_stat(ui, "Live actors", s->live_actors);
