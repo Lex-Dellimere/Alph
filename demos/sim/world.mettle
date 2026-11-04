@@ -3,7 +3,9 @@
 //   world (top level, traps exits)
 //     |- dynamic supervisor, permanent restart: one child per grid cell
 //     |    `- 640 cells, each a plain actor holding an energy value
-//     `- chaos actor: crashes random cells at an adjustable rate
+//     |- chaos actor: crashes random cells at an adjustable rate
+//     `- 32 client actors: each keeps up to 16 requests in flight to random
+//          cells, at a rate the UI sets, and counts how each one ends
 //
 // Shared state is a set of global arrays and counters. Every access goes
 // through alph_atomic_load / store / add, so the UI thread can read them
@@ -14,7 +16,12 @@
 //   sim_energy[i]   the energy cell i published on its last tick
 //   sim_born[i]     alph_now_ms() when cell i was last restarted, 0 if never
 //   sim_msgs, sim_crashes, sim_restarts, sim_sup_restarts   counters
-//   sim_paused      1 makes cells skip their tick work
+//   sim_paused      1 makes cells skip their tick work, and the chaos actor and
+//                   the clients idle
+//   sim_req_*       requests answered, failed (DOWN, or not sent), timed out
+//   sim_req_rate    the target request rate, all clients together, per second
+//   sim_lat[b]      answered requests whose latency fell in bucket b: b is
+//                   floor(log2(microseconds)), so bucket 10 is 1024 to 2047 us
 //   sim_chaos_pid   the chaos actor, so the UI can message it
 
 import "std/mem";
@@ -31,16 +38,27 @@ export const SIM_ONE: int64 = 1000000;          // energy 1.0, fixed point
 export const SIM_TAG_RATE: int64 = ALPH_TAG_USER + 10;   // arg: crashes per second
 export const SIM_TAG_STORM: int64 = ALPH_TAG_USER + 11;  // crash SIM_STORM_SIZE cells now
 export const SIM_STORM_SIZE: int64 = 100;
-export const SIM_DEFAULT_RATE: int64 = 25;
+export const SIM_DEFAULT_RATE: int64 = 0;       // no chaos until the user asks for it
+
+// Request load.
+export const SIM_CLIENTS: int64 = 32;
+export const SIM_WINDOW: int64 = 16;            // requests in flight per client, at most
+export const SIM_LAT_BUCKETS: int64 = 24;
+export const SIM_MAX_REQ_RATE: int64 = 100000;
+export const SIM_REQ_TIMEOUT_MS: int64 = 200;
+export const SIM_TAG_READ: int64 = ALPH_TAG_USER + 20;   // reply arg: the cell's energy
 
 const TAG_TICK: int64 = ALPH_TAG_USER;           // a cell's timer
 const TAG_SHARE: int64 = ALPH_TAG_USER + 1;      // arg: energy handed over
 const TAG_CRASH: int64 = ALPH_TAG_USER + 2;      // arg 0 makes the cell divide by it
 const TAG_SPAWN: int64 = ALPH_TAG_USER + 3;      // the world starting the next batch of cells
 const TAG_CHAOS_TICK: int64 = ALPH_TAG_USER + 4;
+const TAG_CLIENT_TICK: int64 = ALPH_TAG_USER + 5;
+const TAG_READ: int64 = SIM_TAG_READ;
 
 const TICK_MS: int64 = 40;
 const CHAOS_TICK_MS: int64 = 10;
+const CLIENT_TICK_MS: int64 = 2;
 const SPAWN_BATCH: int64 = 16;
 const SHARE_DIV: int64 = 40;      // each neighbour gets 1/40 of the energy per tick
 const GROWTH_PCT: int64 = 9;      // logistic growth per tick, in percent
@@ -58,6 +76,12 @@ export var sim_paused: int64 = 0;
 export var sim_chaos_pid: int64 = 0;
 export var sim_chaos_rate: int64 = 0;
 export var sim_cells_started: int64 = 0;
+export var sim_req_ok: int64 = 0;
+export var sim_req_failed: int64 = 0;
+export var sim_req_timeout: int64 = 0;
+export var sim_req_full: int64 = 0;      // of the failed: the cell's mailbox was full
+export var sim_req_rate: int64 = 0;
+export var sim_lat: int64[24];
 
 // ---------------------------------------------------------------- cells
 
@@ -148,6 +172,8 @@ fn sim_cell(ctx: AlphCtx*, m: AlphMsg*) -> int64 {
   var c: SimCell* = (SimCell*)ctx->state;
   if (m->tag == TAG_SHARE) {
     c->energy = c->energy + m->arg;
+  } else if (m->tag == TAG_READ) {
+    alph_reply(ctx, m, TAG_READ, c->energy);
   } else if (m->tag == TAG_TICK) {
     sim_cell_tick(ctx, c);
   } else if (m->tag == TAG_CRASH) {
@@ -209,11 +235,18 @@ fn sim_chaos(ctx: AlphCtx*, m: AlphMsg*) -> int64 {
     }
     alph_atomic_store(&sim_chaos_rate, ch->rate);
   } else if (m->tag == SIM_TAG_STORM) {
-    sim_chaos_hit(ctx, ch, SIM_STORM_SIZE);
+    if (alph_atomic_load(&sim_paused) == 0) {
+      sim_chaos_hit(ctx, ch, SIM_STORM_SIZE);
+    }
   } else if (m->tag == TAG_CHAOS_TICK) {
     // Crashes owed since the last tick, with the remainder carried over.
+    // While paused nothing is owed, so unpausing does not release a burst.
     var now: int64 = alph_now_ms();
-    ch->owed = ch->owed + (now - ch->last_ms) * ch->rate;
+    if (alph_atomic_load(&sim_paused) == 0) {
+      ch->owed = ch->owed + (now - ch->last_ms) * ch->rate;
+    } else {
+      ch->owed = 0;
+    }
     ch->last_ms = now;
     var n: int64 = ch->owed / 1000;
     ch->owed = ch->owed - n * 1000;
@@ -225,12 +258,147 @@ fn sim_chaos(ctx: AlphCtx*, m: AlphMsg*) -> int64 {
   return ALPH_CONTINUE;
 }
 
+// ---------------------------------------------------------------- clients
+
+// A client keeps up to SIM_WINDOW requests in flight to random cells. refs and
+// sent_ns are a small table: slot i holds the ref of a request in flight (0
+// for a free slot) and when it was sent.
+struct SimClient {
+  rng: int64;
+  owed: int64;      // requests owed, times CLIENTS * 1000000
+  last_ns: int64;
+  inflight: int64;
+  refs: int64[16];
+  sent_ns: int64[16];
+}
+
+fn sim_client_pick(c: SimClient*) -> int64 {
+  c->rng = (c->rng * 1103515245 + 12345) & 2147483647;
+  return (c->rng >> 8) % SIM_CELLS;
+}
+
+// floor(log2(us)), clamped to the buckets; 0 for anything under 2 us.
+fn sim_lat_bucket(us: int64) -> int64 {
+  var b: int64 = 0;
+  var v: int64 = us;
+  while (v > 1 && b < SIM_LAT_BUCKETS - 1) {
+    v = v >> 1;
+    b = b + 1;
+  }
+  return b;
+}
+
+// Frees the slot of request ref and returns its send time, or 0 when the
+// client has no such request.
+fn sim_client_take(c: SimClient*, ref: int64) -> int64 {
+  for i: int64 in 0..SIM_WINDOW {
+    if (c->refs[i] == ref) {
+      c->refs[i] = 0;
+      c->inflight = c->inflight - 1;
+      return c->sent_ns[i];
+    }
+  }
+  return 0;
+}
+
+// Puts a request that was sent into a free slot.
+fn sim_client_put(c: SimClient*, ref: int64, now_ns: int64) {
+  for i: int64 in 0..SIM_WINDOW {
+    if (c->refs[i] == 0) {
+      c->refs[i] = ref;
+      c->sent_ns[i] = now_ns;
+      c->inflight = c->inflight + 1;
+      return;
+    }
+  }
+}
+
+fn sim_client_send(ctx: AlphCtx*, c: SimClient*) {
+  var pid: int64 = alph_atomic_load(&sim_pid[sim_client_pick(c)]);
+  if (pid == 0) {
+    return;   // the cell has not started yet
+  }
+  var now_ns: int64 = alph_now_ns();
+  var ref: int64 = alph_request(ctx, pid, TAG_READ, 0, SIM_REQ_TIMEOUT_MS);
+  if (ref > 0) {
+    sim_client_put(c, ref, now_ns);
+  } else {
+    // ALPH_FULL (or no memory): the request was never sent.
+    alph_atomic_add(&sim_req_full, 1);
+    alph_atomic_add(&sim_req_failed, 1);
+  }
+}
+
+fn sim_client_tick(ctx: AlphCtx*, c: SimClient*) {
+  alph_send_after(ctx, CLIENT_TICK_MS, ctx->self, TAG_CLIENT_TICK, 0);
+  var now_ns: int64 = alph_now_ns();
+  var rate: int64 = alph_atomic_load(&sim_req_rate);
+  if (alph_atomic_load(&sim_paused) != 0 || rate <= 0) {
+    c->owed = 0;
+    c->last_ns = now_ns;
+    return;
+  }
+  // Requests owed since the last tick: all clients together send `rate` a
+  // second, so this one sends rate / SIM_CLIENTS. The remainder is carried.
+  var unit: int64 = SIM_CLIENTS * 1000000000;
+  c->owed = c->owed + (now_ns - c->last_ns) * rate;
+  c->last_ns = now_ns;
+  var n: int64 = c->owed / unit;
+  c->owed = c->owed - n * unit;
+  var room: int64 = SIM_WINDOW - c->inflight;
+  if (n > room) {
+    n = room;   // the window is full: the rest is not owed, it is shed
+  }
+  for i: int64 in 0..n {
+    sim_client_send(ctx, c);
+  }
+}
+
+// An answer, a DOWN or a TIMEOUT for request m->ref.
+fn sim_client_done(c: SimClient*, m: AlphMsg*) {
+  var sent: int64 = sim_client_take(c, m->ref);
+  if (sent == 0) {
+    return;
+  }
+  if (m->tag == TAG_READ) {
+    alph_atomic_add(&sim_req_ok, 1);
+    alph_atomic_add(&sim_lat[sim_lat_bucket((alph_now_ns() - sent) / 1000)], 1);
+  } else if (m->tag == ALPH_TAG_DOWN) {
+    alph_atomic_add(&sim_req_failed, 1);
+  } else {
+    alph_atomic_add(&sim_req_timeout, 1);
+  }
+}
+
+fn sim_client(ctx: AlphCtx*, m: AlphMsg*) -> int64 {
+  var c: SimClient* = (SimClient*)ctx->state;
+  if (m->tag == ALPH_TAG_INIT) {
+    c->last_ns = alph_now_ns();
+    alph_send_after(ctx, CLIENT_TICK_MS, ctx->self, TAG_CLIENT_TICK, 0);
+  } else if (m->tag == TAG_CLIENT_TICK) {
+    sim_client_tick(ctx, c);
+  } else if (m->tag == TAG_READ || m->tag == ALPH_TAG_DOWN || m->tag == ALPH_TAG_TIMEOUT) {
+    sim_client_done(c, m);
+  }
+  return ALPH_CONTINUE;
+}
+
 // ---------------------------------------------------------------- world
 
 struct SimWorld {
   sup: int64;      // the dynamic supervisor
   chaos: int64;
   next: int64;     // the next cell to start
+  clients_up: int64;   // 1 once the clients are started
+  seed: int64;
+}
+
+fn sim_world_spawn_client(ctx: AlphCtx*, w: SimWorld*) {
+  var cl: SimClient;
+  memset((rawptr)&cl, 0, (int64)sizeof(SimClient));
+  w->seed = w->seed + 7919;
+  cl.rng = 1 + (w->seed + alph_now_ms()) % 2147483647;
+  alph_spawn_value<SimClient>(ctx, ALPH_LINK, &cl, &sim_client);
 }
 
 fn sim_world_spawn_chaos(ctx: AlphCtx*, w: SimWorld*) {
@@ -277,8 +445,16 @@ fn sim_world(ctx: AlphCtx*, m: AlphMsg*) -> int64 {
     }
     if (w->next < SIM_CELLS) {
       alph_send_after(ctx, 2, ctx->self, TAG_SPAWN, 0);
-    } else if (w->chaos == 0) {
-      sim_world_spawn_chaos(ctx, w);
+    } else {
+      if (w->chaos == 0) {
+        sim_world_spawn_chaos(ctx, w);
+      }
+      if (w->clients_up == 0) {
+        w->clients_up = 1;
+        for i: int64 in 0..SIM_CLIENTS {
+          sim_world_spawn_client(ctx, w);
+        }
+      }
     }
   } else if (m->tag == ALPH_TAG_EXIT) {
     if (m->from == w->sup) {
@@ -287,26 +463,29 @@ fn sim_world(ctx: AlphCtx*, m: AlphMsg*) -> int64 {
       sim_world_boot(ctx, w);
     } else if (m->from == w->chaos) {
       sim_world_spawn_chaos(ctx, w);
+    } else {
+      sim_world_spawn_client(ctx, w);   // a client died: replace it
     }
   }
   return ALPH_CONTINUE;
 }
 
 // Starts the node and the world, with the chaos actor at `rate` crashes per
-// second. schedulers 0 is one per CPU. Returns false when the node would not
+// second and the clients at `requests` requests per second. schedulers 0 is one per CPU. Returns false when the node would not
 // start.
-export fn sim_start(schedulers: int64, rate: int64) -> bool {
+export fn sim_start(schedulers: int64, rate: int64, requests: int64) -> bool {
   var cfg: AlphConfig;
   alph_config(&cfg);
   if (schedulers > 0) {
     cfg.schedulers = schedulers;
   }
   cfg.max_actors = 4096;
-  cfg.mailbox_size = 512;   // a cell gets four shares a tick, a crash storm adds more
+  cfg.mailbox_size = 512;   // a cell gets four shares a tick and a few requests; a crash storm adds more
   if (!alph_node_start(&sim_node, &cfg)) {
     return false;
   }
   alph_atomic_store(&sim_chaos_rate, rate);
+  alph_atomic_store(&sim_req_rate, requests);
   var w: SimWorld;
   memset((rawptr)&w, 0, (int64)sizeof(SimWorld));
   return alph_node_spawn_value<SimWorld>(&sim_node, 0, &w, &sim_world) != 0;
@@ -340,4 +519,9 @@ export fn sim_set_paused(on: bool) {
   } else {
     alph_atomic_store(&sim_paused, 0);
   }
+}
+
+// Sets the target request rate, all clients together, per second.
+export fn sim_set_requests(n: int64) {
+  alph_atomic_store(&sim_req_rate, n);
 }

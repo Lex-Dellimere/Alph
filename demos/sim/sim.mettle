@@ -1,10 +1,13 @@
 // sim: a live world of alph actors in a MythicUI window with MistPlot charts.
 //
 // 640 cell actors (a 32 x 20 grid) pass energy to their neighbours and grow
-// logistically. A chaos actor crashes random cells at a rate the UI sets, and
-// a dynamic supervisor restarts every one of them. The window shows the
-// grid as a heatmap (a restarted cell flashes red and regrows from zero) and
-// live charts of energy, message rate, crashes, restarts and live actors.
+// logistically. A dynamic supervisor restarts every cell that crashes. Nothing
+// crashes until the UI raises the chaos rate (or presses Crash storm); then a
+// chaos actor crashes random cells. 32 client actors send requests to random
+// cells at a rate the UI sets and count the answers, the DOWNs and the
+// timeouts. The window shows the grid as a heatmap (a restarted cell flashes
+// red and regrows from zero) and live charts of energy, messages, requests,
+// request latency, crashes and restarts.
 //
 // The alph schedulers run on their own threads. This thread, the UI, reads only
 // the shared atomics in world.mettle, and talks to the actors with
@@ -13,7 +16,9 @@
 //   sim                                         open the window
 //   sim --snapshot out.png --seconds 3 [--storm]   headless: run, write the last frame, exit
 //
-// Other flags: --rate N sets the starting chaos rate, --stderr keeps stderr.
+// Other flags: --rate N sets the starting chaos rate (crashes per second,
+// default 0), --requests N the starting request rate (per second, default 0),
+// --stderr keeps stderr.
 // The Mettle runtime prints a stack trace to stderr for every crash it
 // recovers from, which at the chaos rates here would bury the terminal, so
 // stderr goes to /dev/null unless --stderr is given.
@@ -35,7 +40,7 @@ import "alph/alph";
 import "world";
 
 const WINDOW_W: float32 = 1360.0;
-const WINDOW_H: float32 = 800.0;
+const WINDOW_H: float32 = 980.0;
 const SAMPLE_MS: int64 = 100;       // a chart sample every 100 ms
 const RATE_LOOKBACK: int64 = 5;     // rates are over the last 5 samples, 500 ms
 const HISTORY: int64 = 16;
@@ -46,14 +51,18 @@ const FLASH_MS: int64 = 700;
 struct SimUi {
   lv_energy: MpLive*;
   lv_msgs: MpLive*;
+  lv_reqs: MpLive*;
+  lv_lat: MpLive*;
   lv_faults: MpLive*;
-  lv_live: MpLive*;
   ch_energy: MpMythicChart*;
   ch_msgs: MpMythicChart*;
+  ch_reqs: MpMythicChart*;
+  ch_lat: MpMythicChart*;
   ch_faults: MpMythicChart*;
-  ch_live: MpMythicChart*;
   rate: float32;            // chaos slider, crashes per second
   rate_sent: int64;
+  req: float32;             // request slider, requests per second
+  req_sent: int64;
   paused: bool;
   paused_sent: bool;
   t0: int64;                // real time of the first sample
@@ -63,11 +72,17 @@ struct SimUi {
   hist_msgs: int64[16];
   hist_crashes: int64[16];
   hist_restarts: int64[16];
+  hist_ok: int64[16];
+  hist_failed: int64[16];
+  hist_timeout: int64[16];
+  hist_lat: int64[384];     // 16 samples of the 24 latency buckets
   total: int64;             // latest total energy, fixed point
   msgs_rate: int64;
   crash_rate: int64;
   restart_rate: int64;
   live_actors: int64;
+  p50_us: int64;
+  p99_us: int64;
 }
 
 // ---------------------------------------------------------------- charts
@@ -95,36 +110,46 @@ fn sim_chart_state() -> MpMythicChart* {
   return st;
 }
 
-fn sim_ui_new(rate: int64) -> SimUi* {
+fn sim_ui_new(rate: int64, requests: int64) -> SimUi* {
   var s: SimUi* = (SimUi*)malloc((int64)sizeof(SimUi));
   memset((rawptr)s, 0, (int64)sizeof(SimUi));
   s->lv_energy = sim_chart_live("Total energy", 1, "");
   s->lv_msgs = sim_chart_live("Messages per second", 1, "");
+  s->lv_reqs = sim_chart_live("Requests per second", 3, "");
+  s->lv_lat = sim_chart_live("Request latency (us)", 2, "");
   s->lv_faults = sim_chart_live("Crashes and restarts per second", 2, "");
-  s->lv_live = sim_chart_live("Live actors", 1, "");
   mp_live_series_name(s->lv_energy, 0, "energy");
   mp_live_series_name(s->lv_msgs, 0, "messages/s");
+  mp_live_series_name(s->lv_reqs, 0, "answered/s");
+  mp_live_series_name(s->lv_reqs, 1, "failed/s");
+  mp_live_series_name(s->lv_reqs, 2, "timed out/s");
+  mp_live_series_name(s->lv_lat, 0, "p50");
+  mp_live_series_name(s->lv_lat, 1, "p99");
   mp_live_series_name(s->lv_faults, 0, "crashes/s");
   mp_live_series_name(s->lv_faults, 1, "restarts/s");
-  mp_live_series_name(s->lv_live, 0, "actors");
   s->ch_energy = sim_chart_state();
   s->ch_msgs = sim_chart_state();
+  s->ch_reqs = sim_chart_state();
+  s->ch_lat = sim_chart_state();
   s->ch_faults = sim_chart_state();
-  s->ch_live = sim_chart_state();
   s->rate = (float32)rate;
   s->rate_sent = rate;
+  s->req = (float32)requests;
+  s->req_sent = requests;
   return s;
 }
 
 fn sim_ui_free(s: SimUi*) {
   mp_mythic_chart_free(s->ch_energy);
   mp_mythic_chart_free(s->ch_msgs);
+  mp_mythic_chart_free(s->ch_reqs);
+  mp_mythic_chart_free(s->ch_lat);
   mp_mythic_chart_free(s->ch_faults);
-  mp_mythic_chart_free(s->ch_live);
   mp_live_free(s->lv_energy);
   mp_live_free(s->lv_msgs);
+  mp_live_free(s->lv_reqs);
+  mp_live_free(s->lv_lat);
   mp_live_free(s->lv_faults);
-  mp_live_free(s->lv_live);
   free((rawptr)s);
 }
 
@@ -139,6 +164,28 @@ fn sim_rate(hist: int64*, hist_t: int64*, n: int64, now: int64, count: int64) ->
     return 0;
   }
   return (count - hist[j % HISTORY]) * 1000 / dt;
+}
+
+// The latency in microseconds under which q permille of the requests in
+// h[0..24] finished, as the middle of the log2 bucket it falls in. 0 when h
+// is empty.
+fn sim_percentile(h: int64*, q: int64) -> int64 {
+  var total: int64 = 0;
+  for b: int64 in 0..SIM_LAT_BUCKETS {
+    total = total + h[b];
+  }
+  if (total <= 0) {
+    return 0;
+  }
+  var want: int64 = (total * q + 999) / 1000;   // rounded up: the want'th request
+  var seen: int64 = 0;
+  for b: int64 in 0..SIM_LAT_BUCKETS {
+    seen = seen + h[b];
+    if (seen >= want) {
+      return ((int64)3 << b) / 2;
+    }
+  }
+  return 0;
 }
 
 // Reads the counters and pushes a sample into every chart, every SAMPLE_MS.
@@ -163,11 +210,35 @@ fn sim_sample(ui: MythicUi*, s: SimUi*) {
   var msgs: int64 = alph_atomic_load(&sim_msgs);
   var crashes: int64 = alph_atomic_load(&sim_crashes);
   var restarts: int64 = alph_atomic_load(&sim_restarts);
+  var ok: int64 = alph_atomic_load(&sim_req_ok);
+  var failed: int64 = alph_atomic_load(&sim_req_failed);
+  var timeouts: int64 = alph_atomic_load(&sim_req_timeout);
   var n: int64 = s->samples;
+  // Latency over the last RATE_LOOKBACK samples: the bucket counts now minus
+  // the counts then.
+  var j: int64 = n - RATE_LOOKBACK;
+  if (j < 0) {
+    j = 0;
+  }
+  var lat: int64[24];
+  var lat_n: int64 = 0;
+  for b: int64 in 0..SIM_LAT_BUCKETS {
+    lat[b] = alph_atomic_load(&sim_lat[b]) - s->hist_lat[(j % HISTORY) * SIM_LAT_BUCKETS + b];
+    lat_n = lat_n + lat[b];
+  }
   s->msgs_rate = sim_rate(&s->hist_msgs[0], &s->hist_t[0], n, now, msgs);
   s->crash_rate = sim_rate(&s->hist_crashes[0], &s->hist_t[0], n, now, crashes);
   s->restart_rate = sim_rate(&s->hist_restarts[0], &s->hist_t[0], n, now, restarts);
+  var ok_rate: int64 = sim_rate(&s->hist_ok[0], &s->hist_t[0], n, now, ok);
+  var failed_rate: int64 = sim_rate(&s->hist_failed[0], &s->hist_t[0], n, now, failed);
+  var timeout_rate: int64 = sim_rate(&s->hist_timeout[0], &s->hist_t[0], n, now, timeouts);
+  for b: int64 in 0..SIM_LAT_BUCKETS {
+    s->hist_lat[(n % HISTORY) * SIM_LAT_BUCKETS + b] = alph_atomic_load(&sim_lat[b]);
+  }
   s->hist_t[n % HISTORY] = now;
+  s->hist_ok[n % HISTORY] = ok;
+  s->hist_failed[n % HISTORY] = failed;
+  s->hist_timeout[n % HISTORY] = timeouts;
   s->hist_msgs[n % HISTORY] = msgs;
   s->hist_crashes[n % HISTORY] = crashes;
   s->hist_restarts[n % HISTORY] = restarts;
@@ -181,7 +252,16 @@ fn sim_sample(ui: MythicUi*, s: SimUi*) {
   mp_live_push(s->lv_msgs, 0, x, (float64)s->msgs_rate);
   mp_live_push(s->lv_faults, 0, x, (float64)s->crash_rate);
   mp_live_push(s->lv_faults, 1, x, (float64)s->restart_rate);
-  mp_live_push(s->lv_live, 0, x, (float64)stats.live);
+  mp_live_push(s->lv_reqs, 0, x, (float64)ok_rate);
+  mp_live_push(s->lv_reqs, 1, x, (float64)failed_rate);
+  mp_live_push(s->lv_reqs, 2, x, (float64)timeout_rate);
+  // No answers in the interval means no latency to plot: leave a gap.
+  if (lat_n > 0) {
+    s->p50_us = sim_percentile(&lat[0], 500);
+    s->p99_us = sim_percentile(&lat[0], 990);
+    mp_live_push(s->lv_lat, 0, x, (float64)s->p50_us);
+    mp_live_push(s->lv_lat, 1, x, (float64)s->p99_us);
+  }
 }
 
 // ---------------------------------------------------------------- heatmap
@@ -251,7 +331,7 @@ fn sim_header(ui: MythicUi*) {
   mythic_row_begin(ui, { width: mythic_grow(), align_y: MYTHIC_ALIGN_CENTER, gap: 16 });
     mythic_column_begin(ui, { gap: 2 });
       mythic_label_ex(ui, "alph: a live world of actors", { role: MYTHIC_TYPE_HEADING });
-      mythic_label_ex(ui, "640 supervised cells pass energy to their neighbours while a chaos actor crashes them",
+      mythic_label_ex(ui, "640 supervised cells pass energy and answer requests. Nothing crashes until you raise the chaos rate",
                       { role: MYTHIC_TYPE_BODY, tone: MYTHIC_TONE_SECONDARY });
     mythic_end(ui);
   mythic_end(ui);
@@ -274,18 +354,28 @@ fn sim_world_card(ui: MythicUi*, s: SimUi*) {
   mythic_end(ui);
 }
 
+fn sim_stat(ui: MythicUi*, name: string, value: int64) {
+  mythic_column_begin(ui, { gap: 2 });
+    mythic_label_ex(ui, name, { role: MYTHIC_TYPE_CAPTION, tone: MYTHIC_TONE_SECONDARY });
+    mythic_label_ex(ui, "{value}", { role: MYTHIC_TYPE_BODY_STRONG });
+  mythic_end(ui);
+}
+
 fn sim_controls(ui: MythicUi*, s: SimUi*) {
   mythic_card_begin_ex(ui, { width: mythic_grow(), pad: mythic_pad(16), gap: 12 }, { elevation: 1 });
     mythic_label_ex(ui, "Controls", { role: MYTHIC_TYPE_TITLE });
     var rate: int64 = (int64)(s->rate + 0.5);
-    mythic_label_ex(ui, "Chaos rate: {rate} crashes per second", { role: MYTHIC_TYPE_LABEL });
+    mythic_label_ex(ui, "Chaos rate: {rate} crashes per second (0 = no crashes)", { role: MYTHIC_TYPE_LABEL });
     mythic_slider_ex(ui, "##chaos", &s->rate, { min: 0.0, max: 200.0, step: 1.0, width: mythic_grow() });
+    var req: int64 = (int64)(s->req + 0.5);
+    mythic_label_ex(ui, "Request rate: {req} requests per second (0 = none)", { role: MYTHIC_TYPE_LABEL });
+    mythic_slider_ex(ui, "##requests", &s->req, { min: 0.0, max: (float32)SIM_MAX_REQ_RATE, step: 500.0, width: mythic_grow() });
     mythic_row_begin(ui, { width: mythic_grow(), align_y: MYTHIC_ALIGN_CENTER, gap: 16 });
       mythic_switch(ui, "Pause world", &s->paused);
       mythic_spacer(ui);
       var storm: bool = mythic_button_ex(ui, "Crash storm", { variant: MYTHIC_BTN_DANGER });
-      mythic_tooltip(ui, "Crash 100 cells at once");
-      if (storm && ui->pass == 0) {
+      mythic_tooltip(ui, "Crash 100 cells at once (ignored while paused)");
+      if (storm && ui->pass == 0 && !s->paused) {
         sim_storm();
       }
     mythic_end(ui);
@@ -295,6 +385,10 @@ fn sim_controls(ui: MythicUi*, s: SimUi*) {
         s->rate_sent = rate;
         sim_set_rate(rate);
       }
+      if (req != s->req_sent) {
+        s->req_sent = req;
+        sim_set_requests(req);
+      }
       if (s->paused != s->paused_sent) {
         s->paused_sent = s->paused;
         sim_set_paused(s->paused);
@@ -302,22 +396,15 @@ fn sim_controls(ui: MythicUi*, s: SimUi*) {
     }
     mythic_separator(ui);
     mythic_row_begin(ui, { width: mythic_grow(), gap: 20 });
-      mythic_column_begin(ui, { gap: 2 });
-        mythic_label_ex(ui, "Messages", { role: MYTHIC_TYPE_CAPTION, tone: MYTHIC_TONE_SECONDARY });
-        mythic_label_ex(ui, "{alph_atomic_load(&sim_msgs)}", { role: MYTHIC_TYPE_BODY_STRONG });
-      mythic_end(ui);
-      mythic_column_begin(ui, { gap: 2 });
-        mythic_label_ex(ui, "Crashes", { role: MYTHIC_TYPE_CAPTION, tone: MYTHIC_TONE_SECONDARY });
-        mythic_label_ex(ui, "{alph_atomic_load(&sim_crashes)}", { role: MYTHIC_TYPE_BODY_STRONG });
-      mythic_end(ui);
-      mythic_column_begin(ui, { gap: 2 });
-        mythic_label_ex(ui, "Restarts", { role: MYTHIC_TYPE_CAPTION, tone: MYTHIC_TONE_SECONDARY });
-        mythic_label_ex(ui, "{alph_atomic_load(&sim_restarts)}", { role: MYTHIC_TYPE_BODY_STRONG });
-      mythic_end(ui);
-      mythic_column_begin(ui, { gap: 2 });
-        mythic_label_ex(ui, "Live actors", { role: MYTHIC_TYPE_CAPTION, tone: MYTHIC_TONE_SECONDARY });
-        mythic_label_ex(ui, "{s->live_actors}", { role: MYTHIC_TYPE_BODY_STRONG });
-      mythic_end(ui);
+      sim_stat(ui, "Messages", alph_atomic_load(&sim_msgs));
+      sim_stat(ui, "Crashes", alph_atomic_load(&sim_crashes));
+      sim_stat(ui, "Restarts", alph_atomic_load(&sim_restarts));
+      sim_stat(ui, "Live actors", s->live_actors);
+    mythic_end(ui);
+    mythic_row_begin(ui, { width: mythic_grow(), gap: 20 });
+      sim_stat(ui, "Requests answered", alph_atomic_load(&sim_req_ok));
+      sim_stat(ui, "Failed", alph_atomic_load(&sim_req_failed));
+      sim_stat(ui, "Timed out", alph_atomic_load(&sim_req_timeout));
     mythic_end(ui);
   mythic_end(ui);
 }
@@ -342,8 +429,9 @@ fn sim_frame(ui: MythicUi*, ud: rawptr) {
       mythic_column_begin(ui, { width: mythic_fixed(540), height: mythic_grow(), gap: 10 });
         sim_chart_card(ui, s->ch_energy, s->lv_energy);
         sim_chart_card(ui, s->ch_msgs, s->lv_msgs);
+        sim_chart_card(ui, s->ch_reqs, s->lv_reqs);
+        sim_chart_card(ui, s->ch_lat, s->lv_lat);
         sim_chart_card(ui, s->ch_faults, s->lv_faults);
-        sim_chart_card(ui, s->ch_live, s->lv_live);
       mythic_end(ui);
     mythic_end(ui);
   mythic_end(ui);
@@ -357,7 +445,17 @@ fn sim_counts_line() {
   var restarts: int64 = alph_atomic_load(&sim_restarts);
   var started: int64 = alph_atomic_load(&sim_cells_started);
   var supr: int64 = alph_atomic_load(&sim_sup_restarts);
-  println("cells={SIM_CELLS} messages={msgs} crashes={crashes} restarts={restarts} cell_starts={started} supervisor_restarts={supr}");
+  var ok: int64 = alph_atomic_load(&sim_req_ok);
+  var failed: int64 = alph_atomic_load(&sim_req_failed);
+  var full: int64 = alph_atomic_load(&sim_req_full);
+  var timeouts: int64 = alph_atomic_load(&sim_req_timeout);
+  var lat: int64[24];
+  for b: int64 in 0..SIM_LAT_BUCKETS {
+    lat[b] = alph_atomic_load(&sim_lat[b]);
+  }
+  var p50: int64 = sim_percentile(&lat[0], 500);
+  var p99: int64 = sim_percentile(&lat[0], 990);
+  println("cells={SIM_CELLS} messages={msgs} crashes={crashes} restarts={restarts} cell_starts={started} supervisor_restarts={supr} requests_answered={ok} requests_failed={failed} (full={full}) requests_timed_out={timeouts} p50_us={p50} p99_us={p99}");
 }
 
 // Runs the world and the UI on the headless platform for `seconds` of real
@@ -390,6 +488,10 @@ fn sim_snapshot(s: SimUi*, path: string, seconds: int64, storm: bool) -> int32 {
     mythic_app_step(app, &sim_frame, (rawptr)s, false);
   }
   var ok: bool = mythic_app_save_png(app, path);
+  // Stop the load and let the requests in flight end, so the counts line
+  // covers the run and no request is still pending.
+  sim_set_requests(0);
+  time_sleep_ms(SIM_REQ_TIMEOUT_MS + 100);
   var frames: int64 = mythic_app_frames(app);
   mythic_app_destroy(app);
   if (!ok) {
@@ -405,6 +507,7 @@ fn main(argc: int32, argv: cstring*) -> int32 {
   var seconds: int64 = 3;
   var storm: bool = false;
   var rate: int64 = SIM_DEFAULT_RATE;
+  var requests: int64 = 0;
   var keep_stderr: bool = false;
   var i: int32 = 1;
   while (i < argc) {
@@ -418,12 +521,15 @@ fn main(argc: int32, argv: cstring*) -> int32 {
     } else if (a == "--rate" && i + 1 < argc) {
       rate = (int64)atoi(argv[(int64)(i + 1)]);
       i = i + 1;
+    } else if (a == "--requests" && i + 1 < argc) {
+      requests = (int64)atoi(argv[(int64)(i + 1)]);
+      i = i + 1;
     } else if (a == "--storm") {
       storm = true;
     } else if (a == "--stderr") {
       keep_stderr = true;
     } else {
-      println("usage: sim [--rate N] [--stderr] [--snapshot out.png [--seconds N] [--storm]]");
+      println("usage: sim [--rate N] [--requests N] [--stderr] [--snapshot out.png [--seconds N] [--storm]]");
       return 2;
     }
     i = i + 1;
@@ -440,11 +546,17 @@ fn main(argc: int32, argv: cstring*) -> int32 {
   if (rate > 200) {
     rate = 200;
   }
-  if (!sim_start(0, rate)) {
+  if (requests < 0) {
+    requests = 0;
+  }
+  if (requests > SIM_MAX_REQ_RATE) {
+    requests = SIM_MAX_REQ_RATE;
+  }
+  if (!sim_start(0, rate, requests)) {
     println("could not start the alph node");
     return 1;
   }
-  var s: SimUi* = sim_ui_new(rate);
+  var s: SimUi* = sim_ui_new(rate, requests);
   var rc: int32 = 0;
   if (snapshot.length > (uint64)0) {
     rc = sim_snapshot(s, snapshot, seconds, storm);
