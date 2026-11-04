@@ -19,6 +19,13 @@ OUT="build/check"
 MODES=("-s" "-s --release")
 mkdir -p "$OUT"
 
+# mettle.deps is generated (mbuild writes it on every build). Without mbuild,
+# write the two mappings the compiler needs, in mbuild's own block so a later
+# mbuild run replaces them instead of warning.
+if [ ! -f mettle.deps ]; then
+  printf '# >>> mbuild: generated, edits inside this block are overwritten\nalph=./src\ncrypto=../cryptex/src\n# <<< mbuild\n' > mettle.deps
+fi
+
 if [ ! -x "$METTLE" ]; then
   echo "no compiler at $METTLE (set METTLE)"
   exit 2
