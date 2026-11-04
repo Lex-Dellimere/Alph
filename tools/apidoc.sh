@@ -24,6 +24,7 @@ MODULES=(
   src/work/limiter.mettle
   src/net/port.mettle
   src/net/dist.mettle
+  src/net/noise.mettle
   src/sys/atomic.mettle
   src/sys/clock.mettle
   src/sys/thread.mettle

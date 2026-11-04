@@ -2235,6 +2235,164 @@ started with port 0. The answer is ALPH_TAG_DIST_PORT with arg = the
 port. Returns the request's ref, or ALPH_GONE when no manager runs.
 Thread: a handler.
 
+## alph/net/noise
+
+The Noise_XXpsk3_25519_ChaChaPoly_SHA256 handshake and
+transport ciphers (noiseprotocol.org, revision 34), on the crypto package.
+
+```text
+-> e
+<- e, ee, s, es
+-> s, se, psk
+```
+
+Both sides prove knowledge of a pre-shared key (alph uses the SHA-256 of
+the cluster cookie) without sending it, and each learns the other's static
+public key. Handshake payloads are empty. After the third message,
+alph_noise_split gives each side a sending and a receiving cipher. The
+initiator only knows the responder holds the key once a transport message
+from it decrypts.
+
+Plain data, no actors: alph/net/dist drives it. Thread: whoever owns the
+state.
+
+The longest Noise message, and the most plaintext one transport message
+can carry.
+
+```mettle
+export const ALPH_NOISE_MAX: int64 = 65535;
+export const ALPH_NOISE_PLAIN_MAX: int64 = 65519;
+```
+
+### `AlphNoiseCipher`
+
+```mettle
+export struct AlphNoiseCipher {
+  k: CrKey32;
+  n: int64;
+}
+```
+
+One direction of an established session.
+
+### `AlphNoise`
+
+```mettle
+export struct AlphNoise {
+  initiator: int64;
+  step: int64;         // handshake messages written or read so far
+  h: uint8[32];
+  ck: uint8[32];
+  c: AlphNoiseCipher;
+  has_key: int64;
+  s_sk: CrX25519Secret;
+  s_pk: CrX25519Public;
+  e_sk: CrX25519Secret;
+  e_pk: CrX25519Public;
+  fixed_e: int64;      // alph_noise_set_ephemeral was called
+  re: CrX25519Public;
+  rs: CrX25519Public;
+  psk: uint8[32];
+}
+```
+
+A handshake in progress. Fill it with alph_noise_init; its fields are
+this module's own.
+
+### `alph_noise_init`
+
+```mettle
+export fn alph_noise_init(n: AlphNoise*, initiator: bool, s_sk: CrX25519Secret*, psk: uint8*) -> bool
+```
+
+Starts a handshake.
+
+```text
+n          the state to fill
+initiator  true on the side that connects
+s_sk       this node's static secret key
+psk        32 bytes both sides share
+```
+
+Returns false when the crypto package fails. Thread: any.
+
+### `alph_noise_set_ephemeral`
+
+```mettle
+export fn alph_noise_set_ephemeral(n: AlphNoise*, e_sk: CrX25519Secret*) -> bool
+```
+
+Uses e_sk as the next ephemeral key instead of a random one. For tests
+against fixed vectors only; a real handshake must never reuse one.
+
+### `alph_noise_write`
+
+```mettle
+export fn alph_noise_write(n: AlphNoise*, out: uint8*, cap: int64, out_len: int64*) -> bool
+```
+
+Writes this side's next handshake message to out (cap at least 96
+bytes) and its length to *out_len. Returns false when it is not this
+side's turn or the crypto package fails. Thread: the state's owner.
+
+### `alph_noise_read`
+
+```mettle
+export fn alph_noise_read(n: AlphNoise*, msg: uint8*, len: int64) -> bool
+```
+
+Reads the other side's next handshake message. Returns false when it is
+not the other side's turn, the message has the wrong length, or it does
+not authenticate (a wrong pre-shared key shows up here, on the
+responder's side of the third message). Thread: the state's owner.
+
+### `alph_noise_done`
+
+```mettle
+export fn alph_noise_done(n: AlphNoise*) -> bool
+```
+
+True once all three handshake messages are done. Thread: the owner.
+
+### `alph_noise_peer`
+
+```mettle
+export fn alph_noise_peer(n: AlphNoise*, out: CrX25519Public*)
+```
+
+The other side's static public key, valid once the handshake is done.
+Thread: the state's owner.
+
+### `alph_noise_split`
+
+```mettle
+export fn alph_noise_split(n: AlphNoise*, send: AlphNoiseCipher*, recv: AlphNoiseCipher*) -> bool
+```
+
+Ends a finished handshake: fills the sending and receiving ciphers and
+wipes the handshake's secrets. Returns false when the handshake is not
+done. Thread: the state's owner.
+
+### `alph_noise_seal`
+
+```mettle
+export fn alph_noise_seal(c: AlphNoiseCipher*, out: uint8*, pt: uint8*, len: int64) -> bool
+```
+
+Encrypts len bytes at pt (at most ALPH_NOISE_PLAIN_MAX) to out, which
+gets len + 16 bytes. Returns false when len is too long or the nonce is
+exhausted. Thread: the cipher's owner.
+
+### `alph_noise_open`
+
+```mettle
+export fn alph_noise_open(c: AlphNoiseCipher*, out: uint8*, ct: uint8*, len: int64) -> bool
+```
+
+Decrypts a transport message of len bytes at ct to out, which gets
+len - 16 bytes. Returns false when it does not authenticate.
+Thread: the cipher's owner.
+
 ## alph/sys/atomic
 
 64-bit atomics on x86-64.

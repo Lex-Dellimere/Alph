@@ -1,6 +1,5 @@
 # alph=./src lets every file import the library as "alph/actor", here and
 # from an app that maps alph=<path>/src in its own mettle.deps.
 alph=./src
-# >>> mbuild: generated, edits inside this block are overwritten
-alph=.
-# <<< mbuild
+# crypto=../cryptex/src is the crypto package alph/net/noise uses.
+crypto=../cryptex/src

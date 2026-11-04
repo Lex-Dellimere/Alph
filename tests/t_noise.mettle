@@ -1,0 +1,146 @@
+// Noise_XXpsk3_25519_ChaChaPoly_SHA256: with fixed keys, every handshake
+// message and the first transport message each way match the reference in
+// tools/noise_ref.py byte for byte; a wrong pre-shared key, a changed byte
+// and an out-of-turn message are all refused; random keys complete a
+// handshake and carry data both ways.
+
+import "std/io";
+import "std/mem";
+import "crypto/crypto";
+import "alph/net/noise";
+
+var g_failures: int64 = 0;
+
+fn expect(ok: bool, what: string) {
+  if (!ok) {
+    println("FAIL {what}");
+    g_failures = g_failures + 1;
+  }
+}
+
+fn hex_digit(c: int64) -> int64 {
+  if (c >= 48 && c <= 57) {
+    return c - 48;
+  }
+  return c - 87;
+}
+
+// True when len bytes at data spell hex.
+fn same_hex(data: uint8*, len: int64, hex: string) -> bool {
+  if ((int64)hex.length != len * 2) {
+    return false;
+  }
+  for i: int64 in 0..len {
+    var hi: int64 = hex_digit((int64)hex[i * 2]);
+    var lo: int64 = hex_digit((int64)hex[i * 2 + 1]);
+    if ((int64)data[i] != hi * 16 + lo) {
+      return false;
+    }
+  }
+  return true;
+}
+
+fn fill(k: CrX25519Secret*, v: int64) {
+  for i: int64 in 0..32 {
+    k->b[i] = (uint8)v;
+  }
+}
+
+// Runs a handshake between two fresh states. With fixed, the reference keys
+// are used and the messages compared. Returns true when it completed.
+fn handshake(i: AlphNoise*, r: AlphNoise*, psk_i: uint8*, psk_r: uint8*, fixed: bool,
+             tamper: int64) -> bool {
+  var si: CrX25519Secret;
+  var sr: CrX25519Secret;
+  if (fixed) {
+    fill(&si, 1);
+    fill(&sr, 2);
+  } else {
+    cr_random_bytes(&si.b[0], 32);
+    cr_random_bytes(&sr.b[0], 32);
+  }
+  expect(alph_noise_init(i, true, &si, psk_i), "initiator init");
+  expect(alph_noise_init(r, false, &sr, psk_r), "responder init");
+  if (fixed) {
+    var ei: CrX25519Secret;
+    var er: CrX25519Secret;
+    fill(&ei, 3);
+    fill(&er, 4);
+    alph_noise_set_ephemeral(i, &ei);
+    alph_noise_set_ephemeral(r, &er);
+  }
+  var msg: uint8[96];
+  var len: int64 = 0;
+  expect(!alph_noise_write(r, &msg[0], 96, &len), "the responder cannot speak first");
+  expect(alph_noise_write(i, &msg[0], 96, &len) && len == 48, "message 1 written");
+  if (fixed) {
+    expect(same_hex(&msg[0], len, "5dfedd3b6bd47f6fa28ee15d969d5bb0ea53774d488bdaf9df1c6e0124b3ef223911d3b6fd48d4acb1f84918d39cdd1a"),
+           "message 1 matches the reference");
+  }
+  if (!alph_noise_read(r, &msg[0], len)) {
+    return false;
+  }
+  expect(alph_noise_write(r, &msg[0], 96, &len) && len == 96, "message 2 written");
+  if (fixed) {
+    expect(same_hex(&msg[0], len, "ac01b2209e86354fb853237b5de0f4fab13c7fcbf433a61c019369617fecf10bbf9b5fc689c59c49a5ba82f99bbd09ea850d5dd361c269336bed0833f998c7a2b1d634a830b6b1e9ed87556b774302a47112013e0bcb6d7ab46a93cd7b6c350b"),
+           "message 2 matches the reference");
+  }
+  if (tamper == 2) {
+    msg[40] = (uint8)((int64)msg[40] ^ 1);
+  }
+  if (!alph_noise_read(i, &msg[0], len)) {
+    return false;
+  }
+  expect(alph_noise_write(i, &msg[0], 96, &len) && len == 64, "message 3 written");
+  if (fixed) {
+    expect(same_hex(&msg[0], len, "25cd249d14fcab3aefe0a4da1143c7924b66bb1506daf37971082290f2140b6897c4b0d0fb8f7fc41e29c8def6bc26e0d7ffac7b1a8c0e287d71219fb1efc186"),
+           "message 3 matches the reference");
+  }
+  if (!alph_noise_read(r, &msg[0], len)) {
+    return false;
+  }
+  return alph_noise_done(i) && alph_noise_done(r);
+}
+
+fn main() -> int32 {
+  var psk: uint8[32];
+  var other: uint8[32];
+  for k: int64 in 0..32 {
+    psk[k] = (uint8)k;
+    other[k] = (uint8)(k + 1);
+  }
+  var i: AlphNoise;
+  var r: AlphNoise;
+
+  expect(handshake(&i, &r, &psk[0], &psk[0], true, 0), "the fixed handshake completes");
+  var is: AlphNoiseCipher;
+  var ir: AlphNoiseCipher;
+  var rs: AlphNoiseCipher;
+  var rr: AlphNoiseCipher;
+  expect(alph_noise_split(&i, &is, &ir) && alph_noise_split(&r, &rs, &rr), "both sides split");
+  var ct: uint8[64];
+  var pt: uint8[64];
+  expect(alph_noise_seal(&is, &ct[0], "hello".chars, 5), "sealed");
+  expect(same_hex(&ct[0], 21, "4b5827d42a994b8c911391c258bfe620fda50592f0"), "transport 1 matches the reference");
+  expect(alph_noise_open(&rr, &pt[0], &ct[0], 21) && memcmp((rawptr)&pt[0], (rawptr)"hello".chars, 5) == 0,
+         "the responder reads it");
+  expect(alph_noise_seal(&rs, &ct[0], "world".chars, 5), "sealed back");
+  expect(same_hex(&ct[0], 21, "e2b91483f4af3abd4b143bc367f4cbe1b4caf40304"), "transport 2 matches the reference");
+  expect(alph_noise_open(&ir, &pt[0], &ct[0], 21), "the initiator reads it");
+  ct[3] = (uint8)((int64)ct[3] ^ 1);
+  expect(!alph_noise_open(&ir, &pt[0], &ct[0], 21), "a changed transport message is refused");
+
+  expect(!handshake(&i, &r, &psk[0], &other[0], false, 0), "a wrong pre-shared key is refused");
+  expect(!handshake(&i, &r, &psk[0], &psk[0], false, 2), "a changed handshake message is refused");
+  expect(handshake(&i, &r, &psk[0], &psk[0], false, 0), "random keys complete a handshake");
+  expect(alph_noise_split(&i, &is, &ir) && alph_noise_split(&r, &rs, &rr), "random keys split");
+  for n: int64 in 0..100 {
+    expect(alph_noise_seal(&is, &ct[0], "ping".chars, 4) && alph_noise_open(&rr, &pt[0], &ct[0], 20),
+           "many messages keep their nonces in step");
+  }
+  if (g_failures != 0) {
+    return 1;
+  }
+  println("noise ok");
+  return 0;
+}
