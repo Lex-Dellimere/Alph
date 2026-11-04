@@ -1,0 +1,62 @@
+// Requests: a client asks a server, gets the reply matched by ref, and then
+// sees how a request to a server that is gone ends: with DOWN, not a hang.
+
+import "std/io";
+import "alph/alph";
+
+const TAG_SQUARE: int64 = ALPH_TAG_USER;      // arg = the number
+const TAG_RESULT: int64 = ALPH_TAG_USER + 1;  // arg = its square
+const TAG_QUIT: int64 = ALPH_TAG_USER + 2;
+
+fn server(ctx: AlphCtx*, m: AlphMsg*) -> int64 {
+  if (m->tag == TAG_SQUARE) {
+    alph_reply(ctx, m, TAG_RESULT, m->arg * m->arg);
+  } else if (m->tag == TAG_QUIT) {
+    return alph_stop(ctx, ALPH_NORMAL);
+  }
+  return ALPH_CONTINUE;
+}
+
+struct Client {
+  server: int64;
+  asking: int64;  // ref of the request in flight
+}
+
+fn client(ctx: AlphCtx*, m: AlphMsg*) -> int64 {
+  var c: Client* = (Client*)ctx->state;
+  if (m->tag == ALPH_TAG_INIT) {
+    c->server = alph_spawn(ctx, 0, &server);
+    c->asking = alph_request(ctx, c->server, TAG_SQUARE, 12, 1000);
+    return ALPH_CONTINUE;
+  }
+  if (m->tag == TAG_RESULT && m->ref == c->asking) {
+    println("12 squared is {m->arg}");
+    // Stop the server, then ask again: the answer is a DOWN.
+    alph_send(ctx, c->server, TAG_QUIT, 0);
+    c->asking = alph_request(ctx, c->server, TAG_SQUARE, 3, 1000);
+    return ALPH_CONTINUE;
+  }
+  if (m->tag == ALPH_TAG_DOWN && m->ref == c->asking) {
+    println("the server was gone, so the request ended with DOWN");
+    alph_halt(ctx, 0);
+  } else if (m->tag == ALPH_TAG_TIMEOUT && m->ref == c->asking) {
+    println("no answer in time");
+    alph_halt(ctx, 1);
+  }
+  return ALPH_CONTINUE;
+}
+
+var g_node: AlphNode;
+
+fn main() -> int32 {
+  var cfg: AlphConfig;
+  alph_config(&cfg);
+  if (!alph_node_start(&g_node, &cfg)) {
+    return 1;
+  }
+  var c: Client;
+  c.server = 0;
+  c.asking = 0;
+  alph_node_spawn_value<Client>(&g_node, &c, &client);
+  return (int32)alph_node_wait(&g_node);
+}

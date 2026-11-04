@@ -1,0 +1,374 @@
+// alph/heal/supervisor: each strategy, restart types, restart intensity, ordered
+// start with acks, reverse-order shutdown with a kill after the deadline,
+// and backoff. An observer actor parents each supervisor and logs what the
+// children and supervisors do; the main thread drives and checks the log.
+
+import "std/io";
+import "std/mem";
+import "std/thread";
+import "alph/sys/atomic";
+import "alph/sys/clock";
+import "alph/core/mailbox";
+import "alph/core/node";
+import "alph/heal/supervisor";
+
+const TAG_HELLO: int64 = 100;
+const TAG_CRASH: int64 = 101;
+const TAG_QUIT: int64 = 102;
+const TAG_STOPPING: int64 = 103;
+const TAG_START_SUP: int64 = 104;
+
+const EV_HELLO: int64 = 1;     // a child started
+const EV_STOPPING: int64 = 2;  // a child saw the shutdown
+const EV_SUP_EXIT: int64 = 3;  // the supervisor exited
+
+const MODE_PLAIN: int64 = 0;     // does not trap exits
+const MODE_POLITE: int64 = 1;    // traps, reports, then stops
+const MODE_STUBBORN: int64 = 2;  // traps, reports, keeps running
+const MODE_SILENT: int64 = 3;    // never acks
+
+struct Kid {
+  index: int64;
+  observer: int64;
+  mode: int64;
+}
+
+struct Event {
+  kind: int64;
+  index: int64;
+  pid: int64;
+  arg: int64;
+  at_ms: int64;
+}
+
+var g_node: AlphNode;
+var g_observer: int64 = 0;
+var g_events: Event[4096];
+var g_event_count: int64 = 0;
+var g_sup: int64 = 0;
+var g_pids: int64[16];
+var g_kids: Kid[16];
+var g_failures: int64 = 0;
+
+fn expect(ok: bool, what: string) {
+  if (!ok) {
+    println("FAIL {what}");
+    g_failures = g_failures + 1;
+  }
+}
+
+// ---- actors ----
+
+fn kid(ctx: AlphCtx*, m: AlphMsg*) -> int64 {
+  var k: Kid* = (Kid*)ctx->state;
+  if (m->tag == ALPH_TAG_INIT) {
+    if (k->mode == MODE_POLITE || k->mode == MODE_STUBBORN) {
+      alph_trap_exits(ctx, true);
+    }
+    alph_send(ctx, k->observer, TAG_HELLO, k->index);
+    if (k->mode != MODE_SILENT) {
+      alph_sup_ack(ctx, m);
+    }
+    return ALPH_CONTINUE;
+  }
+  if (m->tag == TAG_CRASH) {
+    var p: int64* = (int64*)(m->tag - m->tag);
+    *p = 1;
+  }
+  if (m->tag == TAG_QUIT) {
+    return alph_stop(ctx, ALPH_NORMAL);
+  }
+  if (m->tag == ALPH_TAG_EXIT && m->arg == ALPH_SHUTDOWN) {
+    alph_send(ctx, k->observer, TAG_STOPPING, k->index);
+    if (k->mode == MODE_POLITE) {
+      return alph_stop(ctx, ALPH_SHUTDOWN);
+    }
+  }
+  return ALPH_CONTINUE;
+}
+
+fn log_event(kind: int64, index: int64, pid: int64, arg: int64) {
+  var n: int64 = g_event_count;
+  g_events[n].kind = kind;
+  g_events[n].index = index;
+  g_events[n].pid = pid;
+  g_events[n].arg = arg;
+  g_events[n].at_ms = alph_now_ms();
+  alph_atomic_store(&g_event_count, n + 1);
+}
+
+fn observer(ctx: AlphCtx*, m: AlphMsg*) -> int64 {
+  if (m->tag == ALPH_TAG_INIT) {
+    alph_trap_exits(ctx, true);
+    return ALPH_CONTINUE;
+  }
+  if (m->tag == TAG_START_SUP) {
+    var spec: AlphSupSpec;
+    expect(alph_msg_value<AlphSupSpec>(m, &spec), "the message carries a spec");
+    var pid: int64 = alph_spawn_sup(ctx, &spec);
+    alph_atomic_store(&g_sup, pid);
+    return ALPH_CONTINUE;
+  }
+  var index: int64 = m->arg;
+  if (m->tag == TAG_HELLO) {
+    g_pids[index] = m->from;
+    log_event(EV_HELLO, index, m->from, 0);
+  } else if (m->tag == TAG_STOPPING) {
+    log_event(EV_STOPPING, index, m->from, 0);
+  } else if (m->tag == ALPH_TAG_EXIT) {
+    log_event(EV_SUP_EXIT, -1, m->from, m->arg);
+  }
+  return ALPH_CONTINUE;
+}
+
+// ---- main-thread helpers ----
+
+fn events() -> int64 {
+  return alph_atomic_load(&g_event_count);
+}
+
+// Waits until the log holds n events. Returns false after 3 seconds.
+fn wait_events(n: int64) -> bool {
+  for i: int64 in 0..3000 {
+    if (events() >= n) {
+      return true;
+    }
+    thread_sleep_ms(1);
+  }
+  println("  waited for {n} events, have {events()}");
+  return false;
+}
+
+fn quiet(ms: int64) {
+  thread_sleep_ms((uint32)ms);
+}
+
+fn kid_spec(spec: AlphSupSpec*, index: int64, mode: int64, restart: int64, shutdown_ms: int64) {
+  g_kids[index].index = index;
+  g_kids[index].observer = g_observer;
+  g_kids[index].mode = mode;
+  var c: AlphChildSpec* = alph_sup_add_value<Kid>(spec, &g_kids[index], &kid);
+  c->restart = restart;
+  c->shutdown_ms = shutdown_ms;
+  c->sync_start = true;
+}
+
+// Starts a supervisor of three children and waits until all said hello.
+fn start(spec: AlphSupSpec*, kids: int64) {
+  var base: int64 = events();
+  alph_atomic_store(&g_sup, 0);
+  alph_node_send_value<AlphSupSpec>(&g_node, g_observer, TAG_START_SUP, spec);
+  expect(wait_events(base + kids), "children started");
+}
+
+fn send(pid: int64, tag: int64) {
+  expect(alph_node_send(&g_node, pid, tag, 0) == ALPH_SENT, "send");
+}
+
+fn hello_order_from(base: int64, a: int64, b: int64, c: int64) -> bool {
+  return g_events[base].kind == EV_HELLO && g_events[base].index == a &&
+         g_events[base + 1].index == b && g_events[base + 2].index == c;
+}
+
+// Stops the current supervisor from outside and waits for its exit event.
+fn shutdown_sup(extra: int64) {
+  var base: int64 = events();
+  alph_node_exit_signal(&g_node, g_sup, ALPH_SHUTDOWN);
+  expect(wait_events(base + 1 + extra), "supervisor shut down");
+  quiet(5);
+}
+
+fn last_sup_exit() -> int64 {
+  var n: int64 = events();
+  var i: int64 = n - 1;
+  while (i >= 0) {
+    if (g_events[i].kind == EV_SUP_EXIT) {
+      return g_events[i].arg;
+    }
+    i = i - 1;
+  }
+  return -1;
+}
+
+// ---- scenarios ----
+
+fn check_strategy(strategy: int64, restarted: int64) {
+  var spec: AlphSupSpec;
+  alph_sup_init(&spec, strategy);
+  spec.max_restarts = 10;
+  spec.period_ms = 5000;
+  for i: int64 in 0..3 {
+    kid_spec(&spec, i, MODE_PLAIN, ALPH_PERMANENT, 100);
+  }
+  start(&spec, 3);
+  var before: int64[3];
+  for i: int64 in 0..3 {
+    before[i] = g_pids[i];
+  }
+  var base: int64 = events();
+  send(g_pids[1], TAG_CRASH);
+  expect(wait_events(base + restarted), "restarted children said hello");
+  quiet(20);
+  expect(events() == base + restarted, "no extra restarts");
+  if (strategy == ALPH_ONE_FOR_ONE) {
+    expect(g_pids[0] == before[0] && g_pids[2] == before[2], "one_for_one keeps the others");
+    expect(g_pids[1] != before[1], "one_for_one restarts the crashed child");
+  } else if (strategy == ALPH_REST_FOR_ONE) {
+    expect(g_pids[0] == before[0], "rest_for_one keeps earlier children");
+    expect(g_pids[1] != before[1] && g_pids[2] != before[2], "rest_for_one restarts the rest");
+    expect(g_events[base].index == 1 && g_events[base + 1].index == 2, "rest_for_one restarts in order");
+  } else {
+    for i: int64 in 0..3 {
+      expect(g_pids[i] != before[i], "one_for_all restarts every child");
+    }
+    expect(hello_order_from(base, 0, 1, 2), "one_for_all restarts in order");
+  }
+  shutdown_sup(0);
+}
+
+fn check_intensity() {
+  var spec: AlphSupSpec;
+  alph_sup_init(&spec, ALPH_ONE_FOR_ONE);
+  spec.max_restarts = 2;
+  spec.period_ms = 5000;
+  for i: int64 in 0..3 {
+    kid_spec(&spec, i, MODE_PLAIN, ALPH_PERMANENT, 100);
+  }
+  start(&spec, 3);
+  var kids: int64[3];
+  for round: int64 in 0..2 {
+    var base: int64 = events();
+    send(g_pids[0], TAG_CRASH);
+    expect(wait_events(base + 1), "restart within intensity");
+  }
+  for i: int64 in 0..3 {
+    kids[i] = g_pids[i];
+  }
+  var base: int64 = events();
+  send(g_pids[0], TAG_CRASH);
+  expect(wait_events(base + 1), "supervisor gave up");
+  expect(last_sup_exit() == ALPH_SHUTDOWN, "a supervisor that gives up exits with SHUTDOWN");
+  quiet(5);
+  for i: int64 in 1..3 {
+    expect(alph_node_send(&g_node, kids[i], TAG_QUIT, 0) == ALPH_GONE,
+           "its children are gone");
+  }
+}
+
+fn check_restart_types() {
+  var spec: AlphSupSpec;
+  alph_sup_init(&spec, ALPH_ONE_FOR_ONE);
+  spec.max_restarts = 10;
+  spec.period_ms = 5000;
+  kid_spec(&spec, 0, MODE_PLAIN, ALPH_TRANSIENT, 100);
+  kid_spec(&spec, 1, MODE_PLAIN, ALPH_TEMPORARY, 100);
+  kid_spec(&spec, 2, MODE_PLAIN, ALPH_TRANSIENT, 100);
+  start(&spec, 3);
+  var base: int64 = events();
+  send(g_pids[0], TAG_QUIT);
+  send(g_pids[1], TAG_CRASH);
+  quiet(30);
+  expect(events() == base, "transient after a normal exit and temporary stay down");
+  send(g_pids[2], TAG_CRASH);
+  expect(wait_events(base + 1) && g_events[base].index == 2, "transient after a crash restarts");
+  shutdown_sup(0);
+}
+
+fn check_shutdown_order() {
+  var spec: AlphSupSpec;
+  alph_sup_init(&spec, ALPH_ONE_FOR_ONE);
+  spec.max_restarts = 10;
+  spec.period_ms = 5000;
+  kid_spec(&spec, 0, MODE_POLITE, ALPH_PERMANENT, 100);
+  kid_spec(&spec, 1, MODE_STUBBORN, ALPH_PERMANENT, 40);
+  kid_spec(&spec, 2, MODE_POLITE, ALPH_PERMANENT, 100);
+  start(&spec, 3);
+  var stubborn: int64 = g_pids[1];
+  var base: int64 = events();
+  shutdown_sup(3);
+  var ordered: bool = g_events[base].kind == EV_STOPPING && g_events[base].index == 2 &&
+                      g_events[base + 1].index == 1 && g_events[base + 2].index == 0;
+  if (!ordered) {
+    for i: int64 in base..events() {
+      println("  event kind {g_events[i].kind} index {g_events[i].index} at {g_events[i].at_ms}");
+    }
+  }
+  expect(ordered, "children stop in reverse order");
+  expect(g_events[base + 2].at_ms - g_events[base + 1].at_ms >= 30,
+         "the stubborn child gets its shutdown time");
+  expect(last_sup_exit() == ALPH_SHUTDOWN, "supervisor exits with the shutdown reason");
+  expect(alph_node_send(&g_node, stubborn, TAG_QUIT, 0) == ALPH_GONE,
+         "the stubborn child was killed");
+}
+
+fn check_backoff() {
+  var spec: AlphSupSpec;
+  alph_sup_init(&spec, ALPH_ONE_FOR_ONE);
+  spec.max_restarts = 10;
+  spec.period_ms = 5000;
+  spec.backoff_ms = 30;
+  spec.backoff_max_ms = 1000;
+  kid_spec(&spec, 0, MODE_PLAIN, ALPH_PERMANENT, 100);
+  start(&spec, 1);
+  var gaps: int64[2];
+  for round: int64 in 0..2 {
+    var base: int64 = events();
+    var sent: int64 = alph_now_ms();
+    send(g_pids[0], TAG_CRASH);
+    expect(wait_events(base + 1), "restart after backoff");
+    gaps[round] = g_events[base].at_ms - sent;
+  }
+  expect(gaps[0] >= 25, "first restart waits the backoff");
+  expect(gaps[1] >= 55, "second restart waits twice as long");
+  shutdown_sup(0);
+}
+
+fn check_ack_timeout() {
+  var spec: AlphSupSpec;
+  alph_sup_init(&spec, ALPH_ONE_FOR_ONE);
+  spec.max_restarts = 10;
+  spec.period_ms = 5000;
+  spec.start_timeout_ms = 30;
+  kid_spec(&spec, 0, MODE_PLAIN, ALPH_PERMANENT, 100);
+  kid_spec(&spec, 1, MODE_SILENT, ALPH_PERMANENT, 100);
+  kid_spec(&spec, 2, MODE_PLAIN, ALPH_PERMANENT, 100);
+  var base: int64 = events();
+  alph_atomic_store(&g_sup, 0);
+  alph_node_send_value<AlphSupSpec>(&g_node, g_observer, TAG_START_SUP, &spec);
+  expect(wait_events(base + 3), "start failure reported");
+  expect(g_events[base].index == 0 && g_events[base + 1].index == 1, "children start in order");
+  expect(g_events[base + 2].kind == EV_SUP_EXIT && g_events[base + 2].arg == ALPH_SHUTDOWN,
+         "a child that never acks fails the start; the next one never starts");
+}
+
+// Starts g_node with a fixed shape, so runs are comparable across machines.
+fn start_node(schedulers: int64, max_actors: int64, mailbox_size: int64) {
+  var cfg: AlphConfig;
+  alph_config(&cfg);
+  cfg.schedulers = schedulers;
+  cfg.max_actors = max_actors;
+  cfg.mailbox_size = mailbox_size;
+  expect(alph_node_start(&g_node, &cfg), "node started");
+}
+
+fn main() -> int32 {
+  start_node(4, 4096, 64);
+  g_observer = alph_node_spawn(&g_node, &observer);
+  check_strategy(ALPH_ONE_FOR_ONE, 1);
+  check_strategy(ALPH_REST_FOR_ONE, 2);
+  check_strategy(ALPH_ONE_FOR_ALL, 3);
+  check_intensity();
+  check_restart_types();
+  check_shutdown_order();
+  check_backoff();
+  check_ack_timeout();
+  alph_node_halt(&g_node, 0);
+  alph_node_wait(&g_node);
+  if (g_failures != 0) {
+    return 1;
+  }
+  var stats: AlphStats;
+  alph_node_stats(&g_node, &stats);
+  println("supervisor ok: {events()} events, {stats.crashed} crashes");
+  return 0;
+}

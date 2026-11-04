@@ -1,0 +1,1625 @@
+// alph/core/node: actors and the node that runs them.
+//
+// A node is one OS process running a set of schedulers, one thread each. An
+// actor is a state block, a bounded mailbox, a signal queue and a handler:
+//
+//   fn handler(ctx: AlphCtx*, m: AlphMsg*) -> int64
+//
+// The handler runs one message to completion and returns ALPH_CONTINUE, or
+// `alph_stop(ctx, reason)` to exit. That return is the only point where a
+// scheduler switches actors, so a handler must not block or loop without
+// bound: give it a `where cycles < N` deadline to have the compiler prove
+// it. The first message every actor gets is ALPH_TAG_INIT.
+//
+// A crash inside a handler (a failed check, a null or wild pointer, a divide
+// by zero, a stack overflow) ends only that actor, with ALPH_CRASHED, and its
+// links and monitors see it as on BEAM. Programs must be built with -s for
+// failed checks to be caught.
+//
+// Signals (link, unlink, exit, monitor, demonitor, down, timer) travel on a
+// separate unbounded queue and are never dropped. Exits and downs keep their
+// order with messages: each records how far the receiver's mailbox was
+// filled when it was sent, and waits until those messages are handled. So a
+// result sent just before an exit is seen before the exit.
+//
+// Function families: names that take ctx are called from a handler; names
+// that start alph_node_ take the node and work from any thread. A bare name
+// sends a tag and one word, _value<T> sends one T, _bytes sends raw bytes.
+
+import "std/mem";
+import "alph/sys/atomic";
+import "alph/sys/clock";
+import "alph/sys/recover";
+import "alph/sys/thread";
+import "alph/core/queue";
+import "alph/core/mailbox";
+
+// ---- constants -------------------------------------------------------------
+
+// Exit reasons, carried in m->arg of EXIT and DOWN. Your own reasons start
+// at ALPH_REASON_USER.
+export const ALPH_NORMAL: int64 = 0;    // a clean exit; links ignore it
+export const ALPH_KILL: int64 = 1;      // send with alph_exit_signal to kill; cannot be trapped
+export const ALPH_KILLED: int64 = 2;    // how an actor that was killed exits
+export const ALPH_NOPROC: int64 = 3;    // the actor was already gone
+export const ALPH_CRASHED: int64 = 4;   // a trap or fault inside the handler
+export const ALPH_SHUTDOWN: int64 = 5;  // an orderly stop, from a supervisor
+export const ALPH_REASON_USER: int64 = 100;
+
+// Tags the runtime delivers. Tags below ALPH_TAG_USER belong to the runtime;
+// your own tags start at ALPH_TAG_USER.
+export const ALPH_TAG_INIT: int64 = 1;     // the first message; from = parent (0 if none)
+export const ALPH_TAG_EXIT: int64 = 2;     // a linked actor exited; only with alph_trap_exits on. from = it, arg = reason
+export const ALPH_TAG_DOWN: int64 = 3;     // a monitored actor exited. from = it, ref = the monitor, arg = reason
+export const ALPH_TAG_TIMEOUT: int64 = 4;  // a request got no reply in time. ref = the request, arg = the server
+export const ALPH_TAG_CRASHED: int64 = 6;  // to a medic: its patient crashed. from = it, arg = reason
+export const ALPH_TAG_USER: int64 = 100;
+
+// What a handler returns.
+export const ALPH_CONTINUE: int64 = 0;  // keep running
+export const ALPH_STOP: int64 = 1;      // exit; return alph_stop(ctx, reason) rather than this
+
+// What sending returns.
+export const ALPH_SENT: int64 = 0;   // in the receiver's mailbox
+export const ALPH_FULL: int64 = -1;  // the receiver's mailbox is full; nothing was sent
+export const ALPH_GONE: int64 = -2;  // the receiver has exited; nothing was sent
+export const ALPH_NOMEM: int64 = -3; // no memory for a large payload; nothing was sent
+
+// Spawn flags; combine with |.
+export const ALPH_LINK: int64 = 1;     // link the new actor to the caller
+export const ALPH_MONITOR: int64 = 2;  // the caller monitors the new actor
+
+// Actor status.
+const ALPH_P_FREE: int64 = 0;
+const ALPH_P_IDLE: int64 = 1;
+const ALPH_P_QUEUED: int64 = 2;
+const ALPH_P_RUNNING: int64 = 3;
+const ALPH_P_DIRTY: int64 = 4;    // running, and work arrived meanwhile
+const ALPH_P_EXITING: int64 = 5;
+const ALPH_P_CRASHED: int64 = 6;  // crashed, held in place for its medic
+
+// Signal kinds.
+const ALPH_SIG_LINK: int64 = 1;
+const ALPH_SIG_UNLINK: int64 = 2;
+const ALPH_SIG_EXIT: int64 = 3;       // explicit, from alph_exit_signal
+const ALPH_SIG_LINK_EXIT: int64 = 4;  // a linked actor exited
+const ALPH_SIG_MONITOR: int64 = 5;
+const ALPH_SIG_DEMONITOR: int64 = 6;
+const ALPH_SIG_DOWN: int64 = 7;
+const ALPH_SIG_TIMER: int64 = 8;
+const ALPH_SIG_CRASHED: int64 = 9;    // to a medic
+
+// Message flags.
+const ALPH_MSG_REQUEST: int64 = 1;  // ref names the reply the sender waits for
+const ALPH_MSG_REPLY: int64 = 2;    // answers the request with the same ref
+
+// Messages handled before the scheduler moves on to another actor.
+const ALPH_BUDGET: int64 = 64;
+
+const ALPH_NS_PER_MS: int64 = 1000000;
+
+// ---- public types ----------------------------------------------------------
+
+// How to run a node. Fill it with alph_config, then change what you need.
+//
+//   schedulers    scheduler threads; default: one per CPU
+//   max_actors    actors alive at once; default 65536
+//   mailbox_size  messages a mailbox holds before senders get ALPH_FULL;
+//                 rounded up to a power of two; default 64
+//   stack_size    bytes of stack per scheduler, which is how deep a handler
+//                 may call; default 1 MiB
+export struct AlphConfig {
+  schedulers: int64;
+  max_actors: int64;
+  mailbox_size: int64;
+  stack_size: int64;
+}
+
+// Counters from alph_node_stats.
+//
+//   live     actors alive now
+//   spawned  actors started since the node started
+//   crashed  crashes that ended an actor
+//   healed   crashes a medic repaired, unseen by anyone else
+export struct AlphStats {
+  live: int64;
+  spawned: int64;
+  crashed: int64;
+  healed: int64;
+}
+
+// A node. Declare one, start it with alph_node_start, and keep it in place
+// until alph_node_wait returns. Its fields are the runtime's own.
+export struct AlphNode {
+  procs: int64;
+  capacity: int64;
+  mailbox_size: int64;
+  free_stack: int64;
+  free_top: int64;
+  free_lock: int64;
+  scheds: int64;
+  sched_count: int64;
+  next_sched: int64;
+  next_ref: int64;
+  live: int64;
+  spawned: int64;
+  crashed: int64;
+  healed: int64;
+  halted: int64;
+  halt_code: int64;
+}
+
+// What a handler gets besides the message. Read these fields:
+//
+//   self        this actor's pid
+//   state       this actor's state block; cast it to your state type
+//   state_size  its size in bytes
+//   node        the node, for the alph_node_ functions
+//
+// The other fields are the runtime's own. ctx is valid until the handler
+// returns; do not keep it.
+export struct AlphCtx {
+  self: int64;
+  state: rawptr;
+  state_size: int64;
+  node: AlphNode*;
+  proc: int64;
+  sched: int64;
+  stop_reason: int64;
+}
+
+// ---- internal types --------------------------------------------------------
+
+struct AlphVec {
+  data: int64;
+  len: int64;
+  cap: int64;
+}
+
+struct AlphSignal {
+  next: int64;  // queue link, must stay first; a pending timer's deadline
+  kind: int64;
+  from: int64;
+  to: int64;
+  ref: int64;
+  arg: int64;
+  tag: int64;
+  mark: int64;  // exits and downs: the receiver's mailbox fill when sent
+}
+
+struct AlphProc {
+  rq_next: int64;  // run-queue link, must stay first
+  status: int64;
+  pid: int64;      // 0 while the slot is free
+  serial: int64;
+  index: int64;
+  sched: int64;    // home scheduler
+  inited: int64;
+  parent: int64;
+  state: int64;
+  state_size: int64;
+  trap_exit: int64;
+  chunks: int64;   // alph_alloc blocks, freed on exit
+  handled: int64;
+  handler: fn(AlphCtx*, AlphMsg*) -> int64 with alloc, syscall, asm;
+  mailbox: AlphMailbox;
+  signals: AlphQueue;
+  links: AlphVec;
+  mon_refs: AlphVec;      // monitors on this actor: ref
+  mon_watchers: AlphVec;  //   and who watches
+  ref_ids: AlphVec;       // refs this actor waits on: monitors, requests, timers
+  ref_pids: AlphVec;      //   and the actor each one watches, or 0
+  deferred: AlphVec;      // exits and downs waiting for earlier messages
+  medic: int64;           // pid of the medic watching this actor, or 0
+  patient: int64;         // for a medic: the actor it watches
+  poison_heap: int64;     // payload of the message being handled, freed after
+  last_msg: AlphMsg;      // with a medic: the message being handled
+  retry: int64;           // handle last_msg again when resumed
+}
+
+struct AlphSched {
+  runq: AlphQueue;
+  wake: int64;      // futex word, bumped on every push
+  sleeping: int64;
+  index: int64;
+  node: int64;
+  current: int64;   // actor being run; read back from memory after a crash
+  timers: AlphVec;  // binary heap of AlphSignal, by deadline
+  thread: AlphThread;
+  handle: int64;
+}
+
+// ---- small helpers ---------------------------------------------------------
+
+fn alph_vec_push(v: AlphVec*, x: int64) -> bool {
+  if (v->len == v->cap) {
+    var cap: int64 = v->cap * 2;
+    if (cap < 4) {
+      cap = 4;
+    }
+    var grown: rawptr = malloc(cap * 8);
+    if (grown == 0) {
+      return false;
+    }
+    if (v->data != 0) {
+      memcpy(grown, (rawptr)v->data, v->len * 8);
+      free((rawptr)v->data);
+    }
+    v->data = (int64)grown;
+    v->cap = cap;
+  }
+  var at: int64* = (int64*)(v->data + v->len * 8);
+  *at = x;
+  v->len = v->len + 1;
+  return true;
+}
+
+fn alph_vec_get(v: AlphVec*, i: int64) -> int64 {
+  var at: int64* = (int64*)(v->data + i * 8);
+  return *at;
+}
+
+fn alph_vec_set(v: AlphVec*, i: int64, x: int64) {
+  var at: int64* = (int64*)(v->data + i * 8);
+  *at = x;
+}
+
+fn alph_vec_find(v: AlphVec*, x: int64) -> int64 {
+  for i: int64 in 0..v->len {
+    if (alph_vec_get(v, i) == x) {
+      return i;
+    }
+  }
+  return -1;
+}
+
+// Removes entry i by moving the last entry into its place.
+fn alph_vec_remove_at(v: AlphVec*, i: int64) {
+  v->len = v->len - 1;
+  alph_vec_set(v, i, alph_vec_get(v, v->len));
+}
+
+// Removes and returns the oldest entry, keeping the order of the rest.
+fn alph_vec_shift(v: AlphVec*) -> int64 {
+  var first: int64 = alph_vec_get(v, 0);
+  for i: int64 in 1..v->len {
+    alph_vec_set(v, i - 1, alph_vec_get(v, i));
+  }
+  v->len = v->len - 1;
+  return first;
+}
+
+fn alph_vec_release(v: AlphVec*) {
+  if (v->data != 0) {
+    free((rawptr)v->data);
+  }
+  v->data = 0;
+  v->len = 0;
+  v->cap = 0;
+}
+
+fn alph_spin_lock(lock: int64*) {
+  while (alph_atomic_cas(lock, 0, 1) != 0) {
+    alph_cpu_relax();
+  }
+}
+
+fn alph_spin_unlock(lock: int64*) {
+  alph_atomic_store(lock, 0);
+}
+
+fn alph_slot(node: AlphNode*, index: int64) -> AlphProc* {
+  return (AlphProc*)(node->procs + index * (int64)sizeof(AlphProc));
+}
+
+fn alph_sched_at(node: AlphNode*, index: int64) -> AlphSched* {
+  return (AlphSched*)(node->scheds + index * (int64)sizeof(AlphSched));
+}
+
+fn alph_me(ctx: AlphCtx*) -> AlphProc* {
+  return (AlphProc*)ctx->proc;
+}
+
+fn alph_here(ctx: AlphCtx*) -> AlphSched* {
+  return (AlphSched*)ctx->sched;
+}
+
+// The live actor a pid names, or 0 when it has exited.
+fn alph_resolve(node: AlphNode*, pid: int64) -> AlphProc* {
+  var index: int64 = (pid & (((int64)1 << 32) - 1)) - 1;
+  if (pid <= 0 || index < 0 || index >= node->capacity) {
+    return (AlphProc*)0;
+  }
+  var p: AlphProc* = alph_slot(node, index);
+  if (alph_atomic_load(&p->pid) != pid) {
+    return (AlphProc*)0;
+  }
+  return p;
+}
+
+fn alph_new_ref(node: AlphNode*) -> int64 {
+  return alph_atomic_add(&node->next_ref, 1) + 1;
+}
+
+// Records that p waits on ref, which watches pid (0 for a timer).
+fn alph_hold_ref(p: AlphProc*, ref: int64, pid: int64) {
+  alph_vec_push(&p->ref_ids, ref);
+  alph_vec_push(&p->ref_pids, pid);
+}
+
+// Forgets ref if p was waiting on it. Returns the pid it watched (0 for a
+// timer), or -1 when p was not waiting on it.
+fn alph_take_ref(p: AlphProc*, ref: int64) -> int64 {
+  var at: int64 = alph_vec_find(&p->ref_ids, ref);
+  if (at < 0) {
+    return -1;
+  }
+  var pid: int64 = alph_vec_get(&p->ref_pids, at);
+  alph_vec_remove_at(&p->ref_ids, at);
+  alph_vec_remove_at(&p->ref_pids, at);
+  return pid;
+}
+
+// Frees a message's payload if it has its own allocation.
+fn alph_msg_release(m: AlphMsg*) {
+  if (m->heap != 0) {
+    free((rawptr)m->heap);
+    m->heap = 0;
+  }
+}
+
+// Frees what an actor allocated with alph_alloc.
+fn alph_free_chunks(p: AlphProc*) {
+  var chunk: int64 = p->chunks;
+  while (chunk != 0) {
+    var link: int64* = (int64*)chunk;
+    var next: int64 = *link;
+    free((rawptr)chunk);
+    chunk = next;
+  }
+  p->chunks = 0;
+}
+
+// Replaces an actor's state with a copy of size bytes at state.
+fn alph_set_state(p: AlphProc*, state: rawptr, size: int64) {
+  if (p->state != 0) {
+    free((rawptr)p->state);
+    p->state = 0;
+  }
+  p->state_size = size;
+  if (size > 0) {
+    p->state = (int64)malloc(size);
+    memcpy((rawptr)p->state, state, size);
+  }
+}
+
+// ---- scheduling ------------------------------------------------------------
+
+fn alph_sched_notify(s: AlphSched*) {
+  alph_atomic_add(&s->wake, 1);
+  if (alph_atomic_load(&s->sleeping) != 0) {
+    alph_futex_wake(&s->wake, 1);
+  }
+}
+
+// Makes sure p runs soon after new work was pushed to it.
+//
+// The fence pairs with the sequentially consistent RUNNING store in
+// alph_run_proc. Without both, x86 lets each side's load pass its own earlier
+// store: the scheduler finds the mailbox empty while the sender still reads
+// QUEUED, and the message waits forever.
+fn alph_wake(node: AlphNode*, p: AlphProc*) {
+  alph_atomic_fence();
+  while (true) {
+    var status: int64 = alph_atomic_load(&p->status);
+    if (status == ALPH_P_IDLE) {
+      if (alph_atomic_cas(&p->status, ALPH_P_IDLE, ALPH_P_QUEUED) == ALPH_P_IDLE) {
+        var s: AlphSched* = alph_sched_at(node, p->sched);
+        alph_queue_push(&s->runq, (rawptr)p);
+        alph_sched_notify(s);
+        return;
+      }
+    } else if (status == ALPH_P_RUNNING) {
+      if (alph_atomic_cas(&p->status, ALPH_P_RUNNING, ALPH_P_DIRTY) == ALPH_P_RUNNING) {
+        return;
+      }
+    } else {
+      return;  // already queued, running with work noted, exiting, or held
+    }
+  }
+}
+
+// ---- signals ---------------------------------------------------------------
+
+// Exits and downs wait for messages sent before them. A kill does not wait.
+fn alph_signal_ordered(kind: int64, arg: int64) -> bool {
+  if (kind == ALPH_SIG_EXIT) {
+    return arg != ALPH_KILL;
+  }
+  return kind == ALPH_SIG_LINK_EXIT || kind == ALPH_SIG_DOWN;
+}
+
+// Queues a signal for the actor `to`, if it is alive.
+fn alph_signal(node: AlphNode*, kind: int64, from: int64, to: int64, ref: int64,
+               arg: int64, tag: int64) {
+  var p: AlphProc* = alph_resolve(node, to);
+  if (p == 0) {
+    return;
+  }
+  var sig: AlphSignal* = (AlphSignal*)malloc((int64)sizeof(AlphSignal));
+  if (sig == 0) {
+    return;
+  }
+  sig->kind = kind;
+  sig->from = from;
+  sig->to = to;
+  sig->ref = ref;
+  sig->arg = arg;
+  sig->tag = tag;
+  sig->mark = 0;
+  if (alph_signal_ordered(kind, arg)) {
+    sig->mark = alph_atomic_load(&p->mailbox.enq);
+  }
+  alph_queue_push(&p->signals, (rawptr)sig);
+  alph_wake(node, p);
+}
+
+fn alph_signal_plain(node: AlphNode*, kind: int64, from: int64, to: int64, ref: int64) {
+  alph_signal(node, kind, from, to, ref, 0, 0);
+}
+
+fn alph_signal_link_exit(node: AlphNode*, from: int64, to: int64, reason: int64) {
+  alph_signal(node, ALPH_SIG_LINK_EXIT, from, to, 0, reason, 0);
+}
+
+fn alph_signal_down(node: AlphNode*, from: int64, to: int64, ref: int64, reason: int64) {
+  alph_signal(node, ALPH_SIG_DOWN, from, to, ref, reason, 0);
+}
+
+// ---- sending ---------------------------------------------------------------
+
+fn alph_message(m: AlphMsg*, from: int64, to: int64, tag: int64, arg: int64, size: int64) {
+  m->tag = tag;
+  m->from = from;
+  m->to = to;
+  m->ref = 0;
+  m->arg = arg;
+  m->flags = 0;
+  m->size = size;
+  m->heap = 0;
+}
+
+// Copies the payload into m and m into the receiver's mailbox.
+fn alph_post(node: AlphNode*, m: AlphMsg*, payload: rawptr) -> int64 {
+  var p: AlphProc* = alph_resolve(node, m->to);
+  if (p == 0) {
+    return ALPH_GONE;
+  }
+  m->heap = 0;
+  if (m->size > ALPH_INLINE) {
+    var block: rawptr = malloc(m->size);
+    if (block == 0) {
+      return ALPH_NOMEM;
+    }
+    memcpy(block, payload, m->size);
+    m->heap = (int64)block;
+  } else if (m->size > 0) {
+    memcpy((rawptr)&m->data[0], payload, m->size);
+  }
+  if (!alph_mailbox_push(&p->mailbox, m)) {
+    alph_msg_release(m);
+    return ALPH_FULL;
+  }
+  alph_wake(node, p);
+  return ALPH_SENT;
+}
+
+fn alph_send_raw(node: AlphNode*, from: int64, to: int64, tag: int64, arg: int64,
+                 data: rawptr, size: int64) -> int64 {
+  var m: AlphMsg;
+  alph_message(&m, from, to, tag, arg, size);
+  return alph_post(node, &m, data);
+}
+
+// Sends a tag and one word to another actor.
+//
+//   to   the receiver's pid
+//   tag  what the message means; your tags start at ALPH_TAG_USER
+//   arg  one word of data, read as m->arg
+//
+// Returns ALPH_SENT, ALPH_FULL when the receiver's mailbox is full, or
+// ALPH_GONE when it has exited. Nothing is sent unless it returns ALPH_SENT.
+// Messages from one sender arrive in the order they were sent.
+// Thread: a handler. Outside the node, use alph_node_send.
+export fn alph_send(ctx: AlphCtx*, to: int64, tag: int64, arg: int64) -> int64 {
+  return alph_send_raw(ctx->node, ctx->self, to, tag, arg, (rawptr)0, 0);
+}
+
+// Sends one T, copied, as the payload. The receiver reads it with
+// alph_msg_value<T>. Returns as alph_send, plus ALPH_NOMEM when a payload
+// over ALPH_INLINE bytes could not be allocated.
+// Thread: a handler. Outside the node, use alph_node_send_value.
+export fn alph_send_value<T>(ctx: AlphCtx*, to: int64, tag: int64, value: T*) -> int64 {
+  return alph_send_raw(ctx->node, ctx->self, to, tag, 0, (rawptr)value, (int64)sizeof(T));
+}
+
+// Sends size bytes at data, copied, as the payload: for data whose length is
+// only known at run time. The receiver reads it with alph_msg_bytes.
+// Returns as alph_send_value.
+// Thread: a handler. Outside the node, use alph_node_send_bytes.
+export fn alph_send_bytes(ctx: AlphCtx*, to: int64, tag: int64, data: rawptr, size: int64) -> int64 {
+  return alph_send_raw(ctx->node, ctx->self, to, tag, 0, data, size);
+}
+
+// Sends a tag and one word from outside the node; m->from is 0.
+// Returns as alph_send. Thread: any.
+export fn alph_node_send(node: AlphNode*, to: int64, tag: int64, arg: int64) -> int64 {
+  return alph_send_raw(node, 0, to, tag, arg, (rawptr)0, 0);
+}
+
+// Sends one T from outside the node. Returns as alph_send_value.
+// Thread: any.
+export fn alph_node_send_value<T>(node: AlphNode*, to: int64, tag: int64, value: T*) -> int64 {
+  return alph_send_raw(node, 0, to, tag, 0, (rawptr)value, (int64)sizeof(T));
+}
+
+// Sends size bytes from outside the node. Returns as alph_send_value.
+// Thread: any.
+export fn alph_node_send_bytes(node: AlphNode*, to: int64, tag: int64, data: rawptr,
+                               size: int64) -> int64 {
+  return alph_send_raw(node, 0, to, tag, 0, data, size);
+}
+
+// ---- requests and replies --------------------------------------------------
+
+fn alph_request_raw(ctx: AlphCtx*, to: int64, tag: int64, arg: int64, data: rawptr,
+                    size: int64, timeout_ms: int64) -> int64 {
+  var ref: int64 = alph_monitor(ctx, to);
+  var m: AlphMsg;
+  alph_message(&m, ctx->self, to, tag, arg, size);
+  m.ref = ref;
+  m.flags = ALPH_MSG_REQUEST;
+  var sent: int64 = alph_post(ctx->node, &m, data);
+  if (sent != ALPH_SENT && sent != ALPH_GONE) {
+    alph_demonitor(ctx, ref);
+    return sent;
+  }
+  // A gone server needs no timer: the monitor delivers DOWN with ALPH_NOPROC.
+  if (timeout_ms > 0) {
+    alph_timer(ctx, timeout_ms, ctx->self, ALPH_TAG_TIMEOUT, ref, to);
+  }
+  return ref;
+}
+
+// Sends a request: a message whose answer comes back with the same ref.
+//
+//   to          the server's pid
+//   tag, arg    as alph_send
+//   timeout_ms  how long to wait for the reply, or 0 to wait for ever
+//
+// Returns the request's ref (above 0), or ALPH_FULL or ALPH_NOMEM when the
+// request was not sent. Exactly one of these then arrives, carrying the ref:
+//
+//   the reply           tag and payload as the server sent them
+//   ALPH_TAG_DOWN       the server exited first, or was already gone;
+//                       arg = its exit reason
+//   ALPH_TAG_TIMEOUT    no reply within timeout_ms; arg = the server
+//
+// Anything later for that ref is dropped, so a late reply never surprises
+// the requester. The server answers with alph_reply.
+// Thread: a handler.
+export fn alph_request(ctx: AlphCtx*, to: int64, tag: int64, arg: int64, timeout_ms: int64) -> int64 {
+  return alph_request_raw(ctx, to, tag, arg, (rawptr)0, 0, timeout_ms);
+}
+
+// Sends a request carrying one T. Otherwise as alph_request.
+// Thread: a handler.
+export fn alph_request_value<T>(ctx: AlphCtx*, to: int64, tag: int64, value: T*,
+                                timeout_ms: int64) -> int64 {
+  return alph_request_raw(ctx, to, tag, 0, (rawptr)value, (int64)sizeof(T), timeout_ms);
+}
+
+// Sends a request carrying size bytes. Otherwise as alph_request.
+// Thread: a handler.
+export fn alph_request_bytes(ctx: AlphCtx*, to: int64, tag: int64, data: rawptr, size: int64,
+                             timeout_ms: int64) -> int64 {
+  return alph_request_raw(ctx, to, tag, 0, data, size, timeout_ms);
+}
+
+fn alph_reply_raw(ctx: AlphCtx*, request: AlphMsg*, tag: int64, arg: int64, data: rawptr,
+                  size: int64) -> int64 {
+  var m: AlphMsg;
+  alph_message(&m, ctx->self, request->from, tag, arg, size);
+  m.ref = request->ref;
+  m.flags = ALPH_MSG_REPLY;
+  return alph_post(ctx->node, &m, data);
+}
+
+// Answers a request with a tag and one word.
+//
+//   request  the request message as the handler received it
+//
+// The reply goes to the requester with the request's ref. Returns as
+// alph_send. A requester that already timed out or exited drops it.
+// Thread: a handler.
+export fn alph_reply(ctx: AlphCtx*, request: AlphMsg*, tag: int64, arg: int64) -> int64 {
+  return alph_reply_raw(ctx, request, tag, arg, (rawptr)0, 0);
+}
+
+// Answers a request with one T. Otherwise as alph_reply.
+// Thread: a handler.
+export fn alph_reply_value<T>(ctx: AlphCtx*, request: AlphMsg*, tag: int64, value: T*) -> int64 {
+  return alph_reply_raw(ctx, request, tag, 0, (rawptr)value, (int64)sizeof(T));
+}
+
+// Answers a request with size bytes. Otherwise as alph_reply.
+// Thread: a handler.
+export fn alph_reply_bytes(ctx: AlphCtx*, request: AlphMsg*, tag: int64, data: rawptr,
+                           size: int64) -> int64 {
+  return alph_reply_raw(ctx, request, tag, 0, data, size);
+}
+
+// ---- links, monitors, exit signals -----------------------------------------
+
+// Links this actor with pid, both ways: when either exits with a reason
+// other than ALPH_NORMAL, the other exits with the same reason, or gets an
+// ALPH_TAG_EXIT message if it traps exits. Linking to a gone actor acts as
+// if it had just exited with ALPH_NOPROC. Linking twice is one link.
+// Thread: a handler.
+export fn alph_link(ctx: AlphCtx*, pid: int64) {
+  var p: AlphProc* = alph_me(ctx);
+  if (pid == ctx->self || alph_vec_find(&p->links, pid) >= 0) {
+    return;
+  }
+  alph_vec_push(&p->links, pid);
+  if (alph_resolve(ctx->node, pid) == 0) {
+    alph_signal_link_exit(ctx->node, pid, ctx->self, ALPH_NOPROC);
+    return;
+  }
+  alph_signal_plain(ctx->node, ALPH_SIG_LINK, ctx->self, pid, 0);
+}
+
+// Removes the link with pid, both ways. Does nothing if there is none.
+// Thread: a handler.
+export fn alph_unlink(ctx: AlphCtx*, pid: int64) {
+  var p: AlphProc* = alph_me(ctx);
+  var at: int64 = alph_vec_find(&p->links, pid);
+  if (at >= 0) {
+    alph_vec_remove_at(&p->links, at);
+    alph_signal_plain(ctx->node, ALPH_SIG_UNLINK, ctx->self, pid, 0);
+  }
+}
+
+// Watches pid, one way. When it exits, an ALPH_TAG_DOWN message arrives with
+// the returned ref and its exit reason in arg; if it is already gone, DOWN
+// arrives with ALPH_NOPROC. Each call is a separate monitor.
+// Returns the monitor's ref. Thread: a handler.
+export fn alph_monitor(ctx: AlphCtx*, pid: int64) -> int64 {
+  var ref: int64 = alph_new_ref(ctx->node);
+  alph_hold_ref(alph_me(ctx), ref, pid);
+  if (alph_resolve(ctx->node, pid) == 0) {
+    alph_signal_down(ctx->node, pid, ctx->self, ref, ALPH_NOPROC);
+  } else {
+    alph_signal_plain(ctx->node, ALPH_SIG_MONITOR, ctx->self, pid, ref);
+  }
+  return ref;
+}
+
+// Stops a monitor. A DOWN for it that is already on its way is dropped.
+//
+//   ref  from alph_monitor
+//
+// Thread: a handler.
+export fn alph_demonitor(ctx: AlphCtx*, ref: int64) {
+  var pid: int64 = alph_take_ref(alph_me(ctx), ref);
+  if (pid > 0) {
+    alph_signal_plain(ctx->node, ALPH_SIG_DEMONITOR, ctx->self, pid, ref);
+  }
+}
+
+// With on, exits of linked actors arrive as ALPH_TAG_EXIT messages (from =
+// the linked actor, arg = its reason) instead of ending this actor. Kills
+// still end it. Off by default. Thread: a handler.
+export fn alph_trap_exits(ctx: AlphCtx*, on: bool) {
+  var p: AlphProc* = alph_me(ctx);
+  p->trap_exit = 0;
+  if (on) {
+    p->trap_exit = 1;
+  }
+}
+
+// Sends an exit signal to pid, as erlang:exit/2. The target exits with
+// reason unless it traps exits, in which case it gets an ALPH_TAG_EXIT
+// message. ALPH_KILL cannot be trapped: the target exits with ALPH_KILLED.
+// ALPH_NORMAL is ignored by an actor that does not trap exits.
+// Thread: a handler. Outside the node, use alph_node_exit_signal.
+export fn alph_exit_signal(ctx: AlphCtx*, pid: int64, reason: int64) {
+  alph_signal(ctx->node, ALPH_SIG_EXIT, ctx->self, pid, 0, reason, 0);
+}
+
+// Sends an exit signal from outside the node, as alph_exit_signal; the
+// message's from is 0. Thread: any.
+export fn alph_node_exit_signal(node: AlphNode*, pid: int64, reason: int64) {
+  alph_signal(node, ALPH_SIG_EXIT, 0, pid, 0, reason, 0);
+}
+
+// Ends this actor once the handler returns: `return alph_stop(ctx, reason);`
+// Its links and monitors see reason. Returns ALPH_STOP. Thread: a handler.
+export fn alph_stop(ctx: AlphCtx*, reason: int64) -> int64 {
+  ctx->stop_reason = reason;
+  return ALPH_STOP;
+}
+
+// The pid of the actor that spawned this one, or 0 when the node did.
+// Thread: a handler.
+export fn alph_parent(ctx: AlphCtx*) -> int64 {
+  return alph_me(ctx)->parent;
+}
+
+// ---- timers ----------------------------------------------------------------
+
+fn alph_timer_deadline(sig: int64) -> int64 {
+  var s: AlphSignal* = (AlphSignal*)sig;
+  return s->next;
+}
+
+fn alph_timers_swap(h: AlphVec*, a: int64, b: int64) {
+  var t: int64 = alph_vec_get(h, a);
+  alph_vec_set(h, a, alph_vec_get(h, b));
+  alph_vec_set(h, b, t);
+}
+
+fn alph_timers_add(h: AlphVec*, sig: AlphSignal*) {
+  if (!alph_vec_push(h, 0)) {
+    free((rawptr)sig);
+    return;
+  }
+  var i: int64 = h->len - 1;
+  // A typed store, so the memory analyser sees the timer kept.
+  var slot: AlphSignal** = (AlphSignal**)(h->data + i * 8);
+  *slot = sig;
+  while (i > 0) {
+    var parent: int64 = (i - 1) / 2;
+    if (alph_timer_deadline(alph_vec_get(h, parent)) <= alph_timer_deadline(alph_vec_get(h, i))) {
+      break;
+    }
+    alph_timers_swap(h, i, parent);
+    i = parent;
+  }
+}
+
+fn alph_timers_pop(h: AlphVec*) -> AlphSignal* {
+  var top: int64 = alph_vec_get(h, 0);
+  alph_vec_remove_at(h, 0);
+  var i: int64 = 0;
+  while (true) {
+    var left: int64 = i * 2 + 1;
+    var right: int64 = left + 1;
+    var least: int64 = i;
+    if (left < h->len && alph_timer_deadline(alph_vec_get(h, left)) < alph_timer_deadline(alph_vec_get(h, least))) {
+      least = left;
+    }
+    if (right < h->len && alph_timer_deadline(alph_vec_get(h, right)) < alph_timer_deadline(alph_vec_get(h, least))) {
+      least = right;
+    }
+    if (least == i) {
+      break;
+    }
+    alph_timers_swap(h, i, least);
+    i = least;
+  }
+  return (AlphSignal*)top;
+}
+
+// Delivers a message with tag, ref and arg to `to` after ms milliseconds,
+// from the caller's scheduler. A timer that carries a ref is dropped if the
+// receiver stopped waiting on that ref.
+fn alph_timer(ctx: AlphCtx*, ms: int64, to: int64, tag: int64, ref: int64, arg: int64) {
+  var sig: AlphSignal* = (AlphSignal*)malloc((int64)sizeof(AlphSignal));
+  if (sig == 0) {
+    return;
+  }
+  sig->next = alph_now_ns() + ms * ALPH_NS_PER_MS;
+  sig->kind = ALPH_SIG_TIMER;
+  sig->from = ctx->self;
+  sig->to = to;
+  sig->ref = ref;
+  sig->arg = arg;
+  sig->tag = tag;
+  sig->mark = 0;
+  alph_timers_add(&alph_here(ctx)->timers, sig);
+}
+
+// Fires due timers. Returns nanoseconds until the next one, or -1 if none.
+fn alph_timers_fire(node: AlphNode*, h: AlphVec*) -> int64 {
+  var now: int64 = alph_now_ns();
+  while (h->len > 0) {
+    var wait: int64 = alph_timer_deadline(alph_vec_get(h, 0)) - now;
+    if (wait > 0) {
+      return wait;
+    }
+    var sig: AlphSignal* = alph_timers_pop(h);
+    var p: AlphProc* = alph_resolve(node, sig->to);
+    if (p == 0) {
+      free((rawptr)sig);
+    } else {
+      alph_queue_push(&p->signals, (rawptr)sig);
+      alph_wake(node, p);
+    }
+  }
+  return -1;
+}
+
+// Sends a tag and one word to `to` after ms milliseconds. It cannot be
+// cancelled; use alph_start_timer for that. Like every signal it is never
+// dropped for a full mailbox. Thread: a handler.
+export fn alph_send_after(ctx: AlphCtx*, ms: int64, to: int64, tag: int64, arg: int64) {
+  alph_timer(ctx, ms, to, tag, 0, arg);
+}
+
+// Starts a timer for this actor: after ms milliseconds a message with tag
+// and arg arrives, its ref set to the returned value, unless
+// alph_cancel_timer is called first. Returns the timer's ref.
+// Thread: a handler.
+export fn alph_start_timer(ctx: AlphCtx*, ms: int64, tag: int64, arg: int64) -> int64 {
+  var ref: int64 = alph_new_ref(ctx->node);
+  alph_hold_ref(alph_me(ctx), ref, 0);
+  alph_timer(ctx, ms, ctx->self, tag, ref, arg);
+  return ref;
+}
+
+// Cancels a timer from alph_start_timer. Its message never arrives, even if
+// it is already due. Cancelling twice, or after it arrived, does nothing.
+// Thread: a handler.
+export fn alph_cancel_timer(ctx: AlphCtx*, ref: int64) {
+  alph_take_ref(alph_me(ctx), ref);
+}
+
+// ---- per-actor memory ------------------------------------------------------
+
+// Allocates size bytes that live until this actor exits, then are freed for
+// it. Use it for anything the state points to. Returns 0 when out of memory.
+// The memory is not zeroed. Thread: a handler.
+export fn alph_alloc(ctx: AlphCtx*, size: int64) -> rawptr {
+  var block: int64* = (int64*)malloc(size + 16);
+  if (block == 0) {
+    return (rawptr)0;
+  }
+  var p: AlphProc* = alph_me(ctx);
+  block[0] = p->chunks;
+  p->chunks = (int64)block;
+  return (rawptr)((int64)block + 16);
+}
+
+// ---- spawning --------------------------------------------------------------
+
+fn alph_slot_take(node: AlphNode*) -> int64 {
+  alph_spin_lock(&node->free_lock);
+  var index: int64 = -1;
+  if (node->free_top > 0) {
+    node->free_top = node->free_top - 1;
+    var at: int64* = (int64*)(node->free_stack + node->free_top * 8);
+    index = *at;
+  }
+  alph_spin_unlock(&node->free_lock);
+  return index;
+}
+
+fn alph_slot_give(node: AlphNode*, index: int64) {
+  alph_spin_lock(&node->free_lock);
+  var at: int64* = (int64*)(node->free_stack + node->free_top * 8);
+  *at = index;
+  node->free_top = node->free_top + 1;
+  alph_spin_unlock(&node->free_lock);
+}
+
+// Spawns an actor whose state starts as a copy of size bytes at state, and
+// sends it INIT. parent is the spawning pid, or 0. A link to the parent and
+// a monitor by it (monitor_ref non-zero) are in place before the actor can
+// run, so even a crash in INIT reaches them. patient is set for a medic.
+// Returns the pid, or 0 when the node is full or out of memory.
+fn alph_spawn_raw(node: AlphNode*, parent: int64, link: bool, monitor_ref: int64,
+                  patient: int64, state: rawptr, size: int64,
+                  handler: fn(AlphCtx*, AlphMsg*) -> int64 with alloc, syscall, asm) -> int64 {
+  var index: int64 = alph_slot_take(node);
+  if (index < 0) {
+    return 0;
+  }
+  var p: AlphProc* = alph_slot(node, index);
+  if (p->inited == 0) {
+    if (!alph_mailbox_init(&p->mailbox, node->mailbox_size)) {
+      alph_slot_give(node, index);
+      return 0;
+    }
+    alph_queue_init(&p->signals);
+    p->index = index;
+    p->inited = 1;
+  }
+  // Leftovers sent to the previous owner of the slot are dropped.
+  var stale: AlphMsg;
+  while (alph_mailbox_pop(&p->mailbox, &stale)) {
+    alph_msg_release(&stale);
+  }
+  p->state = 0;
+  alph_set_state(p, state, size);
+  p->serial = p->serial + 1;
+  p->parent = parent;
+  p->trap_exit = 0;
+  p->chunks = 0;
+  p->handled = 0;
+  p->handler = handler;
+  p->links.len = 0;
+  p->mon_refs.len = 0;
+  p->mon_watchers.len = 0;
+  p->ref_ids.len = 0;
+  p->ref_pids.len = 0;
+  p->deferred.len = 0;
+  p->medic = 0;
+  p->patient = patient;
+  p->poison_heap = 0;
+  p->retry = 0;
+  if (link && parent != 0) {
+    alph_vec_push(&p->links, parent);
+  }
+  if (monitor_ref != 0) {
+    alph_vec_push(&p->mon_refs, monitor_ref);
+    alph_vec_push(&p->mon_watchers, parent);
+  }
+  p->sched = alph_atomic_add(&node->next_sched, 1) % node->sched_count;
+  var pid: int64 = (p->serial << 32) | (index + 1);
+  alph_atomic_add(&node->live, 1);
+  alph_atomic_add(&node->spawned, 1);
+  alph_atomic_store(&p->status, ALPH_P_IDLE);
+  alph_atomic_store_sc(&p->pid, pid);
+  alph_send_raw(node, parent, pid, ALPH_TAG_INIT, 0, (rawptr)0, 0);
+  return pid;
+}
+
+fn alph_spawn_from(ctx: AlphCtx*, flags: int64, state: rawptr, size: int64,
+                   handler: fn(AlphCtx*, AlphMsg*) -> int64 with alloc, syscall, asm) -> int64 {
+  var link: bool = (flags & ALPH_LINK) != 0;
+  var ref: int64 = 0;
+  if ((flags & ALPH_MONITOR) != 0) {
+    ref = alph_new_ref(ctx->node);
+  }
+  var pid: int64 = alph_spawn_raw(ctx->node, ctx->self, link, ref, 0, state, size, handler);
+  if (pid == 0) {
+    return 0;
+  }
+  var p: AlphProc* = alph_me(ctx);
+  if (link) {
+    alph_vec_push(&p->links, pid);
+  }
+  if (ref != 0) {
+    alph_hold_ref(p, ref, pid);
+  }
+  return pid;
+}
+
+// Spawns an actor with no state.
+//
+//   flags    0, or ALPH_LINK and/or ALPH_MONITOR. Both are set up before the
+//            new actor runs, so even a crash in its INIT reaches the caller.
+//            With ALPH_MONITOR, its DOWN arrives with from = the new pid.
+//   handler  the new actor's handler; its first message is ALPH_TAG_INIT
+//
+// Returns the new pid, or 0 when the node is full (max_actors) or out of
+// memory. Thread: a handler. Outside the node, use alph_node_spawn.
+export fn alph_spawn(ctx: AlphCtx*, flags: int64,
+                     handler: fn(AlphCtx*, AlphMsg*) -> int64 with alloc, syscall, asm) -> int64 {
+  return alph_spawn_from(ctx, flags, (rawptr)0, 0, handler);
+}
+
+// Spawns an actor whose state starts as a copy of *state. The handler reads
+// it as (T*)ctx->state. Otherwise as alph_spawn. Thread: a handler.
+export fn alph_spawn_value<T>(ctx: AlphCtx*, flags: int64, state: T*,
+                              handler: fn(AlphCtx*, AlphMsg*) -> int64 with alloc, syscall, asm) -> int64 {
+  return alph_spawn_from(ctx, flags, (rawptr)state, (int64)sizeof(T), handler);
+}
+
+// Spawns an actor whose state starts as a copy of size bytes at state.
+// Otherwise as alph_spawn. Thread: a handler.
+export fn alph_spawn_bytes(ctx: AlphCtx*, flags: int64, state: rawptr, size: int64,
+                           handler: fn(AlphCtx*, AlphMsg*) -> int64 with alloc, syscall, asm) -> int64 {
+  return alph_spawn_from(ctx, flags, state, size, handler);
+}
+
+// Spawns an actor with no state from outside the node. It has no parent: its
+// INIT comes from 0 and nothing is linked to it. Returns the new pid, or 0.
+// Thread: any.
+export fn alph_node_spawn(node: AlphNode*,
+                          handler: fn(AlphCtx*, AlphMsg*) -> int64 with alloc, syscall, asm) -> int64 {
+  return alph_spawn_raw(node, 0, false, 0, 0, (rawptr)0, 0, handler);
+}
+
+// Spawns an actor whose state starts as a copy of *state, from outside the
+// node. Otherwise as alph_node_spawn. Thread: any.
+export fn alph_node_spawn_value<T>(node: AlphNode*, state: T*,
+                                   handler: fn(AlphCtx*, AlphMsg*) -> int64 with alloc, syscall, asm) -> int64 {
+  return alph_spawn_raw(node, 0, false, 0, 0, (rawptr)state, (int64)sizeof(T), handler);
+}
+
+// Spawns an actor whose state starts as a copy of size bytes at state, from
+// outside the node. Otherwise as alph_node_spawn. Thread: any.
+export fn alph_node_spawn_bytes(node: AlphNode*, state: rawptr, size: int64,
+                                handler: fn(AlphCtx*, AlphMsg*) -> int64 with alloc, syscall, asm) -> int64 {
+  return alph_spawn_raw(node, 0, false, 0, 0, state, size, handler);
+}
+
+// ---- exiting ---------------------------------------------------------------
+
+// Tells everyone who cares that p exited, and frees what p owned.
+fn alph_proc_exit(node: AlphNode*, p: AlphProc*, reason: int64) {
+  alph_atomic_store(&p->status, ALPH_P_EXITING);
+  var pid: int64 = p->pid;
+  alph_atomic_store_sc(&p->pid, 0);
+  if (reason == ALPH_CRASHED) {
+    alph_atomic_add(&node->crashed, 1);
+  }
+
+  for i: int64 in 0..p->links.len {
+    alph_signal_link_exit(node, pid, alph_vec_get(&p->links, i), reason);
+  }
+  for i: int64 in 0..p->mon_refs.len {
+    alph_signal_down(node, pid, alph_vec_get(&p->mon_watchers, i), alph_vec_get(&p->mon_refs, i), reason);
+  }
+  // A link or monitor that arrived too late is answered as if p had been gone.
+  var sig: int64 = alph_queue_pop(&p->signals);
+  while (sig != 0) {
+    var s: AlphSignal* = (AlphSignal*)sig;
+    if (s->kind == ALPH_SIG_LINK) {
+      alph_signal_link_exit(node, pid, s->from, ALPH_NOPROC);
+    } else if (s->kind == ALPH_SIG_MONITOR) {
+      alph_signal_down(node, pid, s->from, s->ref, ALPH_NOPROC);
+    }
+    free((rawptr)sig);
+    sig = alph_queue_pop(&p->signals);
+  }
+  for i: int64 in 0..p->deferred.len {
+    free((rawptr)alph_vec_get(&p->deferred, i));
+  }
+  if (p->poison_heap != 0) {
+    free((rawptr)p->poison_heap);
+    p->poison_heap = 0;
+  }
+  // A medic that exits leaves its patient unwatched; one held after a crash
+  // has nobody left to repair it, so it exits as the crash would have.
+  if (p->patient != 0) {
+    var patient: AlphProc* = alph_resolve(node, p->patient);
+    if (patient != 0 && alph_atomic_cas(&patient->medic, pid, 0) == pid) {
+      if (alph_atomic_cas(&patient->status, ALPH_P_CRASHED, ALPH_P_EXITING) == ALPH_P_CRASHED) {
+        alph_proc_exit(node, patient, ALPH_CRASHED);
+      }
+    }
+  }
+  var m: AlphMsg;
+  while (alph_mailbox_pop(&p->mailbox, &m)) {
+    alph_msg_release(&m);
+  }
+  alph_free_chunks(p);
+  alph_set_state(p, (rawptr)0, 0);
+  alph_vec_release(&p->links);
+  alph_vec_release(&p->mon_refs);
+  alph_vec_release(&p->mon_watchers);
+  alph_vec_release(&p->ref_ids);
+  alph_vec_release(&p->ref_pids);
+  alph_vec_release(&p->deferred);
+  alph_atomic_store(&p->status, ALPH_P_FREE);
+  alph_slot_give(node, p->index);
+  alph_atomic_add(&node->live, -1);
+}
+
+// ---- running an actor ------------------------------------------------------
+
+// Runs the handler on one message. Returns the exit reason, or -1 to go on.
+fn alph_deliver(s: AlphSched*, p: AlphProc*, m: AlphMsg*) -> int64 {
+  var ctx: AlphCtx;
+  ctx.self = p->pid;
+  ctx.state = (rawptr)p->state;
+  ctx.state_size = p->state_size;
+  ctx.node = (AlphNode*)s->node;
+  ctx.proc = (int64)p;
+  ctx.sched = (int64)s;
+  ctx.stop_reason = ALPH_NORMAL;
+  p->handled = p->handled + 1;
+  // Recorded so a crash in the handler can free the payload, and a medic
+  // can see what was being handled.
+  p->poison_heap = m->heap;
+  if (alph_atomic_load(&p->medic) != 0) {
+    p->last_msg = *m;
+  }
+  var result: int64 = p->handler(&ctx, m);
+  p->poison_heap = 0;
+  alph_msg_release(m);
+  if (result == ALPH_STOP) {
+    return ctx.stop_reason;
+  }
+  return -1;
+}
+
+// Builds a message the runtime delivers itself (EXIT, DOWN, TIMEOUT, ...).
+fn alph_runtime_message(m: AlphMsg*, tag: int64, from: int64, to: int64, ref: int64, arg: int64) {
+  alph_message(m, from, to, tag, arg, 0);
+  m->ref = ref;
+}
+
+// An exit signal or a linked actor's exit. Returns an exit reason, or -1.
+fn alph_handle_exit(s: AlphSched*, p: AlphProc*, sig: AlphSignal*) -> int64 {
+  var reason: int64 = sig->arg;
+  if (sig->kind == ALPH_SIG_LINK_EXIT) {
+    var at: int64 = alph_vec_find(&p->links, sig->from);
+    if (at < 0) {
+      return -1;  // unlinked meanwhile
+    }
+    alph_vec_remove_at(&p->links, at);
+  } else if (reason == ALPH_KILL) {
+    return ALPH_KILLED;
+  }
+  if (p->trap_exit != 0) {
+    var m: AlphMsg;
+    alph_runtime_message(&m, ALPH_TAG_EXIT, sig->from, p->pid, 0, reason);
+    return alph_deliver(s, p, &m);
+  }
+  if (reason == ALPH_NORMAL) {
+    return -1;
+  }
+  return reason;
+}
+
+// Handles one signal. Returns an exit reason, or -1 to go on.
+fn alph_handle_signal(s: AlphSched*, p: AlphProc*, sig: AlphSignal*) -> int64 {
+  var node: AlphNode* = (AlphNode*)s->node;
+  var m: AlphMsg;
+  if (sig->to != p->pid) {
+    // Meant for an earlier owner of this slot, which is gone.
+    if (sig->kind == ALPH_SIG_LINK) {
+      alph_signal_link_exit(node, sig->to, sig->from, ALPH_NOPROC);
+    } else if (sig->kind == ALPH_SIG_MONITOR) {
+      alph_signal_down(node, sig->to, sig->from, sig->ref, ALPH_NOPROC);
+    }
+    return -1;
+  }
+  if (sig->kind == ALPH_SIG_LINK) {
+    if (alph_vec_find(&p->links, sig->from) < 0) {
+      alph_vec_push(&p->links, sig->from);
+    }
+    return -1;
+  }
+  if (sig->kind == ALPH_SIG_UNLINK) {
+    var at: int64 = alph_vec_find(&p->links, sig->from);
+    if (at >= 0) {
+      alph_vec_remove_at(&p->links, at);
+    }
+    return -1;
+  }
+  if (sig->kind == ALPH_SIG_MONITOR) {
+    alph_vec_push(&p->mon_refs, sig->ref);
+    alph_vec_push(&p->mon_watchers, sig->from);
+    return -1;
+  }
+  if (sig->kind == ALPH_SIG_DEMONITOR) {
+    var at: int64 = alph_vec_find(&p->mon_refs, sig->ref);
+    if (at >= 0) {
+      alph_vec_remove_at(&p->mon_refs, at);
+      alph_vec_remove_at(&p->mon_watchers, at);
+    }
+    return -1;
+  }
+  if (sig->kind == ALPH_SIG_DOWN) {
+    if (alph_take_ref(p, sig->ref) < 0) {
+      return -1;  // demonitored, or the request already settled
+    }
+    alph_runtime_message(&m, ALPH_TAG_DOWN, sig->from, p->pid, sig->ref, sig->arg);
+    return alph_deliver(s, p, &m);
+  }
+  if (sig->kind == ALPH_SIG_CRASHED) {
+    alph_runtime_message(&m, ALPH_TAG_CRASHED, sig->from, p->pid, 0, sig->arg);
+    return alph_deliver(s, p, &m);
+  }
+  if (sig->kind == ALPH_SIG_TIMER) {
+    if (sig->ref != 0) {
+      var watched: int64 = alph_take_ref(p, sig->ref);
+      if (watched < 0) {
+        return -1;  // cancelled, or the request already settled
+      }
+      if (watched > 0) {
+        // A request timed out: stop watching the server.
+        alph_signal_plain(node, ALPH_SIG_DEMONITOR, p->pid, watched, sig->ref);
+      }
+    }
+    alph_runtime_message(&m, sig->tag, sig->from, p->pid, sig->ref, sig->arg);
+    return alph_deliver(s, p, &m);
+  }
+  return alph_handle_exit(s, p, sig);
+}
+
+fn alph_handle_and_free(s: AlphSched*, p: AlphProc*, sig: int64) -> int64 {
+  var reason: int64 = alph_handle_signal(s, p, (AlphSignal*)sig);
+  free((rawptr)sig);
+  return reason;
+}
+
+// True when the oldest deferred exit or down has no earlier message left.
+fn alph_deferred_ready(p: AlphProc*) -> bool {
+  if (p->deferred.len == 0) {
+    return false;
+  }
+  var head: AlphSignal* = (AlphSignal*)alph_vec_get(&p->deferred, 0);
+  return head->mark <= p->mailbox.deq;
+}
+
+// Handles one popped message. Returns an exit reason, or -1 to go on.
+fn alph_handle_message(s: AlphSched*, p: AlphProc*, m: AlphMsg*) -> int64 {
+  if (m->to != p->pid) {
+    alph_msg_release(m);  // meant for an earlier owner of this slot
+    return -1;
+  }
+  if ((m->flags & ALPH_MSG_REPLY) != 0) {
+    var server: int64 = alph_take_ref(p, m->ref);
+    if (server < 0) {
+      alph_msg_release(m);  // lost to a timeout or a DOWN
+      return -1;
+    }
+    alph_signal_plain((AlphNode*)s->node, ALPH_SIG_DEMONITOR, p->pid, server, m->ref);
+  }
+  return alph_deliver(s, p, m);
+}
+
+// Handles signals, then up to ALPH_BUDGET messages. Returns an exit reason,
+// -1 when the actor ran out of work, or -2 when its budget ran out.
+fn alph_run_some(s: AlphSched*, p: AlphProc*) -> int64 {
+  var m: AlphMsg;
+  if (p->retry != 0) {
+    // Resumed by a medic that asked for the crashing message again.
+    p->retry = 0;
+    m = p->last_msg;
+    p->poison_heap = 0;
+    var again: int64 = alph_deliver(s, p, &m);
+    if (again >= 0) {
+      return again;
+    }
+  }
+  for n: int64 in 0..ALPH_BUDGET {
+    while (alph_deferred_ready(p)) {
+      var reason: int64 = alph_handle_and_free(s, p, alph_vec_shift(&p->deferred));
+      if (reason >= 0) {
+        return reason;
+      }
+    }
+    var sig: int64 = alph_queue_pop(&p->signals);
+    while (sig != 0) {
+      var sg: AlphSignal* = (AlphSignal*)sig;
+      if (alph_signal_ordered(sg->kind, sg->arg) &&
+          (p->deferred.len > 0 || sg->mark > p->mailbox.deq)) {
+        alph_vec_push(&p->deferred, sig);
+      } else {
+        var reason: int64 = alph_handle_and_free(s, p, sig);
+        if (reason >= 0) {
+          return reason;
+        }
+      }
+      sig = alph_queue_pop(&p->signals);
+    }
+    if (!alph_mailbox_pop(&p->mailbox, &m)) {
+      if (alph_deferred_ready(p)) {
+        continue;
+      }
+      // Anything deferred waits on a message still being written; its
+      // sender wakes this actor when the write lands.
+      return -1;
+    }
+    var outcome: int64 = alph_handle_message(s, p, &m);
+    if (outcome >= 0) {
+      return outcome;
+    }
+  }
+  return -2;
+}
+
+fn alph_run_proc(s: AlphSched*, p: AlphProc*) {
+  var node: AlphNode* = (AlphNode*)s->node;
+  alph_atomic_store_sc(&p->status, ALPH_P_RUNNING);  // pairs with the fence in alph_wake
+  s->current = (int64)p;
+  var r: AlphRecover* = &s->thread.recover;
+  alph_recover_arm(r);
+  if (alph_recover_save(&r->regs[0]) != 0) {
+    // The handler crashed and the hook resumed here. s was set before the
+    // save and never reassigned, so the restored registers still hold it;
+    // the actor is read back from memory.
+    var crashed: AlphProc* = (AlphProc*)s->current;
+    s->current = 0;
+    if (!alph_hold_for_medic((AlphNode*)s->node, crashed)) {
+      alph_proc_exit((AlphNode*)s->node, crashed, ALPH_CRASHED);
+    }
+    return;
+  }
+  var outcome: int64 = alph_run_some(s, p);
+  alph_recover_disarm(r);
+  s->current = 0;
+  if (outcome >= 0) {
+    alph_proc_exit(node, p, outcome);
+    return;
+  }
+  if (outcome == -2 ||
+      alph_atomic_cas(&p->status, ALPH_P_RUNNING, ALPH_P_IDLE) != ALPH_P_RUNNING) {
+    // More work is waiting, or arrived while running.
+    alph_atomic_store(&p->status, ALPH_P_QUEUED);
+    alph_queue_push(&s->runq, (rawptr)p);
+  }
+}
+
+// ---- proactive healing -----------------------------------------------------
+//
+// An actor with a medic is not freed when it crashes. It is held in place:
+// same pid, same links and monitors, its mailbox kept and still accepting,
+// its state as the crash left it. The medic gets ALPH_TAG_CRASHED and
+// decides: resume, retry the message, reset, or fail. Only fail makes the
+// crash visible to links, monitors and supervisors. alph/heal/medic builds
+// a medic on these functions; use them directly only to write your own.
+
+// Holds a crashed actor for its medic. Returns false when it has none, and
+// the crash ends the actor as usual.
+fn alph_hold_for_medic(node: AlphNode*, p: AlphProc*) -> bool {
+  var medic: int64 = alph_atomic_load(&p->medic);
+  if (medic == 0 || alph_resolve(node, medic) == 0) {
+    return false;
+  }
+  alph_atomic_store_sc(&p->status, ALPH_P_CRASHED);
+  alph_signal(node, ALPH_SIG_CRASHED, p->pid, medic, 0, ALPH_CRASHED, 0);
+  // If the medic exited meanwhile, its exit may have missed this actor.
+  if (alph_resolve(node, medic) == 0 &&
+      alph_atomic_cas(&p->status, ALPH_P_CRASHED, ALPH_P_EXITING) == ALPH_P_CRASHED) {
+    return false;
+  }
+  return true;
+}
+
+// The crashed patient this medic may act on, or 0.
+fn alph_held_patient(ctx: AlphCtx*, pid: int64) -> AlphProc* {
+  var p: AlphProc* = alph_resolve(ctx->node, pid);
+  if (p == 0 || alph_atomic_load(&p->medic) != ctx->self ||
+      alph_atomic_load(&p->status) != ALPH_P_CRASHED) {
+    return (AlphProc*)0;
+  }
+  return p;
+}
+
+fn alph_release_patient(ctx: AlphCtx*, p: AlphProc*) {
+  alph_atomic_add(&ctx->node->healed, 1);
+  alph_atomic_store_sc(&p->status, ALPH_P_IDLE);
+  alph_wake(ctx->node, p);
+}
+
+fn alph_drop_poison(p: AlphProc*) {
+  if (p->poison_heap != 0) {
+    free((rawptr)p->poison_heap);
+    p->poison_heap = 0;
+  }
+}
+
+// Spawns a medic for the calling actor, which becomes its patient. When the
+// patient crashes, the medic gets ALPH_TAG_CRASHED (from = the patient,
+// arg = the reason) and must answer with one of alph_patient_resume, _reset
+// or _fail. If a live medic is attached already it is kept, since a reset
+// patient runs INIT again.
+//
+//   state, size  the medic's initial state, copied
+//   handler      the medic's handler
+//
+// Returns the medic's pid, or 0. Thread: the patient's handler.
+export fn alph_spawn_medic(ctx: AlphCtx*, state: rawptr, size: int64,
+                           handler: fn(AlphCtx*, AlphMsg*) -> int64 with alloc, syscall, asm) -> int64 {
+  var p: AlphProc* = alph_me(ctx);
+  var current: int64 = alph_atomic_load(&p->medic);
+  if (current != 0 && alph_resolve(ctx->node, current) != 0) {
+    return current;
+  }
+  var medic: int64 = alph_spawn_raw(ctx->node, ctx->self, false, 0, ctx->self, state, size, handler);
+  if (medic != 0) {
+    alph_atomic_store_sc(&p->medic, medic);
+  }
+  return medic;
+}
+
+// For a medic: the crashed patient's state as the crash left it, which the
+// medic may change. *size receives its size. Valid until the patient is
+// resumed, reset or failed. Returns 0 when pid is not this medic's crashed
+// patient. Thread: the medic's handler.
+export fn alph_patient_state(ctx: AlphCtx*, pid: int64, size: int64*) -> rawptr {
+  var p: AlphProc* = alph_held_patient(ctx, pid);
+  if (p == 0) {
+    *size = 0;
+    return (rawptr)0;
+  }
+  *size = p->state_size;
+  return (rawptr)p->state;
+}
+
+// For a medic: the message the patient was handling when it crashed. Valid
+// until the patient is resumed, reset or failed. Returns 0 when pid is not
+// this medic's crashed patient. Thread: the medic's handler.
+export fn alph_patient_message(ctx: AlphCtx*, pid: int64) -> AlphMsg* {
+  var p: AlphProc* = alph_held_patient(ctx, pid);
+  if (p == 0) {
+    return (AlphMsg*)0;
+  }
+  return &p->last_msg;
+}
+
+// For a medic: lets the patient go on with its state as it is now. With
+// retry, the message it crashed on is handled again first; without, that
+// message is dropped. Returns false when pid is not this medic's crashed
+// patient. Thread: the medic's handler.
+export fn alph_patient_resume(ctx: AlphCtx*, pid: int64, retry: bool) -> bool {
+  var p: AlphProc* = alph_held_patient(ctx, pid);
+  if (p == 0) {
+    return false;
+  }
+  if (retry) {
+    p->retry = 1;
+  } else {
+    alph_drop_poison(p);
+  }
+  alph_release_patient(ctx, p);
+  return true;
+}
+
+// For a medic: starts the patient over from a copy of size bytes at state.
+// What it allocated is freed, exits are no longer trapped, and it gets INIT
+// again. Its pid, links, monitors and mailbox stay. Returns false when pid
+// is not this medic's crashed patient. Thread: the medic's handler.
+export fn alph_patient_reset(ctx: AlphCtx*, pid: int64, state: rawptr, size: int64) -> bool {
+  var p: AlphProc* = alph_held_patient(ctx, pid);
+  if (p == 0) {
+    return false;
+  }
+  alph_drop_poison(p);
+  alph_free_chunks(p);
+  alph_set_state(p, state, size);
+  p->trap_exit = 0;
+  p->retry = 0;
+  // INIT travels as a signal so it comes before anything already queued.
+  alph_signal(ctx->node, ALPH_SIG_TIMER, p->parent, pid, 0, 0, ALPH_TAG_INIT);
+  alph_release_patient(ctx, p);
+  return true;
+}
+
+// For a medic: gives up. The patient exits with reason, which its links,
+// monitors and supervisor see; passive healing takes over. Returns false
+// when pid is not this medic's crashed patient. Thread: the medic's handler.
+export fn alph_patient_fail(ctx: AlphCtx*, pid: int64, reason: int64) -> bool {
+  var p: AlphProc* = alph_held_patient(ctx, pid);
+  if (p == 0 || alph_atomic_cas(&p->status, ALPH_P_CRASHED, ALPH_P_EXITING) != ALPH_P_CRASHED) {
+    return false;
+  }
+  alph_proc_exit(ctx->node, p, reason);
+  return true;
+}
+
+// ---- schedulers and the node -----------------------------------------------
+
+fn alph_sched_main(arg: int64) -> int64 {
+  var s: AlphSched* = (AlphSched*)arg;
+  var node: AlphNode* = (AlphNode*)s->node;
+  while (alph_atomic_load(&node->halted) == 0) {
+    var wait: int64 = alph_timers_fire(node, &s->timers);
+    var p: int64 = alph_queue_pop(&s->runq);
+    if (p != 0) {
+      alph_run_proc(s, (AlphProc*)p);
+      continue;
+    }
+    // Park. A pusher bumps wake after its push, then wakes us if sleeping
+    // is set; reading wake first and popping once more closes the gap.
+    var seen: int64 = alph_atomic_load(&s->wake);
+    alph_atomic_store_sc(&s->sleeping, 1);
+    p = alph_queue_pop(&s->runq);
+    if (p != 0) {
+      alph_atomic_store(&s->sleeping, 0);
+      alph_run_proc(s, (AlphProc*)p);
+      continue;
+    }
+    if (alph_atomic_load(&node->halted) == 0) {
+      alph_futex_wait(&s->wake, seen, wait);
+    }
+    alph_atomic_store(&s->sleeping, 0);
+  }
+  return 0;
+}
+
+// Fills cfg with the defaults: one scheduler per CPU, 65536 actors, 64
+// messages per mailbox, 1 MiB of stack per scheduler. Thread: any.
+export fn alph_config(cfg: AlphConfig*) {
+  cfg->schedulers = alph_cpu_count();
+  cfg->max_actors = 65536;
+  cfg->mailbox_size = 64;
+  cfg->stack_size = 1048576;
+}
+
+fn alph_round_pow2(n: int64) -> int64 {
+  var p: int64 = 2;
+  while (p < n) {
+    p = p * 2;
+  }
+  return p;
+}
+
+// Starts a node: its schedulers begin running and actors can be spawned.
+//
+//   node  storage for the node; keep it in place until alph_node_wait returns
+//   cfg   from alph_config, changed as needed; read here and not kept
+//
+// Returns false when cfg is out of range (no schedulers, no actors) or
+// memory or threads run out.
+// Thread: any, once per node.
+export fn alph_node_start(node: AlphNode*, cfg: AlphConfig*) -> bool {
+  if (cfg->schedulers < 1 || cfg->max_actors < 1 || cfg->max_actors > 2147483647) {
+    return false;
+  }
+  memset((rawptr)node, 0, (int64)sizeof(AlphNode));
+  node->capacity = cfg->max_actors;
+  node->mailbox_size = alph_round_pow2(cfg->mailbox_size);
+  node->procs = (int64)calloc(node->capacity, (int64)sizeof(AlphProc));
+  node->free_stack = (int64)malloc(node->capacity * 8);
+  node->scheds = (int64)calloc(cfg->schedulers, (int64)sizeof(AlphSched));
+  if (node->procs == 0 || node->free_stack == 0 || node->scheds == 0) {
+    return false;
+  }
+  for i: int64 in 0..node->capacity {
+    var at: int64* = (int64*)(node->free_stack + i * 8);
+    *at = node->capacity - 1 - i;
+  }
+  node->free_top = node->capacity;
+  node->sched_count = cfg->schedulers;
+  for i: int64 in 0..node->sched_count {
+    var s: AlphSched* = alph_sched_at(node, i);
+    alph_queue_init(&s->runq);
+    s->index = i;
+    s->node = (int64)node;
+  }
+  for i: int64 in 0..node->sched_count {
+    var s: AlphSched* = alph_sched_at(node, i);
+    s->handle = alph_thread_start(&s->thread, &alph_sched_main, (int64)s, cfg->stack_size);
+    if (s->handle == 0) {
+      return false;
+    }
+  }
+  return true;
+}
+
+// Stops the node: each scheduler finishes the actor it is running and
+// exits, and alph_node_wait returns code. Actors still alive are not told.
+// Thread: any. From a handler, alph_halt is the same.
+export fn alph_node_halt(node: AlphNode*, code: int64) {
+  node->halt_code = code;
+  alph_atomic_store_sc(&node->halted, 1);
+  for i: int64 in 0..node->sched_count {
+    alph_sched_notify(alph_sched_at(node, i));
+  }
+}
+
+// Stops the node, as alph_node_halt. The calling handler still returns
+// normally. Thread: a handler.
+export fn alph_halt(ctx: AlphCtx*, code: int64) {
+  alph_node_halt(ctx->node, code);
+}
+
+// Waits until the node is halted and its schedulers have stopped. Returns
+// the code given to alph_halt or alph_node_halt.
+// Thread: any thread that is not one of the node's schedulers, typically
+// main, once.
+export fn alph_node_wait(node: AlphNode*) -> int64 {
+  for i: int64 in 0..node->sched_count {
+    var s: AlphSched* = alph_sched_at(node, i);
+    alph_thread_join(s->handle, &s->thread);
+  }
+  return node->halt_code;
+}
+
+// Copies the node's counters into *stats. Counters from different threads
+// are read one by one, so they may be a moment apart. Thread: any.
+export fn alph_node_stats(node: AlphNode*, stats: AlphStats*) {
+  stats->live = alph_atomic_load(&node->live);
+  stats->spawned = alph_atomic_load(&node->spawned);
+  stats->crashed = alph_atomic_load(&node->crashed);
+  stats->healed = alph_atomic_load(&node->healed);
+}

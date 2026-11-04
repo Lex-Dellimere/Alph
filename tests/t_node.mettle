@@ -1,0 +1,276 @@
+// alph/core/node on one node: spawn, send, ping-pong across schedulers, links
+// and exit signals, monitors, requests with reply, death and timeout, a
+// crash inside a handler, a full mailbox, slot reuse, and halt.
+
+import "std/io";
+import "std/mem";
+import "alph/sys/atomic";
+import "alph/core/mailbox";
+import "alph/core/node";
+
+const TAG_PING: int64 = 100;
+const TAG_PONG: int64 = 101;
+const TAG_GO: int64 = 102;
+const TAG_CRASH: int64 = 103;
+const TAG_ASK: int64 = 104;
+const TAG_ANSWER: int64 = 105;
+const TAG_TICK: int64 = 106;
+const TAG_IGNORE: int64 = 107;
+
+const ROUNDS: int64 = 100000;
+const WORKERS: int64 = 20000;
+const BATCH: int64 = 32;
+
+var g_node: AlphNode;
+var g_failures: int64 = 0;
+var g_steps: int64 = 0;
+
+fn expect(ok: bool, what: string) {
+  if (!ok) {
+    println("FAIL {what}");
+    alph_atomic_add(&g_failures, 1);
+  }
+}
+
+// ---- ping-pong ----
+
+struct Pinger {
+  peer: int64;
+  left: int64;
+  boss: int64;
+}
+
+fn ponger(ctx: AlphCtx*, m: AlphMsg*) -> int64 {
+  if (m->tag == TAG_PING) {
+    alph_send(ctx, m->from, TAG_PONG, 0);
+  }
+  return ALPH_CONTINUE;
+}
+
+fn pinger(ctx: AlphCtx*, m: AlphMsg*) -> int64 {
+  var s: Pinger* = (Pinger*)ctx->state;
+  if (m->tag == TAG_GO || m->tag == TAG_PONG) {
+    if (s->left == 0) {
+      alph_send(ctx, s->boss, TAG_PONG, 0);
+      return alph_stop(ctx, ALPH_NORMAL);
+    }
+    s->left = s->left - 1;
+    alph_send(ctx, s->peer, TAG_PING, 0);
+  }
+  return ALPH_CONTINUE;
+}
+
+// ---- the test driver, itself an actor ----
+
+struct Boss {
+  step: int64;
+  pinger: int64;
+  linked: int64;
+  watched: int64;
+  watch_ref: int64;
+  server: int64;
+  ask_ref: int64;
+  dead_ref: int64;
+  slow_ref: int64;
+  started: int64;
+  workers_done: int64;
+}
+
+fn crasher(ctx: AlphCtx*, m: AlphMsg*) -> int64 {
+  if (m->tag == TAG_CRASH) {
+    var p: int64* = (int64*)(m->tag - m->tag);
+    *p = 1;
+  }
+  return ALPH_CONTINUE;
+}
+
+// A payload larger than ALPH_INLINE, so it travels in its own allocation.
+struct Pair {
+  a: int64;
+  b: int64;
+  pad: int64[6];
+}
+
+fn server(ctx: AlphCtx*, m: AlphMsg*) -> int64 {
+  if (m->tag == TAG_ASK) {
+    var wrong: int64 = 0;
+    expect(!alph_msg_value<int64>(m, &wrong), "reading the wrong type fails");
+    var p: Pair;
+    expect(alph_msg_value<Pair>(m, &p), "the request carries a Pair");
+    p.a = p.a * 2;
+    p.b = p.b * 2;
+    alph_reply_value<Pair>(ctx, m, TAG_ANSWER, &p);
+  }
+  return ALPH_CONTINUE;
+}
+
+fn quitter(ctx: AlphCtx*, m: AlphMsg*) -> int64 {
+  if (m->tag == TAG_ASK) {
+    return alph_stop(ctx, ALPH_REASON_USER + 7);
+  }
+  return ALPH_CONTINUE;
+}
+
+fn worker(ctx: AlphCtx*, m: AlphMsg*) -> int64 {
+  if (m->tag == ALPH_TAG_INIT) {
+    alph_send(ctx, m->from, TAG_PONG, 0);
+    return alph_stop(ctx, ALPH_NORMAL);
+  }
+  return ALPH_CONTINUE;
+}
+
+fn sleeper(ctx: AlphCtx*, m: AlphMsg*) -> int64 {
+  return ALPH_CONTINUE;
+}
+
+fn next_step(ctx: AlphCtx*) {
+  var b: Boss* = (Boss*)ctx->state;
+  b->step = b->step + 1;
+  alph_atomic_store(&g_steps, b->step);
+  alph_send(ctx, ctx->self, TAG_GO, 0);
+}
+
+fn boss(ctx: AlphCtx*, m: AlphMsg*) -> int64 {
+  var b: Boss* = (Boss*)ctx->state;
+  if (m->tag == ALPH_TAG_INIT) {
+    alph_trap_exits(ctx, true);
+    var pong: int64 = alph_spawn(ctx, 0, &ponger);
+    var ps: Pinger;
+    ps.peer = pong;
+    ps.left = ROUNDS;
+    ps.boss = ctx->self;
+    b->pinger = alph_spawn_value<Pinger>(ctx, 0, &ps, &pinger);
+    alph_send(ctx, b->pinger, TAG_GO, 0);
+    return ALPH_CONTINUE;
+  }
+
+  if (b->step == 0 && m->tag == TAG_PONG) {
+    // ping-pong finished; next: a linked actor crashes
+    b->linked = alph_spawn(ctx, ALPH_LINK, &crasher);
+    alph_send(ctx, b->linked, TAG_CRASH, 0);
+    b->step = 1;
+    return ALPH_CONTINUE;
+  }
+  if (b->step == 1 && m->tag == ALPH_TAG_EXIT) {
+    expect(m->from == b->linked, "EXIT comes from the linked actor");
+    expect(m->arg == ALPH_CRASHED, "a crash reads as ALPH_CRASHED");
+    expect(alph_send(ctx, b->linked, TAG_PING, 0) == ALPH_GONE, "a dead pid is gone");
+    // next: monitor an actor that stops with a user reason
+    b->watched = alph_spawn(ctx, 0, &quitter);
+    b->watch_ref = alph_monitor(ctx, b->watched);
+    alph_send(ctx, b->watched, TAG_ASK, 0);
+    b->step = 2;
+    return ALPH_CONTINUE;
+  }
+  if (b->step == 2 && m->tag == ALPH_TAG_DOWN) {
+    expect(m->ref == b->watch_ref, "DOWN carries the monitor ref");
+    expect(m->arg == ALPH_REASON_USER + 7, "DOWN carries the exit reason");
+    var late: int64 = alph_monitor(ctx, b->watched);
+    b->watch_ref = late;
+    b->step = 3;
+    return ALPH_CONTINUE;
+  }
+  if (b->step == 3 && m->tag == ALPH_TAG_DOWN) {
+    expect(m->ref == b->watch_ref && m->arg == ALPH_NOPROC, "monitoring a dead pid gives NOPROC");
+    // next: a request that gets its answer
+    b->server = alph_spawn(ctx, 0, &server);
+    var p: Pair;
+    p.a = 21;
+    p.b = 50;
+    b->ask_ref = alph_request_value<Pair>(ctx, b->server, TAG_ASK, &p, 1000);
+    b->step = 4;
+    return ALPH_CONTINUE;
+  }
+  if (b->step == 4 && m->tag == TAG_ANSWER) {
+    var r: Pair;
+    expect(alph_msg_value<Pair>(m, &r), "the reply carries a Pair");
+    expect(m->ref == b->ask_ref && r.a == 42 && r.b == 100, "reply matches the request");
+    // next: a request whose server dies before answering
+    var q: int64 = alph_spawn(ctx, 0, &quitter);
+    b->dead_ref = alph_request(ctx, q, TAG_ASK, 0, 1000);
+    b->step = 5;
+    return ALPH_CONTINUE;
+  }
+  if (b->step == 5 && m->tag == ALPH_TAG_DOWN) {
+    expect(m->ref == b->dead_ref, "a dead server reads as DOWN for the request");
+    // next: a request nobody answers times out
+    var silent: int64 = alph_spawn(ctx, 0, &sleeper);
+    b->slow_ref = alph_request(ctx, silent, TAG_IGNORE, 0, 30);
+    b->started = alph_now_ms_for_test();
+    b->step = 6;
+    return ALPH_CONTINUE;
+  }
+  if (b->step == 6 && m->tag == ALPH_TAG_TIMEOUT) {
+    expect(m->ref == b->slow_ref, "TIMEOUT carries the request ref");
+    expect(alph_now_ms_for_test() - b->started >= 25, "timeout waited");
+    // next: many short-lived actors, so slots are reused; at most BATCH at
+    // once, since their replies share this actor's bounded mailbox
+    for i: int64 in 0..BATCH {
+      expect(alph_spawn(ctx, 0, &worker) != 0, "worker spawned");
+    }
+    b->started = BATCH;
+    b->step = 7;
+    return ALPH_CONTINUE;
+  }
+  if (b->step == 7 && m->tag == TAG_PONG) {
+    b->workers_done = b->workers_done + 1;
+    if (b->started < WORKERS) {
+      expect(alph_spawn(ctx, 0, &worker) != 0, "worker spawned");
+      b->started = b->started + 1;
+    }
+    if (b->workers_done == WORKERS) {
+      // a mailbox that is never read fills up and refuses
+      var stuck: int64 = alph_spawn(ctx, 0, &sleeper);
+      var full: bool = false;
+      for i: int64 in 0..1000 {
+        if (alph_send(ctx, stuck, TAG_IGNORE, 0) == ALPH_FULL) {
+          full = true;
+        }
+      }
+      expect(full, "an unread mailbox becomes full");
+      b->step = 8;
+      alph_halt(ctx, 0);
+    }
+    return ALPH_CONTINUE;
+  }
+  if (m->tag == ALPH_TAG_EXIT) {
+    return ALPH_CONTINUE;
+  }
+  println("FAIL unexpected tag {m->tag} at step {b->step}");
+  alph_atomic_add(&g_failures, 1);
+  alph_halt(ctx, 1);
+  return ALPH_CONTINUE;
+}
+
+import "alph/sys/clock";
+
+fn alph_now_ms_for_test() -> int64 {
+  return alph_now_ms();
+}
+
+// Starts g_node with a fixed shape, so runs are comparable across machines.
+fn start_node(schedulers: int64, max_actors: int64, mailbox_size: int64) {
+  var cfg: AlphConfig;
+  alph_config(&cfg);
+  cfg.schedulers = schedulers;
+  cfg.max_actors = max_actors;
+  cfg.mailbox_size = mailbox_size;
+  expect(alph_node_start(&g_node, &cfg), "node started");
+}
+
+fn main() -> int32 {
+  start_node(4, 8192, 64);
+  var b: Boss;
+  memset((rawptr)&b, 0, (int64)sizeof(Boss));
+  expect(alph_node_spawn_value<Boss>(&g_node, &b, &boss) != 0, "boss spawned");
+  var code: int64 = alph_node_wait(&g_node);
+  expect(code == 0, "halted cleanly");
+  var stats: AlphStats;
+  alph_node_stats(&g_node, &stats);
+  expect(stats.crashed == 1, "one crash");
+  if (g_failures != 0) {
+    return 1;
+  }
+  println("node ok: spawned {stats.spawned}, crashed {stats.crashed}");
+  return 0;
+}

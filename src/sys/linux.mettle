@@ -1,0 +1,25 @@
+// alph/sys/linux: the Linux x86-64 system call numbers and flags alph uses.
+//
+// Every raw syscall in the runtime goes through these names, so a port to
+// another platform starts here.
+
+// System call numbers.
+export const ALPH_SYS_MMAP: int64 = 9;
+export const ALPH_SYS_MPROTECT: int64 = 10;
+export const ALPH_SYS_MUNMAP: int64 = 11;
+export const ALPH_SYS_SIGALTSTACK: int64 = 131;
+export const ALPH_SYS_FUTEX: int64 = 202;
+export const ALPH_SYS_SCHED_GETAFFINITY: int64 = 204;
+export const ALPH_SYS_CLOCK_GETTIME: int64 = 228;
+
+// Flags for those calls.
+export const ALPH_PROT_NONE: int64 = 0;
+export const ALPH_PROT_READ_WRITE: int64 = 3;
+export const ALPH_MAP_PRIVATE_ANONYMOUS: int64 = 0x22;
+export const ALPH_SS_DISABLE: int64 = 2;
+export const ALPH_CLOCK_MONOTONIC: int64 = 1;
+export const ALPH_FUTEX_WAIT_PRIVATE: int64 = 128;
+export const ALPH_FUTEX_WAKE_PRIVATE: int64 = 129;
+
+// The memory page size, for guard pages.
+export const ALPH_PAGE_SIZE: int64 = 4096;

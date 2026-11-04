@@ -1,0 +1,280 @@
+// alph/heal/medic with alph/heal/supervisor: proactive repairs that nobody else sees
+// (resume, retry, reset), and passive restarts when the medic gives up, is
+// over its repair limit, or is gone.
+
+import "std/io";
+import "std/mem";
+import "std/thread";
+import "alph/sys/atomic";
+import "alph/sys/clock";
+import "alph/core/mailbox";
+import "alph/core/node";
+import "alph/heal/supervisor";
+import "alph/heal/medic";
+
+const TAG_ADD: int64 = 100;
+const TAG_CORRUPT: int64 = 101;
+const TAG_DIVIDE: int64 = 102;
+const TAG_WIPE: int64 = 103;
+const TAG_FATAL: int64 = 104;
+const TAG_HELLO: int64 = 105;
+const TAG_REPORT: int64 = 106;
+const TAG_START_SUP: int64 = 107;
+
+const EV_HELLO: int64 = 1;
+const EV_REPORT: int64 = 2;
+
+struct Account {
+  observer: int64;
+  balance: int64;
+  last_good: int64;
+  divisor: int64;
+}
+
+struct Report {
+  value: int64;
+  medic: int64;
+}
+
+struct Event {
+  kind: int64;
+  pid: int64;
+  value: int64;
+  medic: int64;
+}
+
+var g_node: AlphNode;
+var g_observer: int64 = 0;
+var g_events: Event[1024];
+var g_event_count: int64 = 0;
+var g_failures: int64 = 0;
+var g_account: Account;
+
+fn expect(ok: bool, what: string) {
+  if (!ok) {
+    println("FAIL {what}");
+    g_failures = g_failures + 1;
+  }
+}
+
+// ---- the patient and its repair ----
+
+fn repair(ctx: AlphCtx*, r: AlphRepair*) -> int64 {
+  var a: Account* = (Account*)r->state;
+  var tag: int64 = r->message->tag;
+  if (tag == TAG_CORRUPT) {
+    a->balance = a->last_good;
+    return ALPH_HEAL_RESUME;
+  }
+  if (tag == TAG_DIVIDE) {
+    a->divisor = 1;
+    return ALPH_HEAL_RETRY;
+  }
+  if (tag == TAG_WIPE) {
+    return ALPH_HEAL_RESET;
+  }
+  return ALPH_HEAL_FAIL;
+}
+
+fn report(ctx: AlphCtx*, tag: int64, value: int64, medic: int64) {
+  var a: Account* = (Account*)ctx->state;
+  var r: Report;
+  r.value = value;
+  r.medic = medic;
+  alph_send_value<Report>(ctx, a->observer, tag, &r);
+}
+
+fn crash() {
+  var p: int64* = (int64*)0;
+  *p = 1;
+}
+
+fn account(ctx: AlphCtx*, m: AlphMsg*) -> int64 {
+  var a: Account* = (Account*)ctx->state;
+  if (m->tag == ALPH_TAG_INIT) {
+    var spec: AlphMedicSpec;
+    alph_medic_init(&spec, &repair);
+    spec.period_ms = 5000;
+    var medic: int64 = alph_attach_medic(ctx, &spec);
+    report(ctx, TAG_HELLO, a->balance, medic);
+    return ALPH_CONTINUE;
+  }
+  if (m->tag == TAG_ADD) {
+    a->balance = a->balance + m->arg;
+    a->last_good = a->balance;
+    report(ctx, TAG_REPORT, a->balance, 0);
+  } else if (m->tag == TAG_CORRUPT) {
+    a->balance = -999;
+    crash();
+  } else if (m->tag == TAG_DIVIDE) {
+    report(ctx, TAG_REPORT, 100 / a->divisor, 0);
+  } else if (m->tag == TAG_WIPE || m->tag == TAG_FATAL) {
+    crash();
+  }
+  return ALPH_CONTINUE;
+}
+
+// ---- observer and driver ----
+
+fn observer(ctx: AlphCtx*, m: AlphMsg*) -> int64 {
+  if (m->tag == ALPH_TAG_INIT) {
+    alph_trap_exits(ctx, true);
+    return ALPH_CONTINUE;
+  }
+  if (m->tag == TAG_START_SUP) {
+    var spec: AlphSupSpec;
+    if (alph_msg_value<AlphSupSpec>(m, &spec)) {
+      alph_spawn_sup(ctx, &spec);
+    }
+    return ALPH_CONTINUE;
+  }
+  if (m->tag == TAG_HELLO || m->tag == TAG_REPORT) {
+    var r: Report;
+    expect(alph_msg_value<Report>(m, &r), "reports carry a Report");
+    var n: int64 = g_event_count;
+    g_events[n].kind = EV_HELLO;
+    if (m->tag == TAG_REPORT) {
+      g_events[n].kind = EV_REPORT;
+    }
+    g_events[n].pid = m->from;
+    g_events[n].value = r.value;
+    g_events[n].medic = r.medic;
+    alph_atomic_store(&g_event_count, n + 1);
+  }
+  return ALPH_CONTINUE;
+}
+
+fn stat_healed() -> int64 {
+  var stats: AlphStats;
+  alph_node_stats(&g_node, &stats);
+  return stats.healed;
+}
+
+fn stat_crashed() -> int64 {
+  var stats: AlphStats;
+  alph_node_stats(&g_node, &stats);
+  return stats.crashed;
+}
+
+fn events() -> int64 {
+  return alph_atomic_load(&g_event_count);
+}
+
+fn wait_events(n: int64) -> bool {
+  for i: int64 in 0..3000 {
+    if (events() >= n) {
+      return true;
+    }
+    thread_sleep_ms(1);
+  }
+  println("  waited for {n} events, have {events()}");
+  return false;
+}
+
+fn last() -> Event* {
+  return &g_events[events() - 1];
+}
+
+fn send(pid: int64, tag: int64, value: int64) {
+  expect(alph_node_send(&g_node, pid, tag, value) == ALPH_SENT, "send");
+}
+
+// Sends tag and waits for the next event, which must be a hello (expect_hello)
+// or a report.
+fn step(pid: int64, tag: int64, value: int64, expect_hello: bool) -> Event* {
+  var base: int64 = events();
+  send(pid, tag, value);
+  expect(wait_events(base + 1), "an event follows");
+  var e: Event* = &g_events[base];
+  if (expect_hello) {
+    expect(e->kind == EV_HELLO, "a start follows");
+  } else {
+    expect(e->kind == EV_REPORT, "a report follows");
+  }
+  return e;
+}
+
+// Starts g_node with a fixed shape, so runs are comparable across machines.
+fn start_node(schedulers: int64, max_actors: int64, mailbox_size: int64) {
+  var cfg: AlphConfig;
+  alph_config(&cfg);
+  cfg.schedulers = schedulers;
+  cfg.max_actors = max_actors;
+  cfg.mailbox_size = mailbox_size;
+  expect(alph_node_start(&g_node, &cfg), "node started");
+}
+
+fn main() -> int32 {
+  start_node(4, 1024, 64);
+  g_observer = alph_node_spawn(&g_node, &observer);
+
+  // Passive healing: a supervisor around the account.
+  memset((rawptr)&g_account, 0, (int64)sizeof(Account));
+  g_account.observer = g_observer;
+  var spec: AlphSupSpec;
+  alph_sup_init(&spec, ALPH_ONE_FOR_ONE);
+  spec.max_restarts = 10;
+  alph_sup_add_value<Account>(&spec, &g_account, &account);
+  alph_node_send_value<AlphSupSpec>(&g_node, g_observer, TAG_START_SUP, &spec);
+  expect(wait_events(1) && g_events[0].kind == EV_HELLO, "account started");
+  var pid: int64 = g_events[0].pid;
+  var medic: int64 = g_events[0].medic;
+  expect(medic != 0, "medic attached");
+
+  step(pid, TAG_ADD, 10, false);
+  expect(step(pid, TAG_ADD, 5, false)->value == 15, "balance 15");
+
+  // Resume: the medic restores the last good balance. Messages sent while
+  // the account is held are kept and handled after the repair.
+  var base: int64 = events();
+  send(pid, TAG_CORRUPT, 0);
+  for i: int64 in 0..5 {
+    send(pid, TAG_ADD, 1);
+  }
+  expect(wait_events(base + 5), "queued messages handled after the repair");
+  expect(last()->value == 20 && last()->pid == pid, "resume keeps the pid and the repaired state");
+  expect(stat_healed() == 1, "one crash healed");
+
+  // Retry: the medic fixes the divisor and the same message runs again.
+  expect(step(pid, TAG_DIVIDE, 0, false)->value == 100, "retry handles the message again");
+
+  // Reset: INIT runs again on the same pid, from the state at attach time.
+  var e: Event* = step(pid, TAG_WIPE, 0, true);
+  expect(e->pid == pid && e->value == 0, "reset keeps the pid and restarts the state");
+  expect(e->medic == medic, "reset keeps the medic");
+  expect(step(pid, TAG_ADD, 7, false)->value == 7, "reset state is in use");
+  expect(stat_healed() == 3, "three crashes healed");
+  expect(stat_crashed() == 0, "nothing exited");
+
+  // A fourth repair within the period is over the limit: the medic fails the
+  // account and the supervisor restarts it with a new pid.
+  e = step(pid, TAG_CORRUPT, 0, true);
+  expect(e->pid != pid, "over the repair limit, the supervisor restarts it");
+  expect(stat_crashed() == 1, "that crash ended the actor");
+  thread_sleep_ms(10);
+  expect(alph_node_send(&g_node, medic, TAG_ADD, 0) == ALPH_GONE,
+         "the old medic left with its patient");
+  pid = e->pid;
+  medic = e->medic;
+
+  // Without its medic the account keeps working, and its next crash is passive.
+  alph_node_exit_signal(&g_node, medic, ALPH_KILL);
+  thread_sleep_ms(10);
+  expect(step(pid, TAG_ADD, 3, false)->value == 3, "works without a medic");
+  e = step(pid, TAG_CORRUPT, 0, true);
+  expect(e->pid != pid, "a crash with no medic restarts it");
+  pid = e->pid;
+
+  // A crash the medic will not repair goes to the supervisor too.
+  e = step(pid, TAG_FATAL, 0, true);
+  expect(e->pid != pid, "a refused repair restarts it");
+  expect(stat_crashed() == 3, "three crashes ended an actor");
+
+  alph_node_halt(&g_node, 0);
+  alph_node_wait(&g_node);
+  if (g_failures != 0) {
+    return 1;
+  }
+  println("heal ok: healed {stat_healed()}, restarted {stat_crashed()}");
+  return 0;
+}

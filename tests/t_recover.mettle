@@ -1,0 +1,106 @@
+// alph/sys/recover and alph/sys/thread: each crash kind is caught and the thread
+// keeps going, on an alph thread and on the main thread. In release builds
+// the bounds check is compiled out, so that case may return instead.
+
+import "std/io";
+import "alph/sys/atomic";
+import "alph/sys/recover";
+import "alph/sys/thread";
+
+const KIND_OK: int64 = 0;
+const KIND_BOUNDS: int64 = 1;
+const KIND_NULL: int64 = 2;
+const KIND_DIVIDE: int64 = 3;
+const KIND_OVERFLOW: int64 = 4;
+const KINDS: int64 = 5;
+
+var g_failures: int64 = 0;
+
+fn expect(ok: bool, what: string) {
+  if (!ok) {
+    println("FAIL {what}");
+    g_failures = g_failures + 1;
+  }
+}
+
+fn deep(n: int64) -> int64 {
+  var pad: int64[64];
+  pad[n % 64] = n;
+  return deep(n + 1) + pad[(n * 7) % 64];
+}
+
+fn crash(kind: int64, i: int64) -> int64 {
+  if (kind == KIND_BOUNDS) {
+    var arr: int32[4];
+    arr[0] = 1;
+    return (int64)arr[i];
+  }
+  if (kind == KIND_NULL) {
+    var p: int64* = (int64*)(i - i);
+    return *p;
+  }
+  if (kind == KIND_DIVIDE) {
+    var z: int64 = i - i;
+    return 10 / z;
+  }
+  if (kind == KIND_OVERFLOW) {
+    return deep(i);
+  }
+  return 7;
+}
+
+// Runs crash(kind) under r's recovery point. Returns 1 when it crashed.
+fn guarded(r: AlphRecover*, kind: int64) -> int64 {
+  alph_recover_arm(r);
+  if (alph_recover_save(&r->regs[0]) != 0) {
+    return 1;
+  }
+  var value: int64 = crash(kind, 9);
+  alph_recover_disarm(r);
+  if (kind == KIND_OK) {
+    expect(value == 7, "a clean call returns its value");
+  }
+  return 0;
+}
+
+// Every kind twice, so a recovery that leaves bad state shows on the repeat.
+fn run_all(r: AlphRecover*) -> int64 {
+  var crashed: int64 = 0;
+  for round: int64 in 0..2 {
+    for kind: int64 in 0..KINDS {
+      var hit: int64 = guarded(r, kind);
+      if (kind == KIND_OK) {
+        expect(hit == 0, "clean call did not crash");
+      } else if (kind != KIND_BOUNDS) {
+        expect(hit == 1, "fault kind was recovered");
+      }
+      crashed = crashed + hit;
+    }
+  }
+  return crashed;
+}
+
+fn on_thread(arg: int64) -> int64 {
+  var t: AlphThread* = (AlphThread*)arg;
+  return run_all(&t->recover);
+}
+
+fn main() -> int32 {
+  var t: AlphThread;
+  var handle: int64 = alph_thread_start(&t, &on_thread, (int64)&t, 262144);
+  expect(handle != 0, "thread started");
+  var thread_crashes: int64 = alph_thread_join(handle, &t);
+  expect(thread_crashes >= 6, "thread recovered null, divide and overflow twice");
+  expect(t.recover.crashes == thread_crashes, "hook counted every thread crash");
+
+  var main_r: AlphRecover;
+  expect(alph_recover_register_here(&main_r, 8388608, 1048576), "main registered");
+  var main_crashes: int64 = run_all(&main_r);
+  expect(main_crashes >= 6, "main recovered null, divide and overflow twice");
+
+  if (g_failures != 0) {
+    return 1;
+  }
+  println("recover ok: thread {thread_crashes}, main {main_crashes}");
+  return 0;
+}

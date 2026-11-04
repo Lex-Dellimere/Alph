@@ -1,0 +1,13 @@
+// alph: the alph runtime in one import.
+//
+//   import "alph/alph";
+//
+// Imports are visible through the whole import graph, so this brings in
+// everything an application uses: the node and its actors, messages,
+// supervisors and medics. The x86-64 Linux layer under alph/sys comes along
+// too; most programs never call it directly.
+
+import "alph/core/mailbox";
+import "alph/core/node";
+import "alph/heal/supervisor";
+import "alph/heal/medic";

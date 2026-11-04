@@ -1,0 +1,143 @@
+// alph/core/mailbox: messages, and the bounded mailbox that holds them.
+//
+// The mailbox is Vyukov's bounded queue: each cell carries a sequence number,
+// producers claim a position with one CAS, and the single consumer reads in
+// order. Messages from one sender arrive in the order they were sent. A full
+// mailbox refuses the message instead of growing, so overload shows up at
+// the sender as ALPH_FULL rather than as memory growth.
+
+import "std/mem";
+import "alph/sys/atomic";
+
+// Payloads up to this many bytes travel inside the message. Larger ones cost
+// one allocation and are freed after the handler returns.
+export const ALPH_INLINE: int64 = 40;
+
+// A message, as a handler receives it. Read the fields directly:
+//
+//   tag    what the message means. Tags below ALPH_TAG_USER (100) belong to
+//          the runtime; pick your own from ALPH_TAG_USER up
+//   from   the sender's pid, or 0 when sent from outside the node
+//   to     the receiver's pid
+//   ref    the request this message answers (replies, DOWN, TIMEOUT), else 0
+//   arg    one word of data; the exit reason on EXIT and DOWN
+//   size   payload bytes, 0 when there is none
+//
+// The payload is read with alph_msg_value or alph_msg_bytes. It is valid
+// until the handler returns; copy what you keep.
+export struct AlphMsg {
+  tag: int64;
+  from: int64;
+  to: int64;
+  ref: int64;
+  arg: int64;
+  flags: int64;
+  size: int64;
+  heap: int64;      // payload address when size > ALPH_INLINE, else 0
+  data: uint8[40];  // payload when size <= ALPH_INLINE
+}
+
+// Copies the payload into *out when it holds exactly one T.
+//
+//   m    the message
+//   out  where the T goes
+//
+// Returns false, leaving *out alone, when the payload is not sizeof(T)
+// bytes: usually a tag sent with a different type than the receiver expects.
+// Thread: the handler that received m.
+export fn alph_msg_value<T>(m: AlphMsg*, out: T*) -> bool {
+  if (m->size != (int64)sizeof(T)) {
+    return false;
+  }
+  memcpy((rawptr)out, alph_msg_bytes(m, (int64*)0), m->size);
+  return true;
+}
+
+// The payload's address. If size is not 0, *size receives its length in
+// bytes. Returns the address even for an empty payload; check the size.
+// Thread: the handler that received m.
+export fn alph_msg_bytes(m: AlphMsg*, size: int64*) -> rawptr {
+  if (size != 0) {
+    *size = m->size;
+  }
+  if (m->heap != 0) {
+    return (rawptr)m->heap;
+  }
+  return (rawptr)&m->data[0];
+}
+
+// ---- the mailbox: used by alph/core/node ----------------------------------
+
+struct AlphCell {
+  seq: int64;
+  msg: AlphMsg;
+}
+
+// A bounded multi-producer, single-consumer queue of messages. Internal to
+// the runtime; actors never touch it.
+export struct AlphMailbox {
+  cells: int64;  // AlphCell array, allocated once and kept for reuse
+  mask: int64;
+  enq: int64;    // next position to claim; producers
+  deq: int64;    // next position to read; the consumer
+}
+
+fn alph_cell(mb: AlphMailbox*, pos: int64) -> AlphCell* {
+  return (AlphCell*)(mb->cells + (pos & mb->mask) * (int64)sizeof(AlphCell));
+}
+
+// Allocates room for capacity messages, which must be a power of two.
+// Returns false when out of memory. Thread: any, before the mailbox is used.
+export fn alph_mailbox_init(mb: AlphMailbox*, capacity: int64) -> bool {
+  var cells: rawptr = malloc(capacity * (int64)sizeof(AlphCell));
+  if (cells == 0) {
+    return false;
+  }
+  mb->cells = (int64)cells;
+  mb->mask = capacity - 1;
+  mb->enq = 0;
+  mb->deq = 0;
+  for i: int64 in 0..capacity {
+    alph_cell(mb, i)->seq = i;
+  }
+  return true;
+}
+
+// Copies *m into the mailbox. Returns false when it is full.
+// Thread: any.
+export fn alph_mailbox_push(mb: AlphMailbox*, m: AlphMsg*) -> bool {
+  var pos: int64 = alph_atomic_load(&mb->enq);
+  while (true) {
+    var cell: AlphCell* = alph_cell(mb, pos);
+    var dif: int64 = alph_atomic_load(&cell->seq) - pos;
+    if (dif == 0) {
+      var seen: int64 = alph_atomic_cas(&mb->enq, pos, pos + 1);
+      if (seen == pos) {
+        cell->msg = *m;
+        alph_atomic_store(&cell->seq, pos + 1);
+        return true;
+      }
+      pos = seen;
+    } else if (dif < 0) {
+      return false;
+    } else {
+      pos = alph_atomic_load(&mb->enq);
+    }
+  }
+  return false;
+}
+
+// Moves the oldest message into *out. Returns false when there is none, or
+// when the oldest is still being written by its sender.
+// Thread: the mailbox's one consumer.
+export fn alph_mailbox_pop(mb: AlphMailbox*, out: AlphMsg*) -> bool {
+  var pos: int64 = mb->deq;
+  var cell: AlphCell* = alph_cell(mb, pos);
+  if (alph_atomic_load(&cell->seq) != pos + 1) {
+    return false;
+  }
+  *out = cell->msg;
+  alph_atomic_store(&cell->seq, pos + mb->mask + 1);
+  mb->deq = pos + 1;
+  return true;
+}

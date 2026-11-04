@@ -1,0 +1,90 @@
+// alph/sys/atomic: single-thread results, contended counters, and a spin-wait
+// that must see another thread's store (an optimizer that hoisted the load
+// out of the loop would hang here, and check.sh's timeout would fail it).
+
+import "std/io";
+import "std/thread";
+import "alph/sys/atomic";
+
+const THREADS: int64 = 4;
+const ADDS: int64 = 1000000;
+const CASES: int64 = 200000;
+
+var g_add_total: int64 = 0;
+var g_cas_total: int64 = 0;
+var g_flag: int64 = 0;
+var g_payload: int64 = 0;
+var g_failures: int64 = 0;
+
+fn expect(ok: bool, what: string) {
+  if (!ok) {
+    println("FAIL {what}");
+    g_failures = g_failures + 1;
+  }
+}
+
+fn add_worker(arg: cstring) -> uint32 {
+  for i: int64 in 0..ADDS {
+    alph_atomic_add(&g_add_total, 1);
+  }
+  return 0;
+}
+
+fn cas_worker(arg: cstring) -> uint32 {
+  for i: int64 in 0..CASES {
+    var done: bool = false;
+    while (!done) {
+      var seen: int64 = alph_atomic_load(&g_cas_total);
+      done = alph_atomic_cas(&g_cas_total, seen, seen + 1) == seen;
+    }
+  }
+  return 0;
+}
+
+fn publisher(arg: cstring) -> uint32 {
+  thread_sleep_ms(50);
+  g_payload = 42;
+  alph_atomic_store(&g_flag, 1);
+  return 0;
+}
+
+fn run_threads(entry: fn(cstring) -> uint32) {
+  var handles: int64[4];
+  for i: int64 in 0..THREADS {
+    handles[i] = CreateThread(0, 0, entry, 0, 0, 0);
+  }
+  for i: int64 in 0..THREADS {
+    thread_join_infinite(handles[i]);
+    thread_close(handles[i]);
+  }
+}
+
+fn main() -> int32 {
+  var x: int64 = 5;
+  expect(alph_atomic_cas(&x, 5, 9) == 5 && x == 9, "cas succeeds");
+  expect(alph_atomic_cas(&x, 5, 1) == 9 && x == 9, "cas fails on mismatch");
+  expect(alph_atomic_add(&x, 3) == 9 && x == 12, "add returns the old value");
+  expect(alph_atomic_swap(&x, 7) == 12 && x == 7, "swap returns the old value");
+  alph_atomic_store_sc(&x, 11);
+  alph_atomic_fence();
+  expect(alph_atomic_load(&x) == 11, "store_sc then load");
+
+  run_threads(&add_worker);
+  expect(g_add_total == THREADS * ADDS, "contended add");
+  run_threads(&cas_worker);
+  expect(g_cas_total == THREADS * CASES, "contended cas loop");
+
+  var h: int64 = CreateThread(0, 0, &publisher, 0, 0, 0);
+  while (alph_atomic_load(&g_flag) == 0) {
+    alph_cpu_relax();
+  }
+  expect(g_payload == 42, "payload visible after flag");
+  thread_join_infinite(h);
+  thread_close(h);
+
+  if (g_failures != 0) {
+    return 1;
+  }
+  println("atomic ok: add {g_add_total}, cas {g_cas_total}");
+  return 0;
+}

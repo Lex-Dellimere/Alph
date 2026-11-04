@@ -1,0 +1,50 @@
+// alph/sys/clock: monotonic time and futex parking.
+
+import "alph/sys/linux";
+
+const ALPH_NS_PER_S: int64 = 1000000000;
+const ALPH_NS_PER_MS: int64 = 1000000;
+
+// Monotonic time in nanoseconds. Only differences between two readings mean
+// anything; it never goes backwards.
+// Thread: any.
+export fn alph_now_ns() -> int64 {
+  var ts: int64[2];
+  ts[0] = 0;
+  ts[1] = 0;
+  syscall(ALPH_SYS_CLOCK_GETTIME, ALPH_CLOCK_MONOTONIC, (int64)&ts[0]);
+  return ts[0] * ALPH_NS_PER_S + ts[1];
+}
+
+// Monotonic time in milliseconds, as alph_now_ns.
+// Thread: any.
+export fn alph_now_ms() -> int64 {
+  return alph_now_ns() / ALPH_NS_PER_MS;
+}
+
+// Sleeps while the low 32 bits of *word equal expected.
+//
+//   word        the futex word; only its low 32 bits are compared
+//   expected    the value that means "keep sleeping"
+//   timeout_ns  longest sleep in nanoseconds, or a negative number for none
+//
+// Returns on a wake, a timeout, a signal, or because *word already differs,
+// so callers re-check their condition in a loop.
+// Thread: any. Used by the schedulers to park.
+export fn alph_futex_wait(word: int64*, expected: int64, timeout_ns: int64) {
+  var low: int64 = expected & (((int64)1 << 32) - 1);
+  if (timeout_ns < 0) {
+    syscall(ALPH_SYS_FUTEX, (int64)word, ALPH_FUTEX_WAIT_PRIVATE, low, 0);
+    return;
+  }
+  var ts: int64[2];
+  ts[0] = timeout_ns / ALPH_NS_PER_S;
+  ts[1] = timeout_ns % ALPH_NS_PER_S;
+  syscall(ALPH_SYS_FUTEX, (int64)word, ALPH_FUTEX_WAIT_PRIVATE, low, (int64)&ts[0]);
+}
+
+// Wakes up to count threads sleeping in alph_futex_wait on word.
+// Thread: any.
+export fn alph_futex_wake(word: int64*, count: int64) {
+  syscall(ALPH_SYS_FUTEX, (int64)word, ALPH_FUTEX_WAKE_PRIVATE, count);
+}

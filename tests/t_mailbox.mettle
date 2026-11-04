@@ -1,0 +1,142 @@
+// alph/core/mailbox and alph/core/queue: several producers, one consumer. Checks that
+// nothing is lost or duplicated, that each sender's messages stay in order,
+// and that a full mailbox refuses instead of overwriting.
+
+import "std/io";
+import "std/thread";
+import "alph/sys/atomic";
+import "alph/core/queue";
+import "alph/core/mailbox";
+
+const PRODUCERS: int64 = 4;
+const PER_PRODUCER: int64 = 200000;
+
+struct Node {
+  next: int64;
+  producer: int64;
+  seq: int64;
+}
+
+var g_mailbox: AlphMailbox;
+var g_queue: AlphQueue;
+var g_nodes: int64 = 0;   // Node array, PRODUCERS * PER_PRODUCER
+var g_failures: int64 = 0;
+
+fn expect(ok: bool, what: string) {
+  if (!ok) {
+    println("FAIL {what}");
+    g_failures = g_failures + 1;
+  }
+}
+
+fn mailbox_producer(arg: cstring) -> uint32 {
+  var producer: int64 = (int64)arg;
+  var m: AlphMsg;
+  m.tag = 100;
+  m.from = producer;
+  m.size = 0;
+  m.heap = 0;
+  for i: int64 in 0..PER_PRODUCER {
+    m.arg = i;
+    while (!alph_mailbox_push(&g_mailbox, &m)) {
+      alph_cpu_relax();
+    }
+  }
+  return 0;
+}
+
+fn queue_producer(arg: cstring) -> uint32 {
+  var producer: int64 = (int64)arg;
+  for i: int64 in 0..PER_PRODUCER {
+    var n: Node* = (Node*)(g_nodes + (producer * PER_PRODUCER + i) * (int64)sizeof(Node));
+    n->producer = producer;
+    n->seq = i;
+    alph_queue_push(&g_queue, (rawptr)n);
+  }
+  return 0;
+}
+
+fn start(entry: fn(cstring) -> uint32, handles: int64*) {
+  for p: int64 in 0..PRODUCERS {
+    handles[p] = CreateThread(0, 0, entry, (cstring)p, 0, 0);
+  }
+}
+
+fn join(handles: int64*) {
+  for p: int64 in 0..PRODUCERS {
+    thread_join_infinite(handles[p]);
+    thread_close(handles[p]);
+  }
+}
+
+fn check_mailbox() {
+  expect(alph_mailbox_init(&g_mailbox, 64), "mailbox init");
+  var handles: int64[4];
+  start(&mailbox_producer, &handles[0]);
+  var next: int64[4];
+  for p: int64 in 0..PRODUCERS {
+    next[p] = 0;
+  }
+  var got: int64 = 0;
+  var m: AlphMsg;
+  while (got < PRODUCERS * PER_PRODUCER) {
+    if (alph_mailbox_pop(&g_mailbox, &m)) {
+      expect(m.arg == next[m.from], "mailbox keeps each sender's order");
+      next[m.from] = m.arg + 1;
+      got = got + 1;
+    } else {
+      alph_cpu_relax();
+    }
+  }
+  join(&handles[0]);
+  expect(!alph_mailbox_pop(&g_mailbox, &m), "mailbox empty at the end");
+
+  var full: AlphMailbox;
+  expect(alph_mailbox_init(&full, 4), "small mailbox init");
+  m.size = 0;
+  m.heap = 0;
+  for i: int64 in 0..4 {
+    m.arg = i;
+    expect(alph_mailbox_push(&full, &m), "push into free cell");
+  }
+  m.arg = 99;
+  expect(!alph_mailbox_push(&full, &m), "full mailbox refuses");
+  expect(alph_mailbox_pop(&full, &m) && m.arg == 0, "oldest first");
+  m.arg = 4;
+  expect(alph_mailbox_push(&full, &m), "a pop frees a cell");
+}
+
+fn check_queue() {
+  alph_queue_init(&g_queue);
+  g_nodes = (int64)calloc(PRODUCERS * PER_PRODUCER, (int64)sizeof(Node));
+  var handles: int64[4];
+  start(&queue_producer, &handles[0]);
+  var next: int64[4];
+  for p: int64 in 0..PRODUCERS {
+    next[p] = 0;
+  }
+  var got: int64 = 0;
+  while (got < PRODUCERS * PER_PRODUCER) {
+    var addr: int64 = alph_queue_pop(&g_queue);
+    if (addr != 0) {
+      var n: Node* = (Node*)addr;
+      expect(n->seq == next[n->producer], "queue keeps each producer's order");
+      next[n->producer] = n->seq + 1;
+      got = got + 1;
+    } else {
+      alph_cpu_relax();
+    }
+  }
+  join(&handles[0]);
+  expect(alph_queue_pop(&g_queue) == 0, "queue empty at the end");
+}
+
+fn main() -> int32 {
+  check_mailbox();
+  check_queue();
+  if (g_failures != 0) {
+    return 1;
+  }
+  println("mailbox ok");
+  return 0;
+}

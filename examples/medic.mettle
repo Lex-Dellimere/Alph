@@ -1,0 +1,70 @@
+// Proactive healing: the same bad input, but a medic repairs the worker in
+// place. The worker keeps its pid and its state, and nobody else sees the
+// crash.
+
+import "std/io";
+import "alph/alph";
+
+const TAG_SHARE: int64 = ALPH_TAG_USER;       // arg = how many to split between
+const TAG_RESULT: int64 = ALPH_TAG_USER + 1;   // arg = the share
+
+struct Worker {
+  root: int64;
+  pot: int64;      // what gets shared
+  handled: int64;
+}
+
+// Called by the medic when the worker crashes. A share of zero is bad input:
+// drop that message and let the worker go on with its state as it is.
+fn repair(ctx: AlphCtx*, r: AlphRepair*) -> int64 {
+  if (r->message->tag == TAG_SHARE && r->message->arg == 0) {
+    println("medic: dropped a share of zero, worker resumes");
+    return ALPH_HEAL_RESUME;
+  }
+  return ALPH_HEAL_FAIL;
+}
+
+fn worker(ctx: AlphCtx*, m: AlphMsg*) -> int64 {
+  var w: Worker* = (Worker*)ctx->state;
+  if (m->tag == ALPH_TAG_INIT) {
+    var spec: AlphMedicSpec;
+    alph_medic_init(&spec, &repair);
+    alph_attach_medic(ctx, &spec);
+  } else if (m->tag == TAG_SHARE) {
+    var share: int64 = w->pot / m->arg;  // arg 0 crashes; the medic repairs
+    w->handled = w->handled + 1;
+    alph_send(ctx, w->root, TAG_RESULT, share);
+  }
+  return ALPH_CONTINUE;
+}
+
+fn root(ctx: AlphCtx*, m: AlphMsg*) -> int64 {
+  if (m->tag == ALPH_TAG_INIT) {
+    var w: Worker;
+    w.root = ctx->self;
+    w.pot = 100;
+    w.handled = 0;
+    var pid: int64 = alph_spawn_value<Worker>(ctx, ALPH_LINK, &w, &worker);
+    alph_send(ctx, pid, TAG_SHARE, 0);
+    alph_send(ctx, pid, TAG_SHARE, 4);
+  } else if (m->tag == TAG_RESULT) {
+    println("same worker answered: each gets {m->arg}");
+    alph_halt(ctx, 0);
+  } else if (m->tag == ALPH_TAG_EXIT) {
+    println("the worker exited, which the medic should have prevented");
+    alph_halt(ctx, 1);
+  }
+  return ALPH_CONTINUE;
+}
+
+var g_node: AlphNode;
+
+fn main() -> int32 {
+  var cfg: AlphConfig;
+  alph_config(&cfg);
+  if (!alph_node_start(&g_node, &cfg)) {
+    return 1;
+  }
+  alph_node_spawn(&g_node, &root);
+  return (int32)alph_node_wait(&g_node);
+}

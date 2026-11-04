@@ -1,0 +1,69 @@
+// Passive healing: a worker crashes on bad input and its supervisor starts
+// a fresh one, with a new pid and its initial state.
+
+import "std/io";
+import "alph/alph";
+
+const TAG_STARTED: int64 = ALPH_TAG_USER;    // from the worker, to the root
+const TAG_SHARE: int64 = ALPH_TAG_USER + 1;  // arg = how many to split 100 between
+const TAG_DONE: int64 = ALPH_TAG_USER + 2;   // the root's own timer
+
+struct Worker {
+  root: int64;
+}
+
+fn worker(ctx: AlphCtx*, m: AlphMsg*) -> int64 {
+  var w: Worker* = (Worker*)ctx->state;
+  if (m->tag == ALPH_TAG_INIT) {
+    alph_send(ctx, w->root, TAG_STARTED, 0);
+  } else if (m->tag == TAG_SHARE) {
+    var share: int64 = 100 / m->arg;  // arg 0 crashes this worker
+    println("each gets {share}");
+  }
+  return ALPH_CONTINUE;
+}
+
+struct Root {
+  starts: int64;
+}
+
+fn root(ctx: AlphCtx*, m: AlphMsg*) -> int64 {
+  var r: Root* = (Root*)ctx->state;
+  if (m->tag == ALPH_TAG_INIT) {
+    var w: Worker;
+    w.root = ctx->self;
+    var spec: AlphSupSpec;
+    alph_sup_init(&spec, ALPH_ONE_FOR_ONE);
+    alph_sup_add_value<Worker>(&spec, &w, &worker);
+    alph_spawn_sup(ctx, &spec);
+    return ALPH_CONTINUE;
+  }
+  if (m->tag == TAG_STARTED) {
+    r->starts = r->starts + 1;
+    if (r->starts == 1) {
+      println("worker started; sending it a zero");
+      alph_send(ctx, m->from, TAG_SHARE, 0);
+    } else {
+      println("worker restarted by its supervisor");
+      alph_send(ctx, m->from, TAG_SHARE, 4);
+      alph_send_after(ctx, 20, ctx->self, TAG_DONE, 0);  // let it print first
+    }
+  } else if (m->tag == TAG_DONE) {
+    alph_halt(ctx, 0);
+  }
+  return ALPH_CONTINUE;
+}
+
+var g_node: AlphNode;
+
+fn main() -> int32 {
+  var cfg: AlphConfig;
+  alph_config(&cfg);
+  if (!alph_node_start(&g_node, &cfg)) {
+    return 1;
+  }
+  var r: Root;
+  r.starts = 0;
+  alph_node_spawn_value<Root>(&g_node, &r, &root);
+  return (int32)alph_node_wait(&g_node);
+}

@@ -1,0 +1,39 @@
+// A counter actor: three messages from outside, then it halts the node.
+
+import "std/io";
+import "alph/alph";
+
+const TAG_ADD: int64 = ALPH_TAG_USER;
+
+struct Counter {
+  total: int64;
+}
+
+fn counter(ctx: AlphCtx*, m: AlphMsg*) -> int64 {
+  var c: Counter* = (Counter*)ctx->state;
+  if (m->tag == TAG_ADD) {
+    c->total = c->total + m->arg;
+    if (c->total >= 6) {
+      println("total {c->total}");
+      alph_halt(ctx, 0);
+    }
+  }
+  return ALPH_CONTINUE;
+}
+
+var g_node: AlphNode;
+
+fn main() -> int32 {
+  var cfg: AlphConfig;
+  alph_config(&cfg);
+  if (!alph_node_start(&g_node, &cfg)) {
+    return 1;
+  }
+  var c: Counter;
+  c.total = 0;
+  var pid: int64 = alph_node_spawn_value<Counter>(&g_node, &c, &counter);
+  for i: int64 in 1..4 {
+    alph_node_send(&g_node, pid, TAG_ADD, i);
+  }
+  return (int32)alph_node_wait(&g_node);
+}

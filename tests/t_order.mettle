@@ -1,0 +1,93 @@
+// Messages and exits between two actors arrive in the order they were sent:
+// a worker that sends its result and then exits is seen sending the result
+// first, through a link (EXIT) and through a monitor (DOWN).
+
+import "std/io";
+import "std/mem";
+import "alph/sys/atomic";
+import "alph/core/mailbox";
+import "alph/core/node";
+
+const TAG_RESULT: int64 = 100;
+const ROUNDS: int64 = 2000;
+
+var g_node: AlphNode;
+var g_failures: int64 = 0;
+
+struct Parent {
+  round: int64;
+  worker: int64;
+  got_result: int64;
+}
+
+fn expect(ok: bool, what: string) {
+  if (!ok) {
+    println("FAIL {what}");
+    alph_atomic_add(&g_failures, 1);
+  }
+}
+
+fn worker(ctx: AlphCtx*, m: AlphMsg*) -> int64 {
+  if (m->tag == ALPH_TAG_INIT) {
+    alph_send(ctx, m->from, TAG_RESULT, 0);
+    return alph_stop(ctx, ALPH_REASON_USER + 1);
+  }
+  return ALPH_CONTINUE;
+}
+
+fn next(ctx: AlphCtx*, s: Parent*) -> int64 {
+  if (s->round == ROUNDS) {
+    alph_halt(ctx, 0);
+    return ALPH_CONTINUE;
+  }
+  s->got_result = 0;
+  if (s->round % 2 == 0) {
+    s->worker = alph_spawn(ctx, ALPH_LINK, &worker);
+  } else {
+    s->worker = alph_spawn(ctx, ALPH_MONITOR, &worker);
+  }
+  s->round = s->round + 1;
+  return ALPH_CONTINUE;
+}
+
+fn parent(ctx: AlphCtx*, m: AlphMsg*) -> int64 {
+  var s: Parent* = (Parent*)ctx->state;
+  if (m->tag == ALPH_TAG_INIT) {
+    alph_trap_exits(ctx, true);
+    return next(ctx, s);
+  }
+  if (m->tag == TAG_RESULT) {
+    s->got_result = 1;
+    return ALPH_CONTINUE;
+  }
+  if (m->tag == ALPH_TAG_EXIT || m->tag == ALPH_TAG_DOWN) {
+    expect(m->from == s->worker, "exit comes from the worker");
+    expect(s->got_result == 1, "the result arrives before the exit");
+    expect(m->arg == ALPH_REASON_USER + 1, "exit carries the worker's reason");
+    return next(ctx, s);
+  }
+  return ALPH_CONTINUE;
+}
+
+// Starts g_node with a fixed shape, so runs are comparable across machines.
+fn start_node(schedulers: int64, max_actors: int64, mailbox_size: int64) {
+  var cfg: AlphConfig;
+  alph_config(&cfg);
+  cfg.schedulers = schedulers;
+  cfg.max_actors = max_actors;
+  cfg.mailbox_size = mailbox_size;
+  expect(alph_node_start(&g_node, &cfg), "node started");
+}
+
+fn main() -> int32 {
+  start_node(4, 1024, 16);
+  var s: Parent;
+  memset((rawptr)&s, 0, (int64)sizeof(Parent));
+  alph_node_spawn_value<Parent>(&g_node, &s, &parent);
+  alph_node_wait(&g_node);
+  if (g_failures != 0) {
+    return 1;
+  }
+  println("order ok: {ROUNDS} rounds");
+  return 0;
+}

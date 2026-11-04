@@ -1,0 +1,3 @@
+# alph=./src lets every file import the library as "alph/actor", here and
+# from an app that maps alph=<path>/src in its own mettle.deps.
+alph=./src
