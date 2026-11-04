@@ -2048,6 +2048,44 @@ still waiting; a GRANTED for ref already on its way is dropped. Returns
 as alph_send; on ALPH_FULL try again later, or exit, which also gives it
 back. Thread: a handler.
 
+## alph/net/port
+
+Wait until a TCP port accepts connections.
+
+After starting a server as a child process, a caller often has to wait
+until it listens. alph_spawn_port_wait starts an actor that tries to
+connect every interval_ms and tells its parent once:
+
+```text
+ALPH_TAG_PORT_READY  from = the waiter, arg = 1 when a connection was
+                     accepted, 0 after tries failed attempts
+```
+
+The waiter closes its test connection and exits after telling. To stop it
+early, send it an exit signal.
+
+The waiter's answer, described at the top of this module.
+
+```mettle
+export const ALPH_TAG_PORT_READY: int64 = 24;
+```
+
+### `alph_spawn_port_wait`
+
+```mettle
+export fn alph_spawn_port_wait(ctx: AlphCtx*, ip4: int64, port: int64, interval_ms: int64,
+                               tries: int64) -> int64
+```
+
+Spawns an actor that waits for ip4:port (alph_ip4) to accept TCP
+connections, trying every interval_ms at most tries times (each at least
+1), and answers the caller with ALPH_TAG_PORT_READY. It is linked to the
+caller, so it stops if the caller exits; its own normal exit does not
+reach the caller.
+
+Returns its pid, or 0 when an argument is out of range or the node is
+full. Thread: a handler.
+
 ## alph/sys/atomic
 
 64-bit atomics on x86-64.

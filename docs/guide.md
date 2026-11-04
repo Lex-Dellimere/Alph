@@ -395,35 +395,15 @@ alph_io_arm(ctx, spec.stdout_h, ALPH_IO_IN);
 - **The child's whole process group is killed and reaped** when its owner exits, a crash included, or closes the process handle first.
 - **`alph_proc_kill(ctx, h, sig)`** sends a signal to the group. A graceful stop is `ALPH_SIGTERM`, a timer, then `ALPH_SIGKILL`. `alph_proc_os_pid` gives the OS process id.
 
-To wait for a started server to accept connections, connect on a timer until it works. A refusal shows up at once as a negative result, or after the connect as an error on the handle:
+To wait for a started server to accept connections, spawn a port waiter. It tries to connect every `interval_ms`, at most `tries` times, and answers once with `ALPH_TAG_PORT_READY`: `arg` is 1 when a connection was accepted, 0 when it gave up.
 
 ```mettle
-fn probe_try(ctx: AlphCtx*, p: Probe*) {
-  p->h = alph_tcp_connect(ctx, alph_ip4(127, 0, 0, 1), p->port);
-  if (p->h > 0) {
-    alph_io_arm(ctx, p->h, ALPH_IO_OUT);
-  } else {
-    p->h = 0;
-    alph_start_timer(ctx, 50, TAG_RETRY, 0);
-  }
-}
-
-// in the handler
-if (m->tag == ALPH_TAG_INIT || m->tag == TAG_RETRY) {
-  probe_try(ctx, p);
-} else if (m->tag == ALPH_TAG_IO && m->ref == p->h) {
-  var err: int64 = alph_io_error(ctx, p->h);
-  alph_io_close(ctx, p->h);
-  p->h = 0;
-  if (err == 0) {
-    ...                                   // the port accepts connections
-  } else {
-    alph_start_timer(ctx, 50, TAG_RETRY, 0);
-  }
+alph_spawn_port_wait(ctx, alph_ip4(127, 0, 0, 1), port, 50, 100);
+...
+if (m->tag == ALPH_TAG_PORT_READY && m->arg == 1) {
+  ...                                     // the server accepts connections
 }
 ```
-
-Count the tries and give up after a limit.
 
 ## Dynamic supervisors
 

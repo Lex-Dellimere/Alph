@@ -98,6 +98,7 @@ src/heal/medic.mettle       medics: proactive healing
 src/heal/dynamic.mettle     dynamic supervisors: children started at run time
 src/work/pool.mettle        worker pool: blocking jobs on bound threads
 src/work/limiter.mettle     limiter: a counting semaphore as an actor
+src/net/port.mettle         port waiter: tells you when a TCP port accepts connections
 src/sys/linux.mettle        syscall numbers and flags
 src/sys/atomic.mettle       64-bit atomics
 src/sys/clock.mettle        monotonic time and futex

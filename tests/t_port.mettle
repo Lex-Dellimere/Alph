@@ -1,0 +1,75 @@
+// Waiting for a port: a waiter answers 0 after its tries when nothing
+// listens, and 1 once a listener appears partway through its tries.
+
+import "std/io";
+import "std/mem";
+import "alph/sys/atomic";
+import "alph/alph";
+
+const TAG_LISTEN: int64 = ALPH_TAG_USER;
+
+var g_node: AlphNode;
+var g_failures: int64 = 0;
+
+fn expect(ok: bool, what: string) {
+  if (!ok) {
+    println("FAIL {what}");
+    alph_atomic_add(&g_failures, 1);
+  }
+}
+
+struct Boss {
+  step: int64;
+  port: int64;
+  listener: int64;
+  waiter: int64;
+}
+
+fn boss(ctx: AlphCtx*, m: AlphMsg*) -> int64 {
+  var b: Boss* = (Boss*)ctx->state;
+  var lo: int64 = alph_ip4(127, 0, 0, 1);
+  if (m->tag == ALPH_TAG_INIT) {
+    // Find a free port: listen on port 0, read the port, close it.
+    var h: int64 = alph_tcp_listen(ctx, lo, 0, 16, 0);
+    b->port = alph_tcp_port(ctx, h);
+    alph_io_close(ctx, h);
+    expect(b->port > 0, "got a free port");
+    expect(alph_spawn_port_wait(ctx, lo, b->port, 0, 3) == 0, "a zero interval is refused");
+    b->waiter = alph_spawn_port_wait(ctx, lo, b->port, 10, 3);
+    return ALPH_CONTINUE;
+  }
+  if (b->step == 0 && m->tag == ALPH_TAG_PORT_READY) {
+    expect(m->from == b->waiter && m->arg == 0, "nothing listens: the waiter gives up");
+    b->waiter = alph_spawn_port_wait(ctx, lo, b->port, 20, 50);
+    alph_send_after(ctx, 60, ctx->self, TAG_LISTEN, 0);
+    b->step = 1;
+    return ALPH_CONTINUE;
+  }
+  if (b->step == 1 && m->tag == TAG_LISTEN) {
+    b->listener = alph_tcp_listen(ctx, lo, b->port, 16, 0);
+    expect(b->listener > 0, "listening on the port");
+    return ALPH_CONTINUE;
+  }
+  if (b->step == 1 && m->tag == ALPH_TAG_PORT_READY) {
+    expect(m->from == b->waiter && m->arg == 1, "the waiter sees the listener");
+    alph_halt(ctx, 0);
+  }
+  return ALPH_CONTINUE;
+}
+
+fn main() -> int32 {
+  var cfg: AlphConfig;
+  alph_config(&cfg);
+  cfg.schedulers = 2;
+  cfg.max_actors = 64;
+  expect(alph_node_start(&g_node, &cfg), "node started");
+  var b: Boss;
+  memset((rawptr)&b, 0, (int64)sizeof(Boss));
+  alph_node_spawn_value<Boss>(&g_node, 0, &b, &boss);
+  alph_node_wait(&g_node);
+  if (g_failures != 0) {
+    return 1;
+  }
+  println("port ok");
+  return 0;
+}
