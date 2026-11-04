@@ -124,7 +124,8 @@ const ALPH_MSG_REPLY: int64 = 2;    // answers the request with the same ref
 
 // Messages handled before the scheduler moves on to another actor.
 const ALPH_BUDGET: int64 = 64;
-const ALPH_SHARE_WAKE: int64 = 8;  // actors queued before a sleeping scheduler is woken for them
+const ALPH_SHARE_WAKE: int64 = 8;
+const ALPH_IO_POLL_NS: int64 = 100000;  // a busy scheduler looks at its sockets at least this often
 
 const ALPH_NS_PER_MS: int64 = 1000000;
 
@@ -312,6 +313,7 @@ struct AlphSched {
   runs: int64;          // actor runs, to poll IO now and then while busy
   qlen: int64;          // actors in runq, roughly: pushes counted after, pops after
   pop_lock: int64;      // taken to pop runq: the owner and thieves are its consumers
+  polled_at: int64;     // when a busy scheduler last looked at its sockets (ns)
   hungry: int64;        // 1 while it has no work and may be handed some
 }
 
@@ -555,6 +557,10 @@ fn alph_sched_steal(s: AlphSched*, node: AlphNode*) -> int64 {
       alph_atomic_store(&v->pop_lock, 0);
       if (p != 0) {
         alph_atomic_add(&v->qlen, -1);
+        if (((AlphProc*)p)->io_handles.len > 0) {
+          alph_runq_push(v, (AlphProc*)p);  // socket owners stay home, as above
+          continue;
+        }
         // QUEUED and off every queue: nobody else touches its home now.
         ((AlphProc*)p)->sched = (int64)s;
         return p;
@@ -3268,6 +3274,13 @@ fn alph_sched_share(s: AlphSched*, node: AlphNode*) {
         alph_sched_hungry(h, node);  // nothing to give after all
         return;
       }
+      if (((AlphProc*)p)->io_handles.len > 0) {
+        // Actors that own sockets stay where their sockets are watched:
+        // moved, every event would wake their old scheduler and then hop.
+        alph_runq_push(s, (AlphProc*)p);
+        alph_sched_hungry(h, node);
+        return;
+      }
       // The actor is QUEUED and off every queue: nobody else touches its
       // home now. Set it before the push makes it visible to h.
       ((AlphProc*)p)->sched = (int64)h;
@@ -3342,8 +3355,12 @@ fn alph_sched_main(arg: int64) -> int64 {
       alph_sched_share(s, node);
       // A busy scheduler still looks at its handles now and then.
       s->runs = s->runs + 1;
-      if (s->runs % 64 == 0 && alph_atomic_load(&s->io_count) > 0) {
-        alph_sched_poll(s, 0);
+      if (alph_atomic_load(&s->io_count) > 0) {
+        var t: int64 = alph_now_ns();
+        if (t - s->polled_at > ALPH_IO_POLL_NS) {
+          s->polled_at = t;
+          alph_sched_poll(s, 0);
+        }
       }
       continue;
     }
