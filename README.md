@@ -109,3 +109,7 @@ examples/                   small programs, run by check.sh
 tests/                      self-checking test programs
 tools/                      apidoc.sh, which builds docs/api.md
 ```
+
+## License
+
+Apache License 2.0. See [LICENSE](LICENSE).
