@@ -134,6 +134,9 @@ const ALPH_BUDGET: int64 = 64;
 // messages), so a run of many medium-cost messages cannot hold its
 // scheduler for a millisecond: 64 messages of 20 us did.
 const ALPH_RUN_NS: int64 = 100000;
+// Messages cheaper than this on average are checked against ALPH_RUN_NS
+// every 4; costlier ones after each.
+const ALPH_CHEAP_NS: int64 = 2000;
 // alph_outq_send writes before the end of the run once this much is held.
 export const ALPH_OUTQ_HOLD_BYTES: int64 = 16384;
 export const ALPH_OUTQ_HOLD_SENDS: int64 = 32;
@@ -244,6 +247,8 @@ export struct AlphConfig {
 //   refused  requests their sender refused at once with ALPH_BUSY, as the
 //            server was shedding
 //   yields   actor runs cut short after ALPH_RUN_NS, with mail left
+//   isolated  actors cut short twice in a row and so moved to a scheduler
+//            of their own, away from the work queued behind them
 export struct AlphStats {
   live: int64;
   spawned: int64;
@@ -256,6 +261,7 @@ export struct AlphStats {
   active: int64;
   refused: int64;
   yields: int64;
+  isolated: int64;
 }
 
 // A node. Declare one, start it with alph_node_start, and keep it in place
@@ -320,6 +326,7 @@ export struct AlphNode {
   io_demoted: int64;    // handles turned one-shot because their fd was taken (alph_io_fd)
   rt_offset: int64;     // CLOCK_REALTIME minus CLOCK_MONOTONIC (ns), refreshed by the watchdog
   yields: int64;        // runs cut short by ALPH_RUN_NS
+  isolated: int64;      // CPU-bound actors moved off a busy scheduler after such cuts
   epoch: int64;         // bumped by every retire
   retired: AlphVec;     // pairs: block (bit 0 set: a plain block, else an AlphEntry*), epoch
   retire_lock: int64;
@@ -397,6 +404,7 @@ struct AlphProc {
   shed_state: int64;      //   ALPH_SHED_IDLE, _ARMING (waits above target) or _DROPPING
   shed_pop_at: int64;     //   when it last took a message while not idle (ns, updated every 100 us at most)
   fresh: int64;           // spawned and INIT not yet handled: it goes before any signal
+  cut_streak: int64;      // its runs in a row cut short for time: 2 or more, and it is CPU-bound
   drain_lock: int64;      // held while a late signal queue is drained, and at reuse
   deferred: AlphVec;      // exits and downs waiting for earlier messages
   io_handles: AlphVec;    // handles this actor owns, closed when it exits
@@ -990,6 +998,11 @@ fn alph_sender_sched(node: AlphNode*, from: int64) -> AlphSched* {
   }
   var q: AlphProc* = alph_resolve(node, from);
   if (q == 0 || alph_atomic_load(&q->status) != ALPH_P_RUNNING) {
+    return (AlphSched*)0;
+  }
+  if (q->cut_streak > 0) {
+    // A CPU-bound sender, maybe isolated on its scheduler: what it wakes
+    // would queue behind it, and pull it back into sharing.
     return (AlphSched*)0;
   }
   return (AlphSched*)q->sched;
@@ -2892,6 +2905,8 @@ fn alph_run_some(s: AlphSched*, p: AlphProc*) -> int64 {
   var m: AlphMsg;
   var run_from: int64 = alph_now_ns();
   s->run_at = run_from;
+  var stride: int64 = 3;  // look at the clock every 4 messages, or every one once they cost
+
   if (p->retry != 0) {
     // Resumed by a medic that asked for the crashing message again.
     p->retry = 0;
@@ -2960,8 +2975,14 @@ fn alph_run_some(s: AlphSched*, p: AlphProc*) -> int64 {
     if (outcome >= 0) {
       return outcome;
     }
-    if ((n & 3) == 3 && alph_now_ns() - run_from >= ALPH_RUN_NS) {
-      return -3;
+    if ((n & stride) == stride) {
+      var ran: int64 = alph_now_ns() - run_from;
+      if (ran >= ALPH_RUN_NS) {
+        return -3;
+      }
+      if (ran > (n + 1) * ALPH_CHEAP_NS) {
+        stride = 0;  // costly messages: a slice of 4 of them could overshoot by far
+      }
     }
   }
   return -2;
@@ -3097,18 +3118,31 @@ fn alph_run_proc(s: AlphSched*, p: AlphProc*) {
     return;
   }
   if (outcome == -3) {
-    // Its time ran out with mail left: to the back of this run queue, where
-    // a stealer can take it, and when others wait here too, wake a sleeping
-    // scheduler to share them, as Go's preemption does with wakep: a run cut
-    // short for time is a direct sign of contention.
+    // Its time ran out with mail left. A run cut short for time is a direct
+    // sign of contention. Cut twice in a row, it is CPU-bound: with others
+    // waiting here it moves, whole, to a sleeping scheduler (or one more
+    // activated), so it runs on undisturbed and the rest stay home.
+    // Otherwise it goes to the back of this run queue, and when others wait
+    // too a sleeping scheduler is woken to share them, as Go's preemption
+    // does with wakep.
     alph_atomic_add(&node->yields, 1);
+    p->cut_streak = p->cut_streak + 1;
     alph_atomic_store(&p->status, ALPH_P_QUEUED);
+    if (s->bound == 0 && p->cut_streak >= 2 && alph_atomic_load(&s->qlen) > 0) {
+      var spare: AlphSched* = alph_sched_spare(node, s);
+      if (spare != 0) {
+        alph_atomic_add(&node->isolated, 1);
+        alph_sched_give(s, node, p, spare);
+        return;
+      }
+    }
     alph_runq_push(s, p);
     if (s->bound == 0 && alph_atomic_load(&s->qlen) > 1) {
       alph_sysmon_rescue(node, s);
     }
     return;
   }
+  p->cut_streak = 0;
   if (outcome == -2 ||
       alph_atomic_cas(&p->status, ALPH_P_RUNNING, ALPH_P_IDLE) != ALPH_P_RUNNING) {
     // More work is waiting, or arrived while running.
@@ -5232,21 +5266,29 @@ fn alph_sysmon_main(arg: int64) -> int64 {
 // when every scheduler is active and awake, they find the work themselves
 // once their own runs end.
 fn alph_sysmon_rescue(node: AlphNode*, stuck: AlphSched*) {
+  var spare: AlphSched* = alph_sched_spare(node, stuck);
+  if (spare != 0) {
+    alph_atomic_add(&node->rescued, 1);
+    alph_sched_notify(spare);  // it wakes, goes hungry and steals
+  }
+}
+
+// A scheduler other than s with nothing to do: a sleeping active one, or
+// one more activated now. 0 when every scheduler is active and awake.
+fn alph_sched_spare(node: AlphNode*, s: AlphSched*) -> AlphSched* {
   var active: int64 = alph_atomic_load(&node->active);
   for i: int64 in 0..active {
-    var s: AlphSched* = alph_sched_at(node, i);
-    if (s != stuck && alph_atomic_load(&s->sleeping) != 0) {
-      alph_atomic_add(&node->rescued, 1);
-      alph_sched_notify(s);
-      return;
+    var v: AlphSched* = alph_sched_at(node, i);
+    if (v != s && alph_atomic_load(&v->sleeping) != 0) {
+      return v;
     }
   }
   if (active < node->sched_count && alph_atomic_cas(&node->active, active, active + 1) == active) {
-    alph_atomic_add(&node->rescued, 1);
     alph_atomic_store(&node->low_streak, 0);
     alph_atomic_store(&node->rise_at, alph_now_ns());
-    alph_sched_notify(alph_sched_at(node, active));  // it wakes, goes hungry and steals
+    return alph_sched_at(node, active);
   }
+  return (AlphSched*)0;
 }
 
 // Stops the node: each scheduler finishes the actor it is running and
@@ -5312,4 +5354,5 @@ export fn alph_node_stats(node: AlphNode*, stats: AlphStats*) {
   stats->active = alph_atomic_load(&node->active);
   stats->refused = alph_atomic_load(&node->refused);
   stats->yields = alph_atomic_load(&node->yields);
+  stats->isolated = alph_atomic_load(&node->isolated);
 }

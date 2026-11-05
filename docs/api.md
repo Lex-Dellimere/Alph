@@ -714,6 +714,7 @@ export struct AlphStats {
   active: int64;
   refused: int64;
   yields: int64;
+  isolated: int64;
 }
 ```
 
@@ -735,6 +736,8 @@ active   schedulers taking work now (compaction leaves the rest idle)
 refused  requests their sender refused at once with ALPH_BUSY, as the
          server was shedding
 yields   actor runs cut short after ALPH_RUN_NS, with mail left
+isolated  actors cut short twice in a row and so moved to a scheduler
+         of their own, away from the work queued behind them
 ```
 
 ### `AlphNode`
@@ -800,6 +803,7 @@ export struct AlphNode {
   io_demoted: int64;    // handles turned one-shot because their fd was taken (alph_io_fd)
   rt_offset: int64;     // CLOCK_REALTIME minus CLOCK_MONOTONIC (ns), refreshed by the watchdog
   yields: int64;        // runs cut short by ALPH_RUN_NS
+  isolated: int64;      // CPU-bound actors moved off a busy scheduler after such cuts
   epoch: int64;         // bumped by every retire
   retired: AlphVec;     // pairs: block (bit 0 set: a plain block, else an AlphEntry*), epoch
   retire_lock: int64;
