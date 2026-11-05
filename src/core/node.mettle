@@ -5156,7 +5156,9 @@ fn alph_sched_main(arg: int64) -> int64 {
       // and then.
       s->runs = s->runs + 1;
       if (alph_atomic_load(&s->io_count) > 0 || s->runs % 64 == 0) {
-        var t: int64 = alph_now_ns();
+        // The run's start, read already: at most one run (bounded by
+        // ALPH_RUN_NS) late, and no clock read per run.
+        var t: int64 = s->run_at;
         if (alph_atomic_load(&s->io_count) > 0 && t - s->polled_at > ALPH_IO_POLL_NS) {
           s->polled_at = t;
           alph_sched_poll(s, 0);
