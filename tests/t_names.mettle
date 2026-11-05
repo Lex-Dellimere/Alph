@@ -131,6 +131,8 @@ fn boss(ctx: AlphCtx*, m: AlphMsg*) -> int64 {
   if (b->step == 7 && m->tag == ALPH_TAG_DOWN) {
     expect(m->from == b->members[1] && m->arg == ALPH_CRASHED, "the member crashed");
     expect(alph_node_group_size(ctx->node, "chat") == 1, "a crashed member is gone");
+    expect(alph_node_group_send(ctx->node, "chat", 999, 0) == 1, "a send from outside reaches the last member");
+    expect(alph_node_group_send(ctx->node, "nobody", 999, 0) == 0, "a send from outside to no group reaches nobody");
     expect(alph_group_send(ctx, "chat", TAG_PING, 8) == 1, "the send reaches the last member");
     b->step = 8;
     return ALPH_CONTINUE;

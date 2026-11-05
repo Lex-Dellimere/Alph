@@ -1,0 +1,402 @@
+// Nested supervision trees. A top supervisor (one for one) holds a worker, a
+// static supervisor (one for all, intensity 1) with two workers, a worker
+// started with the ALPH_BOUND flag, and a dynamic supervisor added as a
+// static child. The test checks that:
+//   - a crash inside the nested supervisor restarts only that subtree;
+//   - a nested supervisor that exceeds its restart intensity exits and is
+//     restarted, with all its children, by the top supervisor;
+//   - a dynamic supervisor starts children with a handler of their own
+//     (alph_dyn_start_with) next to ones with the handler of its spec, and
+//     restarts a child with the handler it was started with;
+//   - a static supervisor can be started under a dynamic one, using
+//     alph_sup_bytes and alph_sup_handle;
+//   - a supervisor holds 64 children and refuses the 65th;
+//   - shutting down the top supervisor stops the whole tree, every name
+//     included.
+// Workers count their starts in globals; the main thread waits for the
+// counts with deadlines and sends commands by registered name.
+
+import "std/io";
+import "std/mem";
+import "std/thread";
+import "alph/sys/atomic";
+import "alph/alph";
+
+const TN_CRASH: int64 = ALPH_TAG_USER;
+const TN_START_E: int64 = ALPH_TAG_USER + 1;    // driver: dyn starts "e" with its own handler
+const TN_START_D: int64 = ALPH_TAG_USER + 2;    // driver: dyn starts "d" with the spec handler
+const TN_START_SUP: int64 = ALPH_TAG_USER + 3;  // driver: dyn starts a static supervisor
+
+// Worker kinds, the index into tn_starts and the key of tn_name.
+const W_A: int64 = 0;
+const W_B1: int64 = 1;
+const W_B2: int64 = 2;
+const W_K: int64 = 3;
+const W_D: int64 = 4;
+const W_E: int64 = 5;
+const W_F: int64 = 6;
+const KINDS: int64 = 7;
+
+struct Worker {
+  idx: int64;
+}
+
+var g_node: AlphNode;
+var g_failures: int64 = 0;
+var tn_starts: int64[8];
+var tn_workers: Worker[8];
+var tn_last_init: int64[8];  // the arg of each kind's latest INIT: starts before it
+var tn_replies: int64 = 0;      // ALPH_TAG_STARTED answers the driver has seen
+var tn_started_pid: int64 = 0;  // the pid in the latest one
+
+fn expect(ok: bool, what: string) {
+  if (!ok) {
+    println("FAIL {what}");
+    alph_atomic_add(&g_failures, 1);
+  }
+}
+
+fn tn_name(idx: int64) -> string {
+  if (idx == W_A) {
+    return "a";
+  }
+  if (idx == W_B1) {
+    return "b1";
+  }
+  if (idx == W_B2) {
+    return "b2";
+  }
+  if (idx == W_K) {
+    return "k";
+  }
+  if (idx == W_D) {
+    return "d";
+  }
+  if (idx == W_E) {
+    return "e";
+  }
+  return "f";
+}
+
+// ---- actors ----
+
+// Registers its name, records INIT's arg, counts the start (last, so a
+// waiter that sees the count sees the rest), traps exits (so it stops, rather than
+// is killed, when its supervisor shuts it down) and crashes on TN_CRASH.
+fn tn_work(ctx: AlphCtx*, m: AlphMsg*, idx: int64) -> int64 {
+  if (m->tag == ALPH_TAG_INIT) {
+    alph_trap_exits(ctx, true);
+    expect(alph_register(ctx, tn_name(idx)), "a worker registers its name");
+    alph_atomic_store(&tn_last_init[idx], m->arg);
+    alph_atomic_add(&tn_starts[idx], 1);
+    return ALPH_CONTINUE;
+  }
+  if (m->tag == ALPH_TAG_EXIT) {
+    return alph_stop(ctx, m->arg);
+  }
+  if (m->tag == TN_CRASH) {
+    var p: int64* = (int64*)(m->tag - m->tag);
+    *p = 1;
+  }
+  return ALPH_CONTINUE;
+}
+
+// The static workers take their kind from their state.
+fn tn_worker(ctx: AlphCtx*, m: AlphMsg*) -> int64 {
+  var w: Worker* = (Worker*)ctx->state;
+  return tn_work(ctx, m, w->idx);
+}
+
+// The dynamic supervisor's two kinds of child differ only in their handler.
+fn tn_handler_d(ctx: AlphCtx*, m: AlphMsg*) -> int64 {
+  return tn_work(ctx, m, W_D);
+}
+
+fn tn_handler_e(ctx: AlphCtx*, m: AlphMsg*) -> int64 {
+  return tn_work(ctx, m, W_E);
+}
+
+// The dynamic supervisor's own handler, wrapped so it can be found by name.
+fn tn_dyn(ctx: AlphCtx*, m: AlphMsg*) -> int64 {
+  if (m->tag == ALPH_TAG_INIT) {
+    expect(alph_register(ctx, "dyn"), "the dynamic supervisor registers");
+  }
+  return alph_dyn_handle(ctx, m);
+}
+
+// Asks the dynamic supervisor for children on the main thread's behalf.
+fn tn_driver(ctx: AlphCtx*, m: AlphMsg*) -> int64 {
+  if (m->tag == ALPH_TAG_STARTED) {
+    alph_atomic_store(&tn_started_pid, m->arg);
+    alph_atomic_add(&tn_replies, 1);
+    return ALPH_CONTINUE;
+  }
+  var dyn: int64 = alph_whereis(ctx, "dyn");
+  var ref: int64 = 0;
+  var w: Worker;
+  if (m->tag == TN_START_E) {
+    w.idx = W_E;
+    ref = alph_dyn_start_with(ctx, dyn, (rawptr)&w, (int64)sizeof(Worker), 1000, &tn_handler_e);
+  } else if (m->tag == TN_START_D) {
+    w.idx = W_D;
+    ref = alph_dyn_start_value<Worker>(ctx, dyn, &w, 1000);
+  } else if (m->tag == TN_START_SUP) {
+    var spec: AlphSupSpec;
+    alph_sup_init(&spec, ALPH_ONE_FOR_ONE);
+    w.idx = W_F;
+    alph_sup_add_value<Worker>(&spec, &w, &tn_worker);
+    var size: int64 = 0;
+    var st: rawptr = alph_sup_bytes(&spec, &size);
+    expect(st != 0, "a supervisor state was built");
+    ref = alph_dyn_start_with(ctx, dyn, st, size, 1000, &alph_sup_handle);
+    free(st);
+  } else {
+    return ALPH_CONTINUE;
+  }
+  expect(ref > 0, "the start request was sent");
+  return ALPH_CONTINUE;
+}
+
+// ---- main-thread helpers ----
+
+fn starts(idx: int64) -> int64 {
+  return alph_atomic_load(&tn_starts[idx]);
+}
+
+fn last_init(idx: int64) -> int64 {
+  return alph_atomic_load(&tn_last_init[idx]);
+}
+
+// Waits until worker idx has started n times. False after 3 seconds.
+fn wait_starts(idx: int64, n: int64) -> bool {
+  for i: int64 in 0..3000 {
+    if (starts(idx) >= n) {
+      return true;
+    }
+    thread_sleep_ms(1);
+  }
+  println("  waited for {n} starts of {tn_name(idx)}, have {starts(idx)}");
+  return false;
+}
+
+// Waits until name is registered to a pid other than old. Returns it, or 0.
+fn wait_new_pid(name: string, old: int64) -> int64 {
+  for i: int64 in 0..3000 {
+    var pid: int64 = alph_node_whereis(&g_node, name);
+    if (pid != 0 && pid != old) {
+      return pid;
+    }
+    thread_sleep_ms(1);
+  }
+  println("  waited for a new {name}");
+  return 0;
+}
+
+fn wait_replies(n: int64) -> bool {
+  for i: int64 in 0..3000 {
+    if (alph_atomic_load(&tn_replies) >= n) {
+      return true;
+    }
+    thread_sleep_ms(1);
+  }
+  println("  waited for {n} start replies, have {alph_atomic_load(&tn_replies)}");
+  return false;
+}
+
+fn wait_live(n: int64) -> bool {
+  var stats: AlphStats;
+  for i: int64 in 0..3000 {
+    alph_node_stats(&g_node, &stats);
+    if (stats.live <= n) {
+      return true;
+    }
+    thread_sleep_ms(1);
+  }
+  println("  waited for {n} live actors, have {stats.live}");
+  return false;
+}
+
+fn quiet(ms: int64) {
+  thread_sleep_ms((uint32)ms);
+}
+
+// Sends TN_CRASH to the actor registered as name. Returns its pid.
+fn crash(name: string) -> int64 {
+  var pid: int64 = alph_node_whereis(&g_node, name);
+  expect(pid != 0, "the worker to crash is registered");
+  expect(alph_node_send(&g_node, pid, TN_CRASH, 0) == ALPH_SENT, "the crash command was sent");
+  return pid;
+}
+
+fn live_now() -> int64 {
+  var stats: AlphStats;
+  alph_node_stats(&g_node, &stats);
+  return stats.live;
+}
+
+fn counts_are(a: int64, b1: int64, b2: int64, k: int64) -> bool {
+  return starts(W_A) == a && starts(W_B1) == b1 && starts(W_B2) == b2 && starts(W_K) == k;
+}
+
+// ---- scenarios ----
+
+// The state is read when the top supervisor is spawned, so it lives in a global.
+fn static_worker(spec: AlphSupSpec*, idx: int64) -> AlphChildSpec* {
+  tn_workers[idx].idx = idx;
+  return alph_sup_add_value<Worker>(spec, &tn_workers[idx], &tn_worker);
+}
+
+fn build_tree() -> int64 {
+  var inner: AlphSupSpec;
+  alph_sup_init(&inner, ALPH_ONE_FOR_ALL);
+  inner.max_restarts = 1;
+  inner.period_ms = 5000;
+  static_worker(&inner, W_B1);
+  static_worker(&inner, W_B2);
+
+  var dyn_spec: AlphDynSpec;
+  alph_dyn_init(&dyn_spec, &tn_handler_d);
+  var dyn: AlphDyn;
+
+  var top: AlphSupSpec;
+  alph_sup_init(&top, ALPH_ONE_FOR_ONE);
+  top.max_restarts = 5;
+  top.period_ms = 5000;
+  static_worker(&top, W_A);
+  var ic: AlphChildSpec* = alph_sup_add_sup(&top, &inner);
+  expect(ic != 0 && ic->shutdown_ms == ALPH_SUP_WAIT, "a nested supervisor waits for its shutdown");
+  var kc: AlphChildSpec* = static_worker(&top, W_K);
+  kc->flags = ALPH_BOUND;
+  var dc: AlphChildSpec* = alph_sup_add_dyn(&top, &dyn, &dyn_spec);
+  expect(dc != 0 && dc->shutdown_ms == ALPH_SUP_WAIT, "a dynamic supervisor waits for its shutdown");
+  dc->handler = &tn_dyn;
+  return alph_node_spawn_sup(&g_node, &top);
+}
+
+fn check_start() {
+  for idx: int64 in 0..4 {
+    expect(wait_starts(idx, 1), "the static workers started");
+  }
+  quiet(20);
+  expect(counts_are(1, 1, 1, 1), "each static worker started exactly once");
+  for idx: int64 in 0..4 {
+    expect(alph_node_whereis(&g_node, tn_name(idx)) != 0, "every static worker is registered");
+  }
+  expect(alph_node_whereis(&g_node, "dyn") != 0, "the dynamic supervisor is registered");
+}
+
+// One for all inside the nested supervisor: b1's crash takes b2 along, and
+// the siblings above it do not notice.
+fn check_inner_restart() {
+  var b2: int64 = alph_node_whereis(&g_node, "b2");
+  crash("b1");
+  expect(wait_starts(W_B1, 2) && wait_starts(W_B2, 2), "b1 and b2 restart together");
+  quiet(20);
+  expect(counts_are(1, 2, 2, 1), "only the nested supervisor's children restarted");
+  expect(last_init(W_B1) == 1 && last_init(W_B2) == 1, "restarted children see one earlier start");
+  expect(last_init(W_A) == 0 && last_init(W_K) == 0, "children that never restarted see none");
+  expect(wait_new_pid("b2", b2) != 0, "b2 is a new actor");
+}
+
+// The crash comes within 5000 ms of the previous one, so the nested
+// supervisor (one restart allowed) gives up. It exits with SHUTDOWN and the
+// top supervisor restarts it, which starts both workers again.
+fn check_inner_gives_up() {
+  var b1: int64 = alph_node_whereis(&g_node, "b1");
+  crash("b1");
+  expect(wait_starts(W_B1, 3) && wait_starts(W_B2, 3), "the top supervisor restarts the nested one");
+  expect(wait_new_pid("b1", b1) != 0, "b1 is alive again");
+  expect(alph_node_whereis(&g_node, "b2") != 0, "b2 is alive again");
+  quiet(20);
+  expect(counts_are(1, 3, 3, 1), "the nested supervisor was restarted once");
+  expect(last_init(W_B1) == 0 && last_init(W_B2) == 0, "a restarted nested supervisor counts from zero");
+}
+
+// A worker started with ALPH_BOUND restarts as any other.
+fn check_bound() {
+  var k: int64 = crash("k");
+  expect(wait_starts(W_K, 2), "the bound worker restarts");
+  expect(wait_new_pid("k", k) != 0, "k is a new actor");
+  quiet(20);
+  expect(counts_are(1, 3, 3, 2), "only k restarted");
+  expect(last_init(W_K) == 1, "k sees one earlier start");
+}
+
+fn drive(driver: int64, tag: int64, replies: int64) -> bool {
+  expect(alph_node_send(&g_node, driver, tag, 0) == ALPH_SENT, "the driver took the command");
+  return wait_replies(replies);
+}
+
+fn check_dynamic(driver: int64) {
+  expect(drive(driver, TN_START_E, 1) && alph_atomic_load(&tn_started_pid) != 0, "e started with its own handler");
+  expect(drive(driver, TN_START_D, 2) && alph_atomic_load(&tn_started_pid) != 0, "d started with the spec handler");
+  expect(wait_starts(W_E, 1) && wait_starts(W_D, 1), "both dynamic children ran their handler");
+  var e: int64 = crash("e");
+  expect(wait_starts(W_E, 2), "e is restarted with the handler it was started with");
+  expect(wait_new_pid("e", e) != 0, "e is a new actor");
+  quiet(20);
+  expect(starts(W_E) == 2 && starts(W_D) == 1, "only e restarted, and not as d");
+  expect(last_init(W_E) == 1 && last_init(W_D) == 0, "e sees one earlier start, d none");
+}
+
+fn check_sup_under_dyn(driver: int64) {
+  expect(drive(driver, TN_START_SUP, 3) && alph_atomic_load(&tn_started_pid) != 0, "a supervisor started under dyn");
+  expect(wait_starts(W_F, 1), "the worker of the supervisor under dyn started");
+  expect(alph_node_whereis(&g_node, "f") != 0, "f is registered");
+  quiet(20);
+  expect(starts(W_F) == 1, "f started once");
+}
+
+fn check_limit() {
+  var spec: AlphSupSpec;
+  alph_sup_init(&spec, ALPH_ONE_FOR_ONE);
+  var added: int64 = 0;
+  for i: int64 in 0..ALPH_SUP_MAX_CHILDREN {
+    if (alph_sup_add(&spec, &tn_worker) != 0) {
+      added = added + 1;
+    }
+  }
+  expect(ALPH_SUP_MAX_CHILDREN == 64 && added == 64, "a supervisor accepts 64 children");
+  expect(alph_sup_add(&spec, &tn_worker) == 0, "the 65th child is refused");
+  var other: AlphSupSpec;
+  alph_sup_init(&other, ALPH_ONE_FOR_ONE);
+  expect(alph_sup_add_sup(&spec, &other) == 0, "a full supervisor refuses a nested one");
+}
+
+fn check_shutdown(top: int64, base: int64) {
+  alph_node_exit_signal(&g_node, top, ALPH_SHUTDOWN);
+  expect(wait_live(base), "the whole tree stopped");
+  expect(live_now() == base, "only what ran before the tree remains");
+  for idx: int64 in 0..KINDS {
+    expect(alph_node_whereis(&g_node, tn_name(idx)) == 0, "no worker is left registered");
+  }
+  expect(alph_node_whereis(&g_node, "dyn") == 0, "the dynamic supervisor is gone");
+}
+
+fn main() -> int32 {
+  var cfg: AlphConfig;
+  alph_config(&cfg);
+  cfg.schedulers = 4;
+  cfg.max_actors = 4096;
+  cfg.mailbox_size = 64;
+  expect(alph_node_start(&g_node, &cfg), "node started");
+  var driver: int64 = alph_node_spawn(&g_node, 0, &tn_driver);
+  var base: int64 = live_now();
+  var top: int64 = build_tree();
+  expect(top != 0, "the top supervisor started");
+  check_start();
+  check_inner_restart();
+  check_inner_gives_up();
+  check_bound();
+  check_dynamic(driver);
+  check_sup_under_dyn(driver);
+  check_limit();
+  check_shutdown(top, base);
+  alph_node_halt(&g_node, 0);
+  alph_node_wait(&g_node);
+  if (g_failures != 0) {
+    return 1;
+  }
+  println("nested ok");
+  return 0;
+}

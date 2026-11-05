@@ -14,7 +14,8 @@
 //   ALPH_TRANSIENT  restarted unless it exited with ALPH_NORMAL or ALPH_SHUTDOWN
 //   ALPH_TEMPORARY  never restarted
 //
-// A restarted child is a new actor with a new pid and its initial state.
+// A restarted child is a new actor with a new pid and its initial state;
+// its INIT message's arg counts the starts before it (0 the first time).
 // More than max_restarts restarts within period_ms and the supervisor gives
 // up: it stops every child and exits with ALPH_SHUTDOWN, so its own
 // supervisor sees the failure. Children stop in reverse start order: an
@@ -47,8 +48,12 @@ export const ALPH_PERMANENT: int64 = 0;
 export const ALPH_TRANSIENT: int64 = 1;
 export const ALPH_TEMPORARY: int64 = 2;
 
-// Children one supervisor can hold. Nest supervisors for more.
-export const ALPH_SUP_MAX_CHILDREN: int64 = 16;
+// Children one supervisor can hold. Nest supervisors for more, or use a
+// dynamic supervisor (alph/heal/dynamic) for many alike.
+export const ALPH_SUP_MAX_CHILDREN: int64 = 64;
+
+// AlphChildSpec.shutdown_ms: wait for the child to stop, however long.
+export const ALPH_SUP_WAIT: int64 = -1;
 
 // The tag a sync_start child acknowledges with, through alph_sup_ack.
 export const ALPH_TAG_ACK: int64 = 10;
@@ -65,15 +70,21 @@ const ALPH_SUP_WAITING: int64 = 3;   // backing off before restarting lo..hi-1
 //
 //   restart      ALPH_PERMANENT (default), ALPH_TRANSIENT or ALPH_TEMPORARY
 //   shutdown_ms  how long it gets to stop before it is killed; 0 kills it at
+//                once; ALPH_SUP_WAIT waits as long as it takes (the default
+//                for a nested supervisor, so it stops its own children).
 //                once. Default 5000
 //   sync_start   when true, the next child starts only after this one calls
 //                alph_sup_ack from its INIT handler. Default false
+//   flags        spawn flags besides ALPH_LINK, such as ALPH_BOUND for a
+//                child that may block. Default 0
 //
-// The other fields are set by alph_sup_add.
+// The other fields are set by alph_sup_add and alph_sup_add_sup.
 export struct AlphChildSpec {
   restart: int64;
   shutdown_ms: int64;
   sync_start: bool;
+  flags: int64;
+  sup: int64;  // the AlphSupSpec of a nested supervisor, until spawned, or 0
   state: rawptr;
   state_size: int64;
   state_at: int64;
@@ -101,15 +112,16 @@ export struct AlphSupSpec {
   backoff_max_ms: int64;
   start_timeout_ms: int64;
   count: int64;
-  children: AlphChildSpec[16];
+  children: AlphChildSpec[64];
 }
 
 // The running supervisor's state. The children's initial states follow it
 // in the same block.
 struct AlphSup {
   spec: AlphSupSpec;
-  pids: int64[16];
-  reasons: int64[16];   // last exit reason, for exits handled later
+  pids: int64[64];
+  reasons: int64[64];   // last exit reason, for exits handled later
+  starts: int64[64];    // times each child was started, passed in INIT's arg
   phase: int64;
   lo: int64;
   hi: int64;
@@ -153,6 +165,8 @@ export fn alph_sup_add_bytes(spec: AlphSupSpec*, state: rawptr, size: int64,
   c->restart = ALPH_PERMANENT;
   c->shutdown_ms = 5000;
   c->sync_start = false;
+  c->flags = 0;
+  c->sup = 0;
   c->state = state;
   c->state_size = size;
   c->state_at = 0;
@@ -172,6 +186,21 @@ export fn alph_sup_add_value<T>(spec: AlphSupSpec*, state: T*,
 export fn alph_sup_add(spec: AlphSupSpec*,
                        handler: fn(AlphCtx*, AlphMsg*) -> int64 with alloc, syscall, asm) -> AlphChildSpec* {
   return alph_sup_add_bytes(spec, (rawptr)0, 0, handler);
+}
+
+// Adds a supervisor as a child, so trees nest as in OTP. The child
+// supervisor is built from child, which, like a child's initial state, is
+// read when the parent is spawned: keep it, and the states its children
+// copy, alive until then. Its shutdown_ms is ALPH_SUP_WAIT, OTP's infinity
+// for supervisors. Returns the child spec, or 0 when spec is full.
+// Thread: any.
+export fn alph_sup_add_sup(spec: AlphSupSpec*, child: AlphSupSpec*) -> AlphChildSpec* {
+  var c: AlphChildSpec* = alph_sup_add_bytes(spec, (rawptr)0, 0, &alph_sup_handle);
+  if (c != 0) {
+    c->sup = (int64)child;
+    c->shutdown_ms = ALPH_SUP_WAIT;
+  }
+  return c;
 }
 
 // Tells the supervisor this child finished starting. Only for children with
@@ -216,11 +245,13 @@ fn alph_sup_start_next(ctx: AlphCtx*, s: AlphSup*) -> int64 {
       continue;
     }
     var c: AlphChildSpec* = &s->spec.children[i];
-    var pid: int64 = alph_spawn_bytes(ctx, ALPH_LINK, c->state, c->state_size, c->handler);
+    var pid: int64 = alph_spawn_bytes_arg(ctx, ALPH_LINK | c->flags, c->state, c->state_size, s->starts[i],
+                                          c->handler);
     if (pid == 0) {
       return alph_sup_stop_range(ctx, s, 0, s->spec.count, true, ALPH_SHUTDOWN);
     }
     s->pids[i] = pid;
+    s->starts[i] = s->starts[i] + 1;
     if (c->sync_start) {
       s->timer = alph_start_timer(ctx, s->spec.start_timeout_ms, ALPH_TAG_SUP_TIMER, 0);
       return ALPH_CONTINUE;
@@ -262,11 +293,13 @@ fn alph_sup_stop_next(ctx: AlphCtx*, s: AlphSup*) -> int64 {
     var pid: int64 = s->pids[s->at];
     if (pid != 0) {
       var c: AlphChildSpec* = &s->spec.children[s->at];
-      if (c->shutdown_ms <= 0) {
+      if (c->shutdown_ms == 0) {
         alph_exit_signal(ctx, pid, ALPH_KILL);
       } else {
         alph_exit_signal(ctx, pid, ALPH_SHUTDOWN);
-        s->timer = alph_start_timer(ctx, c->shutdown_ms, ALPH_TAG_SUP_TIMER, 0);
+        if (c->shutdown_ms > 0) {
+          s->timer = alph_start_timer(ctx, c->shutdown_ms, ALPH_TAG_SUP_TIMER, 0);
+        }
       }
       return ALPH_CONTINUE;  // its EXIT continues the stop
     }
@@ -407,7 +440,9 @@ fn alph_sup_timeout(ctx: AlphCtx*, s: AlphSup*) -> int64 {
   return ALPH_CONTINUE;
 }
 
-fn alph_sup_handle(ctx: AlphCtx*, m: AlphMsg*) -> int64 {
+// A supervisor's handler, for starting one where a handler is asked for,
+// with a state from alph_sup_bytes. Thread: the runtime calls it.
+export fn alph_sup_handle(ctx: AlphCtx*, m: AlphMsg*) -> int64 {
   var s: AlphSup* = (AlphSup*)ctx->state;
   if (m->tag == ALPH_TAG_INIT) {
     alph_trap_exits(ctx, true);
@@ -437,17 +472,24 @@ fn alph_sup_handle(ctx: AlphCtx*, m: AlphMsg*) -> int64 {
 
 // ---- spawning --------------------------------------------------------------
 
-// Builds the supervisor's state: an AlphSup followed by a copy of every
-// child's initial state. Returns the block (malloc'd) and its size in *size.
-fn alph_sup_state(spec: AlphSupSpec*, size: int64*) -> rawptr {
+// The size of a supervisor's state: an AlphSup followed by a copy of every
+// child's initial state, a nested supervisor's whole state included.
+fn alph_sup_size(spec: AlphSupSpec*) -> int64 {
   var total: int64 = (int64)sizeof(AlphSup);
   for i: int64 in 0..spec->count {
-    total = total + spec->children[i].state_size;
+    var c: AlphChildSpec* = &spec->children[i];
+    if (c->sup != 0) {
+      total = total + alph_sup_size((AlphSupSpec*)c->sup);
+    } else {
+      total = total + c->state_size;
+    }
   }
-  var block: rawptr = malloc(total);
-  if (block == 0) {
-    return (rawptr)0;
-  }
+  return total;
+}
+
+// Writes a supervisor's state at block, which has alph_sup_size(spec)
+// bytes. Offsets are relative to block, so the state can be copied as is.
+fn alph_sup_fill(spec: AlphSupSpec*, block: rawptr) {
   memset(block, 0, (int64)sizeof(AlphSup));
   var sup: AlphSup* = (AlphSup*)block;
   sup->spec = *spec;
@@ -455,13 +497,37 @@ fn alph_sup_state(spec: AlphSupSpec*, size: int64*) -> rawptr {
   for i: int64 in 0..spec->count {
     var c: AlphChildSpec* = &sup->spec.children[i];
     c->state_at = at;
-    if (c->state_size > 0) {
+    if (c->sup != 0) {
+      var nested: AlphSupSpec* = (AlphSupSpec*)c->sup;
+      c->state_size = alph_sup_size(nested);
+      alph_sup_fill(nested, (rawptr)((int64)block + at));
+      c->sup = 0;  // built; the spec it came from may go
+    } else if (c->state_size > 0) {
       memcpy((rawptr)((int64)block + at), c->state, c->state_size);
     }
     at = at + c->state_size;
   }
+}
+
+// Builds the supervisor's state. Returns the block (malloc'd) and its size
+// in *size.
+fn alph_sup_state(spec: AlphSupSpec*, size: int64*) -> rawptr {
+  var total: int64 = alph_sup_size(spec);
+  var block: rawptr = malloc(total);
+  if (block == 0) {
+    return (rawptr)0;
+  }
+  alph_sup_fill(spec, block);
   *size = total;
   return block;
+}
+
+// A supervisor's initial state, built from spec, for starting it where a
+// state and handler are asked for, such as alph_dyn_start_with with
+// alph_sup_handle. Returns a malloc'd block, its size in *size; free it
+// once it has been copied. Returns 0 when out of memory. Thread: any.
+export fn alph_sup_bytes(spec: AlphSupSpec*, size: int64*) -> rawptr {
+  return alph_sup_state(spec, size);
 }
 
 // Spawns a supervisor linked to the calling actor, which becomes its parent:

@@ -67,7 +67,7 @@ Tags the runtime delivers. Tags below ALPH_TAG_USER belong to the runtime;
 your own tags start at ALPH_TAG_USER.
 
 ```mettle
-export const ALPH_TAG_INIT: int64 = 1;     // the first message; from = parent (0 if none)
+export const ALPH_TAG_INIT: int64 = 1;     // the first message; from = parent (0 if none); arg = restarts so far under a supervisor, else 0
 export const ALPH_TAG_EXIT: int64 = 2;     // a linked actor exited; only with alph_trap_exits on. from = it, arg = reason
 export const ALPH_TAG_DOWN: int64 = 3;     // a monitored actor exited. from = it, ref = the monitor, arg = reason
 export const ALPH_TAG_TIMEOUT: int64 = 4;  // a request got no reply in time. ref = the request, arg = the server
@@ -576,6 +576,27 @@ limit  at least 1
 
 Thread: a handler.
 
+### `alph_on_exit`
+
+```mettle
+export fn alph_on_exit(ctx: AlphCtx*, hook: fn(AlphCtx*, int64) -> int64 with alloc, syscall, asm)
+```
+
+Sets a hook the runtime calls once when this actor exits, before its
+links and monitors are told and its handles close: for state tied to the
+actor's life, such as counters, files or a lease to give back. It runs
+on every exit, crash included, except a kill (ALPH_KILL), which stays the
+hard stop. It gets a ctx like a handler's, with the actor's state, and
+the exit reason; it may send, but its own return value is ignored. A
+crash inside it ends only the hook. Not run when a medic gives up on its
+patient. Setting it again replaces it.
+
+```text
+hook  fn(ctx, reason) -> int64
+```
+
+Thread: a handler.
+
 ### `alph_send_after`
 
 ```mettle
@@ -702,6 +723,18 @@ export fn alph_spawn_bytes(ctx: AlphCtx*, flags: int64, state: rawptr, size: int
 Spawns an actor whose state starts as a copy of size bytes at state.
 Otherwise as alph_spawn. Thread: a handler.
 
+### `alph_spawn_bytes_arg`
+
+```mettle
+export fn alph_spawn_bytes_arg(ctx: AlphCtx*, flags: int64, state: rawptr, size: int64, arg: int64,
+                               handler: fn(AlphCtx*, AlphMsg*) -> int64 with alloc, syscall, asm) -> int64
+```
+
+Spawns an actor whose INIT message carries arg, so it can tell how it was
+started. Supervisors pass the number of times the child was started
+before: 0 the first time, more on a restart. Otherwise as
+alph_spawn_bytes. Thread: a handler.
+
 ### `alph_node_spawn`
 
 ```mettle
@@ -810,6 +843,16 @@ export fn alph_node_group_size(node: AlphNode*, group: string) -> int64
 
 How many actors are in group now; 0 when there is no such group.
 Thread: any.
+
+### `alph_node_group_send`
+
+```mettle
+export fn alph_node_group_send(node: AlphNode*, group: string, tag: int64, arg: int64) -> int64
+```
+
+Sends a tag and one word to every member of group from outside the node,
+with from = 0, each as alph_node_send. Returns how many members got it; a
+full mailbox or an exited member is skipped. Thread: any.
 
 ### `alph_group_send`
 
@@ -1530,7 +1573,8 @@ ALPH_TRANSIENT  restarted unless it exited with ALPH_NORMAL or ALPH_SHUTDOWN
 ALPH_TEMPORARY  never restarted
 ```
 
-A restarted child is a new actor with a new pid and its initial state.
+A restarted child is a new actor with a new pid and its initial state;
+its INIT message's arg counts the starts before it (0 the first time).
 More than max_restarts restarts within period_ms and the supervisor gives
 up: it stops every child and exits with ALPH_SHUTDOWN, so its own
 supervisor sees the failure. Children stop in reverse start order: an
@@ -1566,10 +1610,17 @@ export const ALPH_TRANSIENT: int64 = 1;
 export const ALPH_TEMPORARY: int64 = 2;
 ```
 
-Children one supervisor can hold. Nest supervisors for more.
+Children one supervisor can hold. Nest supervisors for more, or use a
+dynamic supervisor (alph/heal/dynamic) for many alike.
 
 ```mettle
-export const ALPH_SUP_MAX_CHILDREN: int64 = 16;
+export const ALPH_SUP_MAX_CHILDREN: int64 = 64;
+```
+
+AlphChildSpec.shutdown_ms: wait for the child to stop, however long.
+
+```mettle
+export const ALPH_SUP_WAIT: int64 = -1;
 ```
 
 The tag a sync_start child acknowledges with, through alph_sup_ack.
@@ -1585,6 +1636,8 @@ export struct AlphChildSpec {
   restart: int64;
   shutdown_ms: int64;
   sync_start: bool;
+  flags: int64;
+  sup: int64;  // the AlphSupSpec of a nested supervisor, until spawned, or 0
   state: rawptr;
   state_size: int64;
   state_at: int64;
@@ -1597,12 +1650,16 @@ One child of a supervisor, as alph_sup_add returns it. Change these:
 ```text
 restart      ALPH_PERMANENT (default), ALPH_TRANSIENT or ALPH_TEMPORARY
 shutdown_ms  how long it gets to stop before it is killed; 0 kills it at
+             once; ALPH_SUP_WAIT waits as long as it takes (the default
+             for a nested supervisor, so it stops its own children).
              once. Default 5000
 sync_start   when true, the next child starts only after this one calls
              alph_sup_ack from its INIT handler. Default false
+flags        spawn flags besides ALPH_LINK, such as ALPH_BOUND for a
+             child that may block. Default 0
 ```
 
-The other fields are set by alph_sup_add.
+The other fields are set by alph_sup_add and alph_sup_add_sup.
 
 ### `AlphSupSpec`
 
@@ -1615,7 +1672,7 @@ export struct AlphSupSpec {
   backoff_max_ms: int64;
   start_timeout_ms: int64;
   count: int64;
-  children: AlphChildSpec[16];
+  children: AlphChildSpec[64];
 }
 ```
 
@@ -1678,6 +1735,19 @@ export fn alph_sup_add(spec: AlphSupSpec*,
 
 Adds a child with no state. Otherwise as alph_sup_add_bytes. Thread: any.
 
+### `alph_sup_add_sup`
+
+```mettle
+export fn alph_sup_add_sup(spec: AlphSupSpec*, child: AlphSupSpec*) -> AlphChildSpec*
+```
+
+Adds a supervisor as a child, so trees nest as in OTP. The child
+supervisor is built from child, which, like a child's initial state, is
+read when the parent is spawned: keep it, and the states its children
+copy, alive until then. Its shutdown_ms is ALPH_SUP_WAIT, OTP's infinity
+for supervisors. Returns the child spec, or 0 when spec is full.
+Thread: any.
+
 ### `alph_sup_ack`
 
 ```mettle
@@ -1687,6 +1757,26 @@ export fn alph_sup_ack(ctx: AlphCtx*, init: AlphMsg*)
 Tells the supervisor this child finished starting. Only for children with
 sync_start; call it from the INIT handler, passing the INIT message.
 Thread: the child's handler.
+
+### `alph_sup_handle`
+
+```mettle
+export fn alph_sup_handle(ctx: AlphCtx*, m: AlphMsg*) -> int64
+```
+
+A supervisor's handler, for starting one where a handler is asked for,
+with a state from alph_sup_bytes. Thread: the runtime calls it.
+
+### `alph_sup_bytes`
+
+```mettle
+export fn alph_sup_bytes(spec: AlphSupSpec*, size: int64*) -> rawptr
+```
+
+A supervisor's initial state, built from spec, for starting it where a
+state and handler are asked for, such as alph_dyn_start_with with
+alph_sup_handle. Returns a malloc'd block, its size in *size; free it
+once it has been copied. Returns 0 when out of memory. Thread: any.
 
 ### `alph_spawn_sup`
 
@@ -1909,6 +1999,25 @@ max_children  children at once; 0 (default) is no limit
 handler       the children's handler, set by alph_dyn_init
 ```
 
+### `AlphDyn`
+
+```mettle
+export struct AlphDyn {
+  spec: AlphDynSpec;
+  children: int64;      // AlphDynChild array in the supervisor's heap
+  count: int64;
+  cap: int64;
+  stopping: int64;
+  exit_reason: int64;
+  timer: int64;
+  restarts: int64[64];  // times of recent restarts, a ring
+  restart_count: int64;
+}
+```
+
+A dynamic supervisor's state, for alph_sup_add_dyn. Its fields are the
+runtime's own.
+
 ### `alph_dyn_init`
 
 ```mettle
@@ -1917,6 +2026,15 @@ export fn alph_dyn_init(spec: AlphDynSpec*, handler: fn(AlphCtx*, AlphMsg*) -> i
 
 Starts a dynamic supervisor definition for children that run handler,
 with the defaults listed at AlphDynSpec. Thread: any.
+
+### `alph_dyn_handle`
+
+```mettle
+export fn alph_dyn_handle(ctx: AlphCtx*, m: AlphMsg*) -> int64
+```
+
+A dynamic supervisor's handler, for starting one where a handler is asked
+for; alph_sup_add_dyn uses it. Thread: the runtime calls it.
 
 ### `alph_spawn_dyn`
 
@@ -1974,6 +2092,38 @@ export fn alph_dyn_start(ctx: AlphCtx*, sup: int64, arg: int64, timeout_ms: int6
 
 Asks sup to start a child whose state is one int64 holding arg (a
 handle, an index). Otherwise as alph_dyn_start_bytes. Thread: a handler.
+
+### `alph_dyn_start_with`
+
+```mettle
+export fn alph_dyn_start_with(ctx: AlphCtx*, sup: int64, data: rawptr, size: int64, timeout_ms: int64,
+                              handler: fn(AlphCtx*, AlphMsg*) -> int64 with alloc, syscall, asm) -> int64
+```
+
+Asks sup to start a child that runs handler instead of the one in its
+AlphDynSpec, with size bytes at data as its state, copied. A restart
+runs the same handler. Starting a supervisor under sup:
+
+```text
+var size: int64 = 0;
+var st: rawptr = alph_sup_bytes(&child_spec, &size);
+alph_dyn_start_with(ctx, sup, st, size, &alph_sup_handle, 1000);
+free(st);
+```
+
+Otherwise as alph_dyn_start_bytes. Thread: a handler.
+
+### `alph_sup_add_dyn`
+
+```mettle
+export fn alph_sup_add_dyn(spec: AlphSupSpec*, dyn: AlphDyn*, dyn_spec: AlphDynSpec*) -> AlphChildSpec*
+```
+
+Adds a dynamic supervisor as a child of the static supervisor spec. dyn
+receives its initial state, built from dyn_spec; like any child's initial
+state it is copied when the parent is spawned, so keep dyn alive until
+then. Its shutdown_ms is ALPH_SUP_WAIT, so it stops its own children
+first. Returns the child spec, or 0 when spec is full. Thread: any.
 
 ## alph/work/pool
 

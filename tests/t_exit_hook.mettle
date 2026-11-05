@@ -1,0 +1,276 @@
+// alph_on_exit: the hook an actor sets to run once when it exits. The test checks that:
+//   - it runs once on a normal stop, a crash and a shutdown signal, with the
+//     exit reason and the actor's state;
+//   - it does not run on a kill, which still ends the actor with ALPH_KILLED;
+//   - a crash inside it ends only the hook: the observer still gets DOWN with
+//     the worker's own reason, and the actor is released;
+//   - a message the hook sends reaches the observer before the DOWN;
+//   - setting the hook twice keeps only the second.
+// An observer actor runs the cases one after the other, each on a fresh worker
+// it monitors. Hooks count their runs in globals; the main thread waits for the
+// observer to finish with a deadline.
+
+import "std/io";
+import "std/mem";
+import "std/thread";
+import "alph/sys/atomic";
+import "alph/alph";
+
+const TEH_READY: int64 = ALPH_TAG_USER;        // worker to observer, arg: id
+const TEH_STOP: int64 = ALPH_TAG_USER + 1;     // arg: the exit reason
+const TEH_CRASH: int64 = ALPH_TAG_USER + 2;
+const TEH_HOOKMSG: int64 = ALPH_TAG_USER + 3;  // from a hook, arg: id
+const TEH_POLL: int64 = ALPH_TAG_USER + 4;     // observer to itself
+
+const K_RECORD: int64 = 0;   // hook_a
+const K_CRASHING: int64 = 1; // hook_crash
+const K_SENDING: int64 = 2;  // hook_send
+const K_TWICE: int64 = 3;    // hook_a, then hook_b
+const CASES: int64 = 7;
+const OWN_REASON: int64 = 42;
+
+var g_node: AlphNode;
+var g_failures: int64 = 0;
+var g_done: int64 = 0;
+var g_zero: int64 = 0;
+var g_a_runs: int64 = 0;
+var g_a_reason: int64 = 0;
+var g_a_id: int64 = 0;
+var g_b_runs: int64 = 0;
+var g_crash_runs: int64 = 0;
+var g_send_runs: int64 = 0;
+var g_case: int64 = 0;
+
+fn expect(ok: bool, what: string) {
+  if (!ok) {
+    println("FAIL case {g_case}: {what}");
+    alph_atomic_add(&g_failures, 1);
+  }
+}
+
+struct TehWorker {
+  observer: int64;
+  id: int64;
+  kind: int64;
+}
+
+fn hook_a(ctx: AlphCtx*, reason: int64) -> int64 {
+  var w: TehWorker* = (TehWorker*)ctx->state;
+  alph_atomic_store(&g_a_reason, reason);
+  alph_atomic_store(&g_a_id, w->id);
+  alph_atomic_add(&g_a_runs, 1);
+  return 0;
+}
+
+fn hook_b(ctx: AlphCtx*, reason: int64) -> int64 {
+  alph_atomic_add(&g_b_runs, 1);
+  return 0;
+}
+
+fn hook_crash(ctx: AlphCtx*, reason: int64) -> int64 {
+  alph_atomic_add(&g_crash_runs, 1);
+  var z: int64 = g_zero;
+  return 100 / z;
+}
+
+fn hook_send(ctx: AlphCtx*, reason: int64) -> int64 {
+  var w: TehWorker* = (TehWorker*)ctx->state;
+  alph_atomic_add(&g_send_runs, 1);
+  alph_send(ctx, w->observer, TEH_HOOKMSG, w->id);
+  return 0;
+}
+
+fn worker(ctx: AlphCtx*, m: AlphMsg*) -> int64 {
+  var w: TehWorker* = (TehWorker*)ctx->state;
+  if (m->tag == ALPH_TAG_INIT) {
+    if (w->kind == K_RECORD) {
+      alph_on_exit(ctx, &hook_a);
+    } else if (w->kind == K_CRASHING) {
+      alph_on_exit(ctx, &hook_crash);
+    } else if (w->kind == K_SENDING) {
+      alph_on_exit(ctx, &hook_send);
+    } else if (w->kind == K_TWICE) {
+      alph_on_exit(ctx, &hook_a);
+      alph_on_exit(ctx, &hook_b);
+    }
+    alph_send(ctx, w->observer, TEH_READY, w->id);
+  } else if (m->tag == TEH_STOP) {
+    return alph_stop(ctx, m->arg);
+  } else if (m->tag == TEH_CRASH) {
+    var z: int64 = g_zero;
+    alph_send(ctx, w->observer, 100 / z, 0);
+  }
+  return ALPH_CONTINUE;
+}
+
+struct TehObs {
+  step: int64;         // the case running, 1..CASES
+  worker: int64;
+  id: int64;
+  live_before: int64;
+  polls: int64;
+  got_msg: int64;
+}
+
+fn live_now(ctx: AlphCtx*) -> int64 {
+  var stats: AlphStats;
+  alph_node_stats(ctx->node, &stats);
+  return stats.live;
+}
+
+fn kind_of(step: int64) -> int64 {
+  if (step == 5) {
+    return K_CRASHING;
+  }
+  if (step == 6) {
+    return K_SENDING;
+  }
+  if (step == 7) {
+    return K_TWICE;
+  }
+  return K_RECORD;
+}
+
+fn reason_of(step: int64) -> int64 {
+  if (step == 2) {
+    return ALPH_CRASHED;
+  }
+  if (step == 3) {
+    return ALPH_SHUTDOWN;
+  }
+  if (step == 4) {
+    return ALPH_KILLED;
+  }
+  if (step == 5) {
+    return OWN_REASON;
+  }
+  return ALPH_NORMAL;
+}
+
+// Spawns the worker of the next case.
+fn start_case(ctx: AlphCtx*, o: TehObs*) {
+  o->step = o->step + 1;
+  g_case = o->step;
+  o->id = 1000 + o->step;
+  o->got_msg = 0;
+  o->live_before = live_now(ctx);
+  var w: TehWorker;
+  w.observer = ctx->self;
+  w.id = o->id;
+  w.kind = kind_of(o->step);
+  o->worker = alph_spawn_value<TehWorker>(ctx, ALPH_MONITOR, &w, &worker);
+  expect(o->worker != 0, "worker spawned");
+}
+
+// The worker is ready: do what the case needs to end it.
+fn act(ctx: AlphCtx*, o: TehObs*) {
+  if (o->step == 2) {
+    alph_send(ctx, o->worker, TEH_CRASH, 0);
+  } else if (o->step == 3) {
+    alph_exit_signal(ctx, o->worker, ALPH_SHUTDOWN);
+  } else if (o->step == 4) {
+    alph_exit_signal(ctx, o->worker, ALPH_KILL);
+  } else {
+    alph_send(ctx, o->worker, TEH_STOP, reason_of(o->step));
+  }
+}
+
+fn finish_case(ctx: AlphCtx*, o: TehObs*) {
+  if (o->step == CASES) {
+    alph_atomic_store(&g_done, 1);
+    return;
+  }
+  start_case(ctx, o);
+}
+
+// Checks what the hooks did by the time the DOWN of the current case arrived.
+fn check_down(o: TehObs*, reason: int64) {
+  var s: int64 = o->step;
+  expect(reason == reason_of(s), "DOWN carries the worker's own reason");
+  // a_runs counts cases 1..3 only: a kill and the other hooks leave it alone.
+  var a_expected: int64 = s;
+  if (s > 3) {
+    a_expected = 3;
+  }
+  expect(alph_atomic_load(&g_a_runs) == a_expected, "the recording hook ran once per exit, never on a kill");
+  if (s <= 3 && s != 4) {
+    expect(alph_atomic_load(&g_a_reason) == reason_of(s), "the hook got the exit reason");
+    expect(alph_atomic_load(&g_a_id) == o->id, "the hook saw the actor's state");
+  }
+  if (s >= 5) {
+    expect(alph_atomic_load(&g_crash_runs) == 1, "the crashing hook ran once");
+  }
+  if (s == 6) {
+    expect(alph_atomic_load(&g_send_runs) == 1, "the sending hook ran once");
+    expect(o->got_msg == 1, "the hook's message came before the DOWN");
+  } else if (s == 7) {
+    expect(alph_atomic_load(&g_b_runs) == 1, "the second hook ran once");
+    expect(alph_atomic_load(&g_a_runs) == 3, "the replaced hook never ran");
+  }
+}
+
+fn observer(ctx: AlphCtx*, m: AlphMsg*) -> int64 {
+  var o: TehObs* = (TehObs*)ctx->state;
+  if (m->tag == ALPH_TAG_INIT) {
+    start_case(ctx, o);
+  } else if (m->tag == TEH_READY) {
+    expect(m->from == o->worker && m->arg == o->id, "ready comes from the case's worker");
+    act(ctx, o);
+  } else if (m->tag == TEH_HOOKMSG) {
+    expect(m->from == o->worker && m->arg == o->id, "the hook's message names its actor");
+    o->got_msg = 1;
+  } else if (m->tag == ALPH_TAG_DOWN) {
+    expect(m->from == o->worker, "DOWN comes from the case's worker");
+    check_down(o, m->arg);
+    if (o->step == 5) {
+      // The actor's slot is released once the exit completes, which may come
+      // just after the DOWN: poll for the live count to return.
+      o->polls = 0;
+      alph_send_after(ctx, 1, ctx->self, TEH_POLL, 0);
+    } else {
+      finish_case(ctx, o);
+    }
+  } else if (m->tag == TEH_POLL) {
+    if (live_now(ctx) == o->live_before) {
+      finish_case(ctx, o);
+    } else if (o->polls >= 2000) {
+      expect(false, "the live count returns after a crash inside the hook");
+      finish_case(ctx, o);
+    } else {
+      o->polls = o->polls + 1;
+      alph_send_after(ctx, 1, ctx->self, TEH_POLL, 0);
+    }
+  }
+  return ALPH_CONTINUE;
+}
+
+fn main() -> int32 {
+  var cfg: AlphConfig;
+  alph_config(&cfg);
+  cfg.schedulers = 2;
+  cfg.max_actors = 64;
+  expect(alph_node_start(&g_node, &cfg), "node started");
+  var o: TehObs;
+  memset((rawptr)&o, 0, (int64)sizeof(TehObs));
+  alph_node_spawn_value<TehObs>(&g_node, 0, &o, &observer);
+  for i: int64 in 0..5000 {
+    if (alph_atomic_load(&g_done) == 1) {
+      break;
+    }
+    thread_sleep_ms(1);
+  }
+  expect(alph_atomic_load(&g_done) == 1, "every case finished before the deadline");
+  // Hooks that ran twice would show up now; nothing may have changed.
+  thread_sleep_ms(20);
+  expect(alph_atomic_load(&g_a_runs) == 3, "recording hook total");
+  expect(alph_atomic_load(&g_b_runs) == 1, "second hook total");
+  expect(alph_atomic_load(&g_crash_runs) == 1, "crashing hook total");
+  expect(alph_atomic_load(&g_send_runs) == 1, "sending hook total");
+  alph_node_halt(&g_node, 0);
+  alph_node_wait(&g_node);
+  if (g_failures != 0) {
+    return 1;
+  }
+  println("exit hook ok");
+  return 0;
+}
