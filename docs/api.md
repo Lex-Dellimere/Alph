@@ -233,6 +233,9 @@ export struct AlphNode {
   balanced: int64;      // when the last look was (ns)
   low_streak: int64;    // looks in a row that asked for fewer active schedulers
   low_max: int64;       //   and the most any of them asked for
+  epoch: int64;         // bumped by every retire
+  retired: AlphVec;     // pairs: block (bit 0 set: a plain block, else an AlphEntry*), epoch
+  retire_lock: int64;
 }
 ```
 

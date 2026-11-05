@@ -137,6 +137,11 @@ const ALPH_SHRINK_AFTER: int64 = 5;
 
 const ALPH_NS_PER_MS: int64 = 1000000;
 
+// Epoch reclamation: memory a lock-free reader may hold is retired, not
+// freed, and freed once every shared scheduler has been between handlers
+// (or asleep) since. Retire lists past this length are reclaimed at once.
+const ALPH_RETIRE_BATCH: int64 = 1024;
+
 // ---- public types ----------------------------------------------------------
 
 // How to run a node. Fill it with alph_config, then change what you need.
@@ -230,6 +235,9 @@ export struct AlphNode {
   balanced: int64;      // when the last look was (ns)
   low_streak: int64;    // looks in a row that asked for fewer active schedulers
   low_max: int64;       //   and the most any of them asked for
+  epoch: int64;         // bumped by every retire
+  retired: AlphVec;     // pairs: block (bit 0 set: a plain block, else an AlphEntry*), epoch
+  retire_lock: int64;
 }
 
 // What a handler gets besides the message. Read these fields:
@@ -333,6 +341,7 @@ struct AlphSched {
   polled_at: int64;     // when a busy scheduler last looked at its sockets (ns)
   hungry: int64;        // 1 while it has no work and may be handed some
   exiting: int64;       // the actor whose exit hook runs now; read back after a crash
+  quiet: int64;         // node epoch seen between handlers; ALPH_QUIET_PARKED while it sleeps
   work_at: int64;       // when its current stretch of work began (ns), 0 while idle
   busy_ns: int64;       // time spent working, over finished stretches
   busy_seen: int64;     // busy time the last look at the load counted
@@ -364,11 +373,15 @@ struct AlphEntry {
   hash: int64;
 }
 
-// A hash table of entries by name, chained. Guarded by names_lock.
+// A hash table of entries by name, chained. Writers hold names_lock.
+// Readers in handlers take no lock (alph_whereis): the chain heads live in
+// one block (its mask first) published by one pointer, a resize makes seq
+// odd while it relinks, and removed entries and old blocks are freed only
+// through alph_retire, once no handler can still hold them.
 struct AlphTable {
-  slots: int64;  // array of chain heads (AlphEntry*)
-  mask: int64;
+  block: int64;  // [mask][head 0][head 1]...; heads are AlphEntry*
   count: int64;
+  seq: int64;    // odd while a resize relinks the chains
 }
 
 // ---- small helpers ---------------------------------------------------------
@@ -601,6 +614,69 @@ fn alph_sched_steal(s: AlphSched*, node: AlphNode*) -> int64 {
   return 0;
 }
 
+// The quiet value of a sleeping scheduler: above every epoch.
+fn alph_quiet_parked() -> int64 {
+  return (int64)1 << 62;
+}
+
+// Marks s as between handlers: it holds nothing it read without a lock.
+fn alph_sched_quiet(s: AlphSched*, node: AlphNode*) {
+  alph_atomic_store_sc(&s->quiet, alph_atomic_load(&node->epoch));
+}
+
+// Frees what no handler can hold any more: everything retired before the
+// oldest epoch a shared scheduler has seen between handlers.
+fn alph_reclaim(node: AlphNode*) {
+  var oldest: int64 = alph_quiet_parked();
+  for i: int64 in 0..node->sched_count {
+    var q: int64 = alph_atomic_load(&alph_sched_at(node, i)->quiet);
+    if (q < oldest) {
+      oldest = q;
+    }
+  }
+  alph_spin_lock(&node->retire_lock);
+  var v: AlphVec* = &node->retired;
+  var keep: int64 = 0;
+  var i: int64 = 0;
+  while (i + 1 < v->len) {
+    var block: int64 = alph_vec_get(v, i);
+    var epoch: int64 = alph_vec_get(v, i + 1);
+    if (epoch < oldest) {
+      if ((block & 1) != 0) {
+        free((rawptr)(block - 1));
+      } else {
+        alph_entry_free((AlphEntry*)block);
+      }
+    } else {
+      alph_vec_set(v, keep, block);
+      alph_vec_set(v, keep + 1, epoch);
+      keep = keep + 2;
+    }
+    i = i + 2;
+  }
+  v->len = keep;
+  alph_spin_unlock(&node->retire_lock);
+}
+
+// Hands memory that lock-free readers may still hold to reclamation: an
+// AlphEntry*, or a plain block with bit 0 set. Call after unlinking it.
+// If the list cannot grow, the block is kept (leaked) rather than freed
+// under a reader. Thread: any.
+fn alph_retire(node: AlphNode*, block: int64) {
+  var epoch: int64 = alph_atomic_add(&node->epoch, 1);
+  alph_spin_lock(&node->retire_lock);
+  if (alph_vec_push(&node->retired, block)) {
+    if (!alph_vec_push(&node->retired, epoch)) {
+      node->retired.len = node->retired.len - 1;
+    }
+  }
+  var many: bool = node->retired.len >= ALPH_RETIRE_BATCH * 2;
+  alph_spin_unlock(&node->retire_lock);
+  if (many) {
+    alph_reclaim(node);
+  }
+}
+
 // Whether s takes new work. A bound scheduler always runs its one actor.
 fn alph_sched_active(node: AlphNode*, s: AlphSched*) -> bool {
   return s->bound != 0 || s->index < alph_atomic_load(&node->active);
@@ -722,6 +798,9 @@ fn alph_balance(node: AlphNode*, t: int64) {
     alph_atomic_store(&node->balance_at, t + ALPH_BALANCE_NS);
   }
   alph_atomic_store(&node->balance_lock, 0);
+  if (alph_atomic_load(&node->retired.len) > 0) {
+    alph_reclaim(node);
+  }
 }
 
 fn alph_wake(node: AlphNode*, p: AlphProc*) {
@@ -1675,14 +1754,19 @@ fn alph_name_hash(name: string) -> int64 {
 }
 
 fn alph_tab_init(t: AlphTable*) -> bool {
-  t->slots = (int64)calloc(64, 8);
-  t->mask = 63;
+  t->block = (int64)calloc(65, 8);
+  if (t->block == 0) {
+    return false;
+  }
+  *(int64*)t->block = 63;
   t->count = 0;
-  return t->slots != 0;
+  t->seq = 0;
+  return true;
 }
 
 fn alph_tab_head(t: AlphTable*, hash: int64) -> int64* {
-  return (int64*)(t->slots + (hash & t->mask) * 8);
+  var block: int64 = t->block;
+  return (int64*)(block + 8 + (hash & *(int64*)block) * 8);
 }
 
 // The entry called name, or 0.
@@ -1700,37 +1784,72 @@ fn alph_tab_find(t: AlphTable*, name: string) -> AlphEntry* {
 
 // Adds e, whose hash is set. Doubles the table past 3/4 full; if that
 // allocation fails the chains just grow longer.
-fn alph_tab_add(t: AlphTable*, e: AlphEntry*) {
-  if (t->count * 4 >= (t->mask + 1) * 3) {
-    var size: int64 = (t->mask + 1) * 2;
-    var slots: int64 = (int64)calloc(size, 8);
-    if (slots != 0) {
-      for i: int64 in 0..t->mask + 1 {
-        var c: AlphEntry* = (AlphEntry*)*(int64*)(t->slots + i * 8);
+fn alph_tab_add(node: AlphNode*, t: AlphTable*, e: AlphEntry*) {
+  var old: int64 = t->block;
+  var mask: int64 = *(int64*)old;
+  if (t->count * 4 >= (mask + 1) * 3) {
+    var size: int64 = (mask + 1) * 2;
+    var block: int64 = (int64)calloc(size + 1, 8);
+    if (block != 0) {
+      *(int64*)block = size - 1;
+      alph_atomic_add(&t->seq, 1);  // odd: readers retry
+      for i: int64 in 0..mask + 1 {
+        var c: AlphEntry* = (AlphEntry*)*(int64*)(old + 8 + i * 8);
         while (c != 0) {
           var next: int64 = c->next;
-          var at: int64* = (int64*)(slots + (c->hash & (size - 1)) * 8);
+          var at: int64* = (int64*)(block + 8 + (c->hash & (size - 1)) * 8);
           c->next = *at;
           *at = (int64)c;
           c = (AlphEntry*)next;
         }
       }
-      free((rawptr)t->slots);
-      t->slots = slots;
-      t->mask = size - 1;
+      alph_atomic_store(&t->block, block);
+      alph_atomic_add(&t->seq, 1);  // even again
+      alph_retire(node, old | 1);
     }
   }
   var head: int64* = alph_tab_head(t, e->hash);
   e->next = *head;
-  *head = (int64)e;
+  // e is complete before it is linked: x86 keeps these stores in order.
+  alph_atomic_store(head, (int64)e);
   t->count = t->count + 1;
 }
 
+// The pid registered as name, read with no lock: for handlers on shared
+// schedulers only. Returns -1 when a resize got in the way; the caller
+// then takes the lock.
+fn alph_tab_whereis_quiet(t: AlphTable*, name: string) -> int64 {
+  var seq: int64 = alph_atomic_load(&t->seq);
+  if ((seq & 1) != 0) {
+    return -1;
+  }
+  var h: int64 = alph_name_hash(name);
+  var e: AlphEntry* = (AlphEntry*)alph_atomic_load(alph_tab_head(t, h));
+  var pid: int64 = 0;
+  var steps: int64 = 0;
+  while (e != 0) {
+    if (e->hash == h && alph_entry_is(e, name)) {
+      pid = alph_atomic_load(&e->pid);
+      break;
+    }
+    e = (AlphEntry*)alph_atomic_load(&e->next);
+    steps = steps + 1;
+    if (steps > 4096) {
+      return -1;  // a chain that long is a resize under way, or bad luck
+    }
+  }
+  if (alph_atomic_load(&t->seq) != seq) {
+    return -1;
+  }
+  return pid;
+}
+
+// Unlinks e. Its next stays, so a reader standing on it walks on.
 fn alph_tab_remove(t: AlphTable*, e: AlphEntry*) {
   var link: int64* = alph_tab_head(t, e->hash);
   while (*link != 0) {
     if (*link == (int64)e) {
-      *link = e->next;
+      alph_atomic_store(link, e->next);
       t->count = t->count - 1;
       return;
     }
@@ -1785,7 +1904,7 @@ fn alph_names_drop(node: AlphNode*, p: AlphProc*, pid: int64) {
     if (e->pid == pid) {
       alph_tab_remove((AlphTable*)node->names, e);
     }
-    alph_entry_free(e);  // still ours, or taken over and already out of the table
+    alph_retire(node, (int64)e);  // still ours, or taken over and already out of the table
   }
   p->names.len = 0;
   for i: int64 in 0..p->groups.len {
@@ -1829,10 +1948,10 @@ export fn alph_register(ctx: AlphCtx*, name: string) -> bool {
     } else {
       if (old != 0) {
         alph_tab_remove(t, old);
-        old->pid = 0;
+        alph_atomic_store(&old->pid, 0);
       }
       e->pid = ctx->self;
-      alph_tab_add(t, e);
+      alph_tab_add(node, t, e);
     }
   }
   alph_spin_unlock(&node->names_lock);
@@ -1852,7 +1971,7 @@ export fn alph_unregister(ctx: AlphCtx*, name: string) {
     if (at >= 0) {
       alph_vec_remove_at(&p->names, at);
     }
-    alph_entry_free(e);
+    alph_retire(node, (int64)e);
   }
   alph_spin_unlock(&node->names_lock);
 }
@@ -1877,6 +1996,18 @@ export fn alph_node_whereis(node: AlphNode*, name: string) -> int64 {
 // The pid registered as name, or 0; as alph_node_whereis.
 // Thread: a handler.
 export fn alph_whereis(ctx: AlphCtx*, name: string) -> int64 {
+  // A shared scheduler marks itself quiet between handlers, so it may read
+  // the table with no lock. A bound one may block mid-handler and is not
+  // counted by alph_reclaim: it takes the lock.
+  if (((AlphSched*)ctx->sched)->bound == 0) {
+    var pid: int64 = alph_tab_whereis_quiet((AlphTable*)ctx->node->names, name);
+    if (pid >= 0) {
+      if (pid == 0 || alph_resolve(ctx->node, pid) == 0) {
+        return 0;
+      }
+      return pid;
+    }
+  }
   return alph_node_whereis(ctx->node, name);
 }
 
@@ -1899,7 +2030,7 @@ export fn alph_group_join(ctx: AlphCtx*, group: string) -> bool {
   if (g == 0) {
     g = alph_entry_new(group);
     if (g != 0) {
-      alph_tab_add(t, g);
+      alph_tab_add(node, t, g);
     }
   }
   if (g == 0) {
@@ -3675,6 +3806,7 @@ fn alph_sched_main(arg: int64) -> int64 {
   var s: AlphSched* = (AlphSched*)arg;
   var node: AlphNode* = (AlphNode*)s->node;
   while (alph_atomic_load(&node->halted) == 0 && alph_atomic_load(&s->done) == 0) {
+    alph_sched_quiet(s, node);
     var wait: int64 = alph_timers_fire(node, &s->timers);
     var p: int64 = alph_runq_pop(s);
     if (p != 0) {
@@ -3727,7 +3859,9 @@ fn alph_sched_main(arg: int64) -> int64 {
       if (wait >= 0) {
         timeout_ms = (wait + ALPH_NS_PER_MS - 1) / ALPH_NS_PER_MS;
       }
+      alph_atomic_store_sc(&s->quiet, alph_quiet_parked());
       alph_sched_poll(s, timeout_ms);
+      alph_sched_quiet(s, node);
     }
     alph_atomic_store(&s->sleeping, 0);
   }

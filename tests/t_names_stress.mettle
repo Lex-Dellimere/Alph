@@ -1,0 +1,341 @@
+// Names under heavy concurrency. alph_whereis reads the name table from
+// handlers with no lock while writers (register, unregister, exit) take one;
+// removed entries are freed later and the table resizes as it fills. This
+// test hammers all of that and checks that:
+//   - a name never has two holders (each key has an atomic holder count that
+//     must go from 0 to 1 on every successful register);
+//   - no lookup crashes or returns a pid that is not a slot of this node;
+//   - once everyone has stopped, no name is left and every count is 0;
+//   - the table still works afterwards.
+// 128 churners register, unregister and sometimes stop while holding names;
+// a supervisor respawns them until told to stop. 64 readers look names up in
+// a loop. The main thread lets them run for about two seconds.
+
+import "std/io";
+import "std/mem";
+import "std/conv";
+import "std/thread";
+import "alph/sys/atomic";
+import "alph/alph";
+
+const TNS_TICK: int64 = ALPH_TAG_USER;
+const KEYS: int64 = 512;
+const CHURNERS: int64 = 128;
+const READERS: int64 = 64;
+const HOLD_MAX: int64 = 4;
+const OPS_PER_TICK: int64 = 4;
+const LOOKUPS_PER_TICK: int64 = 2000;
+const MAX_ACTORS: int64 = 1024;
+const RUN_MS: int64 = 2000;
+
+var g_node: AlphNode;
+var g_failures: int64 = 0;
+var tns_names: uint8[4096];      // key i is "k<i>" at offset i * 8
+var tns_lens: int64[512];
+var tns_holders: int64[512];     // live holders of each key; must stay 0 or 1
+var tns_stop: int64 = 0;
+var tns_seed: int64 = 0;
+var tns_regs: int64 = 0;
+var tns_lookups: int64 = 0;
+var tns_hits: int64 = 0;
+var tns_uniq: int64 = 0;         // a register that found the key already counted
+var tns_bad_pid: int64 = 0;      // a lookup that returned a pid that is no slot
+var tns_final: int64 = 0;        // 1 ok, 2 failed: the fresh actor's checks
+
+fn expect(ok: bool, what: string) {
+  if (!ok) {
+    println("FAIL {what}");
+    alph_atomic_add(&g_failures, 1);
+  }
+}
+
+fn tns_key(i: int64) -> string {
+  return str_from_bytes((cstring)&tns_names[i * 8], tns_lens[i]);
+}
+
+fn tns_next(x: int64) -> int64 {
+  return (x * 1103515245 + 12345) & 2147483647;
+}
+
+// ---- churners ----------------------------------------------------------------
+
+struct TnsChurn {
+  x: int64;
+  nkeys: int64;
+  keys: int64[4];
+}
+
+// Runs when a churner exits however it exits, before the runtime drops its
+// names: the counts must be right by the time anyone else can take them.
+fn churn_exit(ctx: AlphCtx*, reason: int64) -> int64 {
+  var c: TnsChurn* = (TnsChurn*)ctx->state;
+  for i: int64 in 0..c->nkeys {
+    alph_atomic_add(&tns_holders[c->keys[i]], -1);
+  }
+  c->nkeys = 0;
+  return 0;
+}
+
+fn churn_holds(c: TnsChurn*, key: int64) -> bool {
+  for i: int64 in 0..c->nkeys {
+    if (c->keys[i] == key) {
+      return true;
+    }
+  }
+  return false;
+}
+
+fn churn_register(ctx: AlphCtx*, c: TnsChurn*) {
+  for tries: int64 in 0..8 {
+    c->x = tns_next(c->x);
+    var key: int64 = (c->x >> 8) % KEYS;
+    if (!churn_holds(c, key)) {
+      if (alph_register(ctx, tns_key(key))) {
+        var before: int64 = alph_atomic_add(&tns_holders[key], 1);
+        if (before != 0) {
+          alph_atomic_add(&tns_uniq, 1);
+        }
+        c->keys[c->nkeys] = key;
+        c->nkeys = c->nkeys + 1;
+        alph_atomic_add(&tns_regs, 1);
+      }
+      return;
+    }
+  }
+}
+
+// Drops the key at position at; the count goes down before the name goes.
+fn churn_unregister(ctx: AlphCtx*, c: TnsChurn*, at: int64) {
+  var key: int64 = c->keys[at];
+  alph_atomic_add(&tns_holders[key], -1);
+  alph_unregister(ctx, tns_key(key));
+  c->nkeys = c->nkeys - 1;
+  c->keys[at] = c->keys[c->nkeys];
+}
+
+fn churner(ctx: AlphCtx*, m: AlphMsg*) -> int64 {
+  var c: TnsChurn* = (TnsChurn*)ctx->state;
+  if (m->tag == ALPH_TAG_INIT) {
+    alph_on_exit(ctx, &churn_exit);
+    c->x = tns_next(alph_atomic_add(&tns_seed, 1) * 40503 + 1);
+    alph_send(ctx, ctx->self, TNS_TICK, 0);
+    return ALPH_CONTINUE;
+  }
+  if (m->tag != TNS_TICK) {
+    return ALPH_CONTINUE;
+  }
+  if (alph_atomic_load(&tns_stop) == 1) {
+    while (c->nkeys > 0) {
+      churn_unregister(ctx, c, c->nkeys - 1);
+    }
+    return alph_stop(ctx, ALPH_NORMAL);
+  }
+  for op: int64 in 0..OPS_PER_TICK {
+    c->x = tns_next(c->x);
+    var r1: int64 = c->x >> 8;
+    c->x = tns_next(c->x);
+    var r2: int64 = c->x >> 8;
+    if (c->nkeys > 0 && r1 % (50 * OPS_PER_TICK) == 0) {
+      return alph_stop(ctx, ALPH_NORMAL);  // keeps its names: the exit hook settles the counts
+    }
+    if (c->nkeys == 0 || (c->nkeys < HOLD_MAX && r2 % 2 == 0)) {
+      churn_register(ctx, c);
+    } else {
+      churn_unregister(ctx, c, r2 % c->nkeys);
+    }
+  }
+  alph_send(ctx, ctx->self, TNS_TICK, 0);
+  return ALPH_CONTINUE;
+}
+
+// ---- readers -----------------------------------------------------------------
+
+struct TnsRead {
+  x: int64;
+}
+
+fn reader(ctx: AlphCtx*, m: AlphMsg*) -> int64 {
+  var r: TnsRead* = (TnsRead*)ctx->state;
+  if (m->tag == ALPH_TAG_INIT) {
+    r->x = tns_next(alph_atomic_add(&tns_seed, 1) * 40503 + 7);
+    alph_send(ctx, ctx->self, TNS_TICK, 0);
+    return ALPH_CONTINUE;
+  }
+  if (m->tag != TNS_TICK) {
+    return ALPH_CONTINUE;
+  }
+  if (alph_atomic_load(&tns_stop) == 1) {
+    return alph_stop(ctx, ALPH_NORMAL);
+  }
+  var hits: int64 = 0;
+  var bad: int64 = 0;
+  for i: int64 in 0..LOOKUPS_PER_TICK {
+    r->x = tns_next(r->x);
+    var pid: int64 = alph_whereis(ctx, tns_key((r->x >> 8) % KEYS));
+    if (pid != 0) {
+      hits = hits + 1;
+      var slot: int64 = pid & (((int64)1 << 32) - 1);
+      if (pid < 0 || slot < 1 || slot > MAX_ACTORS) {
+        bad = bad + 1;
+      }
+    }
+  }
+  alph_atomic_add(&tns_lookups, LOOKUPS_PER_TICK);
+  alph_atomic_add(&tns_hits, hits);
+  if (bad != 0) {
+    alph_atomic_add(&tns_bad_pid, bad);
+  }
+  alph_send(ctx, ctx->self, TNS_TICK, 0);
+  return ALPH_CONTINUE;
+}
+
+// ---- parent of both ----------------------------------------------------------
+
+struct TnsParent {
+  alive: int64;
+}
+
+fn spawn_churner(ctx: AlphCtx*, p: TnsParent*) {
+  var c: TnsChurn;
+  memset((rawptr)&c, 0, (int64)sizeof(TnsChurn));
+  if (alph_spawn_value<TnsChurn>(ctx, ALPH_MONITOR, &c, &churner) != 0) {
+    p->alive = p->alive + 1;
+  } else {
+    expect(false, "a churner could be spawned");
+  }
+}
+
+// Starts the churners and readers, replaces each churner that stops until
+// the stop flag is set, and ends itself once every child is gone.
+fn parent(ctx: AlphCtx*, m: AlphMsg*) -> int64 {
+  var p: TnsParent* = (TnsParent*)ctx->state;
+  if (m->tag == ALPH_TAG_INIT) {
+    for i: int64 in 0..CHURNERS {
+      spawn_churner(ctx, p);
+    }
+    for i: int64 in 0..READERS {
+      var r: TnsRead;
+      r.x = 0;
+      if (alph_spawn_value<TnsRead>(ctx, ALPH_MONITOR, &r, &reader) != 0) {
+        p->alive = p->alive + 1;
+      } else {
+        expect(false, "a reader could be spawned");
+      }
+    }
+  } else if (m->tag == ALPH_TAG_DOWN) {
+    p->alive = p->alive - 1;
+    if (alph_atomic_load(&tns_stop) == 0) {
+      spawn_churner(ctx, p);
+    } else if (p->alive == 0) {
+      return alph_stop(ctx, ALPH_NORMAL);
+    }
+  }
+  return ALPH_CONTINUE;
+}
+
+// A fresh actor on the emptied table: registers, finds, drops.
+fn finalizer(ctx: AlphCtx*, m: AlphMsg*) -> int64 {
+  if (m->tag == ALPH_TAG_INIT) {
+    var ok: bool = true;
+    for j: int64 in 0..5 {
+      var name: string = tns_key(j * 97);
+      ok = ok && alph_register(ctx, name);
+      ok = ok && alph_whereis(ctx, name) == ctx->self;
+      ok = ok && alph_node_whereis(ctx->node, name) == ctx->self;
+    }
+    for j: int64 in 0..5 {
+      alph_unregister(ctx, tns_key(j * 97));
+      ok = ok && alph_whereis(ctx, tns_key(j * 97)) == 0;
+    }
+    if (ok) {
+      alph_atomic_store(&tns_final, 1);
+    } else {
+      alph_atomic_store(&tns_final, 2);
+    }
+    return alph_stop(ctx, ALPH_NORMAL);
+  }
+  return ALPH_CONTINUE;
+}
+
+fn live_now() -> int64 {
+  var stats: AlphStats;
+  alph_node_stats(&g_node, &stats);
+  return stats.live;
+}
+
+fn wait_for(flag: int64*, want: int64, ms: int64) {
+  for i: int64 in 0..ms {
+    if (alph_atomic_load(flag) == want) {
+      break;
+    }
+    thread_sleep_ms(1);
+  }
+}
+
+fn main() -> int32 {
+  for i: int64 in 0..KEYS {
+    var digits: uint8[24];
+    tns_names[i * 8] = 107;  // 'k'
+    var n: int64 = (int64)int_to_dec(&digits[0], i);
+    for j: int64 in 0..n {
+      tns_names[i * 8 + 1 + j] = digits[j];
+    }
+    tns_lens[i] = n + 1;
+  }
+  var cfg: AlphConfig;
+  alph_config(&cfg);
+  cfg.schedulers = 16;
+  cfg.max_actors = MAX_ACTORS;
+  expect(alph_node_start(&g_node, &cfg), "node started");
+  var baseline: int64 = live_now();
+  var p: TnsParent;
+  memset((rawptr)&p, 0, (int64)sizeof(TnsParent));
+  alph_node_spawn_value<TnsParent>(&g_node, 0, &p, &parent);
+  thread_sleep_ms((uint32)RUN_MS);
+  alph_atomic_store(&tns_stop, 1);
+  for i: int64 in 0..10000 {
+    if (live_now() == baseline) {
+      break;
+    }
+    thread_sleep_ms(1);
+  }
+  expect(live_now() == baseline, "every actor stopped before the deadline");
+
+  expect(alph_atomic_load(&tns_uniq) == 0, "no name ever had two holders");
+  expect(alph_atomic_load(&tns_bad_pid) == 0, "every lookup returned 0 or a valid pid");
+  var stuck: int64 = 0;
+  var left: int64 = 0;
+  for k: int64 in 0..KEYS {
+    if (alph_atomic_load(&tns_holders[k]) != 0) {
+      stuck = stuck + 1;
+    }
+    if (alph_node_whereis(&g_node, tns_key(k)) != 0) {
+      left = left + 1;
+    }
+  }
+  expect(stuck == 0, "every holder count is back to 0");
+  expect(left == 0, "no name is left once everyone stopped");
+  var regs: int64 = alph_atomic_load(&tns_regs);
+  var lookups: int64 = alph_atomic_load(&tns_lookups);
+  var hits: int64 = alph_atomic_load(&tns_hits);
+  expect(hits > 0, "lookups found some names");
+  expect(regs > 10000, "enough registrations happened");
+
+  alph_node_spawn(&g_node, 0, &finalizer);
+  wait_for(&tns_final, 1, 5000);
+  expect(alph_atomic_load(&tns_final) == 1, "a fresh actor can register and look up names");
+  for k: int64 in 0..KEYS {
+    if (alph_node_whereis(&g_node, tns_key(k)) != 0) {
+      left = left + 1;
+    }
+  }
+  expect(left == 0, "the fresh actor's names are gone too");
+  alph_node_halt(&g_node, 0);
+  alph_node_wait(&g_node);
+  if (g_failures != 0) {
+    println("stuck {stuck}, left {left}, regs {regs}, lookups {lookups}, hits {hits}, uniq {tns_uniq}, bad {tns_bad_pid}");
+    return 1;
+  }
+  println("names stress ok: {regs} registrations, {lookups} lookups, {hits} hits");
+  return 0;
+}
