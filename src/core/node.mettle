@@ -158,9 +158,13 @@ const ALPH_BOUND_KEEP: int64 = 8;
 const ALPH_BOUND_DECAY_NS: int64 = 500000000;
 // A bound actor that finds no spare while one is on its way (its actor just
 // exited, or its thread was just trimmed) waits up to this long for it
-// rather than open a new scheduler: microseconds, against a thread start
-// and two descriptors.
+// rather than open a new scheduler: measured 1-2 us on average (71 us at
+// worst, in 20K racing spawns), against 28-34 us for a thread start and two
+// descriptors. A handler on a shared scheduler waits at most
+// ALPH_BOUND_WAIT_HANDLER_NS, about one thread start, as every actor queued
+// there waits with it.
 const ALPH_BOUND_WAIT_NS: int64 = 2000000;
+const ALPH_BOUND_WAIT_HANDLER_NS: int64 = 30000;
 // An actor's run also ends once it has taken this long (checked every 4
 // messages), so a run of many medium-cost messages cannot hold its
 // scheduler for a millisecond: 64 messages of 20 us did.
@@ -5566,7 +5570,12 @@ fn alph_sched_bound(node: AlphNode*) -> AlphSched* {
     // A spare is on its way: wait for it, a while, before opening another.
     var now: int64 = alph_now_ns();
     if (until == 0) {
-      until = now + ALPH_BOUND_WAIT_NS;
+      var budget: int64 = ALPH_BOUND_WAIT_NS;
+      var here: AlphRecover* = alph_recover_current();
+      if (here != 0 && here->owner != 0 && ((AlphSched*)here->owner)->bound == 0) {
+        budget = ALPH_BOUND_WAIT_HANDLER_NS;  // a handler on a shared scheduler
+      }
+      until = now + budget;
     } else if (now >= until) {
       break;
     }
