@@ -1,0 +1,342 @@
+// alph/sched/exec on its own, with no node and no actors: 100000 grouped tasks
+// from the main thread, a recursive fork-join sum with alph_task_help, work
+// spreading over 8 workers, alph_exec_wait_idle, a task timer (runs once, not
+// early) and a cancelled one, alph_task_on_ready on a pipe, 4 outside threads
+// spawning at once, idle workers using almost no CPU, and stop followed by a
+// second executor.
+
+import "std/io";
+import "std/thread";
+import "alph/sys/linux";
+import "alph/sys/fd";
+import "alph/sys/atomic";
+import "alph/sys/clock";
+import "alph/io/reactor";
+import "alph/sched/exec";
+
+const TEX_WORKERS: int64 = 8;
+const TEX_MS: int64 = 1000000;
+
+struct TexRange {
+  lo: int64;
+  hi: int64;
+  out: int64;
+}
+
+var tex_failures: int64 = 0;
+var tex_ex: AlphExec;
+var tex_count: int64 = 0;
+var tex_per: int64[8];
+var tex_timer_fired: int64 = 0;
+var tex_timer_at: int64 = 0;
+var tex_timer_t0: int64 = 0;
+var tex_never: int64 = 0;
+var tex_cancel1: int64 = 0;
+var tex_cancel2: int64 = 1;
+var tex_armed: int64 = 0;
+var tex_ready_done: int64 = 0;
+var tex_ready_events: int64 = 0;
+var tex_ready_byte: int64 = 0;
+var tex_ready_removed: int64 = -1;
+var tex_pipe_r: int64 = -1;
+var tex_pipe_w: int64 = -1;
+
+fn expect(ok: bool, what: string) {
+  if (!ok) {
+    println("FAIL {what}");
+    alph_atomic_add(&tex_failures, 1);
+  }
+}
+
+// Globals shared with workers are only touched with alph_atomic_ functions:
+// a plain store to a global in a function can be flushed late from a register
+// and wipe out concurrent atomic updates.
+
+// Waits up to 3 s for *flag to become non-zero.
+fn tex_wait_flag(flag: int64*) -> bool {
+  var give_up: int64 = alph_now_ns() + (int64)3000 * TEX_MS;
+  while (alph_atomic_load(flag) == 0 && alph_now_ns() < give_up) {
+    thread_sleep_ms(1);
+  }
+  return alph_atomic_load(flag) != 0;
+}
+
+fn tex_start(threads: int64) {
+  var cfg: AlphExecConfig;
+  alph_exec_config(&cfg);
+  cfg.threads = threads;
+  expect(alph_exec_start(&tex_ex, &cfg), "executor starts");
+}
+
+fn tex_inc(tc: AlphTaskCtx*, a: int64) -> int64 {
+  alph_atomic_add(&tex_count, 1);
+  return 0;
+}
+
+// 1: many tasks from the main thread into one group.
+fn tex_many() {
+  var g: AlphGroup;
+  alph_group_init(&g);
+  alph_atomic_store(&tex_count, 0);
+  var ok: int64 = 0;
+  for i: int64 in 0..100000 {
+    if (alph_exec_spawn_in(&tex_ex, &g, i, &tex_inc)) {
+      ok = ok + 1;
+    }
+  }
+  expect(ok == 100000, "100000 spawns accepted");
+  alph_group_wait(&g);
+  expect(alph_atomic_load(&tex_count) == 100000, "100000 tasks ran exactly once each");
+  expect(alph_group_pending(&g) == 0, "group has nothing pending");
+}
+
+// 2: recursive parallel sum with local groups and alph_task_help.
+fn tex_sum(tc: AlphTaskCtx*, a: int64) -> int64 {
+  var r: TexRange* = (TexRange*)a;
+  if (r->hi - r->lo <= 2000) {
+    var s: int64 = 0;
+    for i: int64 in r->lo..r->hi {
+      s = s + i;
+    }
+    r->out = s;
+    return 0;
+  }
+  var mid: int64 = r->lo + (r->hi - r->lo) / 2;
+  var left: TexRange;
+  var right: TexRange;
+  left.lo = r->lo;
+  left.hi = mid;
+  left.out = 0;
+  right.lo = mid;
+  right.hi = r->hi;
+  right.out = 0;
+  var g: AlphGroup;
+  alph_group_init(&g);
+  expect(alph_task_spawn_in(tc, &g, (int64)&left, &tex_sum), "left subtask spawned");
+  expect(alph_task_spawn_in(tc, &g, (int64)&right, &tex_sum), "right subtask spawned");
+  alph_task_help(tc, &g);
+  r->out = left.out + right.out;
+  return 0;
+}
+
+fn tex_forkjoin() {
+  var root: TexRange;
+  root.lo = 0;
+  root.hi = 1000000;
+  root.out = 0;
+  var g: AlphGroup;
+  alph_group_init(&g);
+  expect(alph_exec_spawn_in(&tex_ex, &g, (int64)&root, &tex_sum), "root spawned");
+  alph_group_wait(&g);
+  expect(root.out == (int64)499999500000, "fork-join sum of 0..1000000 is 499999500000");
+}
+
+// 3: work spreads over workers.
+fn tex_spin(tc: AlphTaskCtx*, a: int64) -> int64 {
+  var until: int64 = alph_now_ns() + 200000;
+  while (alph_now_ns() < until) {
+    alph_cpu_relax();
+  }
+  alph_atomic_add(&tex_per[tc->worker], 1);
+  return 0;
+}
+
+fn tex_spread() {
+  var g: AlphGroup;
+  alph_group_init(&g);
+  for i: int64 in 0..TEX_WORKERS {
+    alph_atomic_store(&tex_per[i], 0);
+  }
+  for i: int64 in 0..400 {
+    alph_exec_spawn_in(&tex_ex, &g, i, &tex_spin);
+  }
+  alph_group_wait(&g);
+  var used: int64 = 0;
+  var total: int64 = 0;
+  for i: int64 in 0..TEX_WORKERS {
+    var n: int64 = alph_atomic_load(&tex_per[i]);
+    total = total + n;
+    if (n > 0) {
+      used = used + 1;
+    }
+  }
+  expect(total == 400, "all spinning tasks ran");
+  expect(used >= 4, "at least 4 workers ran tasks");
+  println("workers used: {used} of {TEX_WORKERS}");
+}
+
+// 4: wait_idle after plain spawns.
+fn tex_idle_wait() {
+  alph_atomic_store(&tex_count, 0);
+  for i: int64 in 0..5000 {
+    alph_exec_spawn(&tex_ex, i, &tex_inc);
+  }
+  alph_exec_wait_idle(&tex_ex);
+  expect(alph_atomic_load(&tex_count) == 5000, "wait_idle returns after 5000 plain tasks finished");
+}
+
+// 5: task timers.
+fn tex_timer_run(tc: AlphTaskCtx*, a: int64) -> int64 {
+  alph_atomic_store(&tex_timer_at, alph_now_ns());
+  alph_atomic_add(&tex_timer_fired, 1);
+  return 0;
+}
+
+fn tex_never_run(tc: AlphTaskCtx*, a: int64) -> int64 {
+  alph_atomic_add(&tex_never, 1);
+  return 0;
+}
+
+fn tex_arm_timers(tc: AlphTaskCtx*, a: int64) -> int64 {
+  alph_atomic_store(&tex_timer_t0, alph_now_ns());
+  var id: int64 = alph_task_after(tc, 2 * TEX_MS, 0, &tex_timer_run);
+  var dead: int64 = alph_task_after(tc, 4 * TEX_MS, 0, &tex_never_run);
+  expect(id > 0 && dead > 0, "timers started");
+  if (alph_task_cancel(tc, dead)) {
+    alph_atomic_store(&tex_cancel1, 1);
+  }
+  if (alph_task_cancel(tc, dead)) {
+    alph_atomic_store(&tex_cancel2, 1);
+  } else {
+    alph_atomic_store(&tex_cancel2, 0);
+  }
+  return 0;
+}
+
+fn tex_timers() {
+  var g: AlphGroup;
+  alph_group_init(&g);
+  expect(alph_exec_spawn_in(&tex_ex, &g, 0, &tex_arm_timers), "timer task spawned");
+  alph_group_wait(&g);
+  expect(tex_wait_flag(&tex_timer_fired), "the 2 ms timer fired");
+  thread_sleep_ms(30);
+  expect(alph_atomic_load(&tex_timer_fired) == 1, "the timer ran exactly once");
+  expect(alph_atomic_load(&tex_timer_at) - alph_atomic_load(&tex_timer_t0) >= 2 * TEX_MS, "the timer did not run early");
+  expect(alph_atomic_load(&tex_cancel1) == 1, "cancelling a pending timer returns true");
+  expect(alph_atomic_load(&tex_cancel2) == 0, "cancelling it again returns false");
+  expect(alph_atomic_load(&tex_never) == 0, "a cancelled timer never ran");
+}
+
+// 6: alph_task_on_ready on a pipe.
+fn tex_on_read(tc: AlphTaskCtx*, a: int64) -> int64 {
+  alph_atomic_store(&tex_ready_events, tc->events);
+  var b: uint8[8];
+  var n: int64 = alph_sys_read(tex_pipe_r, (rawptr)&b[0], 8);
+  if (n == 1) {
+    alph_atomic_store(&tex_ready_byte, (int64)b[0]);
+  }
+  alph_atomic_store(&tex_ready_removed, alph_rx_remove(alph_task_reactor(tc), tex_pipe_r));
+  alph_atomic_store(&tex_ready_done, 1);
+  return 0;
+}
+
+fn tex_arm_pipe(tc: AlphTaskCtx*, a: int64) -> int64 {
+  var r: int64 = alph_task_on_ready(tc, tex_pipe_r, ALPH_RX_READ, 0, &tex_on_read);
+  expect(r == 0, "on_ready arms the pipe");
+  alph_atomic_store(&tex_armed, 1);
+  return 0;
+}
+
+fn tex_ready() {
+  var fds: int32[2];
+  expect(syscall(ALPH_SYS_PIPE2, (int64)&fds[0], ALPH_O_NONBLOCK | ALPH_O_CLOEXEC) == 0, "pipe created");
+  tex_pipe_r = (int64)fds[0];
+  tex_pipe_w = (int64)fds[1];
+  expect(alph_exec_spawn(&tex_ex, 0, &tex_arm_pipe), "arming task spawned");
+  expect(tex_wait_flag(&tex_armed), "pipe armed");
+  thread_sleep_ms(5);
+  expect(alph_atomic_load(&tex_ready_done) == 0, "continuation waits for data");
+  var b: uint8[1];
+  b[0] = (uint8)90;
+  expect(alph_sys_write(tex_pipe_w, (rawptr)&b[0], 1) == 1, "pipe write");
+  expect(tex_wait_flag(&tex_ready_done), "continuation ran after the write");
+  expect((alph_atomic_load(&tex_ready_events) & ALPH_RX_READ) != 0, "continuation saw ALPH_RX_READ");
+  expect(alph_atomic_load(&tex_ready_byte) == 90, "continuation read the byte");
+  expect(alph_atomic_load(&tex_ready_removed) == 0, "fd removed from the worker's reactor");
+  alph_sys_close(tex_pipe_r);
+  alph_sys_close(tex_pipe_w);
+}
+
+// 7: spawning from several outside threads at once.
+var tex_group: AlphGroup;
+
+fn tex_spawner(arg: cstring) -> uint32 {
+  for i: int64 in 0..20000 {
+    alph_exec_spawn_in(&tex_ex, &tex_group, i, &tex_inc);
+  }
+  return 0;
+}
+
+fn tex_threads() {
+  var handles: int64[4];
+  alph_group_init(&tex_group);
+  alph_atomic_store(&tex_count, 0);
+  for i: int64 in 0..4 {
+    handles[i] = CreateThread(0, 0, &tex_spawner, 0, 0, 0);
+  }
+  for i: int64 in 0..4 {
+    thread_join_infinite(handles[i]);
+    thread_close(handles[i]);
+  }
+  alph_group_wait(&tex_group);
+  expect(alph_atomic_load(&tex_count) == 80000, "4 threads x 20000 tasks all ran");
+  expect(alph_group_pending(&tex_group) == 0, "group drained");
+}
+
+// 8: idle workers sleep. Process CPU (user + system) in microseconds.
+fn tex_cpu_us() -> int64 {
+  var ru: int64[18];
+  for i: int64 in 0..18 {
+    ru[i] = 0;
+  }
+  syscall(98, 0, (int64)&ru[0]);
+  return ru[0] * 1000000 + ru[1] + ru[2] * 1000000 + ru[3];
+}
+
+fn tex_cpu() {
+  alph_exec_wait_idle(&tex_ex);
+  thread_sleep_ms(50);  // let spinners fall asleep
+  var c0: int64 = tex_cpu_us();
+  thread_sleep_ms(200);
+  var used: int64 = tex_cpu_us() - c0;
+  println("idle CPU over 200 ms: {used} us");
+  expect(used < 20000, "idle workers use under 20 ms of CPU in 200 ms");
+}
+
+// 9: stop, then a second executor.
+fn tex_restart() {
+  alph_exec_stop(&tex_ex);
+  expect(tex_ex.count == 0, "stop joined and released the workers");
+  var cfg: AlphExecConfig;
+  alph_exec_config(&cfg);
+  cfg.threads = 2;
+  expect(alph_exec_start(&tex_ex, &cfg), "second executor starts");
+  var g: AlphGroup;
+  alph_group_init(&g);
+  alph_atomic_store(&tex_count, 0);
+  for i: int64 in 0..1000 {
+    alph_exec_spawn_in(&tex_ex, &g, i, &tex_inc);
+  }
+  alph_group_wait(&g);
+  expect(alph_atomic_load(&tex_count) == 1000, "second executor ran its 1000 tasks");
+  alph_exec_stop(&tex_ex);
+  expect(tex_ex.count == 0, "second executor stopped");
+}
+
+fn main() -> int32 {
+  tex_start(TEX_WORKERS);
+  tex_many();
+  tex_forkjoin();
+  tex_spread();
+  tex_idle_wait();
+  tex_timers();
+  tex_ready();
+  tex_threads();
+  tex_cpu();
+  tex_restart();
+  if (alph_atomic_load(&tex_failures) != 0) {
+    return 1;
+  }
+  println("exec ok");
+  return 0;
+}

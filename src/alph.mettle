@@ -9,6 +9,7 @@
 // too; most programs never call it directly.
 
 import "alph/io/reactor";
+import "alph/sched/exec";
 import "alph/core/mailbox";
 import "alph/core/node";
 import "alph/heal/supervisor";

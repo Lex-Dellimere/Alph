@@ -196,6 +196,17 @@ export fn alph_rx_cancel(r: AlphReactor*, id: int64) -> bool
 Cancels timer id. Returns false when it already fired or was cancelled.
 Thread: its owner.
 
+### `alph_rx_cancel_data`
+
+```mettle
+export fn alph_rx_cancel_data(r: AlphReactor*, id: int64, data: int64*) -> bool
+```
+
+Cancels timer id as alph_rx_cancel, and stores its data in *data, so a
+caller that keeps an allocation in the data can free it. Returns false,
+leaving *data alone, when it already fired or was cancelled.
+Thread: its owner.
+
 ### `alph_rx_timers`
 
 ```mettle
@@ -237,7 +248,274 @@ just look), then fills out with up to cap events: ready fds, timers that
 came due, a wake, signals. Timers fire with the timerfd's nanosecond
 precision, not epoll's milliseconds. Returns how many events, 0 on a
 timeout, or a negative errno (-4 when a signal handler interrupted the
-wait). Thread: its owner.
+wait and there was nothing to report). Thread: its owner.
+
+## alph/sched/exec
+
+A work-stealing task executor, with no actors.
+
+Worker threads run plain tasks: a function and one word, run to the end.
+Each worker keeps its own deque of tasks (Chase-Lev): it pushes and pops
+at one end, and idle workers steal from the other, so a busy worker's
+backlog spreads without a shared queue. Tasks from outside threads go
+through one injection queue. Each worker also owns an alph/io reactor, so
+a task can wait for a socket or a timer without blocking its thread: the
+reactor runs the next task when the fd is ready or the time comes. Idle
+workers spin briefly, then sleep in their reactor; nothing busy-waits.
+
+For compilers, build tools and batch work, groups give fork and join: a
+thread waits for a group with alph_group_wait, and a task that needs its
+subtasks' results helps run tasks until they are done (alph_task_help).
+
+```text
+fn compile(tc: AlphTaskCtx*, unit: int64) -> int64 ... { ...; return 0; }
+var ex: AlphExec;
+var cfg: AlphExecConfig;
+alph_exec_config(&cfg);
+alph_exec_start(&ex, &cfg);
+var g: AlphGroup;
+alph_group_init(&g);
+for u: int64 in 0..units { alph_exec_spawn_in(&ex, &g, u, &compile); }
+alph_group_wait(&g);
+alph_exec_stop(&ex);
+```
+
+Tasks are not isolated like actors: a crash in a task ends the process.
+Use alph/core/node when work must survive its own failures.
+
+### `AlphExecConfig`
+
+```mettle
+export struct AlphExecConfig {
+  threads: int64;
+  spin_us: int64;
+  stack_size: int64;
+}
+```
+
+How to run an executor. Fill it with alph_exec_config, then change what
+you need:
+
+```text
+threads     worker threads; default one per CPU
+spin_us     how long an idle worker looks for work before it sleeps;
+            default 50
+stack_size  bytes of stack per worker; default 1 MiB
+```
+
+### `AlphTaskCtx`
+
+```mettle
+export struct AlphTaskCtx {
+  exec: AlphExec*;
+  worker: int64;
+  events: int64;
+  self: int64;
+}
+```
+
+What a task gets besides its word. Read these fields:
+
+```text
+exec    the executor, for alph_exec_ functions
+worker  the index of the worker running it
+events  for a task started by alph_task_on_ready: what was ready
+        (ALPH_RX_READ, ALPH_RX_WRITE, ...); else 0
+```
+
+The rest is the runtime's own. ctx is valid until the task returns.
+
+### `AlphGroup`
+
+```mettle
+export struct AlphGroup {
+  pending: int64;
+}
+```
+
+A group of tasks to wait for. Start it with alph_group_init; tasks join it
+when spawned with an _in function and leave when they return.
+
+### `AlphExec`
+
+```mettle
+export struct AlphExec {
+  workers: int64;    // AlphWorker array
+  count: int64;
+  spin_ns: int64;
+  stop: int64;
+  sleepers: int64;   // workers asleep now
+  pending: int64;    // tasks queued or running, for alph_exec_wait_idle
+  inj_lock: int64;
+  inj: int64;        // AlphJob ring, grown under inj_lock
+  inj_head: int64;
+  inj_len: int64;
+  inj_cap: int64;
+}
+```
+
+An executor. Declare one, start it with alph_exec_start, and keep it in
+place until alph_exec_stop returns. Its fields are the runtime's own.
+
+### `alph_exec_config`
+
+```mettle
+export fn alph_exec_config(cfg: AlphExecConfig*)
+```
+
+Fills cfg with the defaults listed at AlphExecConfig. Thread: any.
+
+### `alph_exec_start`
+
+```mettle
+export fn alph_exec_start(ex: AlphExec*, cfg: AlphExecConfig*) -> bool
+```
+
+Starts an executor with cfg->threads workers. Returns false when threads,
+reactors or memory cannot be had. Thread: any.
+
+### `alph_exec_spawn`
+
+```mettle
+export fn alph_exec_spawn(ex: AlphExec*, arg: int64,
+                          f: fn(AlphTaskCtx*, int64) -> int64 with alloc, syscall, asm) -> bool
+```
+
+Queues a task from any thread: f(ctx, arg) runs on some worker. Returns
+false when memory runs out. Thread: any.
+
+### `alph_exec_spawn_in`
+
+```mettle
+export fn alph_exec_spawn_in(ex: AlphExec*, g: AlphGroup*, arg: int64,
+                             f: fn(AlphTaskCtx*, int64) -> int64 with alloc, syscall, asm) -> bool
+```
+
+As alph_exec_spawn, and the task joins group g (0 for none) until it
+returns. Thread: any.
+
+### `alph_task_spawn_in`
+
+```mettle
+export fn alph_task_spawn_in(tc: AlphTaskCtx*, g: AlphGroup*, arg: int64,
+                             f: fn(AlphTaskCtx*, int64) -> int64 with alloc, syscall, asm) -> bool
+```
+
+Queues a subtask from inside a task, on this worker's own deque, where it
+runs next unless another worker steals it first (work-first, as Cilk and
+Tokio do). It joins group g (0 for none). Returns false when memory runs
+out. Thread: a task.
+
+### `alph_task_spawn`
+
+```mettle
+export fn alph_task_spawn(tc: AlphTaskCtx*, arg: int64,
+                          f: fn(AlphTaskCtx*, int64) -> int64 with alloc, syscall, asm) -> bool
+```
+
+As alph_task_spawn_in with no group. Thread: a task.
+
+### `alph_group_init`
+
+```mettle
+export fn alph_group_init(g: AlphGroup*)
+```
+
+Starts group g empty. Thread: any.
+
+### `alph_group_pending`
+
+```mettle
+export fn alph_group_pending(g: AlphGroup*) -> int64
+```
+
+Tasks in g not yet finished. Thread: any.
+
+### `alph_group_wait`
+
+```mettle
+export fn alph_group_wait(g: AlphGroup*)
+```
+
+Blocks the calling thread until every task in g has returned. Not for a
+task: a worker blocked here runs nothing; use alph_task_help.
+Thread: any thread that is not a worker.
+
+### `alph_task_help`
+
+```mettle
+export fn alph_task_help(tc: AlphTaskCtx*, g: AlphGroup*)
+```
+
+From inside a task: runs other tasks until every task in g has returned,
+so a task can wait for its subtasks without holding up its worker.
+Thread: a task.
+
+### `alph_exec_wait_idle`
+
+```mettle
+export fn alph_exec_wait_idle(ex: AlphExec*)
+```
+
+Blocks the calling thread until no task is queued or running (tasks
+waiting on fds or timers do not count). Thread: any thread that is not a
+worker.
+
+### `alph_task_on_ready`
+
+```mettle
+export fn alph_task_on_ready(tc: AlphTaskCtx*, fd: int64, events: int64, arg: int64,
+                             f: fn(AlphTaskCtx*, int64) -> int64 with alloc, syscall, asm) -> int64
+```
+
+From inside a task: runs f(ctx, arg) on this worker once fd is ready for
+events (ALPH_RX_READ, ALPH_RX_WRITE), with ctx->events saying what is
+ready. One shot: call again to wait again, but only after the previous
+wait on fd has run (a wait replaced before it runs is lost, with its
+memory). fd must be non-blocking and
+stay with this worker's tasks while it is watched; alph_rx_remove it from
+alph_task_reactor(tc) before closing it. Returns 0, or a negative errno.
+Thread: a task.
+
+### `alph_task_after`
+
+```mettle
+export fn alph_task_after(tc: AlphTaskCtx*, ns: int64, arg: int64,
+                          f: fn(AlphTaskCtx*, int64) -> int64 with alloc, syscall, asm) -> int64
+```
+
+From inside a task: runs f(ctx, arg) on this worker after ns nanoseconds.
+Returns the timer's id for alph_task_cancel, or 0 when memory runs out.
+Thread: a task.
+
+### `alph_task_cancel`
+
+```mettle
+export fn alph_task_cancel(tc: AlphTaskCtx*, id: int64) -> bool
+```
+
+Cancels a timer from alph_task_after, on the worker that started it.
+Returns false when it already ran or was cancelled. Thread: a task on the
+same worker.
+
+### `alph_task_reactor`
+
+```mettle
+export fn alph_task_reactor(tc: AlphTaskCtx*) -> AlphReactor*
+```
+
+This worker's reactor, to add or remove fds directly. Thread: a task.
+
+### `alph_exec_stop`
+
+```mettle
+export fn alph_exec_stop(ex: AlphExec*)
+```
+
+Stops the executor: workers finish the task they are running and exit,
+and this returns once all have. Queued tasks are dropped; call
+alph_exec_wait_idle first to let them run. Thread: any thread that is not
+a worker.
 
 ## alph/core/node
 

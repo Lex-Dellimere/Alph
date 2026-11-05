@@ -16,6 +16,7 @@ cd "$ROOT" || exit 2
 MODULES=(
   src/alph.mettle
   src/io/reactor.mettle
+  src/sched/exec.mettle
   src/core/node.mettle
   src/core/mailbox.mettle
   src/heal/supervisor.mettle
