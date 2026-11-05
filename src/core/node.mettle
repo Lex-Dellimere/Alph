@@ -329,6 +329,8 @@ struct AlphProc {
   ref_ids: AlphVec;       // refs this actor waits on: monitors, requests, timers
   ref_pids: AlphVec;      //   and the actor each one watches, or 0
   ref_timers: AlphVec;    //   and its pending timer (an AlphSignal*), or 0
+  sig_closed: int64;      // the actor exited: senders answer their own late signals
+  drain_lock: int64;      // held while a late signal queue is drained, and at reuse
   deferred: AlphVec;      // exits and downs waiting for earlier messages
   io_handles: AlphVec;    // handles this actor owns, closed when it exits
   names: AlphVec;         // entries of the names registered to this actor
@@ -921,6 +923,49 @@ fn alph_signal_ordered(kind: int64, arg: int64) -> bool {
 
 // Queues a signal for the actor `to`, if it is alive. Returns false when it
 // is not, or memory ran out.
+// Answers a signal sent to an actor that is gone, as if it had been gone
+// when it was sent: a link or a monitor learns ALPH_NOPROC at once, and a
+// handle given to it is closed. s->to is the dead pid.
+fn alph_answer_gone(node: AlphNode*, s: AlphSignal*) {
+  if (s->kind == ALPH_SIG_LINK) {
+    alph_signal_link_exit(node, s->to, s->from, ALPH_NOPROC);
+  } else if (s->kind == ALPH_SIG_MONITOR) {
+    alph_signal_down(node, s->to, s->from, s->ref, ALPH_NOPROC);
+  } else if (s->kind == ALPH_SIG_IO_GIVEN) {
+    alph_io_drop(node, s->ref, s->to);
+  }
+}
+
+// Drains the signal queue of an exited actor's slot, answering each signal
+// as alph_answer_gone does. Called by alph_proc_exit after it closed the
+// queue, and by any sender that finds the queue closed after its push, so a
+// signal that raced the exit is never left unanswered. One drainer at a
+// time, under drain_lock; each one looks again after letting go, so a push
+// that finished while the lock was held is not missed. Stops when the slot
+// has been reused (sig_closed back to 0): its new owner reads the queue then.
+fn alph_drain_late(node: AlphNode*, p: AlphProc*) {
+  while (true) {
+    if (alph_atomic_cas(&p->drain_lock, 0, 1) != 0) {
+      return;  // the holder looks again after letting go
+    }
+    if (alph_atomic_load(&p->sig_closed) == 0) {
+      alph_atomic_store(&p->drain_lock, 0);
+      return;
+    }
+    var sig: int64 = alph_queue_pop(&p->signals);
+    var any: bool = sig != 0;
+    while (sig != 0) {
+      alph_answer_gone(node, (AlphSignal*)sig);
+      free((rawptr)sig);
+      sig = alph_queue_pop(&p->signals);
+    }
+    alph_atomic_store_sc(&p->drain_lock, 0);
+    if (!any) {
+      return;
+    }
+  }
+}
+
 fn alph_signal(node: AlphNode*, kind: int64, from: int64, to: int64, ref: int64,
                arg: int64, tag: int64) -> bool {
   var p: AlphProc* = alph_resolve(node, to);
@@ -942,6 +987,15 @@ fn alph_signal(node: AlphNode*, kind: int64, from: int64, to: int64, ref: int64,
     sig->mark = alph_atomic_load(&p->mailbox.enq);
   }
   alph_queue_push(&p->signals, (rawptr)sig);
+  // The target may have finished its exit between our resolve and our push.
+  // The full fence pairs with the sequentially consistent store of
+  // sig_closed in alph_proc_exit: either it drains after our push, or we
+  // see it closed and drain ourselves.
+  alph_atomic_fence();
+  if (alph_atomic_load(&p->sig_closed) != 0) {
+    alph_drain_late(node, p);
+    return true;
+  }
   alph_wake(node, p);
   return true;
 }
@@ -1187,7 +1241,9 @@ export fn alph_link(ctx: AlphCtx*, pid: int64) {
     alph_signal_link_exit(ctx->node, pid, ctx->self, ALPH_NOPROC);
     return;
   }
-  alph_signal_plain(ctx->node, ALPH_SIG_LINK, ctx->self, pid, 0);
+  if (!alph_signal(ctx->node, ALPH_SIG_LINK, ctx->self, pid, 0, 0, 0)) {
+    alph_signal_link_exit(ctx->node, pid, ctx->self, ALPH_NOPROC);  // it went in between
+  }
 }
 
 // Removes the link with pid, both ways. Does nothing if there is none.
@@ -1211,7 +1267,9 @@ export fn alph_monitor(ctx: AlphCtx*, pid: int64) -> int64 {
   if (alph_resolve(ctx->node, pid) == 0) {
     alph_signal_down(ctx->node, pid, ctx->self, ref, ALPH_NOPROC);
   } else {
-    alph_signal_plain(ctx->node, ALPH_SIG_MONITOR, ctx->self, pid, ref);
+    if (!alph_signal(ctx->node, ALPH_SIG_MONITOR, ctx->self, pid, ref, 0, 0)) {
+      alph_signal_down(ctx->node, pid, ctx->self, ref, ALPH_NOPROC);  // it went in between
+    }
   }
   return ref;
 }
@@ -1542,6 +1600,13 @@ fn alph_spawn_raw(node: AlphNode*, parent: int64, flags: int64, monitor_ref: int
     return 0;
   }
   var p: AlphProc* = alph_slot(node, index);
+  // Reopen the slot's signal queue; a late drainer of the previous owner
+  // finishes first, and none starts after this.
+  while (alph_atomic_cas(&p->drain_lock, 0, 1) != 0) {
+    alph_cpu_relax();
+  }
+  alph_atomic_store(&p->sig_closed, 0);
+  alph_atomic_store_sc(&p->drain_lock, 0);
   if (p->inited == 0) {
     if (!alph_mailbox_init(&p->mailbox, node->mailbox_size)) {
       alph_slot_give(node, index);
@@ -1779,17 +1844,15 @@ fn alph_proc_exit(node: AlphNode*, p: AlphProc*, reason: int64) {
   // A link or monitor that arrived too late is answered as if p had been gone.
   var sig: int64 = alph_queue_pop(&p->signals);
   while (sig != 0) {
-    var s: AlphSignal* = (AlphSignal*)sig;
-    if (s->kind == ALPH_SIG_LINK) {
-      alph_signal_link_exit(node, pid, s->from, ALPH_NOPROC);
-    } else if (s->kind == ALPH_SIG_MONITOR) {
-      alph_signal_down(node, pid, s->from, s->ref, ALPH_NOPROC);
-    } else if (s->kind == ALPH_SIG_IO_GIVEN) {
-      alph_io_drop(node, s->ref, pid);
-    }
+    alph_answer_gone(node, (AlphSignal*)sig);
     free((rawptr)sig);
     sig = alph_queue_pop(&p->signals);
   }
+  // Close the queue: a sender that resolved pid before it was cleared and
+  // pushes from now on answers its own signal (alph_signal). Then drain once
+  // more for the pushes that landed in between.
+  alph_atomic_store_sc(&p->sig_closed, 1);
+  alph_drain_late(node, p);
   alph_names_drop(node, p, pid);
   for i: int64 in 0..p->deferred.len {
     free((rawptr)alph_vec_get(&p->deferred, i));

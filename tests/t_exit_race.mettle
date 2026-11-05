@@ -1,0 +1,355 @@
+// Monitors, links and requests that race the exit of their target. A MONITOR
+// or LINK signal (or a request, which monitors its server) that reaches an
+// actor while it is exiting used to be left unanswered. Now every monitor
+// must get exactly one DOWN, every request exactly one answer (a reply or a
+// DOWN; a TIMEOUT counts as a failure, 2000 ms is far beyond any honest
+// delay), and every link exactly one EXIT for a trapping linker.
+// Rounds of 64 targets, each stopping itself on its first message or after 0
+// to 3 self-sent hops, and 64 trapping watchers, one per target. A watcher
+// does monitor, request and link in an order that varies, and the stop
+// message comes from the spawner at the same moment, from another thread.
+// Watchers report what they saw to a coordinator, which tallies it. The main
+// thread keeps two rounds in flight for about 1.5 s, then checks the totals.
+
+import "std/io";
+import "std/mem";
+import "std/thread";
+import "alph/sys/atomic";
+import "alph/sys/clock";
+import "alph/alph";
+
+const TER_STOP: int64 = ALPH_TAG_USER;
+const TER_REQ: int64 = ALPH_TAG_USER + 1;
+const TER_HOP: int64 = ALPH_TAG_USER + 2;
+const TER_REPLY: int64 = ALPH_TAG_USER + 3;
+const TER_BATCH: int64 = ALPH_TAG_USER + 4;
+const TER_CHECK: int64 = ALPH_TAG_USER + 5;
+const TER_REPORT: int64 = ALPH_TAG_USER + 6;
+const ROUND: int64 = 64;
+const SPAWNERS: int64 = 4;
+const RING: int64 = 4;               // batches of pids kept in ter_pids
+const RUN_MS: int64 = 1500;
+const REQ_TIMEOUT_MS: int64 = 2000;
+const FAST_MS: int64 = 20;           // grace for duplicates once all three answers are in
+const SLOW_MS: int64 = 300;          // give up on a missing monitor or link answer
+
+var g_node: AlphNode;
+var g_failures: int64 = 0;
+var ter_pids: int64[256];            // RING * ROUND target pids
+var ter_seed: int64 = 0;
+var ter_coord: int64 = 0;
+var ter_spawners: int64[4];
+var ter_reports: int64 = 0;          // watchers that reported
+var ter_lost: int64 = 0;             // reports that could not be sent
+var ter_mon_got: int64 = 0;          // monitors that got a DOWN
+var ter_mon_dup: int64 = 0;          // DOWNs beyond the first
+var ter_req_got: int64 = 0;          // requests that got an answer
+var ter_req_dup: int64 = 0;
+var ter_link_got: int64 = 0;         // links that got an EXIT
+var ter_link_dup: int64 = 0;
+var ter_replies: int64 = 0;
+var ter_downs: int64 = 0;
+var ter_timeouts: int64 = 0;
+var ter_bad_reason: int64 = 0;       // an EXIT whose reason is not NORMAL or NOPROC
+var ter_last_bad: int64 = -1;
+var ter_other: int64 = 0;            // a message of an unexpected kind or ref
+
+fn expect(ok: bool, what: string) {
+  if (!ok) {
+    println("FAIL {what}");
+    alph_atomic_add(&g_failures, 1);
+  }
+}
+
+fn ter_next(x: int64) -> int64 {
+  return (x * 1103515245 + 12345) & 2147483647;
+}
+
+// ---- targets -----------------------------------------------------------------
+
+struct TerTarget {
+  x: int64;
+  begun: int64;
+  hops: int64;
+}
+
+fn target(ctx: AlphCtx*, m: AlphMsg*) -> int64 {
+  var t: TerTarget* = (TerTarget*)ctx->state;
+  if (m->tag == ALPH_TAG_INIT) {
+    t->x = ter_next(alph_atomic_add(&ter_seed, 1) * 40503 + 1);
+    return ALPH_CONTINUE;
+  }
+  t->x = ter_next(t->x);
+  if (m->tag == TER_HOP) {
+    if (t->hops > 0) {
+      t->hops = t->hops - 1;
+      alph_send(ctx, ctx->self, TER_HOP, 0);
+      return ALPH_CONTINUE;
+    }
+    return alph_stop(ctx, ALPH_NORMAL);
+  }
+  if (m->tag != TER_STOP && m->tag != TER_REQ) {
+    return ALPH_CONTINUE;
+  }
+  if ((m->flags & ALPH_MSG_FLAG_REQUEST) != 0 && (t->x >> 8) % 2 == 0) {
+    alph_reply(ctx, m, TER_REPLY, 1);
+  }
+  if (t->begun == 0) {
+    t->begun = 1;
+    t->hops = (t->x >> 12) % 4;
+    if (t->hops == 0) {
+      return alph_stop(ctx, ALPH_NORMAL);
+    }
+    t->hops = t->hops - 1;
+    alph_send(ctx, ctx->self, TER_HOP, 0);
+  }
+  return ALPH_CONTINUE;
+}
+
+// ---- watchers ----------------------------------------------------------------
+
+struct TerWatch {
+  target: int64;
+  idx: int64;
+  mon_ref: int64;
+  req_ref: int64;
+  mon: int64;       // DOWNs for the monitor
+  reply: int64;     // replies for the request
+  down: int64;      // DOWNs for the request
+  timeout: int64;   // TIMEOUTs for the request
+  unsent: int64;    // the request was refused
+  link: int64;      // EXITs from the target
+  bad: int64;       // EXITs with another reason
+  other: int64;
+  fast: int64;
+  slow: int64;
+}
+
+struct TerReport {
+  mon: int64;
+  reply: int64;
+  down: int64;
+  timeout: int64;
+  link: int64;
+  bad: int64;
+  other: int64;
+}
+
+fn w_op(ctx: AlphCtx*, w: TerWatch*, which: int64) {
+  if (which == 0) {
+    w->mon_ref = alph_monitor(ctx, w->target);
+  } else if (which == 1) {
+    w->req_ref = alph_request(ctx, w->target, TER_REQ, 0, REQ_TIMEOUT_MS);
+    if (w->req_ref <= 0) {
+      w->unsent = 1;
+    }
+  } else {
+    alph_link(ctx, w->target);
+  }
+}
+
+// Schedules the check that reports and stops: soon once all three answers
+// are in (late duplicates would still show), later when one is missing.
+fn w_progress(ctx: AlphCtx*, w: TerWatch*) {
+  var ans: int64 = w->reply + w->down + w->timeout + w->unsent;
+  if (ans > 0 && w->slow == 0) {
+    w->slow = 1;
+    alph_send_after(ctx, SLOW_MS, ctx->self, TER_CHECK, 0);
+  }
+  if (ans > 0 && w->mon > 0 && w->link > 0 && w->fast == 0) {
+    w->fast = 1;
+    alph_send_after(ctx, FAST_MS, ctx->self, TER_CHECK, 0);
+  }
+}
+
+fn watcher(ctx: AlphCtx*, m: AlphMsg*) -> int64 {
+  var w: TerWatch* = (TerWatch*)ctx->state;
+  if (m->tag == ALPH_TAG_INIT) {
+    alph_trap_exits(ctx, true);
+    if (w->idx % 4 == 1) {
+      alph_send(ctx, w->target, TER_STOP, 0);
+    }
+    var first: int64 = w->idx % 3;
+    var second: int64 = (first + 1 + (w->idx / 3) % 2) % 3;
+    w_op(ctx, w, first);
+    w_op(ctx, w, second);
+    w_op(ctx, w, 3 - first - second);
+    if (w->idx % 4 == 2) {
+      alph_send(ctx, w->target, TER_STOP, 0);
+    }
+    w_progress(ctx, w);
+    return ALPH_CONTINUE;
+  }
+  if (m->tag == ALPH_TAG_DOWN) {
+    if (m->ref == w->mon_ref && m->from == w->target) {
+      w->mon = w->mon + 1;
+    } else if (m->ref == w->req_ref && m->from == w->target) {
+      w->down = w->down + 1;
+    } else {
+      w->other = w->other + 1;
+    }
+  } else if (m->tag == ALPH_TAG_EXIT) {
+    if (m->from == w->target) {
+      w->link = w->link + 1;
+      if (m->arg != ALPH_NORMAL && m->arg != ALPH_NOPROC) {
+        w->bad = w->bad + 1;
+        alph_atomic_store(&ter_last_bad, m->arg);
+      }
+    } else {
+      w->other = w->other + 1;
+    }
+  } else if (m->tag == TER_REPLY && m->ref == w->req_ref) {
+    w->reply = w->reply + 1;
+  } else if (m->tag == ALPH_TAG_TIMEOUT && m->ref == w->req_ref) {
+    w->timeout = w->timeout + 1;
+  } else if (m->tag == TER_CHECK) {
+    var r: TerReport;
+    r.mon = w->mon;
+    r.reply = w->reply;
+    r.down = w->down;
+    r.timeout = w->timeout;
+    r.link = w->link;
+    r.bad = w->bad;
+    r.other = w->other;
+    if (alph_send_value<TerReport>(ctx, alph_atomic_load(&ter_coord), TER_REPORT, &r) != ALPH_SENT) {
+      alph_atomic_add(&ter_lost, 1);
+      alph_atomic_add(&ter_reports, 1);  // keep the main thread from waiting for it
+    }
+    return alph_stop(ctx, ALPH_NORMAL);
+  } else {
+    w->other = w->other + 1;
+  }
+  w_progress(ctx, w);
+  return ALPH_CONTINUE;
+}
+
+// ---- coordinator -------------------------------------------------------------
+
+fn tally(got: int64, total: int64*, dup: int64*) {
+  if (got > 0) {
+    alph_atomic_add(total, 1);
+  }
+  if (got > 1) {
+    alph_atomic_add(dup, got - 1);
+  }
+}
+
+fn coordinator(ctx: AlphCtx*, m: AlphMsg*) -> int64 {
+  if (m->tag != TER_REPORT) {
+    return ALPH_CONTINUE;
+  }
+  var r: TerReport;
+  if (!alph_msg_value<TerReport>(m, &r)) {
+    alph_atomic_add(&ter_other, 1);
+    alph_atomic_add(&ter_reports, 1);
+    return ALPH_CONTINUE;
+  }
+  tally(r.mon, &ter_mon_got, &ter_mon_dup);
+  tally(r.reply + r.down + r.timeout, &ter_req_got, &ter_req_dup);
+  tally(r.link, &ter_link_got, &ter_link_dup);
+  alph_atomic_add(&ter_replies, r.reply);
+  alph_atomic_add(&ter_downs, r.down);
+  alph_atomic_add(&ter_timeouts, r.timeout);
+  alph_atomic_add(&ter_bad_reason, r.bad);
+  alph_atomic_add(&ter_other, r.other);
+  alph_atomic_add(&ter_reports, 1);
+  return ALPH_CONTINUE;
+}
+
+// ---- spawners: parents of the watchers, one per scheduler thread -----------------
+
+// arg = the first index in ter_pids of the targets to watch; ROUND / SPAWNERS
+// of them. Spawns a watcher for each, then sends the target its stop message
+// at once, while the watcher is starting on another thread.
+fn spawner(ctx: AlphCtx*, m: AlphMsg*) -> int64 {
+  if (m->tag != TER_BATCH) {
+    return ALPH_CONTINUE;
+  }
+  for j: int64 in 0..ROUND / SPAWNERS {
+    var w: TerWatch;
+    memset((rawptr)&w, 0, (int64)sizeof(TerWatch));
+    w.target = alph_atomic_load(&ter_pids[m->arg + j]);
+    w.idx = m->arg + j;
+    if (alph_spawn_value<TerWatch>(ctx, 0, &w, &watcher) == 0) {
+      expect(false, "a watcher could be spawned");
+      alph_atomic_add(&ter_reports, 1);
+    }
+    if (w.idx % 4 == 0) {
+      alph_send(ctx, w.target, TER_STOP, 0);
+    }
+  }
+  return ALPH_CONTINUE;
+}
+
+fn wait_reports(want: int64, ms: int64) {
+  for i: int64 in 0..ms {
+    if (alph_atomic_load(&ter_reports) >= want) {
+      break;
+    }
+    thread_sleep_ms(1);
+  }
+}
+
+fn main() -> int32 {
+  var cfg: AlphConfig;
+  alph_config(&cfg);
+  cfg.schedulers = 16;
+  cfg.max_actors = 4096;
+  cfg.mailbox_size = 512;
+  expect(alph_node_start(&g_node, &cfg), "node started");
+  alph_atomic_store(&ter_coord, alph_node_spawn(&g_node, 0, &coordinator));
+  for s: int64 in 0..SPAWNERS {
+    ter_spawners[s] = alph_node_spawn(&g_node, 0, &spawner);
+  }
+  expect(alph_atomic_load(&ter_coord) != 0 && ter_spawners[SPAWNERS - 1] != 0, "helpers spawned");
+
+  var rounds: int64 = 0;
+  var made: int64 = 0;
+  var start: int64 = alph_now_ms();
+  while (alph_now_ms() - start < RUN_MS && alph_atomic_load(&g_failures) == 0) {
+    if (made - alph_atomic_load(&ter_reports) > ROUND) {
+      thread_sleep_ms(1);
+      continue;
+    }
+    var base: int64 = (rounds % RING) * ROUND;
+    for i: int64 in 0..ROUND {
+      var t: TerTarget;
+      memset((rawptr)&t, 0, (int64)sizeof(TerTarget));
+      var pid: int64 = alph_node_spawn_value<TerTarget>(&g_node, 0, &t, &target);
+      expect(pid != 0, "a target could be spawned");
+      alph_atomic_store(&ter_pids[base + i], pid);
+    }
+    for s: int64 in 0..SPAWNERS {
+      var sent: int64 = alph_node_send(&g_node, ter_spawners[s], TER_BATCH, base + s * (ROUND / SPAWNERS));
+      expect(sent == ALPH_SENT, "a batch could be sent");
+    }
+    made = made + ROUND;
+    rounds = rounds + 1;
+  }
+  wait_reports(made, 6000);
+
+  var reports: int64 = alph_atomic_load(&ter_reports);
+  var mon_got: int64 = alph_atomic_load(&ter_mon_got);
+  var req_got: int64 = alph_atomic_load(&ter_req_got);
+  var link_got: int64 = alph_atomic_load(&ter_link_got);
+  expect(reports == made, "every watcher reported");
+  expect(alph_atomic_load(&ter_lost) == 0, "no report was lost");
+  expect(mon_got == made, "every monitor got a DOWN");
+  expect(req_got == made, "every request got an answer");
+  expect(link_got == made, "every link got an EXIT");
+  expect(alph_atomic_load(&ter_mon_dup) == 0, "no monitor got two DOWNs");
+  expect(alph_atomic_load(&ter_req_dup) == 0, "no request got two answers");
+  expect(alph_atomic_load(&ter_link_dup) == 0, "no link got two EXITs");
+  expect(alph_atomic_load(&ter_timeouts) == 0, "no request timed out");
+  expect(alph_atomic_load(&ter_bad_reason) == 0, "every EXIT had reason NORMAL or NOPROC");
+  expect(alph_atomic_load(&ter_other) == 0, "no stray message");
+  expect(rounds > 5, "enough rounds ran");
+  alph_node_halt(&g_node, 0);
+  alph_node_wait(&g_node);
+  if (g_failures != 0) {
+    println("made {made}, reports {reports}, monitors {mon_got} (dup {ter_mon_dup}), requests {req_got} (dup {ter_req_dup}, replies {ter_replies}, downs {ter_downs}, timeouts {ter_timeouts}), links {link_got} (dup {ter_link_dup}), bad reasons {ter_bad_reason} (last {ter_last_bad}), other {ter_other}, lost {ter_lost}");
+    return 1;
+  }
+  println("exit race ok: {rounds} rounds, {mon_got} monitors, {req_got} requests ({ter_replies} replies, {ter_downs} downs), {link_got} links");
+  return 0;
+}
