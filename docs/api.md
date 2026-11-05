@@ -112,6 +112,7 @@ export struct AlphReactor {
   heap: int64;       // slot indexes, ordered by deadline
   heap_len: int64;
   armed: int64;      // the deadline timerfd is set to, or 0 when disarmed
+  pwait2: int64;     // epoll_pwait2: 0 not tried yet, 1 works, -1 missing (the timerfd is used)
 }
 ```
 
@@ -245,8 +246,10 @@ export fn alph_rx_wait(r: AlphReactor*, out: AlphRxEvent*, cap: int64, timeout_n
 
 Waits until something happens or timeout_ns passes (-1: no limit; 0:
 just look), then fills out with up to cap events: ready fds, timers that
-came due, a wake, signals. Timers fire with the timerfd's nanosecond
-precision, not epoll's milliseconds. Returns how many events, 0 on a
+came due, a wake, signals. Timers fire with nanosecond precision, not
+epoll's milliseconds: the wait itself takes the deadline (epoll_pwait2,
+with the calling thread's timer slack set to 1 ns on its first wait), or
+on kernels before 5.11 the timerfd is armed for it. Returns how many events, 0 on a
 timeout, or a negative errno (-4 when a signal handler interrupted the
 wait and there was nothing to report). Thread: its owner.
 
@@ -4147,6 +4150,15 @@ stores up to max of them in events, which must hold 12 bytes per event.
 Returns how many, or a negative errno (-4 when a signal interrupted it).
 Thread: any.
 
+### `alph_sys_epoll_wait_ns`
+
+```mettle
+export fn alph_sys_epoll_wait_ns(ep: int64, events: rawptr, max: int64, timeout_ns: int64) -> int64
+```
+
+epoll_pwait2 (Linux 5.11): as alph_sys_epoll_wait with the timeout in
+nanoseconds (negative: no limit). Returns -38 (ENOSYS) on older kernels.
+
 ### `alph_sys_event_mask`
 
 ```mettle
@@ -4229,6 +4241,9 @@ export const ALPH_SYS_FUTEX: int64 = 202;
 export const ALPH_SYS_SCHED_GETAFFINITY: int64 = 204;
 export const ALPH_SYS_CLOCK_GETTIME: int64 = 228;
 export const ALPH_SYS_EPOLL_WAIT: int64 = 232;
+export const ALPH_SYS_EPOLL_PWAIT2: int64 = 441;
+export const ALPH_SYS_PRCTL: int64 = 157;
+export const ALPH_PR_SET_TIMERSLACK: int64 = 29;
 export const ALPH_SYS_EPOLL_CTL: int64 = 233;
 export const ALPH_SYS_ACCEPT4: int64 = 288;
 export const ALPH_SYS_EVENTFD2: int64 = 290;

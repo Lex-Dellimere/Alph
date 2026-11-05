@@ -64,6 +64,18 @@ export fn alph_sys_epoll_wait(ep: int64, events: rawptr, max: int64, timeout_ms:
   return syscall(ALPH_SYS_EPOLL_WAIT, ep, (int64)events, max, timeout_ms);
 }
 
+// epoll_pwait2 (Linux 5.11): as alph_sys_epoll_wait with the timeout in
+// nanoseconds (negative: no limit). Returns -38 (ENOSYS) on older kernels.
+export fn alph_sys_epoll_wait_ns(ep: int64, events: rawptr, max: int64, timeout_ns: int64) -> int64 {
+  if (timeout_ns < 0) {
+    return syscall(ALPH_SYS_EPOLL_PWAIT2, ep, (int64)events, max, 0, 0, 8);
+  }
+  var ts: int64[2];
+  ts[0] = timeout_ns / 1000000000;
+  ts[1] = timeout_ns % 1000000000;
+  return syscall(ALPH_SYS_EPOLL_PWAIT2, ep, (int64)events, max, (int64)&ts[0], 0, 8);
+}
+
 // The events mask of event i in an array filled by alph_sys_epoll_wait.
 export fn alph_sys_event_mask(events: rawptr, i: int64) -> int64 {
   var at: uint32* = (uint32*)((int64)events + i * 12);

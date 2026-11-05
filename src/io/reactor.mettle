@@ -93,6 +93,7 @@ export struct AlphReactor {
   heap: int64;       // slot indexes, ordered by deadline
   heap_len: int64;
   armed: int64;      // the deadline timerfd is set to, or 0 when disarmed
+  pwait2: int64;     // epoll_pwait2: 0 not tried yet, 1 works, -1 missing (the timerfd is used)
 }
 
 fn alph_rx_slot(r: AlphReactor*, i: int64) -> AlphRxTimer* {
@@ -409,8 +410,10 @@ fn alph_rx_fire(r: AlphReactor*, out: AlphRxEvent*, n: int64, cap: int64) -> int
 
 // Waits until something happens or timeout_ns passes (-1: no limit; 0:
 // just look), then fills out with up to cap events: ready fds, timers that
-// came due, a wake, signals. Timers fire with the timerfd's nanosecond
-// precision, not epoll's milliseconds. Returns how many events, 0 on a
+// came due, a wake, signals. Timers fire with nanosecond precision, not
+// epoll's milliseconds: the wait itself takes the deadline (epoll_pwait2,
+// with the calling thread's timer slack set to 1 ns on its first wait), or
+// on kernels before 5.11 the timerfd is armed for it. Returns how many events, 0 on a
 // timeout, or a negative errno (-4 when a signal handler interrupted the
 // wait and there was nothing to report). Thread: its owner.
 export fn alph_rx_wait(r: AlphReactor*, out: AlphRxEvent*, cap: int64, timeout_ns: int64) -> int64 {
@@ -427,16 +430,6 @@ export fn alph_rx_wait(r: AlphReactor*, out: AlphRxEvent*, cap: int64, timeout_n
   if (r->heap_len > 0) {
     deadline = alph_rx_slot(r, alph_rx_heap_at(r, 0))->deadline;
   }
-  var wait_ms: int64 = -1;
-  if (timeout == 0) {
-    wait_ms = 0;
-  } else if (timeout > 0) {
-    var until: int64 = alph_now_ns() + timeout;
-    if (deadline == 0 || until < deadline) {
-      deadline = until;
-    }
-  }
-  alph_rx_arm_timerfd(r, deadline);
   var room: int64 = cap - n;
   if (room == 0) {
     return n;  // out is full of due timers; epoll_wait refuses a room of 0
@@ -444,7 +437,49 @@ export fn alph_rx_wait(r: AlphReactor*, out: AlphRxEvent*, cap: int64, timeout_n
   if (room > ALPH_RX_BATCH) {
     room = ALPH_RX_BATCH;
   }
-  var got: int64 = alph_sys_epoll_wait(r->epfd, (rawptr)r->buf, room, wait_ms);
+  if (r->pwait2 == 0) {
+    // A sleeping hrtimer is late by the thread's timer slack, 50 us by
+    // default; the timerfd never was.
+    syscall(ALPH_SYS_PRCTL, ALPH_PR_SET_TIMERSLACK, 1, 0, 0, 0);
+    r->pwait2 = 1;
+  }
+  var got: int64 = -38;
+  if (r->pwait2 > 0) {
+    // The deadline goes into the wait: no timerfd to set and reset.
+    var wait_ns: int64 = -1;
+    if (timeout == 0) {
+      wait_ns = 0;
+    } else if (timeout > 0 || deadline != 0) {
+      var now: int64 = alph_now_ns();
+      if (timeout > 0 && (deadline == 0 || now + timeout < deadline)) {
+        deadline = now + timeout;
+      }
+      wait_ns = deadline - now;
+      if (wait_ns < 0) {
+        wait_ns = 0;
+      }
+    }
+    if (r->armed != 0) {
+      alph_rx_arm_timerfd(r, 0);
+    }
+    got = alph_sys_epoll_wait_ns(r->epfd, (rawptr)r->buf, room, wait_ns);
+    if (got == -38) {
+      r->pwait2 = -1;
+    }
+  }
+  if (got == -38 && r->pwait2 < 0) {
+    var wait_ms: int64 = -1;
+    if (timeout == 0) {
+      wait_ms = 0;
+    } else if (timeout > 0) {
+      var until: int64 = alph_now_ns() + timeout;
+      if (deadline == 0 || until < deadline) {
+        deadline = until;
+      }
+    }
+    alph_rx_arm_timerfd(r, deadline);
+    got = alph_sys_epoll_wait(r->epfd, (rawptr)r->buf, room, wait_ms);
+  }
   if (got < 0) {
     // Timers already taken from the heap are in out: report them rather
     // than lose them to an interrupted wait.
