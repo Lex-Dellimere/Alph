@@ -4287,6 +4287,18 @@ export fn alph_config(cfg: AlphConfig*) {
   cfg->crash_reports = 0;
 }
 
+// Maps size bytes of zeroed memory straight from the kernel, which commits a
+// page only when it is first touched: a node sized for a million actors
+// costs memory for the slots it uses, not for all of them. Returns 0 on
+// failure. The tables it backs live as long as the process.
+fn alph_map_zeroed(size: int64) -> int64 {
+  var got: int64 = syscall(ALPH_SYS_MMAP, 0, size, ALPH_PROT_READ_WRITE, ALPH_MAP_PRIVATE_ANONYMOUS, -1, 0);
+  if (got < 0) {
+    return 0;
+  }
+  return got;
+}
+
 // Starts a node: its schedulers begin running and actors can be spawned.
 //
 //   node  storage for the node; keep it in place until alph_node_wait returns
@@ -4313,7 +4325,7 @@ export fn alph_node_start(node: AlphNode*, cfg: AlphConfig*) -> bool {
   if (node->max_spinners < 1) {
     node->max_spinners = 1;
   }
-  node->procs = (int64)calloc(node->capacity, (int64)sizeof(AlphProc));
+  node->procs = alph_map_zeroed(node->capacity * (int64)sizeof(AlphProc));
   node->free_stack = (int64)malloc(node->capacity * 8);
   node->scheds = (int64)calloc(cfg->schedulers, (int64)sizeof(AlphSched));
   if (node->procs == 0 || node->free_stack == 0 || node->scheds == 0) {
@@ -4325,7 +4337,7 @@ export fn alph_node_start(node: AlphNode*, cfg: AlphConfig*) -> bool {
   }
   node->free_top = node->capacity;
   node->io_capacity = cfg->max_handles;
-  node->ios = (int64)calloc(node->io_capacity, (int64)sizeof(AlphIoSlot));
+  node->ios = alph_map_zeroed(node->io_capacity * (int64)sizeof(AlphIoSlot));
   node->io_free_stack = (int64)malloc(node->io_capacity * 8);
   if (node->ios == 0 || node->io_free_stack == 0) {
     return false;
