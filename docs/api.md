@@ -740,6 +740,8 @@ export struct AlphStats {
   timers_heaped: int64;
   timers_handed: int64;
   isolate_no_spare: int64;
+  bound_waits: int64;
+  bound_wait_max_ns: int64;
 }
 ```
 
@@ -775,6 +777,9 @@ isolate_no_spare  CPU-bound actors that would have been isolated (cut
          short twice with others waiting) but found every scheduler
          awake and active: they stay and yield. The node wants more
          capacity than it has
+bound_waits  bound actors that found no spare scheduler while one was
+         on its way, and waited for it before opening another
+bound_wait_max_ns  the longest of those waits
 timers_handed  times a scheduler handed its pending timers to
          scheduler 0, as compaction left it idle or its bound actor
          exited: they fire there, on time, and it sleeps
@@ -811,6 +816,8 @@ export struct AlphNode {
   bound_warm: int64;    // spares with a parked thread
   bound_ending: int64;  // trimmed spares whose thread has not reached the cold list yet
   bound_parking: int64; // bound schedulers whose actor exited and that have not parked yet
+  bound_waits: int64;   // bound spawns that waited for a spare on its way (stats)
+  bound_wait_max: int64; //   the longest such wait (ns)
   bound_peak: int64;    // the most bound actors lately live at once, decaying
   bound_peak_at: int64; //   when it last halved
   lane_pool: int64;     // lane blocks no scheduler keeps, chained by their first word (never freed)

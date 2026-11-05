@@ -161,8 +161,11 @@ const ALPH_BOUND_DECAY_NS: int64 = 500000000;
 // rather than open a new scheduler: measured 1-2 us on average (71 us at
 // worst, in 20K racing spawns), against 28-34 us for a thread start and two
 // descriptors. A handler on a shared scheduler waits at most
-// ALPH_BOUND_WAIT_HANDLER_NS, about one thread start, as every actor queued
-// there waits with it.
+// ALPH_BOUND_WAIT_HANDLER_NS, as every actor queued there waits with it: the
+// cost of the alternative, one thread start, so by the ski-rental rule
+// waiting never costs more than twice the best choice made in hindsight.
+// Measured here, not calibrated at start; recalibrate it if thread starts
+// get much dearer or cheaper.
 const ALPH_BOUND_WAIT_NS: int64 = 2000000;
 const ALPH_BOUND_WAIT_HANDLER_NS: int64 = 30000;
 // An actor's run also ends once it has taken this long (checked every 4
@@ -305,6 +308,9 @@ export struct AlphConfig {
 //            short twice with others waiting) but found every scheduler
 //            awake and active: they stay and yield. The node wants more
 //            capacity than it has
+//   bound_waits  bound actors that found no spare scheduler while one was
+//            on its way, and waited for it before opening another
+//   bound_wait_max_ns  the longest of those waits
 //   timers_handed  times a scheduler handed its pending timers to
 //            scheduler 0, as compaction left it idle or its bound actor
 //            exited: they fire there, on time, and it sleeps
@@ -327,6 +333,8 @@ export struct AlphStats {
   timers_heaped: int64;
   timers_handed: int64;
   isolate_no_spare: int64;
+  bound_waits: int64;
+  bound_wait_max_ns: int64;
 }
 
 // A node. Declare one, start it with alph_node_start, and keep it in place
@@ -359,6 +367,8 @@ export struct AlphNode {
   bound_warm: int64;    // spares with a parked thread
   bound_ending: int64;  // trimmed spares whose thread has not reached the cold list yet
   bound_parking: int64; // bound schedulers whose actor exited and that have not parked yet
+  bound_waits: int64;   // bound spawns that waited for a spare on its way (stats)
+  bound_wait_max: int64; //   the longest such wait (ns)
   bound_peak: int64;    // the most bound actors lately live at once, decaying
   bound_peak_at: int64; //   when it last halved
   lane_pool: int64;     // lane blocks no scheduler keeps, chained by their first word (never freed)
@@ -5546,6 +5556,8 @@ fn alph_sched_bound(node: AlphNode*) -> AlphSched* {
   var s: AlphSched* = (AlphSched*)0;
   var cold: bool = false;
   var until: int64 = 0;
+  var from: int64 = 0;
+  var handler: bool = false;
   while (true) {
     alph_spin_lock(&node->bound_lock);
     if (node->bound_spare != 0) {
@@ -5563,23 +5575,43 @@ fn alph_sched_bound(node: AlphNode*) -> AlphSched* {
       alph_bound_count(node, 1);
     }
     var coming: int64 = node->bound_ending + alph_atomic_load(&node->bound_parking);
+    var stop: bool = s != 0 || coming <= 0 || alph_atomic_load(&node->halted) != 0;
+    var now: int64 = 0;
+    if (!stop && until != 0) {
+      now = alph_now_ns();
+      stop = now >= until;
+    }
+    if (stop && from != 0) {
+      var waited: int64 = alph_now_ns() - from;
+      node->bound_waits = node->bound_waits + 1;
+      if (waited > node->bound_wait_max) {
+        node->bound_wait_max = waited;
+      }
+    }
     alph_spin_unlock(&node->bound_lock);
-    if (s != 0 || coming <= 0 || alph_atomic_load(&node->halted) != 0) {
+    if (stop) {
       break;
     }
     // A spare is on its way: wait for it, a while, before opening another.
-    var now: int64 = alph_now_ns();
     if (until == 0) {
+      now = alph_now_ns();
+      from = now;
       var budget: int64 = ALPH_BOUND_WAIT_NS;
       var here: AlphRecover* = alph_recover_current();
       if (here != 0 && here->owner != 0 && ((AlphSched*)here->owner)->bound == 0) {
         budget = ALPH_BOUND_WAIT_HANDLER_NS;  // a handler on a shared scheduler
+        handler = true;
       }
       until = now + budget;
-    } else if (now >= until) {
-      break;
     }
-    syscall(ALPH_SYS_SCHED_YIELD);
+    if (handler) {
+      // Spin: a yield could hand the CPU away for far longer than the budget.
+      for i: int64 in 0..64 {
+        alph_cpu_relax();
+      }
+    } else {
+      syscall(ALPH_SYS_SCHED_YIELD);
+    }
   }
   if (s != 0 && !cold) {
     // Its thread reset everything before it parked: wake it for the actor.
@@ -5651,6 +5683,11 @@ fn alph_bound_parked(node: AlphNode*, s: AlphSched*) {
     alph_atomic_add(&node->bound_parking, -1);
   }
 }
+
+// For tests: a bound scheduler whose actor exited takes this long (ns) more
+// to park, so a bound actor spawned meanwhile finds its spare on its way and
+// must wait for it, or not, by the rules of alph_sched_bound. 0 in use.
+export var alph_test_park_delay_ns: int64 = 0;
 
 // Counts a bound actor starting (1) or ending (-1), and keeps the peak.
 // Thread: any, holding bound_lock.
@@ -5724,6 +5761,11 @@ fn alph_bound_park(s: AlphSched*, node: AlphNode*) -> bool {
   alph_atomic_store(&s->exiting, 0);
   alph_rx_reset(&s->rx);
   alph_atomic_store_sc(&s->quiet, alph_quiet_parked());
+  var delay: int64 = alph_atomic_load(&alph_test_park_delay_ns);
+  if (delay > 0) {
+    var none: int64 = 0;
+    alph_futex_wait(&none, 0, delay);
+  }
   alph_spin_lock(&node->bound_lock);
   alph_bound_unlink(&node->bound_list, s);
   alph_bound_count(node, -1);
@@ -6504,6 +6546,8 @@ export fn alph_node_stats(node: AlphNode*, stats: AlphStats*) {
   stats->moves_held = 0;
   stats->timers_heaped = 0;
   stats->isolate_no_spare = 0;
+  stats->bound_waits = alph_atomic_load(&node->bound_waits);
+  stats->bound_wait_max_ns = alph_atomic_load(&node->bound_wait_max);
   for i: int64 in 0..node->sched_count {
     var ps: AlphSched* = alph_sched_at(node, i);
     stats->rehomed = stats->rehomed + ps->moves[ALPH_PLACE_REHOME];

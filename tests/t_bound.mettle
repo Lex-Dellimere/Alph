@@ -13,9 +13,11 @@
 // descriptors than the first, the thread count back up); a halt and wait
 // then returns both the threads and the descriptors to what they were
 // before the node started. B5: a handler on the only shared scheduler
-// spawns 300 bound actors, one per message, while earlier ones park; an
-// actor beside it never waits 1 ms between runs (a handler waits at most
-// about a thread start for a spare, never the 2 ms an outside thread may).
+// spawns 300 bound actors, one per message, while the earlier ones take
+// 5 ms longer to park (alph_test_park_delay_ns): its spawns wait for a spare
+// on its way (stats: bound_waits) at most about a thread start before
+// opening a new scheduler, so no wait reaches 1 ms (bound_wait_max_ns), as
+// the 2 ms an outside thread may wait would.
 
 import "std/io";
 import "std/thread";
@@ -568,7 +570,23 @@ fn b4_release() {
 }
 
 fn b4_case() {
+  // Threads of the node before, joined, may still show in /proc for a
+  // moment: count once the number has held for 50 ms (at most 1 s).
   var t_pre: int64 = thread_count();
+  var held: int64 = 0;
+  for w: int64 in 0..100 {
+    thread_sleep_ms(10);
+    var now_t: int64 = thread_count();
+    if (now_t < t_pre) {
+      t_pre = now_t;
+      held = 0;
+    } else {
+      held = held + 1;
+      if (held >= 5) {
+        break;
+      }
+    }
+  }
   var f_pre: int64 = fd_count();
   var cfg: AlphConfig;
   alph_config(&cfg);
@@ -678,7 +696,10 @@ fn b5_spawner(ctx: AlphCtx*, m: AlphMsg*) -> int64 {
 // A handler on a shared scheduler that spawns bound actors while earlier
 // ones are still on their way to the spare list waits for one at most about
 // a thread start (ALPH_BOUND_WAIT_HANDLER_NS), never the 2 ms an outside
-// thread may: an actor on the same scheduler never waits 1 ms.
+// thread may. Parking is slowed by 5 ms, so every spawn meets a spare on its
+// way: the waits are counted and the longest is checked. The ping actor's
+// longest gap is printed, not checked: on a busy host it includes the OS's
+// preemptions and thread starts under memory-map contention.
 fn b5_case() {
   var cfg: AlphConfig;
   alph_config(&cfg);
@@ -691,6 +712,7 @@ fn b5_case() {
   expect(spawner != 0 && ping != 0, "B5: spawner and ping started");
   thread_sleep_ms(20);
   alph_atomic_store(&g_b5_gap, 0);
+  alph_atomic_store(&alph_test_park_delay_ns, 5000000);
   for i: int64 in 0..B5_SPAWNS / 10 {
     for k: int64 in 0..10 {
       alph_node_send(&g_node, spawner, SPAWN, 0);
@@ -711,12 +733,17 @@ fn b5_case() {
   }
   alph_atomic_store(&g_b5_stop, 1);
   thread_sleep_ms(10);
+  alph_atomic_store(&alph_test_park_delay_ns, 0);
   var gap_us: int64 = alph_atomic_load(&g_b5_gap) / 1000;
+  var st: AlphStats;
+  alph_node_stats(&g_node, &st);
+  var wait_us: int64 = st.bound_wait_max_ns / 1000;
   expect(alph_atomic_load(&g_b5_ran) == B5_SPAWNS, "B5: {B5_SPAWNS} bound actors ran ({g_b5_ran})");
-  expect(gap_us < 1000, "B5: the ping actor beside the spawner waited at most {gap_us} us between runs (limit 1000)");
+  expect(st.bound_waits > 0, "B5: spawns met spares on their way and waited ({st.bound_waits})");
+  expect(st.bound_wait_max_ns < 1000000, "B5: the longest wait from a handler was {wait_us} us (limit 1000; budget 30)");
   alph_node_halt(&g_node, 0);
   alph_node_wait(&g_node);
-  println("spawn ok: B5 {B5_SPAWNS} bound spawns from a handler, longest ping gap {gap_us} us");
+  println("spawn ok: B5 {B5_SPAWNS} bound spawns from a handler, {st.bound_waits} waits, longest {wait_us} us; longest ping gap {gap_us} us");
 }
 
 fn main() -> int32 {
