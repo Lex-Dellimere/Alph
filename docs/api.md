@@ -1674,6 +1674,27 @@ export fn alph_tcp_port(ctx: AlphCtx*, h: int64) -> int64
 The local port of a socket handle: the port a listener opened with port
 0 got. Returns a negative errno on failure. Thread: a handler.
 
+### `alph_tcp_peer`
+
+```mettle
+export fn alph_tcp_peer(ctx: AlphCtx*, h: int64, ip4: int64*, port: int64*) -> int64
+```
+
+The address of the other end of a connected TCP handle: *ip4 in host
+order (alph_ip4(127, 0, 0, 1) for loopback) and *port. For logs and
+access rules. Returns 0, or a negative errno: -107 (ENOTCONN) when it is
+not connected, -9 when this actor does not own h. Thread: a handler.
+
+### `alph_tcp_local`
+
+```mettle
+export fn alph_tcp_local(ctx: AlphCtx*, h: int64, ip4: int64*, port: int64*) -> int64
+```
+
+The local address of a TCP handle, as alph_tcp_peer: the address and port
+a connection arrived on, or a listener listens on. Returns 0 or a
+negative errno. Thread: a handler.
+
 ### `alph_tcp_nodelay`
 
 ```mettle

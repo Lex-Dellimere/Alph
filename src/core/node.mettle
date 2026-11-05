@@ -2931,6 +2931,43 @@ export fn alph_tcp_port(ctx: AlphCtx*, h: int64) -> int64 {
   return ((int64)addr[2] << 8) | (int64)addr[3];
 }
 
+// Reads a socket's address with getsockname (peer false) or getpeername
+// (peer true) into *ip4 (host order, as alph_ip4 builds) and *port.
+fn alph_tcp_addr(ctx: AlphCtx*, h: int64, peer: bool, ip4: int64*, port: int64*) -> int64 {
+  var slot: AlphIoSlot* = alph_io_mine(ctx, h);
+  if (slot == 0) {
+    return -9;
+  }
+  var addr: uint8[16];
+  var len: int32 = 16;
+  var call: int64 = ALPH_SYS_GETSOCKNAME;
+  if (peer) {
+    call = 52;  // getpeername
+  }
+  var err: int64 = syscall(call, slot->fd, (int64)&addr[0], (int64)&len);
+  if (err != 0) {
+    return err;
+  }
+  *ip4 = alph_ip4((int64)addr[4], (int64)addr[5], (int64)addr[6], (int64)addr[7]);
+  *port = ((int64)addr[2] << 8) | (int64)addr[3];
+  return 0;
+}
+
+// The address of the other end of a connected TCP handle: *ip4 in host
+// order (alph_ip4(127, 0, 0, 1) for loopback) and *port. For logs and
+// access rules. Returns 0, or a negative errno: -107 (ENOTCONN) when it is
+// not connected, -9 when this actor does not own h. Thread: a handler.
+export fn alph_tcp_peer(ctx: AlphCtx*, h: int64, ip4: int64*, port: int64*) -> int64 {
+  return alph_tcp_addr(ctx, h, true, ip4, port);
+}
+
+// The local address of a TCP handle, as alph_tcp_peer: the address and port
+// a connection arrived on, or a listener listens on. Returns 0 or a
+// negative errno. Thread: a handler.
+export fn alph_tcp_local(ctx: AlphCtx*, h: int64, ip4: int64*, port: int64*) -> int64 {
+  return alph_tcp_addr(ctx, h, false, ip4, port);
+}
+
 // Turns Nagle's algorithm off (on true) for a TCP handle, so small writes
 // go out at once. Returns 0 or a negative errno. Thread: a handler.
 export fn alph_tcp_nodelay(ctx: AlphCtx*, h: int64, on: bool) -> int64 {

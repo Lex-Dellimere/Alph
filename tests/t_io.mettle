@@ -96,6 +96,15 @@ fn acceptor(ctx: AlphCtx*, m: AlphMsg*) -> int64 {
         break;
       }
       expect(h > 0, "accept succeeds");
+      var pip: int64 = 0;
+      var pport: int64 = 0;
+      expect(alph_tcp_peer(ctx, h, &pip, &pport) == 0, "the peer address is known");
+      expect(pip == alph_ip4(127, 0, 0, 1) && pport > 0, "the peer is loopback, on a port");
+      var lip: int64 = 0;
+      var lport: int64 = 0;
+      expect(alph_tcp_local(ctx, h, &lip, &lport) == 0, "the local address is known");
+      expect(lip == alph_ip4(127, 0, 0, 1) && lport == alph_tcp_port(ctx, a->lh), "it arrived on the listener's port");
+      expect(alph_tcp_peer(ctx, a->lh, &pip, &pport) < 0, "a listener has no peer");
       var c: Conn;
       memset((rawptr)&c, 0, (int64)sizeof(Conn));
       var pid: int64 = alph_spawn_value<Conn>(ctx, 0, &c, &conn);
