@@ -1825,6 +1825,7 @@ export struct AlphOutq {
   h: int64;      // alph_outq_send: the handle it writes to at the end of the run
   held: int64;   //   sends since the last write
   listed: int64; //   1 while on its actor's list to write at the end of the run
+  mark: int64;   //   len when the current handler started: after a crash only bytes before it are trusted
 }
 ```
 
@@ -1857,8 +1858,10 @@ run of the actor ends, together with everything else sent through q
 meanwhile: many answers to one connection go out in one write, as Go's
 buffered writers and the BEAM's iolists do. It writes early once
 ALPH_OUTQ_HOLD_BYTES or ALPH_OUTQ_HOLD_SENDS are held, and before h is
-closed or given away; when the handler crashes or the actor exits, what
-it queued is still written. Use alph_outq_push and alph_outq_flush to
+closed or given away; when the actor exits, what it queued is still
+written, and when a handler crashes, what earlier handlers queued is, but
+not what the crashing one did (it may have been corrupted; a medic retry
+sends it again). Use alph_outq_push and alph_outq_flush to
 write at once instead. Returns ALPH_SENT, ALPH_FULL (nothing queued) or
 ALPH_NOMEM, or a negative errno from an early write.
 Thread: the handler of the actor whose state holds q.

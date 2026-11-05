@@ -2687,6 +2687,9 @@ fn alph_deliver(s: AlphSched*, p: AlphProc*, m: AlphMsg*) -> int64 {
   if (alph_atomic_load(&p->medic) != 0) {
     p->last_msg = *m;
   }
+  if (p->flushq.len > 0) {
+    alph_outq_mark(p);
+  }
   var result: int64 = p->handler(&ctx, m);
   p->poison_heap = 0;
   alph_msg_release(m);
@@ -3609,6 +3612,7 @@ export struct AlphOutq {
   h: int64;      // alph_outq_send: the handle it writes to at the end of the run
   held: int64;   //   sends since the last write
   listed: int64; //   1 while on its actor's list to write at the end of the run
+  mark: int64;   //   len when the current handler started: after a crash only bytes before it are trusted
 }
 
 // Starts q empty, holding at most limit bytes. Thread: any.
@@ -3621,6 +3625,7 @@ export fn alph_outq_init(q: AlphOutq*, limit: int64) {
   q->h = 0;
   q->held = 0;
   q->listed = 0;
+  q->mark = 0;
 }
 
 // Queues size bytes at data on q for handle h, and writes them when this
@@ -3628,12 +3633,17 @@ export fn alph_outq_init(q: AlphOutq*, limit: int64) {
 // meanwhile: many answers to one connection go out in one write, as Go's
 // buffered writers and the BEAM's iolists do. It writes early once
 // ALPH_OUTQ_HOLD_BYTES or ALPH_OUTQ_HOLD_SENDS are held, and before h is
-// closed or given away; when the handler crashes or the actor exits, what
-// it queued is still written. Use alph_outq_push and alph_outq_flush to
+// closed or given away; when the actor exits, what it queued is still
+// written, and when a handler crashes, what earlier handlers queued is, but
+// not what the crashing one did (it may have been corrupted; a medic retry
+// sends it again). Use alph_outq_push and alph_outq_flush to
 // write at once instead. Returns ALPH_SENT, ALPH_FULL (nothing queued) or
 // ALPH_NOMEM, or a negative errno from an early write.
 // Thread: the handler of the actor whose state holds q.
 export fn alph_outq_send(ctx: AlphCtx*, q: AlphOutq*, h: int64, data: rawptr, size: int64) -> int64 {
+  if (q->listed == 0) {
+    q->mark = q->len;  // listed during this handler: what it held before is trusted
+  }
   var r: int64 = alph_outq_push(ctx, q, data, size);
   if (r != ALPH_SENT) {
     return r;
@@ -3656,6 +3666,15 @@ export fn alph_outq_send(ctx: AlphCtx*, q: AlphOutq*, h: int64, data: rawptr, si
     }
   }
   return ALPH_SENT;
+}
+
+// A handler is about to run: what p's queues hold now came from handlers
+// that returned, and stays trusted if this one crashes.
+fn alph_outq_mark(p: AlphProc*) {
+  for i: int64 in 0..p->flushq.len {
+    var q: AlphOutq* = (AlphOutq*)alph_vec_get(&p->flushq, i);
+    q->mark = q->len;
+  }
 }
 
 // Writes what q holds now (staying listed); a negative errno on failure.
@@ -3685,9 +3704,16 @@ fn alph_outq_write_all(ctx: AlphCtx*, p: AlphProc*, h: int64, checked: bool) {
     }
     var ok: bool = true;
     if (checked) {
+      // After a crash the handler that crashed may have written anywhere,
+      // its own bytes and q's fields included, and sending what they point
+      // at could put any memory on the wire. Only bytes queued by handlers
+      // that returned go out (up to mark), and only if q still looks whole.
       var lo: int64 = (int64)p->state;
       ok = (int64)q >= lo && (int64)q + (int64)sizeof(AlphOutq) <= lo + p->state_size &&
-           q->sent >= 0 && q->sent <= q->len && q->len <= q->cap;
+           q->sent >= 0 && q->sent <= q->mark && q->mark <= q->len && q->len <= q->cap;
+      if (ok) {
+        q->len = q->mark;
+      }
     }
     if (ok) {
       alph_outq_write_held(ctx, q);

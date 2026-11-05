@@ -1,13 +1,15 @@
 // alph_outq_send: answers queued for a handle go out together when the
 // actor's run ends. Each case writes to one end of a socket pair and the
 // test reads the other end. Checks, in order:
-//   1. 20 sends in one handler reach the peer, in order, with fewer write
-//      system calls than sends (the process's write count, /proc/self/io)
-//   2. 40 sends in one handler: early writes at ALPH_OUTQ_HOLD_SENDS, all 40
-//      arrive
+//   1. 20 sends in one handler reach the peer, in order, in exactly one
+//      write (a SOCK_SEQPACKET pair: each write arrives as one packet)
+//   2. 40 sends in one handler: exactly two writes, an early one at
+//      ALPH_OUTQ_HOLD_SENDS and the rest at the end of the run
 //   3. sends then alph_io_close in one handler: the peer reads every byte,
 //      then the end of the stream
-//   4. sends then a crash in the same handler: what was sent still arrives
+//   4. one handler queues 3 and returns, the next one in the same run queues
+//      2 and crashes: exactly the 3 arrive (a crashing handler's bytes are
+//      not trusted)
 //   5. sends then alph_io_give to another actor: the bytes arrive before the
 //      new owner's
 
@@ -17,12 +19,14 @@ import "alph/sys/atomic";
 import "alph/alph";
 
 const GO: int64 = ALPH_TAG_USER;
+const CRASHGO: int64 = ALPH_TAG_USER + 1;
 const FRAME: int64 = 16;
 
 var g_node: AlphNode;
 var g_failures: int64 = 0;
 var g_done: int64 = 0;
 var g_taker: int64 = 0;
+var g_reads: int64 = 0;   // reads that returned data in the last read_frames: packets, for SEQPACKET
 
 fn expect(ok: bool, what: string) {
   if (!ok) {
@@ -60,12 +64,22 @@ fn writer(ctx: AlphCtx*, m: AlphMsg*) -> int64 {
     if (g_mode == 1) {
       alph_io_close(ctx, w->h);
     } else if (g_mode == 2) {
-      alph_atomic_store(&g_done, 1);
-      crash();
+      // The next handler of this same run sends more, then crashes.
+      alph_send(ctx, ctx->self, CRASHGO, 2);
+      return ALPH_CONTINUE;
     } else if (g_mode == 3) {
       alph_io_give(ctx, w->h, g_taker);
     }
     alph_atomic_store(&g_done, 1);
+  } else if (m->tag == CRASHGO) {
+    for i: int64 in 0..m->arg {
+      var frame: int64[2];
+      frame[0] = 100 + i;
+      frame[1] = 7;
+      alph_outq_send(ctx, &w->q, w->h, (rawptr)&frame[0], FRAME);
+    }
+    alph_atomic_store(&g_done, 1);
+    crash();
   }
   return ALPH_CONTINUE;
 }
@@ -81,28 +95,6 @@ fn taker(ctx: AlphCtx*, m: AlphMsg*) -> int64 {
   return ALPH_CONTINUE;
 }
 
-fn syscw() -> int64 {
-  var buf: uint8[512];
-  var fd: int64 = syscall(2, (int64)"/proc/self/io\0".chars, 0, 0);
-  var n: int64 = syscall(0, fd, (int64)&buf[0], 511);
-  syscall(3, fd);
-  // the line "syscw: N"
-  var i: int64 = 0;
-  while (i + 6 < n) {
-    if (buf[i] == 115 && buf[i + 1] == 121 && buf[i + 2] == 115 && buf[i + 3] == 99 && buf[i + 4] == 119) {
-      var v: int64 = 0;
-      var j: int64 = i + 7;
-      while (j < n && buf[j] >= 48 && buf[j] <= 57) {
-        v = v * 10 + ((int64)buf[j] - 48);
-        j = j + 1;
-      }
-      return v;
-    }
-    i = i + 1;
-  }
-  return -1;
-}
-
 // Reads frames from fd until want arrived, the stream ended, or 2 s passed.
 // Returns the frames read; *eof is set at the end of the stream; *order is
 // false when ids came out of order (marker frames, id -1, excepted).
@@ -115,6 +107,7 @@ fn read_frames(fd: int64, want: int64, eof: bool*, order: bool*, last_marker: bo
   *order = true;
   *last_marker = false;
   var tries: int64 = 0;
+  g_reads = 0;
   while (tries < 2000) {
     var n: int64 = syscall(0, fd, (int64)&buf[bytes % FRAME], 4096 - FRAME);
     if (n == 0) {
@@ -129,6 +122,7 @@ fn read_frames(fd: int64, want: int64, eof: bool*, order: bool*, last_marker: bo
       tries = tries + 1;
       continue;
     }
+    g_reads = g_reads + 1;
     var at: int64 = 0;
     var total: int64 = (bytes % FRAME) + n;
     while (total - at >= FRAME) {
@@ -150,9 +144,13 @@ fn read_frames(fd: int64, want: int64, eof: bool*, order: bool*, last_marker: bo
 }
 
 fn pair(fds: int32*) {
+  pair_of(fds, 1);  // SOCK_STREAM
+}
+
+fn pair_of(fds: int32*, kind: int64) {
   fds[0] = -1;
   fds[1] = -1;
-  syscall(53, 1, 1, 0, (int64)fds);           // socketpair(AF_UNIX, SOCK_STREAM)
+  syscall(53, 1, kind, 0, (int64)fds);        // socketpair(AF_UNIX, kind)
   syscall(72, (int64)fds[1], 4, 2048);         // fcntl(F_SETFL, O_NONBLOCK) on the test's end
 }
 
@@ -187,22 +185,23 @@ fn main() -> int32 {
   var order: bool = true;
   var marker: bool = false;
 
-  // 1
-  pair(&fds[0]);
+  // 1: a packet per write, so the packets read are the writes made
+  pair_of(&fds[0], 5);  // SOCK_SEQPACKET
   var w1: int64 = start(&fds[0]);
   g_mode = 0;
-  var c0: int64 = syscw();
   go(w1, 20);
   thread_sleep_ms(20);
-  var c1: int64 = syscw();
   var got: int64 = read_frames((int64)fds[1], 20, &eof, &order, &marker);
+  var writes1: int64 = g_reads;
   expect(got == 20 && order, "20 sends arrived in order ({got})");
-  expect(c1 - c0 < 10, "20 sends took fewer writes ({c1 - c0} write calls in the process)");
+  expect(writes1 == 1, "20 sends went out in one write ({writes1})");
 
   // 2
   go(w1, 40);
+  thread_sleep_ms(20);
   got = read_frames((int64)fds[1], 40, &eof, &order, &marker);
   expect(got == 40 && order, "40 sends arrived in order ({got})");
+  expect(g_reads == 2, "40 sends went out in two writes, one early at 32 ({g_reads})");
 
   // 3
   pair(&fds[0]);
@@ -219,10 +218,10 @@ fn main() -> int32 {
   pair(&fds[0]);
   var w4: int64 = start(&fds[0]);
   g_mode = 2;
-  go(w4, 5);
+  go(w4, 3);
   thread_sleep_ms(20);
   got = read_frames((int64)fds[1], 5, &eof, &order, &marker);
-  expect(got == 5 && order, "sends before a crash arrived ({got})");
+  expect(got == 3 && order, "the 3 frames of the handler that returned arrived, not the crashing one's 2 ({got})");
 
   // 5
   pair(&fds[0]);
@@ -239,6 +238,6 @@ fn main() -> int32 {
   if (g_failures != 0) {
     return 1;
   }
-  println("outq send ok: 20 sends in {c1 - c0} write calls");
+  println("outq send ok: 20 sends in {writes1} write");
   return 0;
 }
