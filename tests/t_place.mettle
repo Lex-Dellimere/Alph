@@ -1,7 +1,9 @@
 // Placement damping (alph_place): an actor moved over and over for optional
 // reasons is held still. A hog gets a steady stream of 20 us messages for
-// 1.2 s while plain actors beside it keep waking, which made move-isolation
-// move the hog about 2000 times a second before damping. Checks:
+// 1.2 s, and wakes a plain actor after each: a woken actor whose home
+// sleeps moves to its waker's scheduler (rehome), so wherever the hog goes
+// it soon has company, which made move-isolation move it about 2000 times
+// a second before damping. Checks:
 //   1. it is isolated at all in the first part
 //   2. in the last 600 ms it is isolated at most a few times, and optional
 //      moves are being held back (moves_held grows)
@@ -39,9 +41,13 @@ fn spin(ns: int64) {
   }
 }
 
+// arg of WORK: the plain actor to wake after the work.
 fn hog(ctx: AlphCtx*, m: AlphMsg*) -> int64 {
   if (m->tag == WORK) {
     spin(20000);
+    if (m->arg != 0 && alph_send(ctx, m->arg, PING, 0) == ALPH_SENT) {
+      alph_atomic_add(&g_sent, 1);
+    }
   }
   return ALPH_CONTINUE;
 }
@@ -54,7 +60,7 @@ fn plain(ctx: AlphCtx*, m: AlphMsg*) -> int64 {
 }
 
 // Every 1 ms: 60 messages for the hog (1.2 ms of work, so it never runs
-// dry) and one for each plain actor, all from this scheduler.
+// dry), each naming a plain actor for it to wake.
 fn feeder(ctx: AlphCtx*, m: AlphMsg*) -> int64 {
   var ids: int64* = (int64*)ctx->state;
   if (m->tag == ALPH_TAG_INIT) {
@@ -68,12 +74,7 @@ fn feeder(ctx: AlphCtx*, m: AlphMsg*) -> int64 {
       return ALPH_CONTINUE;
     }
     for i: int64 in 0..60 {
-      alph_send(ctx, ids[0], WORK, 0);
-    }
-    for i: int64 in 0..PLAIN {
-      if (alph_send(ctx, ids[1 + i], PING, 0) == ALPH_SENT) {
-        alph_atomic_add(&g_sent, 1);
-      }
+      alph_send(ctx, ids[0], WORK, ids[1 + i % PLAIN]);
     }
     alph_send_after(ctx, 1, ctx->self, TICK, 0);
   }
