@@ -1,0 +1,336 @@
+// Edge-triggered handles behind alph_io_arm's one-shot contract. Each case
+// uses a socket pair: the actor owns one end, this thread the other.
+//   1. an edge arriving while the owner reads: a burst written in small
+//      pieces while the owner drains to EAGAIN and arms, many rounds; every
+//      byte arrives
+//   2. the owner's scheduler is held by a hog, so the watchdog reads the
+//      socket for it; every byte still arrives
+//   3. the peer writes then closes; the owner, reading 10 bytes per
+//      ALPH_TAG_IO, gets all of it and then the end of the stream
+//   4. a raw-fd owner (alph_io_fd) reading 1 byte per ALPH_TAG_IO is still
+//      woken until all is read; io_demoted counts the handle
+//   5. an owner that ignores ALPH_TAG_IO and arms again is not woken over
+//      and over: a few messages, not thousands
+//   6. 1-byte reads of a 256 KB burst through alph_io_read: every byte
+//   7. a write that stops at EAGAIN finishes once the peer reads
+
+import "std/io";
+import "std/thread";
+import "alph/sys/atomic";
+import "alph/sys/clock";
+import "alph/alph";
+
+const OPEN: int64 = ALPH_TAG_USER;
+const SEND: int64 = ALPH_TAG_USER + 1;
+const HOG: int64 = ALPH_TAG_USER + 2;
+
+var g_node: AlphNode;
+var g_failures: int64 = 0;
+var g_fd: int64 = -1;          // the actor's end, for OPEN
+var g_mode: int64 = 0;         // what the owner does on ALPH_TAG_IO
+var g_bytes: int64 = 0;        // bytes the owner read
+var g_eof: int64 = 0;          // the owner saw the end of the stream
+var g_ios: int64 = 0;          // ALPH_TAG_IO messages the owner got
+var g_h: int64 = 0;
+var g_wrote: int64 = 0;        // case 7: bytes the owner's queue still holds after its first flush
+var g_sent_all: int64 = 0;     // case 7: the owner's queue emptied
+var g_owner: int64 = 0;        // the current case's owner and hog, killed before the next case
+var g_hog: int64 = 0;
+
+fn expect(ok: bool, what: string) {
+  if (!ok) {
+    println("FAIL {what}");
+    alph_atomic_add(&g_failures, 1);
+  }
+}
+
+fn spin(ns: int64) {
+  var end: int64 = alph_now_ns() + ns;
+  while (alph_now_ns() < end) {
+  }
+}
+
+struct Owner {
+  h: int64;
+  mode: int64;
+  q: AlphOutq;
+  big: rawptr;
+}
+
+fn owner(ctx: AlphCtx*, m: AlphMsg*) -> int64 {
+  var o: Owner* = (Owner*)ctx->state;
+  var mode: int64 = o->mode;
+  if (m->tag == ALPH_TAG_INIT) {
+    alph_outq_init(&o->q, 8388608);
+  } else if (m->tag == OPEN) {
+    o->h = alph_io_open(ctx, g_fd);
+    alph_atomic_store(&g_h, o->h);
+    alph_io_arm(ctx, o->h, ALPH_IO_IN);
+  } else if (m->tag == SEND) {
+    // Case 7: 4 MB through the queue; the socket takes far less at once.
+    var chunk: uint8[4096];
+    for i: int64 in 0..4096 {
+      chunk[i] = (uint8)(i & 255);
+    }
+    for k: int64 in 0..1024 {
+      alph_outq_push(ctx, &o->q, (rawptr)&chunk[0], 4096);
+    }
+    alph_outq_flush(ctx, &o->q, o->h);
+    alph_atomic_store(&g_wrote, alph_outq_pending(&o->q));
+    if (alph_outq_pending(&o->q) == 0) {
+      alph_atomic_store(&g_sent_all, 1);
+    }
+  } else if (m->tag == ALPH_TAG_IO) {
+    alph_atomic_add(&g_ios, 1);
+    var buf: uint8[4096];
+    if ((m->arg & ALPH_IO_OUT) != 0 && alph_outq_pending(&o->q) > 0) {
+      alph_outq_flush(ctx, &o->q, o->h);
+      if (alph_outq_pending(&o->q) == 0) {
+        alph_atomic_store(&g_sent_all, 1);
+      }
+    }
+    if (mode == 0) {
+      // Drain to EAGAIN, then arm: the next edge must not be lost.
+      while (true) {
+        var n: int64 = alph_io_read(ctx, o->h, (rawptr)&buf[0], 4096);
+        if (n > 0) {
+          alph_atomic_add(&g_bytes, n);
+        } else {
+          if (n == 0) {
+            alph_atomic_store(&g_eof, 1);
+            return ALPH_CONTINUE;
+          }
+          break;
+        }
+      }
+    } else if (mode == 1 || mode == 4) {
+      // Part of what is there each time (10 bytes, or 1).
+      var want: int64 = 10;
+      if (mode == 4) {
+        want = 1;
+      }
+      var n2: int64 = alph_io_read(ctx, o->h, (rawptr)&buf[0], want);
+      if (n2 > 0) {
+        alph_atomic_add(&g_bytes, n2);
+      } else if (n2 == 0) {
+        alph_atomic_store(&g_eof, 1);
+        return ALPH_CONTINUE;
+      }
+    } else if (mode == 2) {
+      // Raw reads of 1 byte through the descriptor.
+      var fd: int64 = alph_io_fd(ctx, o->h);
+      var n3: int64 = syscall(0, fd, (int64)&buf[0], 1);
+      if (n3 > 0) {
+        alph_atomic_add(&g_bytes, n3);
+      }
+    } else if (mode == 3) {
+      // Ignore it.
+    }
+    if (alph_outq_pending(&o->q) > 0) {
+      alph_io_arm(ctx, o->h, ALPH_IO_IN | ALPH_IO_OUT);
+    } else {
+      alph_io_arm(ctx, o->h, ALPH_IO_IN);
+    }
+  }
+  return ALPH_CONTINUE;
+}
+
+fn hog(ctx: AlphCtx*, m: AlphMsg*) -> int64 {
+  if (m->tag == HOG) {
+    spin(3000000);
+  }
+  return ALPH_CONTINUE;
+}
+
+// Spawns the owner and the hog side by side, on one scheduler.
+fn parent(ctx: AlphCtx*, m: AlphMsg*) -> int64 {
+  var ids: int64* = (int64*)ctx->state;
+  if (m->tag == ALPH_TAG_INIT) {
+    var o: Owner;
+    o.h = 0;
+    o.mode = g_mode;
+    o.big = (rawptr)0;
+    ids[0] = alph_spawn_value<Owner>(ctx, 0, &o, &owner);
+    ids[1] = alph_spawn(ctx, 0, &hog);
+    alph_atomic_store(&g_owner, ids[0]);
+    alph_atomic_store(&g_hog, ids[1]);
+  } else if (m->tag == HOG) {
+    for i: int64 in 0..m->arg {
+      alph_send(ctx, ids[1], HOG, 0);
+    }
+  } else if (m->tag == OPEN || m->tag == SEND) {
+    alph_send(ctx, ids[0], m->tag, 0);
+  }
+  return ALPH_CONTINUE;
+}
+
+fn wait_bytes(want: int64, ms: int64) {
+  for i: int64 in 0..ms {
+    if (alph_atomic_load(&g_bytes) >= want) {
+      return;
+    }
+    thread_sleep_ms(1);
+  }
+}
+
+// A fresh pair, its far end non-blocking for this thread, and a fresh
+// owner holding the near one. Returns the far end.
+fn setup(p: int64*, mode: int64) -> int64 {
+  // The last case's actors go first, their handles with them.
+  if (alph_atomic_load(&g_owner) != 0) {
+    alph_node_exit_signal(&g_node, alph_atomic_load(&g_owner), ALPH_KILL);
+    alph_node_exit_signal(&g_node, alph_atomic_load(&g_hog), ALPH_KILL);
+    alph_node_exit_signal(&g_node, *p, ALPH_KILL);
+    alph_atomic_store(&g_owner, 0);
+    thread_sleep_ms(20);
+  }
+  var fds: int32[2];
+  syscall(53, 1, 1, 0, (int64)&fds[0]);       // socketpair(AF_UNIX, SOCK_STREAM)
+  syscall(72, (int64)fds[1], 4, 2048);         // fcntl(F_SETFL, O_NONBLOCK)
+  g_fd = (int64)fds[0];
+  g_mode = mode;
+  alph_atomic_store(&g_bytes, 0);
+  alph_atomic_store(&g_eof, 0);
+  alph_atomic_store(&g_ios, 0);
+  alph_atomic_store(&g_h, 0);
+  var ids: int64[2];
+  ids[0] = 0;
+  ids[1] = 0;
+  *p = alph_node_spawn_value<int64[2]>(&g_node, 0, &ids, &parent);
+  for i: int64 in 0..1000 {
+    if (alph_atomic_load(&g_owner) != 0) {
+      break;
+    }
+    thread_sleep_ms(1);
+  }
+  alph_node_send(&g_node, *p, OPEN, 0);
+  for i: int64 in 0..1000 {
+    if (alph_atomic_load(&g_h) != 0) {
+      break;
+    }
+    thread_sleep_ms(1);
+  }
+  return (int64)fds[1];
+}
+
+// Writes size bytes in pieces of piece, as fast as the socket takes them.
+fn write_out(fd: int64, size: int64, piece: int64) {
+  var buf: uint8[4096];
+  for i: int64 in 0..4096 {
+    buf[i] = 7;
+  }
+  var left: int64 = size;
+  while (left > 0) {
+    var k: int64 = piece;
+    if (k > left) {
+      k = left;
+    }
+    var n: int64 = syscall(1, fd, (int64)&buf[0], k);
+    if (n > 0) {
+      left = left - n;
+    } else {
+      thread_sleep_ms(1);
+    }
+  }
+}
+
+fn main() -> int32 {
+  var cfg: AlphConfig;
+  alph_config(&cfg);
+  cfg.schedulers = 4;
+  cfg.max_actors = 256;
+  expect(alph_node_start(&g_node, &cfg), "node started");
+  var p: int64 = 0;
+
+  // 1
+  var lost: int64 = 0;
+  for r: int64 in 0..20 {
+    var far: int64 = setup(&p, 0);
+    write_out(far, 200000, 7);
+    wait_bytes(200000, 3000);
+    if (alph_atomic_load(&g_bytes) != 200000) {
+      lost = lost + 1;
+    }
+    syscall(3, far);
+  }
+  expect(lost == 0, "edges mid-read: every byte arrived in every round ({lost} rounds short)");
+
+  // 2
+  var far2: int64 = setup(&p, 0);
+  alph_node_send(&g_node, p, HOG, 20);   // 60 ms of 3 ms handlers on the owner's scheduler
+  thread_sleep_ms(2);
+  write_out(far2, 100000, 100);
+  wait_bytes(100000, 3000);
+  expect(alph_atomic_load(&g_bytes) == 100000, "behind a hog: every byte arrived ({g_bytes})");
+  syscall(3, far2);
+
+  // 3
+  var far3: int64 = setup(&p, 1);
+  write_out(far3, 100, 100);
+  syscall(3, far3);                       // the close right behind the data
+  for i: int64 in 0..2000 {
+    if (alph_atomic_load(&g_eof) != 0) {
+      break;
+    }
+    thread_sleep_ms(1);
+  }
+  expect(alph_atomic_load(&g_bytes) == 100 && alph_atomic_load(&g_eof) == 1,
+         "close after a partial read: all 100 bytes, then the end ({g_bytes}, eof {g_eof})");
+
+  // 4
+  var st0: AlphStats;
+  alph_node_stats(&g_node, &st0);
+  var far4: int64 = setup(&p, 2);
+  write_out(far4, 50, 50);
+  wait_bytes(50, 3000);
+  expect(alph_atomic_load(&g_bytes) == 50, "raw-fd owner reading 1 byte at a time got all 50 ({g_bytes})");
+  var st1: AlphStats;
+  alph_node_stats(&g_node, &st1);
+  expect(st1.io_demoted == st0.io_demoted + 1, "the raw-fd handle counted as demoted");
+  syscall(3, far4);
+
+  // 5
+  var far5: int64 = setup(&p, 3);
+  write_out(far5, 10, 10);
+  thread_sleep_ms(100);
+  var ios: int64 = alph_atomic_load(&g_ios);
+  expect(ios >= 1 && ios < 10, "an owner ignoring readable was told a few times, not over and over ({ios})");
+  syscall(3, far5);
+
+  // 6
+  var far6: int64 = setup(&p, 4);
+  write_out(far6, 262144, 4096);
+  wait_bytes(262144, 10000);
+  expect(alph_atomic_load(&g_bytes) == 262144, "1-byte reads of 256 KB: every byte ({g_bytes})");
+  syscall(3, far6);
+
+  // 7
+  var far7: int64 = setup(&p, 0);
+  alph_atomic_store(&g_sent_all, 0);
+  alph_node_send(&g_node, p, SEND, 0);
+  thread_sleep_ms(20);
+  expect(alph_atomic_load(&g_wrote) > 0, "the 4 MB write stopped short at first ({g_wrote} held)");
+  var got: int64 = 0;
+  var buf: uint8[65536];
+  for i: int64 in 0..20000 {
+    var n: int64 = syscall(0, far7, (int64)&buf[0], 65536);
+    if (n > 0) {
+      got = got + n;
+    } else {
+      if (got >= 4194304) {
+        break;
+      }
+      thread_sleep_ms(1);
+    }
+  }
+  expect(got == 4194304 && alph_atomic_load(&g_sent_all) == 1, "the write finished once the peer read ({got} of 4194304)");
+  syscall(3, far7);
+
+  alph_node_halt(&g_node, 0);
+  alph_node_wait(&g_node);
+  if (g_failures != 0) {
+    return 1;
+  }
+  println("et ok");
+  return 0;
+}
