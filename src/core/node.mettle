@@ -482,6 +482,7 @@ struct AlphSched {
   spin_hits: int64;     // how often its recent spins found work, of 1024 (an average)
   run_seq: int64;       // bumped as each actor run starts, for the watchdog
   run_at: int64;        // when the current (or last) actor run started (ns)
+  run_hint: int64;      // a reading taken just before a run, for the run to start from, or 0
   run_seen: int64;      // run_seq as the watchdog last saw it
   // Counted by this scheduler's own thread only, so plain adds suffice;
   // alph_node_stats sums them, a moment apart.
@@ -1029,7 +1030,9 @@ fn alph_sched_working(s: AlphSched*) {
   if (s->work_at == 0) {
     // Sequentially consistent, paired with the watchdog's store to
     // sysmon_idle and its look at work_at: one of the two sees the other.
-    alph_atomic_store_sc(&s->work_at, alph_now_ns());
+    var t: int64 = alph_now_ns();
+    s->run_hint = t;  // the run about to start begins now: no second reading
+    alph_atomic_store_sc(&s->work_at, t);
     var node: AlphNode* = (AlphNode*)s->node;
     if (alph_atomic_load(&node->sysmon_idle) != 0 && alph_atomic_cas(&node->sysmon_idle, 1, 0) == 1) {
       // The watchdog backed off while the node idled: it looks again now.
@@ -1740,7 +1743,17 @@ fn alph_timer(ctx: AlphCtx*, ms: int64, to: int64, tag: int64, ref: int64, arg: 
 
 // Fires due timers. Returns nanoseconds until the next one, or -1 if none.
 fn alph_timers_fire(node: AlphNode*, h: AlphVec*) -> int64 {
-  var now: int64 = alph_now_ns();
+  if (h->len == 0) {
+    return -1;  // nothing pending: no clock read on every pass of the loop
+  }
+  return alph_timers_fire_at(node, h, alph_now_ns());
+}
+
+// As alph_timers_fire, for a time already read.
+fn alph_timers_fire_at(node: AlphNode*, h: AlphVec*, now: int64) -> int64 {
+  if (h->len == 0) {
+    return -1;
+  }
   while (h->len > 0) {
     var wait: int64 = alph_timer_deadline(alph_vec_get(h, 0)) - now;
     if (wait > 0) {
@@ -3028,8 +3041,12 @@ fn alph_handle_message(s: AlphSched*, p: AlphProc*, m: AlphMsg*) -> int64 {
 // its message budget ran out, or -3 when its time did.
 fn alph_run_some(s: AlphSched*, p: AlphProc*) -> int64 {
   var m: AlphMsg;
-  var run_from: int64 = alph_now_ns();
-  s->run_at = run_from;
+  var run_from: int64 = s->run_hint;
+  s->run_hint = 0;
+  if (run_from == 0) {
+    run_from = alph_now_ns();
+  }
+  alph_atomic_store(&s->run_at, run_from);  // thieves read it (alph_sched_stuck_for)
   var stride: int64 = 3;  // look at the clock every 4 messages, or every one once they cost
 
   if (p->retry != 0) {
@@ -4944,7 +4961,14 @@ fn alph_sched_finish(p: AlphProc*) {
 // (data 0) only wakes the scheduler. timeout_ms 0 polls without waiting.
 fn alph_sched_poll(s: AlphSched*, timeout_ns: int64) {
   var node: AlphNode* = (AlphNode*)s->node;
-  alph_atomic_store(&s->polled_at, alph_now_ns());
+  // Rescuers only ask whether s polled within ALPH_RESCUE_NS (1 ms): a
+  // look without waiting is stamped with the start of s's last run, at
+  // most one run (ALPH_RUN_NS) old, and costs no clock read.
+  if (timeout_ns == 0) {
+    alph_atomic_store(&s->polled_at, s->run_at);
+  } else {
+    alph_atomic_store(&s->polled_at, alph_now_ns());
+  }
   var ev: AlphRxEvent* = (AlphRxEvent*)s->rxev;
   var n: int64 = alph_rx_wait(&s->rx, ev, 64, timeout_ns);
   // Awake again before dispatching: the signals below wake actors at home
@@ -5144,6 +5168,9 @@ fn alph_sched_main(arg: int64) -> int64 {
   var node: AlphNode* = (AlphNode*)s->node;
   while (alph_atomic_load(&node->halted) == 0 && alph_atomic_load(&s->done) == 0) {
     alph_sched_quiet(s, node);
+    // A real reading: one handler may have run for as long as it liked
+    // since the last, and a timer due meanwhile must fire before the
+    // messages that came after it (no clock read when none is pending).
     var wait: int64 = alph_timers_fire(node, &s->timers);
     var p: int64 = alph_runq_pop(s);
     if (p != 0) {
@@ -5505,6 +5532,7 @@ export fn alph_node_stats(node: AlphNode*, stats: AlphStats*) {
     stats->rehomed = stats->rehomed + ps->moves[ALPH_PLACE_REHOME];
     stats->isolated = stats->isolated + ps->moves[ALPH_PLACE_ISOLATE];
     stats->stolen = stats->stolen + ps->moves[ALPH_PLACE_STEAL];
+
     stats->moves_held = stats->moves_held + ps->held[ALPH_PLACE_REHOME] + ps->held[ALPH_PLACE_ISOLATE];
   }
   stats->rescued = alph_atomic_load(&node->rescued);
