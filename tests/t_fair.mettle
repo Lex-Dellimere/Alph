@@ -1,0 +1,110 @@
+// Time slices: an actor's run ends after ALPH_RUN_NS (checked every 4
+// messages), so many medium-cost messages cannot hold a scheduler. A hog
+// gets 200 messages of 20 us each (4 ms of work) and, right behind them on
+// the same scheduler, a victim gets one message: the victim must run within
+// 1 ms, where a 64-message run alone would take 1.3 ms. Only between
+// messages: a single long handler is never cut (that would need
+// preemption); the watchdog bounds what waits behind one (t_rescue).
+
+import "std/io";
+import "std/thread";
+import "alph/sys/atomic";
+import "alph/sys/clock";
+import "alph/alph";
+
+const WORK: int64 = ALPH_TAG_USER;
+const POKE: int64 = ALPH_TAG_USER + 1;
+const KICK: int64 = ALPH_TAG_USER + 2;
+const ROUNDS: int64 = 10;
+
+var g_node: AlphNode;
+var g_failures: int64 = 0;
+var g_hog: int64 = 0;
+var g_victim: int64 = 0;
+var g_poked_at: int64 = 0;
+var g_ran_at: int64 = 0;
+var g_hog_done: int64 = 0;
+
+fn expect(ok: bool, what: string) {
+  if (!ok) {
+    println("FAIL {what}");
+    alph_atomic_add(&g_failures, 1);
+  }
+}
+
+fn spin(ns: int64) {
+  var end: int64 = alph_now_ns() + ns;
+  while (alph_now_ns() < end) {
+  }
+}
+
+fn hog(ctx: AlphCtx*, m: AlphMsg*) -> int64 {
+  if (m->tag == WORK) {
+    spin(20000);
+    if (m->arg == 199) {
+      alph_atomic_add(&g_hog_done, 1);
+    }
+  }
+  return ALPH_CONTINUE;
+}
+
+fn victim(ctx: AlphCtx*, m: AlphMsg*) -> int64 {
+  if (m->tag == POKE) {
+    alph_atomic_store(&g_ran_at, alph_now_ns());
+  }
+  return ALPH_CONTINUE;
+}
+
+// Spawns both, so they share its scheduler, and on KICK queues the hog's
+// work and then the victim's message, from that scheduler.
+fn parent(ctx: AlphCtx*, m: AlphMsg*) -> int64 {
+  if (m->tag == ALPH_TAG_INIT) {
+    g_hog = alph_spawn(ctx, 0, &hog);
+    g_victim = alph_spawn(ctx, 0, &victim);
+  } else if (m->tag == KICK) {
+    for i: int64 in 0..200 {
+      alph_send(ctx, g_hog, WORK, i);
+    }
+    alph_atomic_store(&g_poked_at, alph_now_ns());
+    alph_send(ctx, g_victim, POKE, 0);
+  }
+  return ALPH_CONTINUE;
+}
+
+fn main() -> int32 {
+  var cfg: AlphConfig;
+  alph_config(&cfg);
+  cfg.schedulers = 4;
+  cfg.max_actors = 16;
+  expect(alph_node_start(&g_node, &cfg), "node started");
+  var p: int64 = alph_node_spawn(&g_node, 0, &parent);
+  thread_sleep_ms(20);
+  var worst: int64 = 0;
+  for r: int64 in 0..ROUNDS {
+    alph_atomic_store(&g_ran_at, 0);
+    var done0: int64 = alph_atomic_load(&g_hog_done);
+    alph_node_send(&g_node, p, KICK, 0);
+    for i: int64 in 0..1000 {
+      if (alph_atomic_load(&g_hog_done) > done0 && alph_atomic_load(&g_ran_at) != 0) {
+        break;
+      }
+      thread_sleep_ms(1);
+    }
+    var waited: int64 = (alph_atomic_load(&g_ran_at) - alph_atomic_load(&g_poked_at)) / 1000;
+    if (waited > worst) {
+      worst = waited;
+    }
+    thread_sleep_ms(20);
+  }
+  expect(worst < 1000, "the victim ran within 1 ms behind 4 ms of 20 us messages (worst {worst} us)");
+  var st: AlphStats;
+  alph_node_stats(&g_node, &st);
+  expect(st.yields > 0, "runs were cut short for time ({st.yields})");
+  alph_node_halt(&g_node, 0);
+  alph_node_wait(&g_node);
+  if (g_failures != 0) {
+    return 1;
+  }
+  println("fair ok: victim waited at most {worst} us, {st.yields} runs cut short");
+  return 0;
+}

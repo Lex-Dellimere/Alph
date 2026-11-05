@@ -1,0 +1,209 @@
+// alph_io_recv with kernel arrival stamps (alph_io_stamps) over TCP on
+// loopback. Checks, in order:
+//   1. data written at t0 and read 30 ms later reports arriving near t0
+//      (to within 3 ms), not at the read
+//   2. from <= to, and the first read's from is no later than t0
+//   3. a second write, read after another wait, is stamped with its own
+//      arrival, after the first
+//   4. two writes 30 ms apart read at once: from is at or before the first
+//      one's arrival, to is the second's
+//   5. a read that leaves data behind, then another: the second's from is
+//      the first's last stamp
+//   6. without stamps, both bounds are the time of the read
+
+import "std/io";
+import "std/thread";
+import "alph/sys/atomic";
+import "alph/sys/clock";
+import "alph/alph";
+
+const READ: int64 = ALPH_TAG_USER;
+
+var g_node: AlphNode;
+var g_failures: int64 = 0;
+var g_port: int64 = 0;
+var g_conn: int64 = 0;     // the accepted handle
+var g_got: int64 = 0;
+var g_from: int64 = 0;
+var g_to: int64 = 0;
+var g_read_at: int64 = 0;
+var g_stamps: int64 = 1;
+
+fn expect(ok: bool, what: string) {
+  if (!ok) {
+    println("FAIL {what}");
+    alph_atomic_add(&g_failures, 1);
+  }
+}
+
+fn server(ctx: AlphCtx*, m: AlphMsg*) -> int64 {
+  var l: int64* = (int64*)ctx->state;
+  if (m->tag == ALPH_TAG_INIT) {
+    l[0] = alph_tcp_listen(ctx, alph_ip4(127, 0, 0, 1), 0, 16, 0);
+    alph_atomic_store(&g_port, alph_tcp_port(ctx, l[0]));
+    alph_io_arm(ctx, l[0], ALPH_IO_IN);
+  } else if (m->tag == ALPH_TAG_IO && m->ref == l[0]) {
+    var h: int64 = alph_tcp_accept(ctx, l[0]);
+    if (h > 0) {
+      if (g_stamps != 0) {
+        alph_io_stamps(ctx, h, true);
+      }
+      alph_atomic_store(&g_conn, h);
+    }
+  } else if (m->tag == READ) {
+    var buf: uint8[64];
+    var from: int64 = 0;
+    var to: int64 = 0;
+    var size: int64 = m->arg;
+    if (size <= 0) {
+      size = 64;
+    }
+    var n: int64 = alph_io_recv(ctx, alph_atomic_load(&g_conn), (rawptr)&buf[0], size, &from, &to);
+    g_from = from;
+    g_to = to;
+    g_read_at = alph_now_ns();
+    alph_atomic_store(&g_got, n);
+  }
+  return ALPH_CONTINUE;
+}
+
+fn read_now(srv: int64) {
+  read_size(srv, 0);
+}
+
+fn read_size(srv: int64, size: int64) {
+  alph_atomic_store(&g_got, 0);
+  alph_node_send(&g_node, srv, READ, size);
+  for i: int64 in 0..2000 {
+    if (alph_atomic_load(&g_got) != 0) {
+      return;
+    }
+    thread_sleep_ms(1);
+  }
+}
+
+// A client socket connected to the server, from this thread.
+fn dial() -> int64 {
+  var fd: int64 = syscall(41, 2, 1, 0);  // socket(AF_INET, SOCK_STREAM)
+  var addr: uint8[16];
+  for i: int64 in 0..16 {
+    addr[i] = 0;
+  }
+  addr[0] = 2;
+  var port: int64 = alph_atomic_load(&g_port);
+  addr[2] = (uint8)((port >> 8) & 255);
+  addr[3] = (uint8)(port & 255);
+  addr[4] = 127;
+  addr[7] = 1;
+  syscall(42, fd, (int64)&addr[0], 16);  // connect
+  return fd;
+}
+
+fn round(srv: int64, fd: int64, label: string) -> int64 {
+  var one: uint8 = 7;
+  var t0: int64 = alph_now_ns();
+  syscall(1, fd, (int64)&one, 1);
+  thread_sleep_ms(30);
+  read_now(srv);
+  expect(alph_atomic_load(&g_got) == 1, "{label}: read the byte");
+  expect(g_from <= g_to, "{label}: from <= to");
+  return t0;
+}
+
+fn main() -> int32 {
+  var cfg: AlphConfig;
+  alph_config(&cfg);
+  cfg.schedulers = 2;
+  cfg.max_actors = 16;
+  expect(alph_node_start(&g_node, &cfg), "node started");
+  var zero: int64 = 0;
+  var srv: int64 = alph_node_spawn_value<int64>(&g_node, 0, &zero, &server);
+  for i: int64 in 0..2000 {
+    if (alph_atomic_load(&g_port) != 0) {
+      break;
+    }
+    thread_sleep_ms(1);
+  }
+  var fd: int64 = dial();
+  for i: int64 in 0..2000 {
+    if (alph_atomic_load(&g_conn) != 0) {
+      break;
+    }
+    thread_sleep_ms(1);
+  }
+  expect(alph_atomic_load(&g_conn) > 0, "accepted");
+
+  // 1, 2
+  var t0: int64 = round(srv, fd, "first");
+  var late1: int64 = (g_to - t0) / 1000;
+  expect(g_to >= t0 - 1000000 && g_to - t0 < 3000000, "first: stamped near the write ({late1} us after it)");
+  expect(g_read_at - g_to > 25000000, "first: not stamped at the read");
+  expect(g_from <= t0 + 1000000, "first: from is no later than the write");
+  var first_to: int64 = g_to;
+
+  // 3
+  var t1: int64 = round(srv, fd, "second");
+  var late2: int64 = (g_to - t1) / 1000;
+  expect(g_to - t1 < 3000000 && g_to >= t1 - 1000000, "second: stamped near its own write ({late2} us)");
+  expect(g_to > first_to, "second: after the first");
+
+  // 4
+  var one: uint8 = 7;
+  var ta: int64 = alph_now_ns();
+  syscall(1, fd, (int64)&one, 1);
+  thread_sleep_ms(30);
+  var tb: int64 = alph_now_ns();
+  syscall(1, fd, (int64)&one, 1);
+  thread_sleep_ms(5);
+  read_now(srv);
+  expect(alph_atomic_load(&g_got) == 2, "two writes: read both bytes ({g_got})");
+  expect(g_from <= ta + 1000000, "two writes: from is no later than the first write");
+  expect(g_to >= tb - 1000000 && g_to - tb < 3000000, "two writes: to is the second write's arrival");
+
+  // 5
+  var two: uint8[2];
+  two[0] = 1;
+  two[1] = 2;
+  syscall(1, fd, (int64)&two[0], 2);
+  thread_sleep_ms(5);
+  read_size(srv, 1);
+  var first_stamp: int64 = g_to;
+  expect(alph_atomic_load(&g_got) == 1, "partial: read one of two bytes");
+  read_size(srv, 1);
+  // Both reads come from one packet; its stamp is converted to the
+  // monotonic clock with an offset the watchdog refreshes, so allow for
+  // that refresh moving it by a few microseconds between the reads.
+  expect(g_from >= first_stamp - 100000, "partial: the second read's from is at or after the first's stamp ({(first_stamp - g_from) / 1000} us before)");
+
+  alph_node_halt(&g_node, 0);
+  alph_node_wait(&g_node);
+
+  // 6: a fresh node without stamps
+  g_stamps = 0;
+  alph_atomic_store(&g_port, 0);
+  alph_atomic_store(&g_conn, 0);
+  expect(alph_node_start(&g_node, &cfg), "second node started");
+  srv = alph_node_spawn_value<int64>(&g_node, 0, &zero, &server);
+  for i: int64 in 0..2000 {
+    if (alph_atomic_load(&g_port) != 0) {
+      break;
+    }
+    thread_sleep_ms(1);
+  }
+  var fd2: int64 = dial();
+  for i: int64 in 0..2000 {
+    if (alph_atomic_load(&g_conn) != 0) {
+      break;
+    }
+    thread_sleep_ms(1);
+  }
+  round(srv, fd2, "unstamped");
+  expect(g_read_at - g_to < 5000000, "unstamped: stamped at the read");
+  alph_node_halt(&g_node, 0);
+  alph_node_wait(&g_node);
+  if (g_failures != 0) {
+    return 1;
+  }
+  println("io stamps ok: arrival {late1} us and {late2} us after the writes, reads 30 ms later");
+  return 0;
+}

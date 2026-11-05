@@ -140,6 +140,30 @@ export fn alph_now_ns() -> int64 {
   return ts[0] * ALPH_NS_PER_S + ts[1];
 }
 
+// Wall-clock time (CLOCK_REALTIME) in nanoseconds since 1970, read as
+// alph_now_ns reads the monotonic clock. It may jump when the system's time
+// is set; use it only to convert kernel timestamps, which are in it.
+// Thread: any.
+export fn alph_realtime_ns() -> int64 {
+  var ts: int64[2];
+  ts[0] = 0;
+  ts[1] = 0;
+  var at: int64 = alph_vdso_clock;
+  if (at == 0) {
+    at = alph_vdso_find();
+    alph_vdso_clock = at;
+  }
+  if (at > 0) {
+    // The vDSO may itself fall back to the system call.
+    var gettime: fn(int64, int64*) -> int64 with syscall = (fn(int64, int64*) -> int64 with syscall)(rawptr)at;
+    if (gettime(0, &ts[0]) == 0) {
+      return ts[0] * ALPH_NS_PER_S + ts[1];
+    }
+  }
+  syscall(ALPH_SYS_CLOCK_GETTIME, 0, (int64)&ts[0]);
+  return ts[0] * ALPH_NS_PER_S + ts[1];
+}
+
 // Monotonic time in milliseconds, as alph_now_ns.
 // Thread: any.
 export fn alph_now_ms() -> int64 {

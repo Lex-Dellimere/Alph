@@ -713,6 +713,7 @@ export struct AlphStats {
   io_demoted: int64;
   active: int64;
   refused: int64;
+  yields: int64;
 }
 ```
 
@@ -733,6 +734,7 @@ io_demoted  handles watched one-shot since their fd was taken with
 active   schedulers taking work now (compaction leaves the rest idle)
 refused  requests their sender refused at once with ALPH_BUSY, as the
          server was shedding
+yields   actor runs cut short after ALPH_RUN_NS, with mail left
 ```
 
 ### `AlphNode`
@@ -796,6 +798,8 @@ export struct AlphNode {
   refused: int64;       // requests refused at once with ALPH_BUSY by their senders
   sysmon_looks: int64;  // times the watchdog woke to look
   io_demoted: int64;    // handles turned one-shot because their fd was taken (alph_io_fd)
+  rt_offset: int64;     // CLOCK_REALTIME minus CLOCK_MONOTONIC (ns), refreshed by the watchdog
+  yields: int64;        // runs cut short by ALPH_RUN_NS
   epoch: int64;         // bumped by every retire
   retired: AlphVec;     // pairs: block (bit 0 set: a plain block, else an AlphEntry*), epoch
   retire_lock: int64;
@@ -942,6 +946,19 @@ ALPH_TAG_BUSY       the server shed it unhandled for waiting too long
 Anything later for that ref is dropped, so a late reply never surprises
 the requester. alph_demonitor(ctx, ref) gives up on a request: nothing
 for that ref arrives after it. The server answers with alph_reply.
+Thread: a handler.
+
+### `alph_request_at`
+
+```mettle
+export fn alph_request_at(ctx: AlphCtx*, to: int64, tag: int64, arg: int64, timeout_ms: int64,
+                          sent_at: int64) -> int64
+```
+
+As alph_request, for a request that really arrived at sent_at (monotonic
+ns, as alph_now_ns; from alph_io_recv for one read from a socket): a
+server that sheds load (alph_mailbox_shed) counts its wait from then,
+so time spent in the kernel's buffers or the caller's queue counts too.
 Thread: a handler.
 
 ### `alph_request_value`
@@ -1666,6 +1683,33 @@ Returns the count, 0 at end of stream (the peer closed), ALPH_IO_AGAIN
 when nothing is there yet (arm ALPH_IO_IN and try again), or a negative
 errno (-9 when this actor does not own h). Thread: a handler.
 
+### `alph_io_stamps`
+
+```mettle
+export fn alph_io_stamps(ctx: AlphCtx*, h: int64, on: bool) -> int64
+```
+
+Turns on (or off) kernel arrival stamps for handle h, a socket, for
+alph_io_recv. Turning them on for any socket makes the kernel stamp every
+packet the host receives (a clock read each): small, but host-wide, so it
+is off unless asked for. Returns 0 or a negative errno. Thread: a handler.
+
+### `alph_io_recv`
+
+```mettle
+export fn alph_io_recv(ctx: AlphCtx*, h: int64, buf: rawptr, size: int64, from_ns: int64*,
+                       to_ns: int64*) -> int64
+```
+
+As alph_io_read, and says when what it read arrived: every byte arrived
+at or after *from_ns and at or before *to_ns (monotonic ns, as
+alph_now_ns). For a stream the kernel stamps the last packet read
+(*to_ns); bytes before it may be older, back to *from_ns: the end of the
+last read when that one emptied the socket, else the last packet it
+read. A batch of requests can be given times between the two, the oldest
+first. Without stamps (alph_io_stamps) both are the time of this call.
+Thread: a handler.
+
 ### `alph_io_write`
 
 ```mettle
@@ -2327,6 +2371,16 @@ export fn alph_mailbox_push(mb: AlphMailbox*, m: AlphMsg*) -> bool
 
 Copies *m into the mailbox. Returns false when it holds its limit, or
 when a new segment was needed and memory ran out. Thread: any.
+
+### `alph_mailbox_push_at`
+
+```mettle
+export fn alph_mailbox_push_at(mb: AlphMailbox*, m: AlphMsg*, at: int64) -> bool
+```
+
+As alph_mailbox_push, noting at (monotonic ns, above 0) instead of now as
+the time m was sent, while the mailbox stamps: the time its request
+really arrived, before it waited elsewhere. Thread: any.
 
 ### `alph_mailbox_push_any`
 
@@ -3858,6 +3912,17 @@ vDSO, about 20 ns, and falls back to the system call (about 150-190 ns)
 where there is none; the kernel picks the clock source either way.
 Thread: any.
 
+### `alph_realtime_ns`
+
+```mettle
+export fn alph_realtime_ns() -> int64
+```
+
+Wall-clock time (CLOCK_REALTIME) in nanoseconds since 1970, read as
+alph_now_ns reads the monotonic clock. It may jump when the system's time
+is set; use it only to convert kernel timestamps, which are in it.
+Thread: any.
+
 ### `alph_now_ms`
 
 ```mettle
@@ -4316,6 +4381,7 @@ export const ALPH_SYS_BIND: int64 = 49;
 export const ALPH_SYS_LISTEN: int64 = 50;
 export const ALPH_SYS_GETSOCKNAME: int64 = 51;
 export const ALPH_SYS_SETSOCKOPT: int64 = 54;
+export const ALPH_SYS_RECVMSG: int64 = 47;
 export const ALPH_SYS_GETSOCKOPT: int64 = 55;
 export const ALPH_SYS_FCNTL: int64 = 72;
 export const ALPH_SYS_SIGALTSTACK: int64 = 131;
@@ -4377,6 +4443,9 @@ export const ALPH_SOCK_STREAM: int64 = 1;
 export const ALPH_SOCK_NONBLOCK: int64 = 2048;
 export const ALPH_SOCK_CLOEXEC: int64 = 524288;
 export const ALPH_SOL_SOCKET: int64 = 1;
+export const ALPH_SO_TIMESTAMPING: int64 = 37;   // SO_TIMESTAMPING_OLD: timespecs, 64-bit on x86-64
+export const ALPH_SOF_RX_SOFTWARE: int64 = 8;
+export const ALPH_SOF_SOFTWARE: int64 = 16;
 export const ALPH_SO_REUSEADDR: int64 = 2;
 export const ALPH_SO_ERROR: int64 = 4;
 export const ALPH_SO_REUSEPORT: int64 = 15;

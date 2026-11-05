@@ -130,6 +130,10 @@ const ALPH_MSG_REPLY: int64 = 2;    // answers the request with the same ref
 
 // Messages handled before the scheduler moves on to another actor.
 const ALPH_BUDGET: int64 = 64;
+// An actor's run also ends once it has taken this long (checked every 4
+// messages), so a run of many medium-cost messages cannot hold its
+// scheduler for a millisecond: 64 messages of 20 us did.
+const ALPH_RUN_NS: int64 = 100000;
 // alph_outq_send writes before the end of the run once this much is held.
 export const ALPH_OUTQ_HOLD_BYTES: int64 = 16384;
 export const ALPH_OUTQ_HOLD_SENDS: int64 = 32;
@@ -239,6 +243,7 @@ export struct AlphConfig {
 //   active   schedulers taking work now (compaction leaves the rest idle)
 //   refused  requests their sender refused at once with ALPH_BUSY, as the
 //            server was shedding
+//   yields   actor runs cut short after ALPH_RUN_NS, with mail left
 export struct AlphStats {
   live: int64;
   spawned: int64;
@@ -250,6 +255,7 @@ export struct AlphStats {
   io_demoted: int64;
   active: int64;
   refused: int64;
+  yields: int64;
 }
 
 // A node. Declare one, start it with alph_node_start, and keep it in place
@@ -312,6 +318,8 @@ export struct AlphNode {
   refused: int64;       // requests refused at once with ALPH_BUSY by their senders
   sysmon_looks: int64;  // times the watchdog woke to look
   io_demoted: int64;    // handles turned one-shot because their fd was taken (alph_io_fd)
+  rt_offset: int64;     // CLOCK_REALTIME minus CLOCK_MONOTONIC (ns), refreshed by the watchdog
+  yields: int64;        // runs cut short by ALPH_RUN_NS
   epoch: int64;         // bumped by every retire
   retired: AlphVec;     // pairs: block (bit 0 set: a plain block, else an AlphEntry*), epoch
   retire_lock: int64;
@@ -429,6 +437,7 @@ struct AlphSched {
   runs: int64;          // actor runs, to poll IO now and then while busy
   spin_hits: int64;     // how often its recent spins found work, of 1024 (an average)
   run_seq: int64;       // bumped as each actor run starts, for the watchdog
+  run_at: int64;        // when the current (or last) actor run started (ns)
   run_seen: int64;      // run_seq as the watchdog last saw it
   spin_skips: int64;    // idle stretches it slept through without spinning
   qlen: int64;          // actors in runq, roughly: pushes counted after, pops after
@@ -465,6 +474,7 @@ struct AlphIoSlot {
   stream: int64;    // 1: a TCP stream, where a short read means the socket is drained
   drained: int64;   // the owner's last read or accept found nothing more (owner only)
   full: int64;      // the owner's last write did not fit (owner only)
+  rx_from: int64;   // alph_io_recv: what is still unread arrived no earlier than this (monotonic ns)
 }
 
 // A registered name, or a process group and its members. The name is a
@@ -1144,6 +1154,12 @@ fn alph_message(m: AlphMsg*, from: int64, to: int64, tag: int64, arg: int64, siz
 
 // Copies the payload into m and m into the receiver's mailbox.
 fn alph_post(node: AlphNode*, m: AlphMsg*, payload: rawptr) -> int64 {
+  return alph_post_at(node, m, payload, 0);
+}
+
+// As alph_post; sent_at (monotonic ns, 0 for now) is what a stamping mailbox
+// notes as the send time.
+fn alph_post_at(node: AlphNode*, m: AlphMsg*, payload: rawptr, sent_at: int64) -> int64 {
   var p: AlphProc* = alph_resolve(node, m->to);
   if (p == 0) {
     return ALPH_GONE;
@@ -1167,7 +1183,7 @@ fn alph_post(node: AlphNode*, m: AlphMsg*, payload: rawptr) -> int64 {
   if ((m->flags & ALPH_MSG_REPLY) != 0) {
     pushed = alph_mailbox_push_any(&p->mailbox, m);
   } else {
-    pushed = alph_mailbox_push(&p->mailbox, m);
+    pushed = alph_mailbox_push_at(&p->mailbox, m, sent_at);
   }
   if (!pushed) {
     alph_msg_release(m);
@@ -1237,6 +1253,11 @@ export fn alph_node_send_bytes(node: AlphNode*, to: int64, tag: int64, data: raw
 
 fn alph_request_raw(ctx: AlphCtx*, to: int64, tag: int64, arg: int64, data: rawptr,
                     size: int64, timeout_ms: int64) -> int64 {
+  return alph_request_from(ctx, to, tag, arg, data, size, timeout_ms, 0);
+}
+
+fn alph_request_from(ctx: AlphCtx*, to: int64, tag: int64, arg: int64, data: rawptr,
+                     size: int64, timeout_ms: int64, sent_at: int64) -> int64 {
   var server: AlphProc* = alph_resolve(ctx->node, to);
   if (server != 0 && server->shed_target > 0 && alph_shed_refuse(server)) {
     alph_atomic_add(&ctx->node->refused, 1);
@@ -1247,7 +1268,7 @@ fn alph_request_raw(ctx: AlphCtx*, to: int64, tag: int64, arg: int64, data: rawp
   alph_message(&m, ctx->self, to, tag, arg, size);
   m.ref = ref;
   m.flags = ALPH_MSG_REQUEST;
-  var sent: int64 = alph_post(ctx->node, &m, data);
+  var sent: int64 = alph_post_at(ctx->node, &m, data, sent_at);
   if (sent != ALPH_SENT && sent != ALPH_GONE) {
     alph_demonitor(ctx, ref);
     return sent;
@@ -1291,6 +1312,16 @@ export fn alph_backlog(ctx: AlphCtx*) -> int64 {
 // Thread: a handler.
 export fn alph_request(ctx: AlphCtx*, to: int64, tag: int64, arg: int64, timeout_ms: int64) -> int64 {
   return alph_request_raw(ctx, to, tag, arg, (rawptr)0, 0, timeout_ms);
+}
+
+// As alph_request, for a request that really arrived at sent_at (monotonic
+// ns, as alph_now_ns; from alph_io_recv for one read from a socket): a
+// server that sheds load (alph_mailbox_shed) counts its wait from then,
+// so time spent in the kernel's buffers or the caller's queue counts too.
+// Thread: a handler.
+export fn alph_request_at(ctx: AlphCtx*, to: int64, tag: int64, arg: int64, timeout_ms: int64,
+                          sent_at: int64) -> int64 {
+  return alph_request_from(ctx, to, tag, arg, (rawptr)0, 0, timeout_ms, sent_at);
 }
 
 // Sends a request carrying one T. Otherwise as alph_request.
@@ -2852,10 +2883,15 @@ fn alph_handle_message(s: AlphSched*, p: AlphProc*, m: AlphMsg*) -> int64 {
   return alph_deliver(s, p, m);
 }
 
-// Handles signals, then up to ALPH_BUDGET messages. Returns an exit reason,
-// -1 when the actor ran out of work, or -2 when its budget ran out.
+// Handles signals, then up to ALPH_BUDGET messages, for up to ALPH_RUN_NS:
+// the clock is read at the start and every 4 messages, and a run that took
+// longer ends after the message in hand. A single long handler is never cut
+// short. Returns an exit reason, -1 when the actor ran out of work, -2 when
+// its message budget ran out, or -3 when its time did.
 fn alph_run_some(s: AlphSched*, p: AlphProc*) -> int64 {
   var m: AlphMsg;
+  var run_from: int64 = alph_now_ns();
+  s->run_at = run_from;
   if (p->retry != 0) {
     // Resumed by a medic that asked for the crashing message again.
     p->retry = 0;
@@ -2923,6 +2959,9 @@ fn alph_run_some(s: AlphSched*, p: AlphProc*) -> int64 {
     var outcome: int64 = alph_handle_message(s, p, &m);
     if (outcome >= 0) {
       return outcome;
+    }
+    if ((n & 3) == 3 && alph_now_ns() - run_from >= ALPH_RUN_NS) {
+      return -3;
     }
   }
   return -2;
@@ -3055,6 +3094,19 @@ fn alph_run_proc(s: AlphSched*, p: AlphProc*) {
   s->current = 0;
   if (outcome >= 0) {
     alph_proc_exit(node, p, outcome);
+    return;
+  }
+  if (outcome == -3) {
+    // Its time ran out with mail left: to the back of this run queue, where
+    // a stealer can take it, and when others wait here too, wake a sleeping
+    // scheduler to share them, as Go's preemption does with wakep: a run cut
+    // short for time is a direct sign of contention.
+    alph_atomic_add(&node->yields, 1);
+    alph_atomic_store(&p->status, ALPH_P_QUEUED);
+    alph_runq_push(s, p);
+    if (s->bound == 0 && alph_atomic_load(&s->qlen) > 1) {
+      alph_sysmon_rescue(node, s);
+    }
     return;
   }
   if (outcome == -2 ||
@@ -3345,6 +3397,83 @@ export fn alph_io_read(ctx: AlphCtx*, h: int64, buf: rawptr, size: int64) -> int
     slot->drained = 1;
   } else if (n >= 0) {
     slot->drained = 0;  // a full read, or the end of the stream, which stays readable
+  }
+  return n;
+}
+
+// Turns on (or off) kernel arrival stamps for handle h, a socket, for
+// alph_io_recv. Turning them on for any socket makes the kernel stamp every
+// packet the host receives (a clock read each): small, but host-wide, so it
+// is off unless asked for. Returns 0 or a negative errno. Thread: a handler.
+export fn alph_io_stamps(ctx: AlphCtx*, h: int64, on: bool) -> int64 {
+  var slot: AlphIoSlot* = alph_io_mine(ctx, h);
+  if (slot == 0) {
+    return -9;
+  }
+  var flags: int64 = 0;
+  if (on) {
+    flags = ALPH_SOF_RX_SOFTWARE | ALPH_SOF_SOFTWARE;
+  }
+  slot->rx_from = alph_now_ns();
+  return alph_sys_setsockopt(slot->fd, ALPH_SOL_SOCKET, ALPH_SO_TIMESTAMPING, flags);
+}
+
+// As alph_io_read, and says when what it read arrived: every byte arrived
+// at or after *from_ns and at or before *to_ns (monotonic ns, as
+// alph_now_ns). For a stream the kernel stamps the last packet read
+// (*to_ns); bytes before it may be older, back to *from_ns: the end of the
+// last read when that one emptied the socket, else the last packet it
+// read. A batch of requests can be given times between the two, the oldest
+// first. Without stamps (alph_io_stamps) both are the time of this call.
+// Thread: a handler.
+export fn alph_io_recv(ctx: AlphCtx*, h: int64, buf: rawptr, size: int64, from_ns: int64*,
+                       to_ns: int64*) -> int64 {
+  var slot: AlphIoSlot* = alph_io_mine(ctx, h);
+  if (slot == 0) {
+    return -9;
+  }
+  var iov: int64[2];
+  iov[0] = (int64)buf;
+  iov[1] = size;
+  var control: int64[16];
+  var msg: int64[7];
+  msg[0] = 0;      // msg_name
+  msg[1] = 0;      // msg_namelen
+  msg[2] = (int64)&iov[0];
+  msg[3] = 1;
+  msg[4] = (int64)&control[0];
+  msg[5] = 128;    // msg_controllen
+  msg[6] = 0;      // msg_flags
+  var n: int64 = syscall(ALPH_SYS_RECVMSG, slot->fd, (int64)&msg[0], 0);
+  var now: int64 = alph_now_ns();
+  var stamp: int64 = 0;
+  if (n > 0 && msg[5] >= 64) {
+    // One cmsghdr: len (8), level (4), type (4), then scm_timestamping:
+    // three timespecs, the first the software stamp (CLOCK_REALTIME).
+    var level: int32 = *(int32*)((int64)&control[0] + 8);
+    var kind: int32 = *(int32*)((int64)&control[0] + 12);
+    if ((int64)level == ALPH_SOL_SOCKET && (int64)kind == ALPH_SO_TIMESTAMPING && control[2] != 0) {
+      stamp = control[2] * 1000000000 + control[3] - alph_atomic_load(&ctx->node->rt_offset);
+      if (stamp > now) {
+        stamp = now;
+      }
+    }
+  }
+  if (stamp == 0) {
+    stamp = now;
+  }
+  var from: int64 = slot->rx_from;
+  if (from == 0 || from > stamp) {
+    from = stamp;
+  }
+  *from_ns = from;
+  *to_ns = stamp;
+  if (n == ALPH_IO_AGAIN || (n > 0 && n < size && slot->stream != 0)) {
+    slot->drained = 1;
+    slot->rx_from = now;  // what comes next arrives after this read
+  } else if (n >= 0) {
+    slot->drained = 0;
+    slot->rx_from = stamp;  // what is left came after the last packet read
   }
   return n;
 }
@@ -5009,6 +5138,7 @@ export fn alph_node_start(node: AlphNode*, cfg: AlphConfig*) -> bool {
       return false;
     }
   }
+  node->rt_offset = alph_realtime_ns() - alph_now_ns();
   node->sysmon_handle = alph_thread_start(&node->sysmon, &alph_sysmon_main, (int64)node, 65536);
   return node->sysmon_handle != 0;
 }
@@ -5047,6 +5177,7 @@ fn alph_sysmon_main(arg: int64) -> int64 {
     alph_futex_wait(&node->sysmon_word, word, delay);
     alph_atomic_store(&node->sysmon_idle, 0);
     alph_atomic_add(&node->sysmon_looks, 1);
+    alph_atomic_store(&node->rt_offset, alph_realtime_ns() - alph_now_ns());
     var busy: bool = false;
     var acted: bool = false;
     var t: int64 = alph_now_ns();
@@ -5174,4 +5305,5 @@ export fn alph_node_stats(node: AlphNode*, stats: AlphStats*) {
   stats->io_demoted = alph_atomic_load(&node->io_demoted);
   stats->active = alph_atomic_load(&node->active);
   stats->refused = alph_atomic_load(&node->refused);
+  stats->yields = alph_atomic_load(&node->yields);
 }
