@@ -14,8 +14,230 @@ import "alph/alph";
 
 Imports are visible through the whole import graph, so this brings in
 everything an application uses: the node and its actors, messages,
-supervisors and medics. The x86-64 Linux layer under alph/sys comes along
+supervisors and medics, and the standalone event loop alph/io/reactor,
+which also works on its own. The x86-64 Linux layer under alph/sys comes along
 too; most programs never call it directly.
+
+## alph/io/reactor
+
+An event loop for one thread, with no actors and no
+threads of its own. Usable alone: a terminal UI, a monitor, a client or a
+small server can run on just this, and alph's schedulers build on it.
+
+A reactor watches file descriptors (sockets, pipes, terminals, anything
+epoll takes), keeps timers with nanosecond deadlines, and can be woken
+from any thread. alph_rx_wait sleeps until something happens and fills an
+array of events; nothing spins, so an idle reactor costs no CPU.
+
+```text
+var r: AlphReactor;
+alph_rx_init(&r);
+alph_rx_add(&r, sock, ALPH_RX_READ, ALPH_RX_ONESHOT, 7);
+var t: int64 = alph_rx_timer(&r, 250 * 1000000, 1);  // 250 ms
+var ev: AlphRxEvent[64];
+while (true) {
+  var n: int64 = alph_rx_wait(&r, &ev[0], 64, -1);
+  for i: int64 in 0..n {
+    if (ev[i].kind == ALPH_RX_FD && ev[i].data == 7) { ... read; alph_rx_modify(...) to re-arm }
+    if (ev[i].kind == ALPH_RX_TIMER) { ... ev[i].data == 1 }
+  }
+}
+```
+
+Only alph_rx_wake may be called from another thread; everything else
+belongs to the thread that runs the reactor. For many threads, run one
+reactor per thread.
+
+Readiness bits, for alph_rx_add and AlphRxEvent.events.
+
+```mettle
+export const ALPH_RX_READ: int64 = 1;           // data to read, or a peer to accept
+export const ALPH_RX_WRITE: int64 = 4;          // room to write, or a connect finished
+export const ALPH_RX_ERROR: int64 = 8;          // an error is pending (always reported)
+export const ALPH_RX_HANGUP: int64 = 16;        // hung up (always reported)
+export const ALPH_RX_PEER_CLOSED: int64 = 8192; // the peer closed its writing side
+```
+
+Arming modes, for alph_rx_add and alph_rx_modify.
+
+```text
+ALPH_RX_LEVEL    reported on every wait while ready (simplest)
+ALPH_RX_ONESHOT  reported once, then quiet until alph_rx_modify arms it
+                 again: one owner handles each readiness exactly once
+ALPH_RX_EDGE     reported when it becomes ready; read or write until
+                 ALPH_IO_AGAIN before waiting again
+```
+
+```mettle
+export const ALPH_RX_LEVEL: int64 = 0;
+export const ALPH_RX_ONESHOT: int64 = 1;
+export const ALPH_RX_EDGE: int64 = 2;
+```
+
+Event kinds, in AlphRxEvent.kind.
+
+```mettle
+export const ALPH_RX_FD: int64 = 1;      // data = the fd's data; events = what is ready
+export const ALPH_RX_TIMER: int64 = 2;   // data = the timer's data; events = its id
+export const ALPH_RX_WAKE: int64 = 3;    // alph_rx_wake was called, once or more
+export const ALPH_RX_SIGNAL: int64 = 4;  // data = the signal number
+```
+
+### `AlphRxEvent`
+
+```mettle
+export struct AlphRxEvent {
+  kind: int64;
+  data: int64;
+  events: int64;
+}
+```
+
+One event from alph_rx_wait.
+
+### `AlphReactor`
+
+```mettle
+export struct AlphReactor {
+  epfd: int64;
+  wakefd: int64;
+  timerfd: int64;
+  sigfd: int64;
+  woken: int64;      // a wake is pending in wakefd
+  buf: int64;        // epoll_event[ALPH_RX_BATCH]
+  slots: int64;      // AlphRxTimer array
+  slot_cap: int64;
+  free_top: int64;   // free slot indexes, a stack in free_list
+  free_list: int64;
+  heap: int64;       // slot indexes, ordered by deadline
+  heap_len: int64;
+  armed: int64;      // the deadline timerfd is set to, or 0 when disarmed
+}
+```
+
+A reactor. Declare one, start it with alph_rx_init, and keep it in place;
+its fields are its own.
+
+### `alph_rx_init`
+
+```mettle
+export fn alph_rx_init(r: AlphReactor*) -> bool
+```
+
+Starts a reactor. Returns false when the kernel refuses an epoll set, an
+eventfd or a timerfd, or memory runs out. Thread: any, before use.
+
+### `alph_rx_free`
+
+```mettle
+export fn alph_rx_free(r: AlphReactor*)
+```
+
+Closes the reactor's own descriptors and frees its memory. The
+descriptors it watched stay open; close them yourself. Thread: its owner.
+
+### `alph_rx_add`
+
+```mettle
+export fn alph_rx_add(r: AlphReactor*, fd: int64, events: int64, mode: int64, data: int64) -> int64
+```
+
+Starts watching fd for events (ALPH_RX_READ, ALPH_RX_WRITE,
+ALPH_RX_PEER_CLOSED; errors and hang-ups always come), armed by mode.
+data comes back in each of its events and must not be negative. The fd
+should be non-blocking (alph_sys_nonblock).
+
+Returns 0, or a negative errno: -17 when fd is already watched, -1 (EPERM)
+for a regular file, which epoll cannot watch. Thread: its owner.
+
+### `alph_rx_modify`
+
+```mettle
+export fn alph_rx_modify(r: AlphReactor*, fd: int64, events: int64, mode: int64, data: int64) -> int64
+```
+
+Changes what fd is watched for, its mode or its data; for a one-shot fd
+this arms it again. Returns 0 or a negative errno. Thread: its owner.
+
+### `alph_rx_remove`
+
+```mettle
+export fn alph_rx_remove(r: AlphReactor*, fd: int64) -> int64
+```
+
+Stops watching fd; call it before closing fd. Returns 0 or a negative
+errno. Thread: its owner.
+
+### `alph_rx_timer_at`
+
+```mettle
+export fn alph_rx_timer_at(r: AlphReactor*, deadline_ns: int64, data: int64) -> int64
+```
+
+Starts a timer that fires once at deadline_ns (alph_now_ns time), with
+data. Returns its id (above 0), to cancel it, or 0 when out of memory.
+Thread: its owner.
+
+### `alph_rx_timer`
+
+```mettle
+export fn alph_rx_timer(r: AlphReactor*, after_ns: int64, data: int64) -> int64
+```
+
+Starts a timer that fires once after after_ns nanoseconds. Otherwise as
+alph_rx_timer_at. Thread: its owner.
+
+### `alph_rx_cancel`
+
+```mettle
+export fn alph_rx_cancel(r: AlphReactor*, id: int64) -> bool
+```
+
+Cancels timer id. Returns false when it already fired or was cancelled.
+Thread: its owner.
+
+### `alph_rx_timers`
+
+```mettle
+export fn alph_rx_timers(r: AlphReactor*) -> int64
+```
+
+Timers pending. Thread: its owner.
+
+### `alph_rx_wake`
+
+```mettle
+export fn alph_rx_wake(r: AlphReactor*)
+```
+
+Wakes the reactor: its current or next alph_rx_wait returns an
+ALPH_RX_WAKE event. Many wakes before a wait make one event.
+Thread: any; this is the one call another thread may make.
+
+### `alph_rx_signals`
+
+```mettle
+export fn alph_rx_signals(r: AlphReactor*, mask: int64) -> bool
+```
+
+Delivers signals (a mask: bit n for signal n, such as (1 << 28) for
+SIGWINCH) as ALPH_RX_SIGNAL events instead of handlers: they are blocked
+for the calling thread, so call this before starting other threads, which
+inherit the block. Returns false when the kernel refuses. Thread: its
+owner.
+
+### `alph_rx_wait`
+
+```mettle
+export fn alph_rx_wait(r: AlphReactor*, out: AlphRxEvent*, cap: int64, timeout_ns: int64) -> int64
+```
+
+Waits until something happens or timeout_ns passes (-1: no limit; 0:
+just look), then fills out with up to cap events: ready fds, timers that
+came due, a wake, signals. Timers fire with the timerfd's nanosecond
+precision, not epoll's milliseconds. Returns how many events, 0 on a
+timeout, or a negative errno (-4 when a signal handler interrupted the
+wait). Thread: its owner.
 
 ## alph/core/node
 
@@ -2595,6 +2817,180 @@ Gives back the permit named by ref, or withdraws the request if it is
 still waiting; a GRANTED for ref already on its way is dropped. Returns
 as alph_send; on ALPH_FULL try again later, or exit, which also gives it
 back. Thread: a handler.
+
+## alph/work/task
+
+One-shot tasks and a bounded parallel map, like Elixir's
+Task and Task.async_stream.
+
+A task is a short-lived actor that runs one function and answers. The
+caller does not block: it gets a ref, and the answer arrives as a message
+with that ref, so "await" is handling ALPH_TAG_TASK_DONE. A task that
+crashes answers with ALPH_TAG_DOWN, and one that runs too long with
+ALPH_TAG_TIMEOUT, as for any alph_request; its late answer is dropped.
+
+```text
+fn square(ctx: AlphCtx*, data: rawptr, size: int64) -> int64 ... {
+  return *(int64*)data * *(int64*)data;
+}
+var ref: int64 = alph_task(ctx, (rawptr)&n, 8, 1000, &square);
+... ALPH_TAG_TASK_DONE with m->ref == ref: m->arg is the square
+```
+
+alph_task_map runs one function over many items with at most a given
+number running at once, and answers once with every result in order.
+
+The answer to alph_task: arg = what the function returned; ref = the ref
+alph_task returned.
+
+```mettle
+export const ALPH_TAG_TASK_DONE: int64 = 51;
+```
+
+The answer to alph_task_map: arg = how many items failed; the payload is
+one AlphTaskResult per item, in item order. ref = the ref alph_task_map
+returned.
+
+```mettle
+export const ALPH_TAG_TASK_ALL: int64 = 52;
+```
+
+### `AlphTaskResult`
+
+```mettle
+export struct AlphTaskResult {
+  ok: int64;
+  value: int64;
+}
+```
+
+One item's outcome in an ALPH_TAG_TASK_ALL answer.
+
+```text
+ok     1 when the function returned, 0 when it crashed or timed out
+value  what it returned, 0 when it failed
+```
+
+### `alph_task`
+
+```mettle
+export fn alph_task(ctx: AlphCtx*, data: rawptr, size: int64, timeout_ms: int64,
+                    work: fn(AlphCtx*, rawptr, int64) -> int64 with alloc, syscall, asm) -> int64
+```
+
+Starts a task running work on a copy of size bytes at data, with
+timeout_ms to answer (0 waits for ever). work gets the task's own ctx, so
+it may allocate, send and spawn like any handler; it must not block.
+
+Returns the ref the answer carries (ALPH_TAG_TASK_DONE, or ALPH_TAG_DOWN
+when the task crashed, or ALPH_TAG_TIMEOUT), or 0 when the node is full,
+or ALPH_FULL or ALPH_NOMEM as alph_request. Thread: a handler.
+
+### `alph_task_map`
+
+```mettle
+export fn alph_task_map(ctx: AlphCtx*, items: rawptr, count: int64, item_size: int64, max_tasks: int64,
+                        item_timeout_ms: int64, timeout_ms: int64,
+                        work: fn(AlphCtx*, rawptr, int64) -> int64 with alloc, syscall, asm) -> int64
+```
+
+Runs work over count items of item_size bytes each, at items, with at
+most max_tasks tasks at once, each given item_timeout_ms (0: no limit).
+The items are copied. The answer, once every item is done, is
+ALPH_TAG_TASK_ALL: arg = how many failed, payload = an AlphTaskResult per
+item in order. A coordinator actor does the work, so the caller stays
+free; if it crashes the answer is ALPH_TAG_DOWN, and timeout_ms bounds
+the whole map (0: no limit).
+
+Returns the ref the answer carries, 0 when the node is full or out of
+memory, or as alph_request. Thread: a handler.
+
+## alph/work/agent
+
+State behind an actor, like Elixir's Agent.
+
+An agent holds one block of state. Others read it with alph_agent_get, or
+change it by sending a function that runs inside the agent, one at a
+time, so no lock is needed. Put it under a supervisor with
+alph_sup_add_bytes(spec, state, size, &alph_agent_handle).
+
+```text
+fn add(state: rawptr, size: int64, arg: int64) -> int64 ... {
+  *(int64*)state = *(int64*)state + arg;
+  return *(int64*)state;
+}
+var counter: int64 = alph_spawn_agent(ctx, ALPH_LINK, (rawptr)&zero, 8);
+alph_agent_update(ctx, counter, 5, 1000, &add);
+... ALPH_TAG_AGENT_DONE: m->arg is the new count
+```
+
+The answer to alph_agent_get: the payload is a copy of the state.
+
+```mettle
+export const ALPH_TAG_AGENT_STATE: int64 = 55;
+```
+
+The answer to alph_agent_update: arg = what the function returned.
+
+```mettle
+export const ALPH_TAG_AGENT_DONE: int64 = 56;
+```
+
+### `alph_agent_handle`
+
+```mettle
+export fn alph_agent_handle(ctx: AlphCtx*, m: AlphMsg*) -> int64
+```
+
+An agent's handler, for starting one where a handler is asked for, such
+as under a supervisor; its state is the agent's state.
+Thread: the runtime calls it.
+
+### `alph_spawn_agent`
+
+```mettle
+export fn alph_spawn_agent(ctx: AlphCtx*, flags: int64, state: rawptr, size: int64) -> int64
+```
+
+Spawns an agent whose state starts as a copy of size bytes at state.
+
+```text
+flags  as alph_spawn: ALPH_LINK to stop it with the caller
+```
+
+Returns its pid, or 0 when the node is full or out of memory.
+Thread: a handler.
+
+### `alph_agent_get`
+
+```mettle
+export fn alph_agent_get(ctx: AlphCtx*, agent: int64, timeout_ms: int64) -> int64
+```
+
+Asks agent for a copy of its state. The answer is ALPH_TAG_AGENT_STATE
+with the copy as payload. Returns as alph_request. Thread: a handler.
+
+### `alph_agent_update`
+
+```mettle
+export fn alph_agent_update(ctx: AlphCtx*, agent: int64, arg: int64, timeout_ms: int64,
+                            f: fn(rawptr, int64, int64) -> int64 with alloc, syscall, asm) -> int64
+```
+
+Runs f(state, size, arg) inside agent; f may change the state in place.
+The answer is ALPH_TAG_AGENT_DONE with what f returned. If f crashes, the
+agent crashes and the answer is ALPH_TAG_DOWN. Returns as alph_request.
+Thread: a handler.
+
+### `alph_agent_cast`
+
+```mettle
+export fn alph_agent_cast(ctx: AlphCtx*, agent: int64, arg: int64,
+                          f: fn(rawptr, int64, int64) -> int64 with alloc, syscall, asm) -> int64
+```
+
+As alph_agent_update with no answer. Returns as alph_send.
+Thread: a handler.
 
 ## alph/net/port
 

@@ -1,0 +1,337 @@
+// alph/io/reactor on its own, with no node and no actors: level, one-shot and
+// edge arming on a pipe, writability of a connecting TCP socket, removal, 200
+// timers with random deadlines (every third cancelled; fired once each, in
+// deadline order, never early), sub-millisecond timer precision, a wake from
+// another thread (and many wakes making one event), a signal delivered as an
+// event, and an idle wait that sleeps its full timeout.
+
+import "std/io";
+import "std/thread";
+import "alph/sys/linux";
+import "alph/sys/fd";
+import "alph/sys/clock";
+import "alph/io/reactor";
+
+const TRX_TIMERS: int64 = 200;
+const TRX_MS: int64 = 1000000;
+
+var trx_r: AlphReactor;
+var trx_failures: int64 = 0;
+var trx_rng: int64 = 12345;
+var trx_pipe_r: int64 = -1;
+var trx_pipe_w: int64 = -1;
+
+fn expect(ok: bool, what: string) {
+  if (!ok) {
+    println("FAIL {what}");
+    trx_failures = trx_failures + 1;
+  }
+}
+
+fn trx_rand() -> int64 {
+  trx_rng = (trx_rng * 1103515245 + 12345) & 2147483647;
+  return trx_rng;
+}
+
+// How many FD events in ev[0..n] carry data, and the OR of their masks.
+fn trx_fd_count(ev: AlphRxEvent*, n: int64, data: int64) -> int64 {
+  var c: int64 = 0;
+  for i: int64 in 0..n {
+    if (ev[i].kind == ALPH_RX_FD && ev[i].data == data) {
+      c = c + 1;
+    }
+  }
+  return c;
+}
+
+fn trx_fd_mask(ev: AlphRxEvent*, n: int64, data: int64) -> int64 {
+  var m: int64 = 0;
+  for i: int64 in 0..n {
+    if (ev[i].kind == ALPH_RX_FD && ev[i].data == data) {
+      m = m | ev[i].events;
+    }
+  }
+  return m;
+}
+
+fn trx_kind_count(ev: AlphRxEvent*, n: int64, kind: int64) -> int64 {
+  var c: int64 = 0;
+  for i: int64 in 0..n {
+    if (ev[i].kind == kind) {
+      c = c + 1;
+    }
+  }
+  return c;
+}
+
+// A fresh reactor and a non-blocking pipe.
+fn trx_begin() {
+  expect(alph_rx_init(&trx_r), "reactor starts");
+  var fds: int32[2];
+  expect(syscall(ALPH_SYS_PIPE2, (int64)&fds[0], ALPH_O_NONBLOCK | ALPH_O_CLOEXEC) == 0, "pipe created");
+  trx_pipe_r = (int64)fds[0];
+  trx_pipe_w = (int64)fds[1];
+}
+
+fn trx_end() {
+  alph_rx_free(&trx_r);
+  alph_sys_close(trx_pipe_r);
+  alph_sys_close(trx_pipe_w);
+}
+
+fn trx_put() {
+  var b: uint8[1];
+  b[0] = (uint8)65;
+  expect(alph_sys_write(trx_pipe_w, (rawptr)&b[0], 1) == 1, "pipe write");
+}
+
+fn trx_drain() {
+  var b: uint8[64];
+  while (alph_sys_read(trx_pipe_r, (rawptr)&b[0], 64) > 0) {
+  }
+}
+
+fn trx_wait(ev: AlphRxEvent*, timeout_ns: int64) -> int64 {
+  return alph_rx_wait(&trx_r, ev, 16, timeout_ns);
+}
+
+fn trx_levels() {
+  var ev: AlphRxEvent[16];
+  trx_begin();
+  expect(alph_rx_add(&trx_r, trx_pipe_r, ALPH_RX_READ, ALPH_RX_LEVEL, 11) == 0, "level add");
+  expect(alph_rx_add(&trx_r, trx_pipe_r, ALPH_RX_READ, ALPH_RX_LEVEL, 11) == -17, "adding twice is EEXIST");
+  expect(trx_wait(&ev[0], 0) == 0, "level: nothing before a write");
+  trx_put();
+  var n: int64 = trx_wait(&ev[0], 100 * TRX_MS);
+  expect(trx_fd_count(&ev[0], n, 11) == 1 && ev[0].kind == ALPH_RX_FD, "level: reported after a write");
+  expect((trx_fd_mask(&ev[0], n, 11) & ALPH_RX_READ) != 0, "level: READ bit set");
+  n = trx_wait(&ev[0], 100 * TRX_MS);
+  expect(trx_fd_count(&ev[0], n, 11) == 1, "level: reported again without reading");
+  trx_drain();
+  n = trx_wait(&ev[0], 0);
+  expect(trx_fd_count(&ev[0], n, 11) == 0, "level: quiet once drained");
+  trx_end();
+}
+
+fn trx_oneshot() {
+  var ev: AlphRxEvent[16];
+  trx_begin();
+  alph_rx_add(&trx_r, trx_pipe_r, ALPH_RX_READ, ALPH_RX_ONESHOT, 12);
+  trx_put();
+  var n: int64 = trx_wait(&ev[0], 100 * TRX_MS);
+  expect(trx_fd_count(&ev[0], n, 12) == 1, "oneshot: reported once");
+  n = trx_wait(&ev[0], 2 * TRX_MS);
+  expect(trx_fd_count(&ev[0], n, 12) == 0, "oneshot: not reported again");
+  expect(alph_rx_modify(&trx_r, trx_pipe_r, ALPH_RX_READ, ALPH_RX_ONESHOT, 12) == 0, "oneshot: modify");
+  n = trx_wait(&ev[0], 100 * TRX_MS);
+  expect(trx_fd_count(&ev[0], n, 12) == 1, "oneshot: reported again after re-arming");
+  n = trx_wait(&ev[0], 2 * TRX_MS);
+  expect(trx_fd_count(&ev[0], n, 12) == 0, "oneshot: quiet after the second report");
+  trx_end();
+}
+
+fn trx_edge() {
+  var ev: AlphRxEvent[16];
+  trx_begin();
+  alph_rx_add(&trx_r, trx_pipe_r, ALPH_RX_READ, ALPH_RX_EDGE, 13);
+  trx_put();
+  var n: int64 = trx_wait(&ev[0], 100 * TRX_MS);
+  expect(trx_fd_count(&ev[0], n, 13) == 1, "edge: reported after a write");
+  n = trx_wait(&ev[0], 2 * TRX_MS);
+  expect(trx_fd_count(&ev[0], n, 13) == 0, "edge: not reported again unread");
+  trx_put();
+  n = trx_wait(&ev[0], 100 * TRX_MS);
+  expect(trx_fd_count(&ev[0], n, 13) == 1, "edge: reported after a new write");
+  n = trx_wait(&ev[0], 2 * TRX_MS);
+  expect(trx_fd_count(&ev[0], n, 13) == 0, "edge: quiet again");
+  trx_end();
+}
+
+fn trx_remove() {
+  var ev: AlphRxEvent[16];
+  trx_begin();
+  alph_rx_add(&trx_r, trx_pipe_r, ALPH_RX_READ, ALPH_RX_LEVEL, 14);
+  expect(alph_rx_remove(&trx_r, trx_pipe_r) == 0, "remove succeeds");
+  expect(alph_rx_remove(&trx_r, trx_pipe_r) < 0, "removing twice fails");
+  trx_put();
+  var n: int64 = trx_wait(&ev[0], 3 * TRX_MS);
+  expect(n == 0, "no events after remove");
+  trx_end();
+}
+
+// A non-blocking TCP socket connecting to a local listener becomes writable.
+fn trx_writable() {
+  var ev: AlphRxEvent[16];
+  expect(alph_rx_init(&trx_r), "reactor starts");
+  var addr: uint8[16];
+  var lfd: int64 = alph_sys_tcp_socket();
+  alph_sys_sockaddr(&addr[0], (127 << 24) | 1, 0);
+  expect(syscall(ALPH_SYS_BIND, lfd, (int64)&addr[0], 16) == 0, "bind");
+  expect(syscall(ALPH_SYS_LISTEN, lfd, 8) == 0, "listen");
+  var len: int32 = 16;
+  expect(syscall(ALPH_SYS_GETSOCKNAME, lfd, (int64)&addr[0], (int64)&len) == 0, "getsockname");
+  var cfd: int64 = alph_sys_tcp_socket();
+  var rc: int64 = syscall(ALPH_SYS_CONNECT, cfd, (int64)&addr[0], 16);
+  expect(rc == 0 || rc == -ALPH_EINPROGRESS, "connect started");
+  expect(alph_rx_add(&trx_r, cfd, ALPH_RX_WRITE, ALPH_RX_LEVEL, 15) == 0, "socket added");
+  var n: int64 = trx_wait(&ev[0], 1000 * TRX_MS);
+  expect((trx_fd_mask(&ev[0], n, 15) & ALPH_RX_WRITE) != 0, "connected socket reports WRITE");
+  alph_rx_free(&trx_r);
+  alph_sys_close(cfd);
+  alph_sys_close(lfd);
+}
+
+fn trx_timers() {
+  var ev: AlphRxEvent[16];
+  var deadline: int64[200];
+  var id: int64[200];
+  var cancelled: int64[200];
+  var fired: int64[200];
+  expect(alph_rx_init(&trx_r), "reactor starts");
+  var base: int64 = alph_now_ns();
+  var want: int64 = 0;
+  for i: int64 in 0..TRX_TIMERS {
+    deadline[i] = base + 100000 + trx_rand() % 19900001;  // 0.1 ms to 20 ms
+    id[i] = alph_rx_timer_at(&trx_r, deadline[i], i);
+    cancelled[i] = 0;
+    fired[i] = 0;
+    expect(id[i] > 0, "timer started");
+  }
+  expect(alph_rx_timers(&trx_r) == TRX_TIMERS, "all timers pending");
+  for i: int64 in 0..TRX_TIMERS {
+    if (i % 3 == 0) {
+      expect(alph_rx_cancel(&trx_r, id[i]), "cancel a pending timer");
+      expect(!alph_rx_cancel(&trx_r, id[i]), "cancelling twice returns false");
+      cancelled[i] = 1;
+    } else {
+      want = want + 1;
+    }
+  }
+  expect(alph_rx_timers(&trx_r) == want, "cancelled timers are gone");
+  var got: int64 = 0;
+  var last: int64 = 0;
+  var give_up: int64 = alph_now_ns() + (int64)3000 * TRX_MS;
+  while (got < want && alph_now_ns() < give_up) {
+    var n: int64 = trx_wait(&ev[0], 100 * TRX_MS);
+    var at: int64 = alph_now_ns();
+    for k: int64 in 0..n {
+      expect(ev[k].kind == ALPH_RX_TIMER, "only timer events");
+      var d: int64 = ev[k].data;
+      if (d < 0 || d >= TRX_TIMERS) {
+        expect(false, "timer data in range");
+        continue;
+      }
+      expect(cancelled[d] == 0, "a cancelled timer never fires");
+      expect(fired[d] == 0, "a timer fires once");
+      expect(ev[k].events == id[d], "the event carries the timer id");
+      expect(at >= deadline[d], "no timer fires early");
+      expect(deadline[d] >= last, "timers fire in deadline order");
+      expect(!alph_rx_cancel(&trx_r, id[d]), "cancelling a fired timer returns false");
+      fired[d] = fired[d] + 1;
+      last = deadline[d];
+      got = got + 1;
+    }
+  }
+  expect(got == want, "every remaining timer fired");
+  expect(alph_rx_timers(&trx_r) == 0, "no timers left");
+  expect(trx_wait(&ev[0], 3 * TRX_MS) == 0, "nothing after the last timer");
+  alph_rx_free(&trx_r);
+}
+
+fn trx_precision() {
+  var ev: AlphRxEvent[16];
+  expect(alph_rx_init(&trx_r), "reactor starts");
+  var best: int64 = 1000 * TRX_MS;
+  var worst: int64 = 0;
+  for s: int64 in 0..5 {
+    var t0: int64 = alph_now_ns();
+    alph_rx_timer(&trx_r, 300000, 1);
+    var n: int64 = trx_wait(&ev[0], -1);
+    var dt: int64 = alph_now_ns() - t0;
+    expect(n == 1 && ev[0].kind == ALPH_RX_TIMER, "300 us timer fires");
+    expect(dt >= 300000, "300 us timer is not early");
+    if (dt < best) {
+      best = dt;
+    }
+    if (dt > worst) {
+      worst = dt;
+    }
+  }
+  println("300 us timer: best {best} ns, worst {worst} ns");
+  expect(best < 5 * TRX_MS, "300 us timer is received within 5 ms");
+  alph_rx_free(&trx_r);
+}
+
+fn trx_waker(arg: cstring) -> uint32 {
+  thread_sleep_ms(5);
+  alph_rx_wake(&trx_r);
+  return 0;
+}
+
+fn trx_wakes() {
+  var ev: AlphRxEvent[16];
+  expect(alph_rx_init(&trx_r), "reactor starts");
+  var t0: int64 = alph_now_ns();
+  var h: int64 = CreateThread(0, 0, &trx_waker, 0, 0, 0);
+  var n: int64 = trx_wait(&ev[0], -1);
+  var dt: int64 = alph_now_ns() - t0;
+  expect(n == 1 && ev[0].kind == ALPH_RX_WAKE, "a wake from another thread ends the wait");
+  expect(dt >= 4 * TRX_MS, "the wake came from the sleeping thread");
+  thread_join_infinite(h);
+  thread_close(h);
+  alph_rx_wake(&trx_r);
+  alph_rx_wake(&trx_r);
+  n = trx_wait(&ev[0], 0);
+  expect(n == 1 && ev[0].kind == ALPH_RX_WAKE, "two wakes make one event");
+  expect(trx_wait(&ev[0], 0) == 0, "and no second event");
+  alph_rx_wake(&trx_r);
+  n = trx_wait(&ev[0], 0);
+  expect(n == 1 && ev[0].kind == ALPH_RX_WAKE, "a wake after a wait works again");
+  alph_rx_free(&trx_r);
+}
+
+fn trx_signals() {
+  var ev: AlphRxEvent[16];
+  expect(alph_rx_init(&trx_r), "reactor starts");
+  expect(alph_rx_signals(&trx_r, (int64)1 << 10), "signals taken");
+  var pid: int64 = syscall(ALPH_SYS_GETPID);
+  expect(syscall(ALPH_SYS_KILL, pid, 10) == 0, "kill SIGUSR1");
+  var n: int64 = trx_wait(&ev[0], 1000 * TRX_MS);
+  var seen: int64 = 0;
+  for i: int64 in 0..n {
+    if (ev[i].kind == ALPH_RX_SIGNAL && ev[i].data == 10) {
+      seen = seen + 1;
+    }
+  }
+  expect(seen == 1, "SIGUSR1 arrives as a SIGNAL event with data 10");
+  alph_rx_free(&trx_r);
+}
+
+fn trx_idle() {
+  var ev: AlphRxEvent[16];
+  expect(alph_rx_init(&trx_r), "reactor starts");
+  var t0: int64 = alph_now_ns();
+  var n: int64 = trx_wait(&ev[0], 50 * TRX_MS);
+  var dt: int64 = alph_now_ns() - t0;
+  expect(n == 0, "an idle wait returns 0");
+  expect(dt >= 50 * TRX_MS, "an idle wait sleeps its whole timeout");
+  alph_rx_free(&trx_r);
+}
+
+fn main() -> int32 {
+  trx_signals();  // first: it blocks SIGUSR1 for this thread, before any other thread starts
+  trx_levels();
+  trx_oneshot();
+  trx_edge();
+  trx_writable();
+  trx_remove();
+  trx_timers();
+  trx_precision();
+  trx_wakes();
+  trx_idle();
+  if (trx_failures != 0) {
+    return 1;
+  }
+  println("reactor ok");
+  return 0;
+}

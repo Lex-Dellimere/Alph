@@ -15,6 +15,7 @@ cd "$ROOT" || exit 2
 # Modules in reading order: what applications use first, internals last.
 MODULES=(
   src/alph.mettle
+  src/io/reactor.mettle
   src/core/node.mettle
   src/core/mailbox.mettle
   src/heal/supervisor.mettle
@@ -22,6 +23,8 @@ MODULES=(
   src/heal/dynamic.mettle
   src/work/pool.mettle
   src/work/limiter.mettle
+  src/work/task.mettle
+  src/work/agent.mettle
   src/net/port.mettle
   src/net/dist.mettle
   src/net/noise.mettle
