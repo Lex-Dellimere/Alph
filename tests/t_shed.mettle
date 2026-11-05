@@ -7,8 +7,9 @@
 //      counter equals the BUSY answers
 //   2. after the flood drained, requests sent one at a time all get replies
 //   3. with shedding off, another flood is served in full, no BUSY
-//   4. with shedding on, a flood of plain sends: the server handles fewer
-//      than were sent, and the shed counter grows by the difference
+//   4. with shedding on for plain sends too (alph_mailbox_shed_casts), a
+//      flood of plain sends: the server handles fewer than were sent, and
+//      the shed counter grows by the difference
 
 import "std/io";
 import "std/mem";
@@ -83,6 +84,7 @@ fn server(ctx: AlphCtx*, m: AlphMsg*) -> int64 {
     alph_atomic_add(&tsh_ack, 1);
   } else if (m->tag == TSH_ON) {
     alph_mailbox_shed(ctx, TARGET_US, INTERVAL_US);
+    alph_mailbox_shed_casts(ctx, true);
     alph_atomic_add(&tsh_ack, 1);
   }
   return ALPH_CONTINUE;

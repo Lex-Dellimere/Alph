@@ -340,6 +340,7 @@ struct AlphProc {
   shed_target: int64;     // alph_mailbox_shed: longest wait wanted (ns), 0 when off
   shed_interval: int64;   //   how long waits must stay above it before shedding (ns)
   shed_above: int64;      //   when shedding may start, if waits are above target; else 0
+  shed_casts: int64;      //   1: plain sends may be shed too, not only requests
   drain_lock: int64;      // held while a late signal queue is drained, and at reuse
   deferred: AlphVec;      // exits and downs waiting for earlier messages
   io_handles: AlphVec;    // handles this actor owns, closed when it exits
@@ -1510,14 +1511,17 @@ export fn alph_continue(ctx: AlphCtx*, tag: int64, arg: int64) {
   alph_signal(ctx->node, ALPH_SIG_TIMER, ctx->self, ctx->self, 0, arg, tag);
 }
 
-// Sheds load by waiting time, as CoDel does for packet queues: once the
-// messages this actor takes have waited longer than target_us continuously
-// for interval_us, it drops them unhandled until one arrives under the
-// target again, so its queueing delay stays near target_us and its time
-// goes to work that can still succeed. A dropped request is answered at
-// once with ALPH_TAG_BUSY (ref = the request's), and every drop counts in
-// alph_node_stats' shed. Senders stamp their messages with the time while
-// this is on: one clock read per send. target_us 0 turns it off.
+// Sheds requests by waiting time, as Facebook's adaptive CoDel does for RPC
+// queues: once the requests this actor takes have waited longer than
+// target_us continuously for interval_us, with the queue never emptying,
+// it drops every one still above the target unhandled, so its queueing
+// delay stays near target_us and its time goes to work that can still
+// succeed. A dropped request is answered at once with ALPH_TAG_BUSY (ref =
+// the request's, arg = how long it waited in us), and every drop counts in
+// alph_node_stats' shed. Only requests are shed: plain sends need
+// alph_mailbox_shed_casts, and replies, DOWN, TIMEOUT and EXIT messages
+// never are. Senders stamp their messages with the time while this is on:
+// one clock read per send. target_us 0 turns it off.
 // For example alph_mailbox_shed(ctx, 5000, 100000): 5 ms, 100 ms.
 // Thread: a handler.
 export fn alph_mailbox_shed(ctx: AlphCtx*, target_us: int64, interval_us: int64) {
@@ -1525,6 +1529,7 @@ export fn alph_mailbox_shed(ctx: AlphCtx*, target_us: int64, interval_us: int64)
   if (target_us <= 0) {
     p->shed_target = 0;
     p->shed_above = 0;
+    p->shed_casts = 0;
     alph_mailbox_stamp(&p->mailbox, false);
     return;
   }
@@ -1532,6 +1537,20 @@ export fn alph_mailbox_shed(ctx: AlphCtx*, target_us: int64, interval_us: int64)
   p->shed_interval = interval_us * 1000;
   p->shed_above = 0;
   alph_mailbox_stamp(&p->mailbox, true);
+}
+
+// With on, alph_mailbox_shed also drops plain user messages (alph_send and
+// friends) that waited too long, silently: a sender learns nothing, so use
+// it only where losing a message is fine, such as telemetry or gossip.
+// Off by default; alph_mailbox_shed(ctx, 0, 0) turns it off too.
+// Thread: a handler.
+export fn alph_mailbox_shed_casts(ctx: AlphCtx*, on: bool) {
+  var p: AlphProc* = alph_me(ctx);
+  if (on) {
+    p->shed_casts = 1;
+  } else {
+    p->shed_casts = 0;
+  }
 }
 
 // Sends a tag and one word to `to` after ms milliseconds. It cannot be
@@ -1667,6 +1686,7 @@ fn alph_spawn_raw(node: AlphNode*, parent: int64, flags: int64, monitor_ref: int
   alph_mailbox_set_limit(&p->mailbox, node->mailbox_size);
   p->shed_target = 0;
   p->shed_above = 0;
+  p->shed_casts = 0;
   alph_mailbox_stamp(&p->mailbox, false);
   p->has_on_exit = 0;
   // Leftovers sent to the previous owner of the slot are dropped.
@@ -2743,11 +2763,15 @@ fn alph_run_some(s: AlphSched*, p: AlphProc*) -> int64 {
       }
       // Anything deferred waits on a message still being written; its
       // sender wakes this actor when the write lands.
+      p->shed_above = 0;  // the queue emptied: no standing delay
       return -1;
     }
-    if (p->shed_target > 0 && sent_at > 0 && alph_shed_now(p, sent_at)) {
-      alph_shed(s, p, &m);
-      continue;
+    if (p->shed_target > 0 && sent_at > 0 && alph_sheddable(p, &m)) {
+      var waited: int64 = alph_shed_wait(p, sent_at);
+      if (waited >= 0) {
+        alph_shed(s, p, &m, waited);
+        continue;
+      }
     }
     var outcome: int64 = alph_handle_message(s, p, &m);
     if (outcome >= 0) {
@@ -2757,30 +2781,53 @@ fn alph_run_some(s: AlphSched*, p: AlphProc*) -> int64 {
   return -2;
 }
 
-// CoDel, simplified: whether the message sent at sent_at should be shed.
-// Waits under the target clear the state; waits that stay above it for a
-// whole interval start shedding, until a message comes in under target.
-fn alph_shed_now(p: AlphProc*, sent_at: int64) -> bool {
-  var now: int64 = alph_now_ns();
-  if (now - sent_at < p->shed_target) {
-    p->shed_above = 0;
+// Whether m may be shed at all: a request to this actor, or with
+// shed_casts a plain user message. Replies, DOWN, TIMEOUT, EXIT and other
+// runtime messages never are: dropping one would leave a request or a
+// monitor unresolved. Messages for an earlier owner of the slot go on to
+// alph_handle_message, which deals with them.
+fn alph_sheddable(p: AlphProc*, m: AlphMsg*) -> bool {
+  if (m->to != p->pid) {
     return false;
+  }
+  if ((m->flags & ALPH_MSG_REQUEST) != 0) {
+    return true;
+  }
+  return p->shed_casts != 0 && m->flags == 0 && m->tag >= ALPH_TAG_USER;
+}
+
+// Maurer's adaptive CoDel ("Fail at Scale", ACM Queue 2015), as at
+// Facebook: once waits have stayed above the target for a whole interval,
+// every message still above it is shed. Returns how long the message sent
+// at sent_at waited (ns) when it should be shed, else -1. A wait under the
+// target, or an empty queue behind this message, clears the state, as
+// Linux codel does when the backlog is at most one packet.
+fn alph_shed_wait(p: AlphProc*, sent_at: int64) -> int64 {
+  var now: int64 = alph_now_ns();
+  var waited: int64 = now - sent_at;
+  if (waited < p->shed_target || alph_mailbox_count(&p->mailbox) == 0) {
+    p->shed_above = 0;
+    return -1;
   }
   if (p->shed_above == 0) {
     p->shed_above = now + p->shed_interval;
-    return false;
+    return -1;
   }
-  return now >= p->shed_above;
+  if (now < p->shed_above) {
+    return -1;
+  }
+  return waited;
 }
 
 // Drops m unhandled; a request is answered with ALPH_TAG_BUSY at once, so
-// its requester need not wait for a timeout.
-fn alph_shed(s: AlphSched*, p: AlphProc*, m: AlphMsg*) {
+// its requester need not wait for a timeout. Its arg is how long the request
+// waited (us), a hint for when to try again.
+fn alph_shed(s: AlphSched*, p: AlphProc*, m: AlphMsg*, waited: int64) {
   var node: AlphNode* = (AlphNode*)s->node;
   alph_atomic_add(&node->shed, 1);
   if ((m->flags & ALPH_MSG_REQUEST) != 0 && m->from != 0) {
     var r: AlphMsg;
-    alph_message(&r, p->pid, m->from, ALPH_TAG_BUSY, 0, 0);
+    alph_message(&r, p->pid, m->from, ALPH_TAG_BUSY, waited / 1000, 0);
     r.ref = m->ref;
     r.flags = ALPH_MSG_REPLY;
     alph_post(node, &r, (rawptr)0);

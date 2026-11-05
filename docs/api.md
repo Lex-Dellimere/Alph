@@ -1150,15 +1150,30 @@ come first. Thread: a handler.
 export fn alph_mailbox_shed(ctx: AlphCtx*, target_us: int64, interval_us: int64)
 ```
 
-Sheds load by waiting time, as CoDel does for packet queues: once the
-messages this actor takes have waited longer than target_us continuously
-for interval_us, it drops them unhandled until one arrives under the
-target again, so its queueing delay stays near target_us and its time
-goes to work that can still succeed. A dropped request is answered at
-once with ALPH_TAG_BUSY (ref = the request's), and every drop counts in
-alph_node_stats' shed. Senders stamp their messages with the time while
-this is on: one clock read per send. target_us 0 turns it off.
+Sheds requests by waiting time, as Facebook's adaptive CoDel does for RPC
+queues: once the requests this actor takes have waited longer than
+target_us continuously for interval_us, with the queue never emptying,
+it drops every one still above the target unhandled, so its queueing
+delay stays near target_us and its time goes to work that can still
+succeed. A dropped request is answered at once with ALPH_TAG_BUSY (ref =
+the request's, arg = how long it waited in us), and every drop counts in
+alph_node_stats' shed. Only requests are shed: plain sends need
+alph_mailbox_shed_casts, and replies, DOWN, TIMEOUT and EXIT messages
+never are. Senders stamp their messages with the time while this is on:
+one clock read per send. target_us 0 turns it off.
 For example alph_mailbox_shed(ctx, 5000, 100000): 5 ms, 100 ms.
+Thread: a handler.
+
+### `alph_mailbox_shed_casts`
+
+```mettle
+export fn alph_mailbox_shed_casts(ctx: AlphCtx*, on: bool)
+```
+
+With on, alph_mailbox_shed also drops plain user messages (alph_send and
+friends) that waited too long, silently: a sender learns nothing, so use
+it only where losing a message is fine, such as telemetry or gossip.
+Off by default; alph_mailbox_shed(ctx, 0, 0) turns it off too.
 Thread: a handler.
 
 ### `alph_send_after`

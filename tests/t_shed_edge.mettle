@@ -1,0 +1,271 @@
+// What load shedding (alph_mailbox_shed) must never drop, and when it must
+// not start. Each check runs a few times, since the faults were timing
+// dependent. Checks, in order:
+//   1. a reply to the shedding actor's own request, arriving while it sheds,
+//      is delivered: the request ends in its reply, not a TIMEOUT
+//   2. a TIMEOUT arriving while it sheds is delivered (timers come as
+//      signals, so this guards against shedding ever reaching them)
+//   3. after the queue emptied and the actor idled, one late request that
+//      waited above the target is served, not shed: shedding needs a whole
+//      interval of standing delay first
+//   4. a kill reaches an actor shedding a backlog of stale requests at once
+
+import "std/io";
+import "std/thread";
+import "alph/sys/atomic";
+import "alph/sys/clock";
+import "alph/alph";
+
+const GO: int64 = ALPH_TAG_USER;
+const PAD: int64 = ALPH_TAG_USER + 1;
+const REQ: int64 = ALPH_TAG_USER + 2;
+const ANS: int64 = ALPH_TAG_USER + 3;
+const SLOW: int64 = ALPH_TAG_USER + 4;
+const FAST: int64 = ALPH_TAG_USER + 5;
+const HOG: int64 = ALPH_TAG_USER + 6;
+const ASK: int64 = ALPH_TAG_USER + 7;
+const FLOOD: int64 = ALPH_TAG_USER + 8;
+const ROUNDS: int64 = 3;
+
+var g_node: AlphNode;
+var g_solo: AlphNode;          // one scheduler, for check 3
+var g_failures: int64 = 0;
+var g_back: int64 = 0;        // replies to REQ
+var g_silent: int64 = 0;      // never replies
+var g_hog: int64 = 0;
+var g_server: int64 = 0;      // the target of an ASK
+var g_mode: int64 = 0;        // 1: ask the backend, 2: ask the silent one
+var a_reply: int64 = 0;
+var a_timeout: int64 = 0;
+var a_busy: int64 = 0;
+var a_done: int64 = 0;
+var b_ready: int64 = 0;
+var b_fast: int64 = 0;
+var b_busy: int64 = 0;
+var c_ready: int64 = 0;
+var c_handled: int64 = 0;
+var c_down_at: int64 = 0;
+var c_reason: int64 = -1;
+
+fn expect(ok: bool, what: string) {
+  if (!ok) {
+    println("FAIL {what}");
+    alph_atomic_add(&g_failures, 1);
+  }
+}
+
+fn spin(ns: int64) {
+  var end: int64 = alph_now_ns() + ns;
+  while (alph_now_ns() < end) {
+  }
+}
+
+fn wait_for(v: int64*, want: int64, ms: int64) {
+  for i: int64 in 0..ms {
+    if (alph_atomic_load(v) >= want) {
+      return;
+    }
+    thread_sleep_ms(1);
+  }
+}
+
+fn backend(ctx: AlphCtx*, m: AlphMsg*) -> int64 {
+  if (m->tag == REQ) {
+    alph_reply(ctx, m, ANS, 0);
+  }
+  return ALPH_CONTINUE;
+}
+
+fn silent(ctx: AlphCtx*, m: AlphMsg*) -> int64 {
+  return ALPH_CONTINUE;
+}
+
+// Checks 1 and 2. GO queues two requests to itself, then asks the backend
+// (or the silent one) and stays busy 5 ms, so everything behind it waits
+// above the 1 ms target. The first PAD starts the interval, the second is
+// shed; the answer to the outside request comes during the shedding.
+fn server_a(ctx: AlphCtx*, m: AlphMsg*) -> int64 {
+  if (m->tag == GO) {
+    alph_mailbox_shed(ctx, 1000, 1000);
+    alph_request(ctx, ctx->self, PAD, 0, 0);
+    alph_request(ctx, ctx->self, PAD, 0, 0);
+    if (g_mode == 1) {
+      alph_request(ctx, g_back, REQ, 0, 300);
+    } else {
+      alph_request(ctx, g_silent, REQ, 0, 2);
+    }
+    spin(5000000);
+  } else if (m->tag == PAD) {
+    spin(3000000);
+    alph_reply(ctx, m, ANS + 100, 0);
+  } else if (m->tag == ANS) {
+    alph_atomic_add(&a_reply, 1);
+    alph_atomic_add(&a_done, 1);
+  } else if (m->tag == ALPH_TAG_TIMEOUT) {
+    alph_atomic_add(&a_timeout, 1);
+    alph_atomic_add(&a_done, 1);
+  } else if (m->tag == ALPH_TAG_BUSY) {
+    alph_atomic_add(&a_busy, 1);
+  }
+  return ALPH_CONTINUE;
+}
+
+fn server_b(ctx: AlphCtx*, m: AlphMsg*) -> int64 {
+  if (m->tag == ALPH_TAG_INIT) {
+    alph_mailbox_shed(ctx, 1000, 20000);
+    alph_atomic_store(&b_ready, 1);
+  } else if (m->tag == SLOW) {
+    spin(3000000);
+    alph_reply(ctx, m, ANS, 0);
+  } else if (m->tag == FAST) {
+    alph_atomic_add(&b_fast, 1);
+    alph_reply(ctx, m, ANS, 0);
+  }
+  return ALPH_CONTINUE;
+}
+
+// Sends server_b its requests on ASK: arg 1 for SLOW then FAST, 2 for FAST.
+fn asker(ctx: AlphCtx*, m: AlphMsg*) -> int64 {
+  if (m->tag == ASK) {
+    if (m->arg == 1) {
+      alph_request(ctx, g_server, SLOW, 0, 1000);
+    }
+    alph_request(ctx, g_server, FAST, 0, 1000);
+  } else if (m->tag == ALPH_TAG_BUSY) {
+    alph_atomic_add(&b_busy, 1);
+  } else if (m->tag == FLOOD) {
+    for i: int64 in 0..m->arg {
+      alph_request(ctx, g_server, REQ, 0, 0);
+    }
+  }
+  return ALPH_CONTINUE;
+}
+
+fn hog(ctx: AlphCtx*, m: AlphMsg*) -> int64 {
+  if (m->tag == HOG) {
+    spin(5000000);
+  }
+  return ALPH_CONTINUE;
+}
+
+// Check 4: sheds a flood of requests, each costing 100 us when served.
+fn server_c(ctx: AlphCtx*, m: AlphMsg*) -> int64 {
+  if (m->tag == ALPH_TAG_INIT) {
+    alph_mailbox_limit(ctx, 100000);
+    alph_mailbox_shed(ctx, 500, 1000);
+    alph_atomic_store(&c_ready, 1);
+  } else if (m->tag == REQ) {
+    spin(100000);
+    alph_atomic_add(&c_handled, 1);
+  }
+  return ALPH_CONTINUE;
+}
+
+fn watcher(ctx: AlphCtx*, m: AlphMsg*) -> int64 {
+  if (m->tag == ALPH_TAG_INIT) {
+    alph_monitor(ctx, g_server);
+  } else if (m->tag == ALPH_TAG_DOWN) {
+    alph_atomic_store(&c_reason, m->arg);
+    alph_atomic_store(&c_down_at, alph_now_ns());
+  }
+  return ALPH_CONTINUE;
+}
+
+fn check_answer(mode: int64, what: string) {
+  for r: int64 in 0..ROUNDS {
+    alph_atomic_store(&a_reply, 0);
+    alph_atomic_store(&a_timeout, 0);
+    alph_atomic_store(&a_busy, 0);
+    alph_atomic_store(&a_done, 0);
+    g_mode = mode;
+    var sa: int64 = alph_node_spawn(&g_node, 0, &server_a);
+    alph_node_send(&g_node, sa, GO, 0);
+    wait_for(&a_done, 1, 1000);
+    thread_sleep_ms(20);
+    if (mode == 1) {
+      expect(alph_atomic_load(&a_reply) == 1 && alph_atomic_load(&a_timeout) == 0,
+             "{what}: the reply arrived (reply {a_reply}, timeout {a_timeout})");
+    } else {
+      expect(alph_atomic_load(&a_timeout) == 1 && alph_atomic_load(&a_reply) == 0,
+             "{what}: the TIMEOUT arrived (reply {a_reply}, timeout {a_timeout})");
+    }
+    expect(alph_atomic_load(&a_busy) >= 1, "{what}: it was shedding meanwhile (busy {a_busy})");
+    alph_node_exit_signal(&g_node, sa, ALPH_KILL);
+  }
+}
+
+fn main() -> int32 {
+  var cfg: AlphConfig;
+  alph_config(&cfg);
+  cfg.schedulers = 4;
+  cfg.max_actors = 64;
+  expect(alph_node_start(&g_node, &cfg), "node started");
+  var solo: AlphConfig;
+  alph_config(&solo);
+  solo.schedulers = 1;
+  solo.max_actors = 16;
+  expect(alph_node_start(&g_solo, &solo), "one-scheduler node started");
+  g_back = alph_node_spawn(&g_node, 0, &backend);
+  g_silent = alph_node_spawn(&g_node, 0, &silent);
+  thread_sleep_ms(20);
+
+  // 1, 2
+  check_answer(1, "reply while shedding");
+  check_answer(2, "timeout while shedding");
+
+  // 3
+  for r: int64 in 0..ROUNDS {
+    alph_atomic_store(&b_ready, 0);
+    alph_atomic_store(&b_fast, 0);
+    alph_atomic_store(&b_busy, 0);
+    g_hog = alph_node_spawn(&g_solo, 0, &hog);
+    g_server = alph_node_spawn(&g_solo, 0, &server_b);
+    var ask: int64 = alph_node_spawn(&g_solo, 0, &asker);
+    wait_for(&b_ready, 1, 1000);
+    alph_node_send(&g_solo, ask, ASK, 1);   // SLOW then FAST: FAST waits 3 ms
+    thread_sleep_ms(200);
+    // The asker runs first and queues FAST; the hog then holds the only
+    // scheduler for 5 ms before server_b gets to it.
+    alph_node_send(&g_solo, ask, ASK, 2);
+    alph_node_send(&g_solo, g_hog, HOG, 0);
+    wait_for(&b_fast, 2, 1000);
+    thread_sleep_ms(20);
+    expect(alph_atomic_load(&b_fast) == 2 && alph_atomic_load(&b_busy) == 0,
+           "late request after idle: served, not shed (fast {b_fast} of 2, busy {b_busy})");
+    alph_node_exit_signal(&g_solo, g_server, ALPH_KILL);
+    alph_node_exit_signal(&g_solo, ask, ALPH_KILL);
+    alph_node_exit_signal(&g_solo, g_hog, ALPH_KILL);
+  }
+
+  // 4
+  alph_atomic_store(&c_ready, 0);
+  g_server = alph_node_spawn(&g_node, 0, &server_c);
+  wait_for(&c_ready, 1, 1000);
+  alph_node_spawn(&g_node, 0, &watcher);
+  var flood: int64 = alph_node_spawn(&g_node, 0, &asker);
+  thread_sleep_ms(10);
+  alph_node_send(&g_node, flood, FLOOD, 50000);
+  thread_sleep_ms(30);
+  var killed_at: int64 = alph_now_ns();
+  alph_node_exit_signal(&g_node, g_server, ALPH_KILL);
+  for i: int64 in 0..2000 {
+    if (alph_atomic_load(&c_down_at) != 0) {
+      break;
+    }
+    thread_sleep_ms(1);
+  }
+  var took_us: int64 = (alph_atomic_load(&c_down_at) - killed_at) / 1000;
+  expect(alph_atomic_load(&c_reason) == ALPH_KILLED, "kill while shedding: the server was killed");
+  expect(alph_atomic_load(&c_down_at) != 0 && took_us < 20000,
+         "kill while shedding: DOWN within 20 ms ({took_us} us)");
+
+  alph_node_halt(&g_solo, 0);
+  alph_node_wait(&g_solo);
+  alph_node_halt(&g_node, 0);
+  alph_node_wait(&g_node);
+  if (g_failures != 0) {
+    return 1;
+  }
+  println("shed edges ok: kill reached a shedding server in {took_us} us");
+  return 0;
+}
