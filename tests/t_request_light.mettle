@@ -1,0 +1,153 @@
+// A server that answers a request drops the requester's monitor itself, and
+// the requester sends no DEMONITOR for it. Checks, in order:
+//   1. 500 requests answered by the server: afterwards it holds no monitor
+//      (alph_monitors_held reads 0), and when it exits, no DOWN reaches the
+//      requester for any of them
+//   2. a request the server forwards to a worker, which answers: the reply
+//      arrives once, and the server's monitor is still dropped (by the
+//      requester's DEMONITOR, as the answer came from someone else)
+//   3. a request that times out, then is answered late: exactly one answer
+//      (the TIMEOUT), and the server holds no monitor afterwards
+
+import "std/io";
+import "std/thread";
+import "alph/sys/atomic";
+import "alph/alph";
+
+const ASK: int64 = ALPH_TAG_USER;
+const ANS: int64 = ALPH_TAG_USER + 1;
+const FWD: int64 = ALPH_TAG_USER + 2;
+const SLOW: int64 = ALPH_TAG_USER + 3;
+const GO: int64 = ALPH_TAG_USER + 4;
+const COUNT: int64 = ALPH_TAG_USER + 5;
+const N: int64 = 500;
+
+var g_node: AlphNode;
+var g_failures: int64 = 0;
+var g_server: int64 = 0;
+var g_worker: int64 = 0;
+var g_answers: int64 = 0;
+var g_downs: int64 = 0;
+var g_timeouts: int64 = 0;
+var g_held: int64 = -1;
+var g_phase: int64 = 0;
+
+fn expect(ok: bool, what: string) {
+  if (!ok) {
+    println("FAIL {what}");
+    alph_atomic_add(&g_failures, 1);
+  }
+}
+
+fn worker(ctx: AlphCtx*, m: AlphMsg*) -> int64 {
+  if (m->tag == FWD) {
+    alph_reply(ctx, m, ANS, 7);
+  }
+  return ALPH_CONTINUE;
+}
+
+fn server(ctx: AlphCtx*, m: AlphMsg*) -> int64 {
+  if (m->tag == ASK) {
+    alph_reply(ctx, m, ANS, 1);
+  } else if (m->tag == FWD) {
+    // Pass the request itself on: the worker answers the requester.
+    alph_node_forward(ctx->node, g_worker, m->from, FWD, m->arg, m->ref, m->flags, (rawptr)0, 0);
+  } else if (m->tag == SLOW) {
+    thread_sleep_ms(30);
+    alph_reply(ctx, m, ANS, 2);
+  } else if (m->tag == COUNT) {
+    alph_atomic_store(&g_held, alph_monitors_held(ctx));
+  }
+  return ALPH_CONTINUE;
+}
+
+fn client(ctx: AlphCtx*, m: AlphMsg*) -> int64 {
+  if (m->tag == GO) {
+    if (m->arg == 1) {
+      for i: int64 in 0..N {
+        alph_request(ctx, g_server, ASK, i, 1000);
+      }
+    } else if (m->arg == 2) {
+      alph_request(ctx, g_server, FWD, 0, 1000);
+    } else if (m->arg == 3) {
+      alph_request(ctx, g_server, SLOW, 0, 5);
+    }
+  } else if (m->tag == ANS) {
+    alph_atomic_add(&g_answers, 1);
+  } else if (m->tag == ALPH_TAG_DOWN) {
+    alph_atomic_add(&g_downs, 1);
+  } else if (m->tag == ALPH_TAG_TIMEOUT) {
+    alph_atomic_add(&g_timeouts, 1);
+  }
+  return ALPH_CONTINUE;
+}
+
+fn wait_for(v: int64*, want: int64) {
+  for i: int64 in 0..3000 {
+    if (alph_atomic_load(v) >= want) {
+      return;
+    }
+    thread_sleep_ms(1);
+  }
+}
+
+fn held() -> int64 {
+  alph_atomic_store(&g_held, -1);
+  alph_node_send(&g_node, g_server, COUNT, 0);
+  for i: int64 in 0..2000 {
+    if (alph_atomic_load(&g_held) >= 0) {
+      break;
+    }
+    thread_sleep_ms(1);
+  }
+  return alph_atomic_load(&g_held);
+}
+
+fn main() -> int32 {
+  var cfg: AlphConfig;
+  alph_config(&cfg);
+  cfg.schedulers = 4;
+  cfg.max_actors = 64;
+  cfg.mailbox_size = 1024;  // the 500 requests go out in one handler
+  expect(alph_node_start(&g_node, &cfg), "node started");
+  g_server = alph_node_spawn(&g_node, 0, &server);
+  g_worker = alph_node_spawn(&g_node, 0, &worker);
+  var c: int64 = alph_node_spawn(&g_node, 0, &client);
+  thread_sleep_ms(10);
+
+  // 1
+  alph_node_send(&g_node, c, GO, 1);
+  wait_for(&g_answers, N);
+  thread_sleep_ms(20);
+  expect(alph_atomic_load(&g_answers) == N, "every request answered once ({g_answers})");
+  expect(held() == 0, "the server holds no monitor after answering ({g_held})");
+
+  // 2
+  var a0: int64 = alph_atomic_load(&g_answers);
+  alph_node_send(&g_node, c, GO, 2);
+  wait_for(&g_answers, a0 + 1);
+  thread_sleep_ms(20);
+  expect(alph_atomic_load(&g_answers) == a0 + 1, "the forwarded request answered once");
+  expect(held() == 0, "after a forwarded answer the server holds no monitor ({g_held})");
+
+  // 3
+  var a1: int64 = alph_atomic_load(&g_answers);
+  alph_node_send(&g_node, c, GO, 3);
+  thread_sleep_ms(80);
+  expect(alph_atomic_load(&g_timeouts) == 1, "the slow request timed out ({g_timeouts})");
+  expect(alph_atomic_load(&g_answers) == a1, "and its late answer was dropped");
+  expect(held() == 0, "after a timeout the server holds no monitor ({g_held})");
+
+  // and the server's exit sends no DOWN for anything it already answered
+  alph_node_exit_signal(&g_node, g_server, ALPH_KILL);
+  thread_sleep_ms(30);
+  expect(alph_atomic_load(&g_downs) == 0, "no DOWN for requests already answered ({g_downs})");
+
+  alph_node_halt(&g_node, 0);
+  alph_node_wait(&g_node);
+  if (g_failures != 0) {
+    return 1;
+  }
+  println("request light ok");
+  return 0;
+}

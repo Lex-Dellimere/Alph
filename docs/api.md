@@ -1098,6 +1098,15 @@ the returned ref and its exit reason in arg; if it is already gone, DOWN
 arrives with ALPH_NOPROC. Each call is a separate monitor.
 Returns the monitor's ref. Thread: a handler.
 
+### `alph_monitors_held`
+
+```mettle
+export fn alph_monitors_held(ctx: AlphCtx*) -> int64
+```
+
+How many monitors watch this actor now: one per alph_monitor on it and
+per request it has taken and not yet answered. Thread: a handler.
+
 ### `alph_demonitor`
 
 ```mettle

@@ -1478,6 +1478,19 @@ export fn alph_request_bytes(ctx: AlphCtx*, to: int64, tag: int64, data: rawptr,
 
 fn alph_reply_raw(ctx: AlphCtx*, request: AlphMsg*, tag: int64, arg: int64, data: rawptr,
                   size: int64) -> int64 {
+  // The requester monitors the actor it sent to. When that actor answers,
+  // it drops the monitor itself, here, and the requester sends no
+  // DEMONITOR for it (alph_handle_message): one signal, its allocation and
+  // its trip through a queue saved per request. An answer from anyone else
+  // (a forwarded request) leaves it to the requester, as before.
+  if (request->to == ctx->self && (request->flags & ALPH_MSG_REQUEST) != 0) {
+    var me: AlphProc* = alph_me(ctx);
+    var at: int64 = alph_vec_find(&me->mon_refs, request->ref);
+    if (at >= 0) {
+      alph_vec_remove_at(&me->mon_refs, at);
+      alph_vec_remove_at(&me->mon_watchers, at);
+    }
+  }
   var m: AlphMsg;
   alph_message(&m, ctx->self, request->from, tag, arg, size);
   m.ref = request->ref;
@@ -1587,6 +1600,12 @@ export fn alph_monitor(ctx: AlphCtx*, pid: int64) -> int64 {
     }
   }
   return ref;
+}
+
+// How many monitors watch this actor now: one per alph_monitor on it and
+// per request it has taken and not yet answered. Thread: a handler.
+export fn alph_monitors_held(ctx: AlphCtx*) -> int64 {
+  return alph_me(ctx)->mon_refs.len;
 }
 
 // Stops a monitor. A DOWN for it that is already on its way is dropped.
@@ -3017,6 +3036,12 @@ fn alph_deferred_ready(p: AlphProc*) -> bool {
   return head->mark <= p->mailbox.deq;
 }
 
+// Whether pid is a dist proxy, the local stand-in for a remote actor.
+fn alph_is_proxy(node: AlphNode*, pid: int64) -> bool {
+  var q: AlphProc* = alph_resolve(node, pid);
+  return q != 0 && q->proxy != 0;
+}
+
 // Handles one popped message. Returns an exit reason, or -1 to go on.
 fn alph_handle_message(s: AlphSched*, p: AlphProc*, m: AlphMsg*) -> int64 {
   if (m->to != p->pid) {
@@ -3029,7 +3054,12 @@ fn alph_handle_message(s: AlphSched*, p: AlphProc*, m: AlphMsg*) -> int64 {
       alph_msg_release(m);  // lost to a timeout or a DOWN
       return -1;
     }
-    alph_signal_plain((AlphNode*)s->node, ALPH_SIG_DEMONITOR, p->pid, server, m->ref);
+    if (m->from != server || alph_is_proxy((AlphNode*)s->node, server)) {
+      // Answered by someone else than the actor monitored (a forward), or
+      // through a dist proxy, which never answers with alph_reply: that
+      // actor still holds the monitor.
+      alph_signal_plain((AlphNode*)s->node, ALPH_SIG_DEMONITOR, p->pid, server, m->ref);
+    }
   }
   return alph_deliver(s, p, m);
 }
