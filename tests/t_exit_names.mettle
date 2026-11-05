@@ -1,0 +1,267 @@
+// Names, registry keys and group memberships are gone before anyone is told
+// that an actor exited. alph_proc_exit used to send EXIT and DOWN first and
+// drop the dead actor's names, keys and groups afterwards, so an actor
+// handling the DOWN or EXIT could still find the dead one under its name,
+// and could fail to register the name again. As on BEAM, it must not.
+//
+// A round: a victim registers a name that is unique to the round, joins a
+// group, and takes a key in a unique and in a duplicate registry; a watcher
+// monitors it (case 1) or is linked to it and traps exits (case 2). The
+// victim then exits, a normal exit (alph_stop) in even rounds and a crash (a
+// null write) in odd ones. In the watcher's DOWN or EXIT handler it checks,
+// in this order:
+//   1. the victim was seen under its name before it exited (set up worked)
+//   2. the message is the right one: from the victim, with its reason
+//   3. alph_whereis finds nothing under the name
+//   4. the unique registry has no holder for the key
+//   5. the duplicate registry has no entry with the dead pid
+//   6. a registry made for the round (the victim holds one key in it) is
+//      empty, by alph_node_reg_count; lookups skip a dead holder, so only
+//      the count shows an entry that is still there
+//   7. the group has no member
+//   8. the watcher can register the name at once, and find itself under it
+//   9. the watcher can take the unique key at once
+// then the watcher drops both and exits. The watcher also monitors the
+// victim EXTRA more times, so the victim has many signals to send; only the
+// first DOWN or EXIT is looked at. Rounds run LANES at a time on 4
+// schedulers so that watcher and dying victim run on different threads.
+// Case 1 runs ROUNDS rounds and case 2 runs ROUNDS more; any failed check
+// fails the test, and the failures are counted per case and check. A
+// watchdog ends a run that stops making progress.
+
+import "std/io";
+import "std/mem";
+import "std/conv";
+import "alph/sys/atomic";
+import "alph/alph";
+
+const ROUNDS: int64 = 300;           // per case
+const LANES: int64 = 12;             // rounds in flight
+const WATCHDOG_MS: int64 = 20000;
+const CHECKS: int64 = 9;
+const EXTRA: int64 = 40;             // monitors the watcher adds, for the victim to answer
+
+const TEN_READY: int64 = ALPH_TAG_USER;      // victim -> watcher: arg 1 when it set everything up
+const TEN_STOP: int64 = ALPH_TAG_USER + 1;   // watcher -> victim
+const TEN_CRASH: int64 = ALPH_TAG_USER + 2;  // watcher -> victim
+const TEN_DONE: int64 = ALPH_TAG_USER + 3;   // watcher -> driver
+const TEN_DOG: int64 = ALPH_TAG_USER + 4;    // driver -> driver
+
+var g_node: AlphNode;
+var g_failures: int64 = 0;
+var g_bad: int64[18];               // [case * CHECKS + check - 1]
+var g_rounds: int64 = 0;             // rounds that ran their checks
+var ten_uniq: int64 = 0;
+var ten_dup: int64 = 0;
+
+fn expect(ok: bool, what: string) {
+  if (!ok) {
+    println("FAIL {what}");
+    alph_atomic_add(&g_failures, 1);
+  }
+}
+
+// One failed check, counted by case (0 or 1) and check number (1 to CHECKS).
+fn ten_check(ok: bool, kase: int64, check: int64) {
+  if (!ok) {
+    alph_atomic_add(&g_bad[kase * CHECKS + check - 1], 1);
+  }
+}
+
+// "<prefix><r>" built in buf (at least 24 bytes).
+fn ten_str(buf: uint8*, prefix: int64, r: int64) -> string {
+  buf[0] = (uint8)prefix;
+  var n: int64 = (int64)int_to_dec(&buf[1], r);
+  return str_from_bytes((cstring)buf, n + 1);
+}
+
+// ---- victim ------------------------------------------------------------------
+
+struct TenVictim {
+  round: int64;
+  priv: int64;       // a duplicate registry of the round's own
+}
+
+fn victim(ctx: AlphCtx*, m: AlphMsg*) -> int64 {
+  var v: TenVictim* = (TenVictim*)ctx->state;
+  if (m->tag == ALPH_TAG_INIT) {
+    var b1: uint8[24];
+    var b2: uint8[24];
+    var b3: uint8[24];
+    var ok: bool = true;
+    ok = ok && alph_register(ctx, ten_str(&b1[0], 110, v->round));
+    ok = ok && alph_group_join(ctx, ten_str(&b2[0], 103, v->round));
+    ok = ok && alph_reg_register(ctx, ten_uniq, ten_str(&b3[0], 107, v->round), 1);
+    ok = ok && alph_reg_register(ctx, ten_dup, ten_str(&b3[0], 107, v->round), 1);
+    ok = ok && alph_reg_register(ctx, ten_dup, ten_str(&b3[0], 107, v->round), 2);
+    ok = ok && alph_reg_register(ctx, v->priv, ten_str(&b3[0], 107, v->round), 1);
+    var one: int64 = 0;
+    if (ok) {
+      one = 1;
+    }
+    alph_send(ctx, alph_parent(ctx), TEN_READY, one);
+  } else if (m->tag == TEN_STOP) {
+    return alph_stop(ctx, ALPH_NORMAL);
+  } else if (m->tag == TEN_CRASH) {
+    var p: int64* = (int64*)0;
+    *p = 1;
+  }
+  return ALPH_CONTINUE;
+}
+
+// ---- watcher -----------------------------------------------------------------
+
+struct TenWatcher {
+  round: int64;
+  kase: int64;       // 0: monitor, 1: link with alph_trap_exits
+  victim: int64;
+  priv: int64;
+}
+
+fn ten_inspect(ctx: AlphCtx*, w: TenWatcher*, m: AlphMsg*) {
+  var k: int64 = w->kase;
+  var crash: bool = (w->round & 1) == 1;
+  var b1: uint8[24];
+  var b2: uint8[24];
+  var b3: uint8[24];
+  var name: string = ten_str(&b1[0], 110, w->round);
+  var group: string = ten_str(&b2[0], 103, w->round);
+  var key: string = ten_str(&b3[0], 107, w->round);
+  var tag: int64 = ALPH_TAG_DOWN;
+  if (k == 1) {
+    tag = ALPH_TAG_EXIT;
+  }
+  var reason: int64 = ALPH_NORMAL;
+  if (crash) {
+    reason = ALPH_CRASHED;
+  }
+  ten_check(m->tag == tag && m->from == w->victim && m->arg == reason, k, 2);
+  ten_check(alph_whereis(ctx, name) == 0, k, 3);
+  var e: AlphRegEntry[4];
+  ten_check(alph_reg_whereis(ctx, ten_uniq, key) == 0 && alph_reg_lookup(ctx, ten_uniq, key, &e[0], 4) == 0, k, 4);
+  var n: int64 = alph_reg_lookup(ctx, ten_dup, key, &e[0], 4);
+  var dead: bool = false;
+  for i: int64 in 0..n {
+    if (i < 4 && e[i].pid == w->victim) {
+      dead = true;
+    }
+  }
+  ten_check(n == 0 && !dead, k, 5);
+  ten_check(alph_node_reg_count(ctx->node, w->priv) == 0, k, 6);
+  ten_check(alph_node_group_size(ctx->node, group) == 0, k, 7);
+  ten_check(alph_register(ctx, name) && alph_whereis(ctx, name) == ctx->self, k, 8);
+  ten_check(alph_reg_register(ctx, ten_uniq, key, 9), k, 9);
+  alph_unregister(ctx, name);
+  alph_reg_unregister(ctx, ten_uniq, key);
+  alph_atomic_add(&g_rounds, 1);
+}
+
+fn watcher(ctx: AlphCtx*, m: AlphMsg*) -> int64 {
+  var w: TenWatcher* = (TenWatcher*)ctx->state;
+  if (m->tag == ALPH_TAG_INIT) {
+    var flags: int64 = ALPH_MONITOR;
+    if (w->kase == 1) {
+      alph_trap_exits(ctx, true);
+      flags = ALPH_LINK;
+    }
+    var v: TenVictim;
+    v.round = w->round;
+    w->priv = alph_node_reg_new(ctx->node, ALPH_REG_DUPLICATE);
+    expect(w->priv != 0, "a registry could be made");
+    v.priv = w->priv;
+    w->victim = alph_spawn_value<TenVictim>(ctx, flags, &v, &victim);
+    expect(w->victim != 0, "a victim could be spawned");
+    // The first DOWN or EXIT is the one checked. The victim answers these
+    // monitors after it, which makes the time between telling the watcher
+    // and the rest of its exit longer, as a victim with many watchers has.
+    for i: int64 in 0..EXTRA {
+      alph_monitor(ctx, w->victim);
+    }
+  } else if (m->tag == TEN_READY) {
+    var b1: uint8[24];
+    ten_check(m->arg == 1, w->kase, 1);
+    ten_check(alph_whereis(ctx, ten_str(&b1[0], 110, w->round)) == w->victim, w->kase, 1);
+    if ((w->round & 1) == 1) {
+      alph_send(ctx, w->victim, TEN_CRASH, 0);
+    } else {
+      alph_send(ctx, w->victim, TEN_STOP, 0);
+    }
+  } else if (m->tag == ALPH_TAG_DOWN || m->tag == ALPH_TAG_EXIT) {
+    ten_inspect(ctx, w, m);
+    alph_send(ctx, alph_parent(ctx), TEN_DONE, 0);
+    return alph_stop(ctx, ALPH_NORMAL);
+  }
+  return ALPH_CONTINUE;
+}
+
+// ---- driver ------------------------------------------------------------------
+
+struct TenDriver {
+  started: int64;
+  done: int64;
+}
+
+fn ten_start(ctx: AlphCtx*, d: TenDriver*) {
+  var w: TenWatcher;
+  w.round = d->started;
+  w.kase = d->started / ROUNDS;
+  w.victim = 0;
+  w.priv = 0;
+  d->started = d->started + 1;
+  expect(alph_spawn_value<TenWatcher>(ctx, 0, &w, &watcher) != 0, "a watcher could be spawned");
+}
+
+fn driver(ctx: AlphCtx*, m: AlphMsg*) -> int64 {
+  var d: TenDriver* = (TenDriver*)ctx->state;
+  if (m->tag == ALPH_TAG_INIT) {
+    alph_send_after(ctx, WATCHDOG_MS, ctx->self, TEN_DOG, 0);
+    for i: int64 in 0..LANES {
+      ten_start(ctx, d);
+    }
+  } else if (m->tag == TEN_DONE) {
+    d->done = d->done + 1;
+    if (d->started < 2 * ROUNDS) {
+      ten_start(ctx, d);
+    }
+    if (d->done == 2 * ROUNDS) {
+      alph_halt(ctx, 0);
+    }
+  } else if (m->tag == TEN_DOG) {
+    expect(false, "the rounds finished in time");
+    alph_halt(ctx, 1);
+  }
+  return ALPH_CONTINUE;
+}
+
+fn main() -> int32 {
+  var cfg: AlphConfig;
+  alph_config(&cfg);
+  cfg.schedulers = 4;
+  cfg.max_actors = 256;
+  expect(alph_node_start(&g_node, &cfg), "node started");
+  ten_uniq = alph_node_reg_new(&g_node, ALPH_REG_UNIQUE);
+  ten_dup = alph_node_reg_new(&g_node, ALPH_REG_DUPLICATE);
+  expect(ten_uniq != 0 && ten_dup != 0, "registries made");
+  var d: TenDriver;
+  memset((rawptr)&d, 0, (int64)sizeof(TenDriver));
+  alph_node_spawn_value<TenDriver>(&g_node, 0, &d, &driver);
+  alph_node_wait(&g_node);
+  var bad: int64 = 0;
+  for k: int64 in 0..2 {
+    for c: int64 in 0..CHECKS {
+      var n: int64 = g_bad[k * CHECKS + c];
+      if (n != 0) {
+        println("FAIL case {k + 1} check {c + 1}: {n} of {ROUNDS} rounds");
+        bad = bad + n;
+      }
+    }
+  }
+  expect(g_rounds == 2 * ROUNDS, "every round ran its checks");
+  expect(alph_node_reg_count(&g_node, ten_uniq) == 0 && alph_node_reg_count(&g_node, ten_dup) == 0, "no key is left");
+  if (g_failures != 0 || bad != 0) {
+    println("rounds run: {g_rounds}, failed checks: {bad}");
+    return 1;
+  }
+  println("exit names ok ({g_rounds} rounds)");
+  return 0;
+}

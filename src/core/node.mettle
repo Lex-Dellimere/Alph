@@ -2776,10 +2776,14 @@ fn alph_proc_exit(node: AlphNode*, p: AlphProc*, reason: int64) {
     alph_atomic_add(&node->crashed, 1);
   }
 
-  // Handles close (children are killed and reaped) before anyone is told.
+  // Handles close (children are killed and reaped), and names, registry
+  // keys and group memberships go, before anyone is told: as on BEAM, an
+  // actor handling the DOWN or EXIT never finds the dead one under its name
+  // and can register the name again at once.
   for i: int64 in 0..p->io_handles.len {
     alph_io_drop(node, alph_vec_get(&p->io_handles, i), pid);
   }
+  alph_names_drop(node, p, pid);
   for i: int64 in 0..p->links.len {
     alph_signal_link_exit(node, pid, alph_vec_get(&p->links, i), reason);
   }
@@ -2798,7 +2802,6 @@ fn alph_proc_exit(node: AlphNode*, p: AlphProc*, reason: int64) {
   // more for the pushes that landed in between.
   alph_atomic_store_sc(&p->sig_closed, 1);
   alph_drain_late(node, p);
-  alph_names_drop(node, p, pid);
   for i: int64 in 0..p->deferred.len {
     free((rawptr)alph_vec_get(&p->deferred, i));
   }
