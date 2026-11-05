@@ -174,7 +174,7 @@ export struct AlphRegEntry {
 //   signals       OS signals the node takes over, as bits (1 << ALPH_SIGINT)
 //                 and so on; default 0. See alph_node_signals
 //   spin_us       how long an idle scheduler keeps checking for work before
-//                 it sleeps; default 50. Work that arrives meanwhile starts
+//                 it sleeps; default 2. Work that arrives meanwhile starts
 //                 without a wake-up system call. 0 sleeps at once
 export struct AlphConfig {
   schedulers: int64;
@@ -4153,7 +4153,7 @@ export fn alph_config(cfg: AlphConfig*) {
   cfg->heap_limit = 0;
   cfg->max_handles = 65536;
   cfg->signals = 0;
-  cfg->spin_us = 50;
+  cfg->spin_us = 2;
 }
 
 // Starts a node: its schedulers begin running and actors can be spawned.

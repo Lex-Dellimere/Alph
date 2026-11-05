@@ -677,7 +677,7 @@ max_handles   IO handles open at once; default 65536
 signals       OS signals the node takes over, as bits (1 << ALPH_SIGINT)
               and so on; default 0. See alph_node_signals
 spin_us       how long an idle scheduler keeps checking for work before
-              it sleeps; default 50. Work that arrives meanwhile starts
+              it sleeps; default 2. Work that arrives meanwhile starts
               without a wake-up system call. 0 sleeps at once
 ```
 
