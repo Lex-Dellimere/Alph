@@ -392,6 +392,9 @@ export fn alph_rx_signals(r: AlphReactor*, mask: int64) -> bool {
 // new count.
 fn alph_rx_fire(r: AlphReactor*, out: AlphRxEvent*, n: int64, cap: int64) -> int64 {
   var k: int64 = n;
+  if (r->heap_len == 0) {
+    return k;  // no timers: no clock read on every look at the sockets
+  }
   var now: int64 = alph_now_ns();
   while (k < cap && r->heap_len > 0) {
     var slot: int64 = alph_rx_heap_at(r, 0);
