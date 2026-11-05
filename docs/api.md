@@ -212,8 +212,8 @@ export struct AlphNode {
   io_free_stack: int64;
   io_free_top: int64;
   io_lock: int64;
-  names: int64;         // AlphVec of AlphEntry*: registered names
-  groups: int64;        // AlphVec of AlphEntry*: process groups
+  names: int64;         // AlphTable of registered names
+  groups: int64;        // AlphTable of process groups
   names_lock: int64;    // guards names, groups and every group's members
   env: int64;           // the environment the process started with, for children
   env_lock: int64;
