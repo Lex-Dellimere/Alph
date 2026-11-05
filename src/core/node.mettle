@@ -126,6 +126,9 @@ const ALPH_MSG_REPLY: int64 = 2;    // answers the request with the same ref
 const ALPH_BUDGET: int64 = 64;
 const ALPH_SHARE_WAKE: int64 = 8;
 const ALPH_IO_POLL_NS: int64 = 100000;  // a busy scheduler looks at its sockets at least this often
+// An awake scheduler that has not looked at its sockets for this long has
+// probably been paused by the OS; a spinning one looks for it.
+const ALPH_RESCUE_NS: int64 = 1000000;
 
 // Compaction. Every ALPH_BALANCE_NS the node sums how long its schedulers
 // were busy and keeps just enough of them active that each is busy about
@@ -348,7 +351,7 @@ struct AlphSched {
   runs: int64;          // actor runs, to poll IO now and then while busy
   qlen: int64;          // actors in runq, roughly: pushes counted after, pops after
   pop_lock: int64;      // taken to pop runq: the owner and thieves are its consumers
-  polled_at: int64;     // when a busy scheduler last looked at its sockets (ns)
+  polled_at: int64;     // when it last looked at its sockets, or was rescued (ns)
   hungry: int64;        // 1 while it has no work and may be handed some
   exiting: int64;       // the actor whose exit hook runs now; read back after a crash
   quiet: int64;         // node epoch seen between handlers; ALPH_QUIET_PARKED while it sleeps
@@ -622,11 +625,10 @@ fn alph_sched_steal(s: AlphSched*, node: AlphNode*) -> int64 {
       alph_atomic_store(&v->pop_lock, 0);
       if (p != 0) {
         alph_atomic_add(&v->qlen, -1);
-        if (((AlphProc*)p)->io_handles.len > 0) {
-          alph_runq_push(v, (AlphProc*)p);  // socket owners stay home, as above
-          continue;
-        }
         // QUEUED and off every queue: nobody else touches its home now.
+        // Its sockets come along, so its events reach s directly; a victim
+        // the OS has paused cannot hold them hostage either.
+        alph_io_move(node, (AlphProc*)p, s);
         ((AlphProc*)p)->sched = (int64)s;
         return p;
       }
@@ -3861,6 +3863,7 @@ fn alph_sched_finish(p: AlphProc*) {
 // (data 0) only wakes the scheduler. timeout_ms 0 polls without waiting.
 fn alph_sched_poll(s: AlphSched*, timeout_ms: int64) {
   var node: AlphNode* = (AlphNode*)s->node;
+  alph_atomic_store(&s->polled_at, alph_now_ns());
   var n: int64 = alph_sys_epoll_wait(s->epfd, (rawptr)s->events, 64, timeout_ms);
   for i: int64 in 0..n {
     var data: int64 = alph_sys_event_data((rawptr)s->events, i);
@@ -3876,6 +3879,40 @@ fn alph_sched_poll(s: AlphSched*, timeout_ms: int64) {
                           (ALPH_IO_IN | ALPH_IO_OUT | ALPH_IO_ERR | ALPH_IO_HUP);
         slot->armed = 0;  // one-shot: it fired, and is disarmed until armed again
         alph_signal(node, ALPH_SIG_IO, 0, slot->owner, data, mask, 0);
+      }
+    }
+  }
+}
+
+// Rescue, as BEAM's separate poll thread gives for free: when the OS pauses
+// an awake scheduler's thread (a busy host), its sockets go unread and its
+// actors wait for a whole time slice. A spinning scheduler s looks at the
+// sockets of any awake scheduler that has not done so for ALPH_RESCUE_NS,
+// turning ready ones into signals; the woken actors queue at their home,
+// and idle schedulers steal them, sockets and all. The eventfd and
+// signalfd entries are left for their owner.
+fn alph_sched_rescue(s: AlphSched*, node: AlphNode*) {
+  var t: int64 = alph_now_ns();
+  for i: int64 in 0..node->sched_count {
+    var v: AlphSched* = alph_sched_at(node, i);
+    if (v == s || alph_atomic_load(&v->io_count) == 0 || alph_atomic_load(&v->sleeping) != 0) {
+      continue;
+    }
+    var seen: int64 = alph_atomic_load(&v->polled_at);
+    if (t - seen < ALPH_RESCUE_NS || alph_atomic_cas(&v->polled_at, seen, t) != seen) {
+      continue;
+    }
+    var n: int64 = alph_sys_epoll_wait(v->epfd, (rawptr)s->events, 64, 0);
+    for k: int64 in 0..n {
+      var data: int64 = alph_sys_event_data((rawptr)s->events, k);
+      if (data > 0) {
+        var slot: AlphIoSlot* = alph_io_slot(node, data);
+        if (slot != 0) {
+          var mask: int64 = alph_sys_event_mask((rawptr)s->events, k) &
+                            (ALPH_IO_IN | ALPH_IO_OUT | ALPH_IO_ERR | ALPH_IO_HUP);
+          slot->armed = 0;
+          alph_signal(node, ALPH_SIG_IO, 0, slot->owner, data, mask, 0);
+        }
       }
     }
   }
@@ -3964,6 +4001,9 @@ fn alph_sched_spin_for(s: AlphSched*, node: AlphNode*, wait: int64, budget: int6
       if (p != 0) {
         return p;
       }
+    }
+    if (spins % 128 == 0) {
+      alph_sched_rescue(s, node);
     }
     // Sockets are watched through this scheduler's epoll set, so look at it
     // too, or a reply waits out the whole spin.
