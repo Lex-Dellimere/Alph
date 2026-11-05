@@ -129,6 +129,11 @@ const ALPH_MSG_REPLY: int64 = 2;    // answers the request with the same ref
 
 // Messages handled before the scheduler moves on to another actor.
 const ALPH_BUDGET: int64 = 64;
+// A scheduler out of work spins only while at least this many of 1024 of its
+// recent spins found work: below it, spinning costs more than the sleeps and
+// wake-ups it saves. In the sim a spin caught work 1.5%
+// of the time at 20K requests/s and 56% at 100K.
+const ALPH_SPIN_HITS: int64 = 256;
 const ALPH_SHARE_WAKE: int64 = 8;
 const ALPH_IO_POLL_NS: int64 = 100000;  // a busy scheduler looks at its sockets at least this often
 // An awake scheduler that has not looked at its sockets for this long has
@@ -378,6 +383,8 @@ struct AlphSched {
   rxev: int64;          // AlphRxEvent[64], for alph_rx_wait
   io_count: int64;      // handles registered here
   runs: int64;          // actor runs, to poll IO now and then while busy
+  spin_hits: int64;     // how often its recent spins found work, of 1024 (an average)
+  spin_skips: int64;    // idle stretches it slept through without spinning
   qlen: int64;          // actors in runq, roughly: pushes counted after, pops after
   pop_lock: int64;      // taken to pop runq: the owner and thieves are its consumers
   polled_at: int64;     // when it last looked at its sockets, or was rescued (ns)
@@ -4277,12 +4284,27 @@ fn alph_sched_spin(s: AlphSched*, node: AlphNode*, wait: int64) -> int64 {
   if (s->bound != 0 || budget <= 0) {
     return 0;
   }
+  if (s->spin_hits < ALPH_SPIN_HITS) {
+    // Spins have mostly ended empty: work comes later than a spin lasts,
+    // so one would burn its budget, and poll epoll for nothing, before
+    // sleeping anyway. Every 16th idle stretch still spins, to notice when
+    // the load picks up.
+    s->spin_skips = s->spin_skips + 1;
+    if (s->spin_skips % 16 != 0) {
+      return 0;
+    }
+  }
   if (alph_atomic_add(&node->spinners, 1) >= node->max_spinners) {
     alph_atomic_add(&node->spinners, -1);
     return 0;  // enough schedulers spin already: sleep
   }
   var p: int64 = alph_sched_spin_for(s, node, wait, budget);
   alph_atomic_add(&node->spinners, -1);
+  var hit: int64 = 0;
+  if (p != 0) {
+    hit = 1024;
+  }
+  s->spin_hits = s->spin_hits + (hit - s->spin_hits) / 8;  // weight 1/8
   return p;
 }
 
@@ -4405,6 +4427,7 @@ fn alph_sched_main(arg: int64) -> int64 {
 
 // Gives a scheduler its reactor and event buffers. Returns false on failure.
 fn alph_sched_init_io(s: AlphSched*) -> bool {
+  s->spin_hits = 1024;  // spin until spins prove useless
   s->events = (int64)malloc(64 * 12);
   s->rxev = (int64)malloc(64 * (int64)sizeof(AlphRxEvent));
   return s->events != 0 && s->rxev != 0 && alph_rx_init(&s->rx);
