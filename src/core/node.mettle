@@ -6247,6 +6247,9 @@ fn alph_map_zeroed(size: int64) -> int64 {
   if (got < 0) {
     return 0;
   }
+  // Small pages only: the tables are touched a slot at a time, and with
+  // transparent huge pages one slot would commit 2 MiB around it.
+  syscall(ALPH_SYS_MADVISE, got, size, ALPH_MADV_NOHUGEPAGE);
   return got;
 }
 
