@@ -28,6 +28,7 @@ export const ALPH_SYS_EPOLL_WAIT: int64 = 232;
 export const ALPH_SYS_EPOLL_PWAIT2: int64 = 441;
 export const ALPH_SYS_PRCTL: int64 = 157;
 export const ALPH_PR_SET_TIMERSLACK: int64 = 29;
+export const ALPH_PR_SET_NAME: int64 = 15;
 export const ALPH_SYS_EPOLL_CTL: int64 = 233;
 export const ALPH_SYS_ACCEPT4: int64 = 288;
 export const ALPH_SYS_EVENTFD2: int64 = 290;

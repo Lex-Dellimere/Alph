@@ -279,6 +279,9 @@ export struct AlphConfig {
 //            the handle, which spins
 //   timers_heaped  timers no lane took, as all 8 on their scheduler held
 //            timers of other spans: they went to the slower timer heap
+//   timers_handed  times a scheduler handed its pending timers to
+//            scheduler 0, as compaction left it idle or its bound actor
+//            exited: they fire there, on time, and it sleeps
 export struct AlphStats {
   live: int64;
   spawned: int64;
@@ -296,6 +299,7 @@ export struct AlphStats {
   stolen: int64;
   moves_held: int64;
   timers_heaped: int64;
+  timers_handed: int64;
 }
 
 // A node. Declare one, start it with alph_node_start, and keep it in place
@@ -363,6 +367,7 @@ export struct AlphNode {
   yields: int64;        // runs cut short by ALPH_RUN_NS
   isolated: int64;      // CPU-bound actors moved off a busy scheduler after such cuts
   io_hup_rearms: int64; // arms answered at once with nothing but a hang-up or error already reported
+  timers_handed: int64; // parcels of timers handed to scheduler 0
   epoch: int64;         // bumped by every retire
   retired: AlphVec;     // pairs: block (bit 0 set: a plain block, else an AlphEntry*), epoch
   retire_lock: int64;
@@ -480,6 +485,18 @@ struct AlphLane {
   tail: int64;     // the block being filled
   tail_at: int64;  //   and its next free index
   last: int64;     // the latest deadline queued: a later timer never gets an earlier one
+  n: int64;        // timers in it, stopped ones not yet popped included
+}
+
+// A scheduler's pending timers, handed whole to scheduler 0 when it stops
+// taking work (compaction) or for good (a bound scheduler whose actor
+// exited): its lanes, block chains and all, so every stop still lands on
+// the timer's own slot, and its heap.
+struct AlphTimerParcel {
+  next: int64;          // link in the receiver's timer_inbox: the first word
+  link: int64;          // the next parcel the receiver holds
+  lanes: AlphLane[8];   // ALPH_LANES
+  heap: AlphVec;
 }
 
 struct AlphSched {
@@ -495,6 +512,8 @@ struct AlphSched {
   lane_count: int64;   // timers in the lanes, cancelled ones not yet popped included
   lane_free: int64;    // blocks the lanes gave back, chained by their first word
   heaped: int64;       // timers of 1 ms or more that found no lane (stats: timers_heaped)
+  timer_inbox: AlphQueue;  // scheduler 0 only: parcels handed to it
+  parcels: int64;      // scheduler 0 only: parcels it took, draining, chained by link
   pool: AlphPool;  // chunks for the heaps of actors that live here
   scratch: AlphScratch;  // alph_scratch memory, reset after every handler call
   thread: AlphThread;
@@ -1849,6 +1868,7 @@ fn alph_lane_oldest(s: AlphSched*, lane: AlphLane*) -> AlphLaneTimer* {
       return t;
     }
     lane->head_at = lane->head_at + 1;
+    lane->n = lane->n - 1;
     s->lane_count = s->lane_count - 1;
   }
   return 0;
@@ -1907,6 +1927,7 @@ fn alph_lane_push(s: AlphSched*, lane: AlphLane*, deadline: int64) -> AlphLaneTi
   lane->last = deadline;
   var t: AlphLaneTimer* = alph_lane_slot(lane->tail, lane->tail_at);
   lane->tail_at = lane->tail_at + 1;
+  lane->n = lane->n + 1;
   s->lane_count = s->lane_count + 1;
   t->next = deadline;
   return t;
@@ -1946,6 +1967,7 @@ fn alph_lane_fire(node: AlphNode*, s: AlphSched*, lane: AlphLane*) -> bool {
     }
   }
   lane->head_at = lane->head_at + 1;
+  lane->n = lane->n - 1;
   s->lane_count = s->lane_count - 1;
   return true;
 }
@@ -2001,11 +2023,127 @@ fn alph_timer(ctx: AlphCtx*, ms: int64, to: int64, tag: int64, ref: int64, arg: 
   return at;
 }
 
+// Gives every block of an empty lane back to s, and clears the lane.
+fn alph_lane_release(s: AlphSched*, lane: AlphLane*) {
+  var b: int64 = lane->head;
+  while (b != 0) {
+    var next: int64 = *(int64*)b;
+    *(int64*)b = s->lane_free;
+    s->lane_free = b;
+    b = next;
+  }
+  lane->span = 0;
+  lane->head = 0;
+  lane->head_at = 0;
+  lane->tail = 0;
+  lane->tail_at = 0;
+  lane->last = 0;
+  lane->n = 0;
+}
+
+// Hands s's pending timers to scheduler 0, for s takes no more work: its
+// lanes whole, its heap, and any parcels it holds. Thread: s's, and no
+// handler of s runs while it does. Returns false when it kept them, out
+// of memory: they fire here then, and wake it.
+fn alph_timers_handoff(s: AlphSched*, node: AlphNode*) -> bool {
+  var to: AlphSched* = alph_sched_at(node, 0);
+  if (to == s) {
+    return true;
+  }
+  var moved: bool = false;
+  while (s->parcels != 0) {
+    var held: AlphTimerParcel* = (AlphTimerParcel*)s->parcels;
+    s->parcels = held->link;
+    for j: int64 in 0..ALPH_LANES {
+      s->lane_count = s->lane_count - held->lanes[j].n;
+    }
+    alph_queue_push(&to->timer_inbox, (rawptr)held);
+    moved = true;
+  }
+  if (s->lane_count > 0 || s->timers.len > 0) {
+    var pc: AlphTimerParcel* = (AlphTimerParcel*)calloc(1, (int64)sizeof(AlphTimerParcel));
+    if (pc == 0) {
+      if (moved) {
+        alph_sched_notify(to);
+      }
+      return false;
+    }
+    for i: int64 in 0..ALPH_LANES {
+      pc->lanes[i] = s->lanes[i];
+      s->lanes[i].span = 0;
+      s->lanes[i].head = 0;
+      s->lanes[i].head_at = 0;
+      s->lanes[i].tail = 0;
+      s->lanes[i].tail_at = 0;
+      s->lanes[i].last = 0;
+      s->lanes[i].n = 0;
+    }
+    s->lanes_hi = 0;
+    s->lane_count = 0;
+    pc->heap = s->timers;
+    s->timers.data = 0;
+    s->timers.len = 0;
+    s->timers.cap = 0;
+    alph_queue_push(&to->timer_inbox, (rawptr)pc);
+    alph_atomic_add(&node->timers_handed, 1);
+    moved = true;
+  }
+  if (moved) {
+    alph_sched_notify(to);  // it may sleep towards a later deadline
+  }
+  return true;
+}
+
+// Scheduler 0 takes the parcels handed to it: their heaps join its own,
+// and their lanes are looked at beside its own until they drain.
+fn alph_timers_adopt(s: AlphSched*) {
+  var got: int64 = alph_queue_pop(&s->timer_inbox);
+  while (got != 0) {
+    var pc: AlphTimerParcel* = (AlphTimerParcel*)got;
+    for i: int64 in 0..pc->heap.len {
+      alph_timers_add(&s->timers, (AlphSignal*)alph_vec_get(&pc->heap, i));
+    }
+    alph_vec_release(&pc->heap);
+    for j: int64 in 0..ALPH_LANES {
+      s->lane_count = s->lane_count + pc->lanes[j].n;
+    }
+    pc->link = s->parcels;
+    s->parcels = got;
+    got = alph_queue_pop(&s->timer_inbox);
+  }
+}
+
+// Frees the parcels whose lanes have all drained.
+fn alph_parcels_drop(s: AlphSched*) {
+  var at: int64* = &s->parcels;
+  while (*at != 0) {
+    var pc: AlphTimerParcel* = (AlphTimerParcel*)*at;
+    var left: int64 = 0;
+    for j: int64 in 0..ALPH_LANES {
+      if (pc->lanes[j].n > 0) {
+        left = left + 1;
+      }
+    }
+    if (left == 0) {
+      *at = pc->link;
+      for j: int64 in 0..ALPH_LANES {
+        alph_lane_release(s, &pc->lanes[j]);
+      }
+      free((rawptr)pc);
+    } else {
+      at = &pc->link;
+    }
+  }
+}
+
 // Fires s's due timers. Returns nanoseconds until the next one, or -1 if
 // none. With none pending it reads no clock; with some, the reading it
 // takes becomes the next run's start (s->run_hint), as Go's checkTimers
 // hands its now to the scheduler: one clock read per pass, not two.
 fn alph_timers_fire(node: AlphNode*, s: AlphSched*) -> int64 {
+  if (s->index == 0 && s->bound == 0) {
+    alph_timers_adopt(s);
+  }
   if (s->timers.len == 0) {
     if (s->lane_count == 0) {
       return -1;
@@ -2015,6 +2153,22 @@ fn alph_timers_fire(node: AlphNode*, s: AlphSched*) -> int64 {
       if (alph_lane_oldest(s, &s->lanes[i]) != 0) {
         any = true;
         break;
+      }
+    }
+    if (!any && s->parcels != 0) {
+      var at: int64 = s->parcels;
+      while (at != 0 && !any) {
+        var pc: AlphTimerParcel* = (AlphTimerParcel*)at;
+        for j: int64 in 0..ALPH_LANES {
+          if (pc->lanes[j].n > 0 && alph_lane_oldest(s, &pc->lanes[j]) != 0) {
+            any = true;
+            break;
+          }
+        }
+        at = pc->link;
+      }
+      if (!any) {
+        alph_parcels_drop(s);
       }
     }
     if (!any) {
@@ -2027,37 +2181,58 @@ fn alph_timers_fire(node: AlphNode*, s: AlphSched*) -> int64 {
 }
 
 // As alph_timers_fire, for a time already read. Due timers fire in
-// deadline order across the lanes and the heap.
+// deadline order across the lanes, the parcels' lanes and the heap.
 fn alph_timers_fire_at(node: AlphNode*, s: AlphSched*, now: int64) -> int64 {
   var h: AlphVec* = &s->timers;
   while (true) {
-    var best: int64 = -1;  // a lane's index, or ALPH_LANES for the heap
+    var best: AlphLane* = 0;  // the lane due first, or 0 for the heap
+    var found: bool = false;
     var best_at: int64 = 0;
     if (s->lane_count > 0) {
       for i: int64 in 0..s->lanes_hi {
         var t: AlphLaneTimer* = alph_lane_oldest(s, &s->lanes[i]);
-        if (t != 0 && (best < 0 || t->next < best_at)) {
-          best = i;
+        if (t != 0 && (!found || t->next < best_at)) {
+          best = &s->lanes[i];
+          found = true;
           best_at = t->next;
         }
+      }
+      var at: int64 = s->parcels;
+      while (at != 0) {
+        var pc: AlphTimerParcel* = (AlphTimerParcel*)at;
+        for j: int64 in 0..ALPH_LANES {
+          if (pc->lanes[j].n > 0) {
+            var t: AlphLaneTimer* = alph_lane_oldest(s, &pc->lanes[j]);
+            if (t != 0 && (!found || t->next < best_at)) {
+              best = &pc->lanes[j];
+              found = true;
+              best_at = t->next;
+            }
+          }
+        }
+        at = pc->link;
       }
     }
     if (h->len > 0) {
       var d: int64 = alph_timer_deadline(alph_vec_get(h, 0));
-      if (best < 0 || d < best_at) {
-        best = ALPH_LANES;
+      if (!found || d < best_at) {
+        best = (AlphLane*)0;
+        found = true;
         best_at = d;
       }
     }
-    if (best < 0) {
+    if (s->parcels != 0) {
+      alph_parcels_drop(s);
+    }
+    if (!found) {
       return -1;
     }
     var wait: int64 = best_at - now;
     if (wait > 0) {
       return wait;
     }
-    if (best < ALPH_LANES) {
-      if (!alph_lane_fire(node, s, &s->lanes[best])) {
+    if (best != 0) {
+      if (!alph_lane_fire(node, s, best)) {
         return ALPH_NS_PER_MS;  // out of memory: try again in a while
       }
     } else {
@@ -5246,6 +5421,7 @@ fn alph_sched_bound(node: AlphNode*) -> AlphSched* {
     return (AlphSched*)0;
   }
   alph_queue_init(&s->runq);
+  alph_queue_init(&s->timer_inbox);
   s->index = -1;
   s->node = (int64)node;
   s->bound = 1;
@@ -5484,6 +5660,7 @@ fn alph_sched_take(s: AlphSched*, node: AlphNode*, p: AlphProc*) -> bool {
 fn alph_sched_main(arg: int64) -> int64 {
   var s: AlphSched* = (AlphSched*)arg;
   var node: AlphNode* = (AlphNode*)s->node;
+  alph_sched_name(s);
   while (alph_atomic_load(&node->halted) == 0 && alph_atomic_load(&s->done) == 0) {
     alph_sched_quiet(s, node);
     // A real reading: one handler may have run for as long as it liked
@@ -5531,6 +5708,11 @@ fn alph_sched_main(arg: int64) -> int64 {
       }
     } else {
       alph_sched_fed(s, node);
+      // Compaction left it idle: its timers fire on scheduler 0, so that
+      // it sleeps until it is given work.
+      if (alph_timers_handoff(s, node)) {
+        wait = -1;
+      }
     }
     // Park in epoll. A pusher bumps wake after its push, then writes the
     // eventfd if sleeping is set; setting sleeping first and popping once
@@ -5552,9 +5734,45 @@ fn alph_sched_main(arg: int64) -> int64 {
     alph_atomic_store(&s->sleeping, 0);
   }
   if (s->bound != 0) {
+    // Its actor exited, but timers it started for others, as alph_send_after,
+    // are still due: scheduler 0 fires them.
+    if (alph_atomic_load(&node->halted) == 0) {
+      alph_timers_handoff(s, node);
+    }
     alph_rx_free(&s->rx);
   }
   return 0;
+}
+
+// Names s's thread for ps, top and /proc: alph-s<index>, or alph-bound.
+fn alph_sched_name(s: AlphSched*) {
+  var name: uint8[16];
+  var text: string = "alph-bound";
+  var n: int64 = 0;
+  if (s->bound == 0) {
+    text = "alph-s";
+  }
+  for i: int64 in 0..text.length {
+    name[n] = text[i];
+    n = n + 1;
+  }
+  if (s->bound == 0) {
+    var digits: uint8[8];
+    var k: int64 = 0;
+    var v: int64 = s->index;
+    while (k == 0 || v > 0) {
+      digits[k] = (uint8)(48 + v % 10);
+      v = v / 10;
+      k = k + 1;
+    }
+    while (k > 0 && n < 15) {
+      k = k - 1;
+      name[n] = digits[k];
+      n = n + 1;
+    }
+  }
+  name[n] = 0;
+  syscall(ALPH_SYS_PRCTL, ALPH_PR_SET_NAME, (int64)&name[0], 0, 0, 0);
 }
 
 // Gives a scheduler its reactor and event buffers. Returns false on failure.
@@ -5656,6 +5874,7 @@ export fn alph_node_start(node: AlphNode*, cfg: AlphConfig*) -> bool {
   for i: int64 in 0..node->sched_count {
     var s: AlphSched* = alph_sched_at(node, i);
     alph_queue_init(&s->runq);
+    alph_queue_init(&s->timer_inbox);
     s->index = i;
     s->node = (int64)node;
     if (!alph_sched_init_io(s)) {
@@ -5693,6 +5912,13 @@ export fn alph_node_start(node: AlphNode*, cfg: AlphConfig*) -> bool {
 // ALPH_SYSMON_IDLE_NS while none do.
 fn alph_sysmon_main(arg: int64) -> int64 {
   var node: AlphNode* = (AlphNode*)arg;
+  var name: uint8[16];
+  var text: string = "alph-sysmon";
+  for i: int64 in 0..text.length {
+    name[i] = text[i];
+  }
+  name[text.length] = 0;
+  syscall(ALPH_SYS_PRCTL, ALPH_PR_SET_NAME, (int64)&name[0], 0, 0, 0);
   var buf: int64 = (int64)malloc(64 * 12);
   var delay: int64 = ALPH_SYSMON_NS;
   while (alph_atomic_load(&node->halted) == 0) {
@@ -5864,4 +6090,5 @@ export fn alph_node_stats(node: AlphNode*, stats: AlphStats*) {
   stats->refused = alph_atomic_load(&node->refused);
   stats->yields = alph_atomic_load(&node->yields);
   stats->io_hup_rearms = alph_atomic_load(&node->io_hup_rearms);
+  stats->timers_handed = alph_atomic_load(&node->timers_handed);
 }

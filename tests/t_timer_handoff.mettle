@@ -1,0 +1,610 @@
+// Timers handed to scheduler 0: when a scheduler stops taking work, its
+// pending timers are handed whole to scheduler 0, which fires them on time.
+// Two things stop a scheduler: its bound actor exits (the thread ends), and
+// compaction (an idle node lowers the number of active schedulers, and a
+// deactivated one sleeps instead of waking for each deadline). Scheduler
+// threads are named alph-s0, alph-s1 and so on, so the test finds them in
+// /proc/self/task and counts their voluntary context switches. Checks, in
+// order:
+//   C1. a bound actor starts alph_send_after timers for a collector (50 ms
+//       and 0 ms) and one timer of its own, then exits: the collector gets
+//       the 0 ms one within 30 ms and the 50 ms one between 50 and 100 ms
+//       after the start, and a scheduler handed timers over (timers_handed)
+//   C2. 200 bound actors, in batches of 10, each send_after 20 ms and
+//       exit: all 200 arrive, each exactly once
+//   C3. on a node of 4 schedulers, 16 actors start 20 timers each (about 200
+//       to 390 ms) and the node goes quiet, with only a heartbeat actor
+//       (compaction looks at the load when a scheduler ends a stretch of
+//       work, so a node with no work at all never compacts): all 320 arrive,
+//       none earlier than its span (5 ms of slack for the spawn spread) and
+//       none later than 30 ms after it; the threads alph-s1..s3 make only a
+//       few voluntary context switches between 150 and 450 ms (they sleep,
+//       and do not wake for each deadline); compaction left 1 scheduler
+//       active and handed timers over
+//   C4. 16 clients each request a slow server (timeout 400 ms) while 3
+//       busy actors load the node, which then idles: the server answers
+//       all 16 after 250 ms, and no TIMEOUT arrives, not within 500 ms of
+//       the requests either
+//   C5. after the node idled again and load returned, 8 new actors start a
+//       timer of 20 ms: all 8 arrive within 20 to 60 ms
+
+import "std/io";
+import "std/thread";
+import "alph/sys/atomic";
+import "alph/sys/clock";
+import "alph/alph";
+
+const LATE: int64 = ALPH_TAG_USER;
+const GO: int64 = ALPH_TAG_USER + 1;
+const OWN: int64 = ALPH_TAG_USER + 2;
+const LATE2: int64 = ALPH_TAG_USER + 3;
+const TICK: int64 = ALPH_TAG_USER + 4;
+const REQ: int64 = ALPH_TAG_USER + 5;
+const ANS: int64 = ALPH_TAG_USER + 6;
+const FIRE: int64 = ALPH_TAG_USER + 7;
+const BUSY: int64 = ALPH_TAG_USER + 8;
+const BEAT: int64 = ALPH_TAG_USER + 9;
+const MS: int64 = 1000000;
+const NTIMERS: int64 = 320;
+
+// The most voluntary context switches the three sleeping schedulers of C3 may
+// make together in 300 ms. Observed: 2 to 3 (each wakes once, at the first
+// deadline it still held, to hand the rest over); without the hand-off they
+// woke for every deadline, about 40.
+const C3_CTXSW_LIMIT: int64 = 10;
+
+var g_node: AlphNode;
+var g_failures: int64 = 0;
+var g_collector: int64 = 0;
+var g_slow: int64 = 0;
+var g_beating: int64 = 0;
+
+// C1
+var g_c1_t0: int64 = 0;
+var g_c1_at1: int64 = 0;
+var g_c1_at2: int64 = 0;
+var g_c1_got: int64 = 0;
+// C2
+var g_c2_next: int64 = 0;
+var g_c2_exited: int64 = 0;
+var g_c2_got: int64 = 0;
+var g_c2_seen: int64[200];
+// C3
+var g_c3_t0: int64 = 0;
+var g_c3_n: int64 = 0;
+var g_c3_late: int64[320];
+// C4
+var g_c4_ans: int64 = 0;
+var g_c4_to: int64 = 0;
+// C5
+var g_c5_n: int64 = 0;
+var g_c5_dt: int64[16];
+
+fn expect(ok: bool, what: string) {
+  if (!ok) {
+    println("FAIL {what}");
+    alph_atomic_add(&g_failures, 1);
+  }
+}
+
+fn wait_for(v: int64*, want: int64, ms: int64) {
+  for i: int64 in 0..ms {
+    if (alph_atomic_load(v) >= want) {
+      return;
+    }
+    thread_sleep_ms(1);
+  }
+}
+
+fn sleep_until(t: int64) {
+  while (alph_now_ns() < t) {
+    thread_sleep_ms(1);
+  }
+}
+
+// ---- /proc ------------------------------------------------------------------
+
+const SYS_READ: int64 = 0;
+const SYS_OPEN: int64 = 2;
+const SYS_CLOSE: int64 = 3;
+const SYS_GETDENTS64: int64 = 217;
+const O_DIRECTORY: int64 = 65536;
+
+// Writes /proc/self/task/<tid>/<tail> into out as a cstring.
+fn task_path(out: uint8*, tid: int64, tail: string) {
+  var head: string = "/proc/self/task/";
+  var n: int64 = 0;
+  for i: int64 in 0..(int64)head.length {
+    out[n] = head.chars[i];
+    n = n + 1;
+  }
+  var digits: uint8[24];
+  var d: int64 = 0;
+  var v: int64 = tid;
+  while (v > 0) {
+    digits[d] = (uint8)(48 + v % 10);
+    d = d + 1;
+    v = v / 10;
+  }
+  while (d > 0) {
+    d = d - 1;
+    out[n] = digits[d];
+    n = n + 1;
+  }
+  out[n] = 47;
+  n = n + 1;
+  for i: int64 in 0..(int64)tail.length {
+    out[n] = tail.chars[i];
+    n = n + 1;
+  }
+  out[n] = 0;
+}
+
+// Reads a file of a thread into buf (up to size - 1 bytes, a cstring), or
+// returns -1.
+fn task_read(tid: int64, tail: string, buf: uint8*, size: int64) -> int64 {
+  var path: uint8[96];
+  task_path(&path[0], tid, tail);
+  var fd: int64 = syscall(SYS_OPEN, (int64)&path[0], 0, 0);
+  if (fd < 0) {
+    return -1;
+  }
+  var n: int64 = syscall(SYS_READ, fd, (int64)buf, size - 1);
+  syscall(SYS_CLOSE, fd);
+  if (n < 0) {
+    return -1;
+  }
+  buf[n] = 0;
+  return n;
+}
+
+// The tid of the thread of this process named name, or 0.
+fn find_tid(name: string) -> int64 {
+  var dir: string = "/proc/self/task\0";
+  var fd: int64 = syscall(SYS_OPEN, (int64)dir.chars, O_DIRECTORY, 0);
+  if (fd < 0) {
+    return 0;
+  }
+  var found: int64 = 0;
+  var ents: uint8[8192];
+  while (found == 0) {
+    var n: int64 = syscall(SYS_GETDENTS64, fd, (int64)&ents[0], 8192);
+    if (n <= 0) {
+      break;
+    }
+    var off: int64 = 0;
+    while (off < n && found == 0) {
+      var reclen: int64 = (int64)ents[off + 16] + (int64)ents[off + 17] * 256;
+      var tid: int64 = 0;
+      var ok: bool = true;
+      var j: int64 = off + 19;
+      while (ents[j] != 0) {
+        var c: int64 = (int64)ents[j];
+        if (c < 48 || c > 57) {
+          ok = false;
+          break;
+        }
+        tid = tid * 10 + c - 48;
+        j = j + 1;
+      }
+      if (ok && tid > 0) {
+        var comm: uint8[32];
+        var cn: int64 = task_read(tid, "comm", &comm[0], 32);
+        if (cn == (int64)name.length + 1 && comm[(int64)name.length] == 10) {
+          var same: bool = true;
+          for k: int64 in 0..(int64)name.length {
+            if (comm[k] != name.chars[k]) {
+              same = false;
+            }
+          }
+          if (same) {
+            found = tid;
+          }
+        }
+      }
+      off = off + reclen;
+    }
+  }
+  syscall(SYS_CLOSE, fd);
+  return found;
+}
+
+// voluntary_ctxt_switches of a thread, or -1.
+fn ctxsw(tid: int64) -> int64 {
+  var buf: uint8[4096];
+  var n: int64 = task_read(tid, "status", &buf[0], 4096);
+  if (n < 0) {
+    return -1;
+  }
+  var key: string = "\nvoluntary_ctxt_switches:";
+  var i: int64 = 0;
+  while (i + (int64)key.length < n) {
+    var same: bool = true;
+    for k: int64 in 0..(int64)key.length {
+      if (buf[i + k] != key.chars[k]) {
+        same = false;
+        break;
+      }
+    }
+    if (same) {
+      var j: int64 = i + (int64)key.length;
+      while (j < n && (buf[j] == 32 || buf[j] == 9)) {
+        j = j + 1;
+      }
+      var v: int64 = 0;
+      while (j < n && buf[j] >= 48 && buf[j] <= 57) {
+        v = v * 10 + (int64)buf[j] - 48;
+        j = j + 1;
+      }
+      return v;
+    }
+    i = i + 1;
+  }
+  return -1;
+}
+
+// ---- actors -----------------------------------------------------------------
+
+// Gets what the bound actors of C1 and C2 send after they are gone.
+fn collector(ctx: AlphCtx*, m: AlphMsg*) -> int64 {
+  if (m->tag == LATE) {
+    if (m->arg == 1) {
+      alph_atomic_store(&g_c1_at1, alph_now_ns());
+    } else {
+      alph_atomic_store(&g_c1_at2, alph_now_ns());
+    }
+    alph_atomic_add(&g_c1_got, 1);
+  } else if (m->tag == LATE2) {
+    if (m->arg >= 0 && m->arg < 200) {
+      alph_atomic_add(&g_c2_seen[m->arg], 1);
+    }
+    alph_atomic_add(&g_c2_got, 1);
+  }
+  return ALPH_CONTINUE;
+}
+
+// C1
+fn c1_bound(ctx: AlphCtx*, m: AlphMsg*) -> int64 {
+  if (m->tag == GO) {
+    alph_atomic_store(&g_c1_t0, alph_now_ns());
+    alph_send_after(ctx, 50, g_collector, LATE, 1);
+    alph_send_after(ctx, 0, g_collector, LATE, 2);
+    alph_start_timer(ctx, 30, OWN, 0);
+    return alph_stop(ctx, ALPH_NORMAL);
+  }
+  return ALPH_CONTINUE;
+}
+
+// C2
+fn c2_bound(ctx: AlphCtx*, m: AlphMsg*) -> int64 {
+  if (m->tag == ALPH_TAG_INIT) {
+    var i: int64 = alph_atomic_add(&g_c2_next, 1);
+    alph_send_after(ctx, 20, g_collector, LATE2, i);
+    alph_atomic_add(&g_c2_exited, 1);
+    return alph_stop(ctx, ALPH_NORMAL);
+  }
+  return ALPH_CONTINUE;
+}
+
+// The node looks at its load only when a scheduler ends a stretch of work,
+// so a node with no work at all never compacts. This actor is the lightest
+// work there is: a tick every 3 ms, which gives compaction its looks.
+fn heartbeat(ctx: AlphCtx*, m: AlphMsg*) -> int64 {
+  if (alph_atomic_load(&g_beating) != 0) {
+    alph_send_after(ctx, 3, ctx->self, BEAT, 0);
+  }
+  return ALPH_CONTINUE;
+}
+
+// C3: 20 timers of 200 + 10 k + idx ms (idx is the actor's own, 0 to 15, so
+// that no two due together: a burst of messages makes the node activate
+// another scheduler), each recording how late it came
+struct C3State {
+  idx: int64;
+}
+
+fn c3_actor(ctx: AlphCtx*, m: AlphMsg*) -> int64 {
+  if (m->tag == ALPH_TAG_INIT) {
+    var s: C3State* = (C3State*)ctx->state;
+    for k: int64 in 0..20 {
+      var span: int64 = 200 + 10 * k + s->idx;
+      alph_start_timer(ctx, span, TICK, span);
+    }
+  } else if (m->tag == TICK) {
+    var now: int64 = alph_now_ns();
+    var i: int64 = alph_atomic_add(&g_c3_n, 1);
+    if (i < NTIMERS) {
+      alph_atomic_store(&g_c3_late[i], now - alph_atomic_load(&g_c3_t0) - m->arg * MS);
+    }
+  }
+  return ALPH_CONTINUE;
+}
+
+// The load: BUSY spins for arg ms.
+fn busy(ctx: AlphCtx*, m: AlphMsg*) -> int64 {
+  if (m->tag == BUSY) {
+    var end: int64 = alph_now_ns() + m->arg * MS;
+    while (alph_now_ns() < end) {
+    }
+  }
+  return ALPH_CONTINUE;
+}
+
+// C4
+struct SlowState {
+  n: int64;
+  reqs: AlphMsg[16];
+}
+
+fn slow(ctx: AlphCtx*, m: AlphMsg*) -> int64 {
+  var s: SlowState* = (SlowState*)ctx->state;
+  if (m->tag == REQ) {
+    if (s->n < 16) {
+      s->reqs[s->n] = *m;
+      s->n = s->n + 1;
+      if (s->n == 1) {
+        alph_start_timer(ctx, 250, FIRE, 0);
+      }
+    }
+  } else if (m->tag == FIRE) {
+    for i: int64 in 0..s->n {
+      alph_reply(ctx, &s->reqs[i], ANS, i);
+    }
+    s->n = 0;
+  }
+  return ALPH_CONTINUE;
+}
+
+fn c4_client(ctx: AlphCtx*, m: AlphMsg*) -> int64 {
+  if (m->tag == GO) {
+    alph_request(ctx, g_slow, REQ, 0, 400);
+  } else if (m->tag == ANS) {
+    alph_atomic_add(&g_c4_ans, 1);
+  } else if (m->tag == ALPH_TAG_TIMEOUT) {
+    alph_atomic_add(&g_c4_to, 1);
+  }
+  return ALPH_CONTINUE;
+}
+
+// C5
+struct C5State {
+  t0: int64;
+}
+
+fn c5_actor(ctx: AlphCtx*, m: AlphMsg*) -> int64 {
+  var s: C5State* = (C5State*)ctx->state;
+  if (m->tag == ALPH_TAG_INIT) {
+    s->t0 = alph_now_ns();
+    alph_start_timer(ctx, 20, TICK, 0);
+  } else if (m->tag == TICK) {
+    var i: int64 = alph_atomic_add(&g_c5_n, 1);
+    if (i < 16) {
+      alph_atomic_store(&g_c5_dt[i], alph_now_ns() - s->t0);
+    }
+  }
+  return ALPH_CONTINUE;
+}
+
+fn config(schedulers: int64, max_actors: int64) -> AlphConfig {
+  var cfg: AlphConfig;
+  alph_config(&cfg);
+  cfg.schedulers = schedulers;
+  cfg.max_actors = max_actors;
+  cfg.mailbox_size = 256;
+  return cfg;
+}
+
+fn main() -> int32 {
+  var st: AlphStats;
+
+  // ---- C1 and C2: two schedulers
+  var cfg: AlphConfig = config(2, 512);
+  expect(alph_node_start(&g_node, &cfg), "node started");
+  g_collector = alph_node_spawn(&g_node, 0, &collector);
+  expect(g_collector != 0, "collector spawned");
+  thread_sleep_ms(10);
+
+  // C1
+  var c1: int64 = alph_node_spawn(&g_node, ALPH_BOUND, &c1_bound);
+  expect(c1 != 0, "C1: bound actor spawned");
+  thread_sleep_ms(20);
+  alph_node_send(&g_node, c1, GO, 0);
+  wait_for(&g_c1_got, 2, 1000);
+  thread_sleep_ms(20);
+  var t0: int64 = alph_atomic_load(&g_c1_t0);
+  var at1: int64 = alph_atomic_load(&g_c1_at1);
+  var at2: int64 = alph_atomic_load(&g_c1_at2);
+  var late1_us: int64 = (at1 - t0) / 1000;
+  var late2_us: int64 = (at2 - t0) / 1000;
+  expect(alph_atomic_load(&g_c1_got) == 2, "C1: both timers of the exited bound actor arrived ({g_c1_got})");
+  expect(at2 > t0 && at2 - t0 <= 30 * MS, "C1: the 0 ms timer within 30 ms ({late2_us} us)");
+  expect(at1 - t0 >= 50 * MS, "C1: the 50 ms timer no earlier than 50 ms ({late1_us} us)");
+  expect(at1 - t0 <= 100 * MS, "C1: the 50 ms timer no later than 100 ms ({late1_us} us)");
+  alph_node_stats(&g_node, &st);
+  var handed1: int64 = st.timers_handed;
+  expect(handed1 >= 1, "C1: the bound scheduler handed its timers over ({handed1})");
+
+  // C2
+  for b: int64 in 0..20 {
+    for k: int64 in 0..10 {
+      var pid: int64 = 0;
+      for t: int64 in 0..500 {
+        pid = alph_node_spawn(&g_node, ALPH_BOUND, &c2_bound);
+        if (pid != 0) {
+          break;
+        }
+        thread_sleep_ms(1);
+      }
+      expect(pid != 0, "C2: bound actor {b * 10 + k} spawned");
+    }
+    wait_for(&g_c2_exited, (b + 1) * 10, 2000);
+  }
+  wait_for(&g_c2_got, 200, 4000);
+  thread_sleep_ms(30);
+  var got2: int64 = alph_atomic_load(&g_c2_got);
+  expect(got2 == 200, "C2: 200 timers of 200 exited bound actors arrived ({got2})");
+  var dup: int64 = 0;
+  for i: int64 in 0..200 {
+    if (alph_atomic_load(&g_c2_seen[i]) != 1) {
+      dup = dup + 1;
+    }
+  }
+  expect(dup == 0, "C2: every timer arrived exactly once ({dup} did not)");
+  alph_node_halt(&g_node, 0);
+  alph_node_wait(&g_node);
+
+  // ---- C3 to C5: four schedulers
+  cfg = config(4, 256);
+  expect(alph_node_start(&g_node, &cfg), "second node started");
+  var tids: int64[3];
+  for s: int64 in 0..3 {
+    var name: string = "alph-s1";
+    if (s == 1) {
+      name = "alph-s2";
+    } else if (s == 2) {
+      name = "alph-s3";
+    }
+    tids[s] = find_tid(name);
+    expect(tids[s] != 0, "C3: found the thread {name}");
+  }
+  alph_atomic_store(&g_beating, 1);
+  var hb: int64 = alph_node_spawn(&g_node, 0, &heartbeat);
+  expect(hb != 0, "C3: heartbeat spawned");
+  var c3: int64[16];
+  for i: int64 in 0..16 {
+    var cs: C3State;
+    cs.idx = i;
+    c3[i] = alph_node_spawn_value<C3State>(&g_node, 0, &cs, &c3_actor);
+    expect(c3[i] != 0, "C3: actor {i} spawned");
+  }
+  var t3: int64 = alph_now_ns();
+  alph_atomic_store(&g_c3_t0, t3);
+  sleep_until(t3 + 150 * MS);
+  var before: int64[3];
+  for s: int64 in 0..3 {
+    before[s] = ctxsw(tids[s]);
+    expect(before[s] >= 0, "C3: read the context switches of thread {tids[s]}");
+  }
+  sleep_until(t3 + 450 * MS);
+  var sum: int64 = 0;
+  var worst: int64 = 0;
+  for s: int64 in 0..3 {
+    var after: int64 = ctxsw(tids[s]);
+    expect(after >= 0, "C3: read the context switches of thread {tids[s]} again");
+    sum = sum + after - before[s];
+    if (after - before[s] > worst) {
+      worst = after - before[s];
+    }
+  }
+  alph_node_stats(&g_node, &st);
+  var active3: int64 = st.active;
+  var handed3: int64 = st.timers_handed;
+  wait_for(&g_c3_n, NTIMERS, 1000);
+  thread_sleep_ms(20);
+  var n3: int64 = alph_atomic_load(&g_c3_n);
+  expect(n3 == NTIMERS, "C3: all {NTIMERS} timers arrived ({n3})");
+  var latest: int64 = -1000 * MS;
+  var earliest: int64 = 1000 * MS;
+  for i: int64 in 0..NTIMERS {
+    var l: int64 = alph_atomic_load(&g_c3_late[i]);
+    if (l < earliest) {
+      earliest = l;
+    }
+    if (l > latest) {
+      latest = l;
+    }
+  }
+  var earliest_us: int64 = earliest / 1000;
+  var latest_us: int64 = latest / 1000;
+  expect(earliest >= -5 * MS, "C3: no timer earlier than its span - 5 ms ({earliest_us} us)");
+  expect(latest <= 30 * MS, "C3: no timer later than its span + 30 ms ({latest_us} us)");
+  expect(sum <= C3_CTXSW_LIMIT, "C3: alph-s1..s3 made {sum} voluntary context switches in 300 ms (limit {C3_CTXSW_LIMIT})");
+  expect(handed3 >= 1, "C3: compaction handed timers over ({handed3})");
+  expect(active3 == 1, "C3: one scheduler left active at 450 ms ({active3})");
+
+  // C4
+  thread_sleep_ms(100);
+  alph_node_stats(&g_node, &st);
+  var active_idle: int64 = st.active;
+  var handed_before4: int64 = st.timers_handed;
+  var ss: SlowState;
+  ss.n = 0;
+  g_slow = alph_node_spawn_value<SlowState>(&g_node, 0, &ss, &slow);
+  expect(g_slow != 0, "C4: slow server spawned");
+  var c4: int64[16];
+  for i: int64 in 0..16 {
+    c4[i] = alph_node_spawn(&g_node, 0, &c4_client);
+    expect(c4[i] != 0, "C4: client {i} spawned");
+  }
+  var loaders: int64[3];
+  for i: int64 in 0..3 {
+    loaders[i] = alph_node_spawn(&g_node, 0, &busy);
+    expect(loaders[i] != 0, "C4: busy actor {i} spawned");
+  }
+  thread_sleep_ms(10);
+  for i: int64 in 0..3 {
+    for j: int64 in 0..4 {
+      alph_node_send(&g_node, loaders[i], BUSY, 30);
+    }
+  }
+  thread_sleep_ms(30);
+  alph_node_stats(&g_node, &st);
+  var active_busy: int64 = st.active;
+  var t4: int64 = alph_now_ns();
+  for i: int64 in 0..16 {
+    alph_node_send(&g_node, c4[i], GO, 0);
+  }
+  wait_for(&g_c4_ans, 16, 2000);
+  var answered_ms: int64 = (alph_now_ns() - t4) / MS;
+  sleep_until(t4 + 500 * MS);
+  alph_node_stats(&g_node, &st);
+  var handed4: int64 = st.timers_handed - handed_before4;
+  var ans4: int64 = alph_atomic_load(&g_c4_ans);
+  var to4: int64 = alph_atomic_load(&g_c4_to);
+  expect(ans4 == 16, "C4: 16 answers ({ans4})");
+  expect(to4 == 0, "C4: no TIMEOUT after 500 ms ({to4})");
+
+  // C5
+  thread_sleep_ms(150);
+  for i: int64 in 0..3 {
+    for j: int64 in 0..10 {
+      alph_node_send(&g_node, loaders[i], BUSY, 10);
+    }
+  }
+  thread_sleep_ms(30);
+  for i: int64 in 0..8 {
+    var cs: C5State;
+    cs.t0 = 0;
+    var pid: int64 = alph_node_spawn_value<C5State>(&g_node, 0, &cs, &c5_actor);
+    expect(pid != 0, "C5: actor {i} spawned");
+  }
+  wait_for(&g_c5_n, 8, 1000);
+  thread_sleep_ms(50);
+  var n5: int64 = alph_atomic_load(&g_c5_n);
+  expect(n5 == 8, "C5: 8 timers arrived ({n5})");
+  var min5: int64 = 1000 * MS;
+  var max5: int64 = 0;
+  for i: int64 in 0..8 {
+    var dt: int64 = alph_atomic_load(&g_c5_dt[i]);
+    if (dt < min5) {
+      min5 = dt;
+    }
+    if (dt > max5) {
+      max5 = dt;
+    }
+  }
+  var min5_us: int64 = min5 / 1000;
+  var max5_us: int64 = max5 / 1000;
+  expect(min5 >= 20 * MS, "C5: no timer before 20 ms ({min5_us} us)");
+  expect(max5 <= 60 * MS, "C5: no timer after 60 ms ({max5_us} us)");
+
+  alph_atomic_store(&g_beating, 0);
+  alph_node_halt(&g_node, 0);
+  alph_node_wait(&g_node);
+
+  if (g_failures != 0) {
+    return 1;
+  }
+  println("timer handoff ok: C1 timers {late2_us} and {late1_us} us after the start (due 0 and 50000), handed {handed1}; C3 {earliest_us}..{latest_us} us from the span, alph-s1..s3 {sum} voluntary context switches (worst one {worst}), {handed3} handed, {active3} active; C4 idle active {active_idle}, under load {active_busy}, answered {answered_ms} ms after the requests, {handed4} handed during; C5 {min5_us}..{max5_us} us");
+  return 0;
+}

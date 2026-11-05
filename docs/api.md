@@ -719,6 +719,7 @@ export struct AlphStats {
   stolen: int64;
   moves_held: int64;
   timers_heaped: int64;
+  timers_handed: int64;
 }
 ```
 
@@ -750,6 +751,9 @@ io_hup_rearms  arms answered at once with only a hang-up or error that
          the handle, which spins
 timers_heaped  timers no lane took, as all 8 on their scheduler held
          timers of other spans: they went to the slower timer heap
+timers_handed  times a scheduler handed its pending timers to
+         scheduler 0, as compaction left it idle or its bound actor
+         exited: they fire there, on time, and it sleeps
 ```
 
 ### `AlphNode`
@@ -818,6 +822,7 @@ export struct AlphNode {
   yields: int64;        // runs cut short by ALPH_RUN_NS
   isolated: int64;      // CPU-bound actors moved off a busy scheduler after such cuts
   io_hup_rearms: int64; // arms answered at once with nothing but a hang-up or error already reported
+  timers_handed: int64; // parcels of timers handed to scheduler 0
   epoch: int64;         // bumped by every retire
   retired: AlphVec;     // pairs: block (bit 0 set: a plain block, else an AlphEntry*), epoch
   retire_lock: int64;
@@ -4424,6 +4429,7 @@ export const ALPH_SYS_EPOLL_WAIT: int64 = 232;
 export const ALPH_SYS_EPOLL_PWAIT2: int64 = 441;
 export const ALPH_SYS_PRCTL: int64 = 157;
 export const ALPH_PR_SET_TIMERSLACK: int64 = 29;
+export const ALPH_PR_SET_NAME: int64 = 15;
 export const ALPH_SYS_EPOLL_CTL: int64 = 233;
 export const ALPH_SYS_ACCEPT4: int64 = 288;
 export const ALPH_SYS_EVENTFD2: int64 = 290;
