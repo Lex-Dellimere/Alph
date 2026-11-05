@@ -684,6 +684,7 @@ export struct AlphConfig {
   spin_us: int64;
   crash_reports: int64;
   keep_fd_limit: int64;
+  mem_decay_ms: int64;
 }
 ```
 
@@ -711,6 +712,11 @@ crash_reports 1 prints the runtime's full report (stack trace) for every
               a report costs about 60 us of its scheduler's time. Crashes
               are still counted (alph_node_stats) and reach links,
               monitors, medics and supervisors either way
+mem_decay_ms  how long memory an actor heap gave back stays committed
+              before its pages go back to the system, once a whole slab
+              of it is free; default 10000 (jemalloc's dirty decay). 0
+              keeps it all, for latency-critical nodes: no page faults
+              when a burst comes back
 keep_fd_limit 1 leaves the process's limit on open descriptors as it
               is. Default 0: the node raises the soft limit to the hard
               one, as Go does, since a service manager's soft default
@@ -740,6 +746,7 @@ export struct AlphStats {
   timers_heaped: int64;
   timers_handed: int64;
   isolate_no_spare: int64;
+  mem_purged: int64;
   bound_waits: int64;
   bound_wait_max_ns: int64;
 }
@@ -780,6 +787,9 @@ isolate_no_spare  CPU-bound actors that would have been isolated (cut
 bound_waits  bound actors that found no spare scheduler while one was
          on its way, and waited for it before opening another
 bound_wait_max_ns  the longest of those waits
+mem_purged  bytes of actor-heap memory given back to the system after
+         staying free for AlphConfig.mem_decay_ms, since the process
+         started
 timers_handed  times a scheduler handed its pending timers to
          scheduler 0, as compaction left it idle or its bound actor
          exited: they fire there, on time, and it sleeps
@@ -820,6 +830,8 @@ export struct AlphNode {
   bound_wait_max: int64; //   the longest such wait (ns)
   bound_peak: int64;    // the most bound actors lately live at once, decaying
   bound_peak_at: int64; //   when it last halved
+  mem_decay: int64;     // AlphConfig.mem_decay_ms in 100 ms epochs, 0 never
+  purge_at: int64;      // when the watchdog last advanced the purge clock (ns)
   lane_pool: int64;     // lane blocks no scheduler keeps, chained by their first word (never freed)
   lane_pool_lock: int64;
   sysmon: AlphThread;   // the watchdog, alph_sysmon_main
@@ -4454,6 +4466,8 @@ export const ALPH_SYS_CLOSE: int64 = 3;
 export const ALPH_SYS_MMAP: int64 = 9;
 export const ALPH_SYS_MADVISE: int64 = 28;
 export const ALPH_MADV_NOHUGEPAGE: int64 = 15;
+export const ALPH_MADV_DONTNEED: int64 = 4;
+export const ALPH_MAP_NORESERVE: int64 = 0x4000;
 export const ALPH_SYS_MPROTECT: int64 = 10;
 export const ALPH_SYS_MUNMAP: int64 = 11;
 export const ALPH_SYS_SOCKET: int64 = 41;
@@ -4575,10 +4589,16 @@ carved from the heap's current chunk. When the actor exits, its chunks go
 back to a pool as a whole. Nothing is collected and nothing ever pauses
 other actors.
 
-Chunks come from an AlphPool, one per scheduler, which carves them from
-large mmap'd slabs and keeps freed ones for reuse. A pool has a spin lock,
-but only its scheduler uses it in the normal course, so it is uncontended.
-Blocks over 32 KiB bypass chunks and are mapped on their own.
+Chunks come from an AlphPool, one per scheduler. A pool carves them from
+slabs of 1 MiB, each holding chunks of one size, cut from one region of
+address space that every pool shares (reserved, not committed). A chunk
+is taken from the pool's lowest-address slab that has one, so live chunks
+pack low and slabs at the top empty out after a peak; the watchdog then
+gives an empty slab's pages back to the system once it has stayed empty
+for the decay time (alph_pool_purge_all), as jemalloc's dirty decay does.
+A pool has a spin lock, but only its scheduler uses it in the normal
+course, so it is uncontended. Blocks over 32 KiB bypass chunks and are
+mapped on their own.
 
 Internal to the runtime: actors use alph_alloc, alph_free, alph_realloc
 and alph_scratch from alph/core/node.
@@ -4588,13 +4608,17 @@ and alph_scratch from alph/core/node.
 ```mettle
 export struct AlphPool {
   lock: int64;
-  free: int64[3];  // a list per chunk size
-  slab: int64;     // the slab being carved
-  slab_end: int64;
+  bits: int64[3];      // per chunk size: a bitmap over the region's slabs that have a chunk to give, or 0 before the first
+  hint: int64[3];      //   no set bit below this word
+  empty_head: int64;   // empty slabs not yet purged, oldest first
+  empty_tail: int64;
+  empties: int64[3];   //   how many, per chunk size
+  next_pool: int64;    // every pool, for alph_pool_purge_all
 }
 ```
 
-Free chunks of each size, ready for reuse. One per scheduler.
+Chunks of each size, ready for reuse. One per scheduler; zeroed memory
+is an empty pool.
 
 ### `AlphHeap`
 
@@ -4641,8 +4665,19 @@ Thread: any; the pool's lock is taken.
 export fn alph_pool_give(pool: AlphPool*, chunks: int64)
 ```
 
-Gives back a list of chunks linked through their first word.
-Thread: any; the pool's lock is taken.
+Gives back a list of chunks linked through their first word, each to the
+pool its slab belongs to (an actor that moved returns its chunks here).
+Thread: any; each owner's lock is taken.
+
+### `alph_pool_tick`
+
+```mettle
+export fn alph_pool_tick(decay: int64)
+```
+
+Advances the purge clock one epoch (the watchdog calls it every 100 ms)
+and purges every pool. decay: epochs a slab must stay empty, 0 for never.
+Thread: the watchdog.
 
 ### `alph_heap_init`
 

@@ -259,6 +259,11 @@ export struct AlphRegEntry {
 //                 a report costs about 60 us of its scheduler's time. Crashes
 //                 are still counted (alph_node_stats) and reach links,
 //                 monitors, medics and supervisors either way
+//   mem_decay_ms  how long memory an actor heap gave back stays committed
+//                 before its pages go back to the system, once a whole slab
+//                 of it is free; default 10000 (jemalloc's dirty decay). 0
+//                 keeps it all, for latency-critical nodes: no page faults
+//                 when a burst comes back
 //   keep_fd_limit 1 leaves the process's limit on open descriptors as it
 //                 is. Default 0: the node raises the soft limit to the hard
 //                 one, as Go does, since a service manager's soft default
@@ -275,6 +280,7 @@ export struct AlphConfig {
   spin_us: int64;
   crash_reports: int64;
   keep_fd_limit: int64;
+  mem_decay_ms: int64;
 }
 
 // Counters from alph_node_stats.
@@ -311,6 +317,9 @@ export struct AlphConfig {
 //   bound_waits  bound actors that found no spare scheduler while one was
 //            on its way, and waited for it before opening another
 //   bound_wait_max_ns  the longest of those waits
+//   mem_purged  bytes of actor-heap memory given back to the system after
+//            staying free for AlphConfig.mem_decay_ms, since the process
+//            started
 //   timers_handed  times a scheduler handed its pending timers to
 //            scheduler 0, as compaction left it idle or its bound actor
 //            exited: they fire there, on time, and it sleeps
@@ -333,6 +342,7 @@ export struct AlphStats {
   timers_heaped: int64;
   timers_handed: int64;
   isolate_no_spare: int64;
+  mem_purged: int64;
   bound_waits: int64;
   bound_wait_max_ns: int64;
 }
@@ -371,6 +381,8 @@ export struct AlphNode {
   bound_wait_max: int64; //   the longest such wait (ns)
   bound_peak: int64;    // the most bound actors lately live at once, decaying
   bound_peak_at: int64; //   when it last halved
+  mem_decay: int64;     // AlphConfig.mem_decay_ms in 100 ms epochs, 0 never
+  purge_at: int64;      // when the watchdog last advanced the purge clock (ns)
   lane_pool: int64;     // lane blocks no scheduler keeps, chained by their first word (never freed)
   lane_pool_lock: int64;
   sysmon: AlphThread;   // the watchdog, alph_sysmon_main
@@ -6236,6 +6248,7 @@ export fn alph_config(cfg: AlphConfig*) {
   cfg->spin_us = 2;
   cfg->crash_reports = 0;
   cfg->keep_fd_limit = 0;
+  cfg->mem_decay_ms = 10000;
 }
 
 // Maps size bytes of zeroed memory straight from the kernel, which commits a
@@ -6272,6 +6285,10 @@ export fn alph_node_start(node: AlphNode*, cfg: AlphConfig*) -> bool {
   node->heap_limit = cfg->heap_limit;
   node->stack_size = cfg->stack_size;
   node->spin_ns = cfg->spin_us * 1000;
+  node->mem_decay = 0;
+  if (cfg->mem_decay_ms > 0) {
+    node->mem_decay = (cfg->mem_decay_ms + 99) / 100;
+  }
   alph_recover_quiet(cfg->crash_reports == 0);
   // Like Go's runtime, only a few idle schedulers spin; the others sleep at
   // once, so light load stays on few threads and costs little CPU.
@@ -6391,6 +6408,13 @@ fn alph_sysmon_main(arg: int64) -> int64 {
     if (node->bound_warm > ALPH_BOUND_KEEP || node->bound_unjoined != 0) {
       alph_bound_trim(node, alph_now_ns());
       alph_bound_reap(node);
+    }
+    // Every 100 ms: actor-heap slabs empty for mem_decay_ms go back to the
+    // system (alph/core/heap).
+    var pt: int64 = alph_now_ns();
+    if (pt - node->purge_at >= 100000000) {
+      node->purge_at = pt;
+      alph_pool_tick(node->mem_decay);
     }
     var busy: bool = false;
     var acted: bool = false;
@@ -6571,4 +6595,5 @@ export fn alph_node_stats(node: AlphNode*, stats: AlphStats*) {
   stats->yields = alph_atomic_load(&node->yields);
   stats->io_hup_rearms = alph_atomic_load(&node->io_hup_rearms);
   stats->timers_handed = alph_atomic_load(&node->timers_handed);
+  stats->mem_purged = alph_atomic_load(&alph_pool_purged);
 }
