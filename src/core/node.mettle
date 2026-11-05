@@ -718,9 +718,12 @@ fn alph_sched_steal(s: AlphSched*, node: AlphNode*) -> int64 {
       if (p != 0) {
         alph_atomic_add(&v->qlen, -1);
         // QUEUED and off every queue: nobody else touches its home now.
-        // Its sockets come along, so its events reach s directly; a victim
-        // the OS has paused cannot hold them hostage either.
-        alph_io_move(node, (AlphProc*)p, s);
+        // Its sockets stay where they are watched: with edge-triggered
+        // handles any thread may arm, read and write them, the old home's
+        // poller signals the owner wherever it runs, and the watchdog
+        // reads them when that home stalls. Moving them cost two epoll_ctl
+        // per steal. They move when their home stops being active
+        // (alph_sched_give).
         ((AlphProc*)p)->sched = (int64)s;
         return p;
       }
