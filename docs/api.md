@@ -3768,7 +3768,9 @@ export fn alph_now_ns() -> int64
 ```
 
 Monotonic time in nanoseconds. Only differences between two readings mean
-anything; it never goes backwards.
+anything; it never goes backwards. It reads the clock through the kernel's
+vDSO, about 20 ns, and falls back to the system call (about 150-190 ns)
+where there is none; the kernel picks the clock source either way.
 Thread: any.
 
 ### `alph_now_ms`
