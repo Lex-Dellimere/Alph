@@ -1,0 +1,349 @@
+// Registries: a unique registry (one holder per key, a value each), a
+// duplicate one (any number of holders), their independence from each other
+// and from the default names, dispatch by value mask, cleanup when a holder
+// exits or crashes, a bound actor on the locked path, and 5000 keys
+// (several table resizes). A coordinator drives workers by messages: each
+// command gets one TREG_R reply, and the coordinator checks the registries
+// from its own handler between commands.
+
+import "std/io";
+import "std/mem";
+import "std/conv";
+import "alph/sys/atomic";
+import "alph/alph";
+
+const TREG_R: int64 = ALPH_TAG_USER;         // reply: arg is the result
+const TREG_DATA: int64 = ALPH_TAG_USER + 1;  // a send or dispatch from the coordinator
+const OP_REG_U: int64 = ALPH_TAG_USER + 10;     // "a" in U, value arg
+const OP_UPD_U: int64 = ALPH_TAG_USER + 11;     // update "a" in U to arg
+const OP_REG_UB: int64 = ALPH_TAG_USER + 12;    // "b" in U, value arg
+const OP_REG_U2: int64 = ALPH_TAG_USER + 13;    // "a" in U2
+const OP_REG_NAME: int64 = ALPH_TAG_USER + 14;  // "a" with alph_register
+const OP_REG_D: int64 = ALPH_TAG_USER + 15;     // "topic" in D, value arg
+const OP_UNREG_D: int64 = ALPH_TAG_USER + 16;
+const OP_BULK: int64 = ALPH_TAG_USER + 17;      // register KEYS keys in U
+const OP_FIND: int64 = ALPH_TAG_USER + 18;      // how many keys have holder arg
+const OP_BOUND: int64 = ALPH_TAG_USER + 19;     // register and look up; arg is A
+const OP_STOP: int64 = ALPH_TAG_USER + 20;
+const OP_CRASH: int64 = ALPH_TAG_USER + 21;
+const OP_GET: int64 = ALPH_TAG_USER + 22;       // reply with TREG_DATA count
+const KEYS: int64 = 5000;
+
+var g_node: AlphNode;
+var g_failures: int64 = 0;
+var treg_u: int64 = 0;
+var treg_u2: int64 = 0;
+var treg_d: int64 = 0;
+
+fn expect(ok: bool, what: string) {
+  if (!ok) {
+    println("FAIL {what}");
+    alph_atomic_add(&g_failures, 1);
+  }
+}
+
+fn treg_i(ok: bool) -> int64 {
+  if (ok) {
+    return 1;
+  }
+  return 0;
+}
+
+// "k<i>" built in buf (at least 24 bytes).
+fn treg_key(buf: uint8*, i: int64) -> string {
+  buf[0] = 107;
+  var n: int64 = (int64)int_to_dec(&buf[1], i);
+  return str_from_bytes((cstring)buf, n + 1);
+}
+
+// ---- workers -----------------------------------------------------------------
+
+struct TregWorker {
+  got: int64;
+}
+
+fn treg_worker(ctx: AlphCtx*, m: AlphMsg*) -> int64 {
+  var w: TregWorker* = (TregWorker*)ctx->state;
+  if (m->tag == TREG_DATA) {
+    w->got = w->got + 1;
+    return ALPH_CONTINUE;
+  }
+  var r: int64 = 0;
+  if (m->tag == OP_REG_U) {
+    r = treg_i(alph_reg_register(ctx, treg_u, "a", m->arg));
+  } else if (m->tag == OP_UPD_U) {
+    r = treg_i(alph_reg_update(ctx, treg_u, "a", m->arg));
+  } else if (m->tag == OP_REG_UB) {
+    r = treg_i(alph_reg_register(ctx, treg_u, "b", m->arg));
+  } else if (m->tag == OP_REG_U2) {
+    r = treg_i(alph_reg_register(ctx, treg_u2, "a", 1));
+  } else if (m->tag == OP_REG_NAME) {
+    r = treg_i(alph_register(ctx, "a"));
+  } else if (m->tag == OP_REG_D) {
+    r = treg_i(alph_reg_register(ctx, treg_d, "topic", m->arg));
+  } else if (m->tag == OP_UNREG_D) {
+    alph_reg_unregister(ctx, treg_d, "topic");
+    r = 1;
+  } else if (m->tag == OP_BULK) {
+    var buf: uint8[24];
+    for i: int64 in 0..KEYS {
+      r = r + treg_i(alph_reg_register(ctx, treg_u, treg_key(&buf[0], i), i));
+    }
+  } else if (m->tag == OP_FIND) {
+    var buf: uint8[24];
+    for i: int64 in 0..KEYS {
+      r = r + treg_i(alph_reg_whereis(ctx, treg_u, treg_key(&buf[0], i)) == m->arg);
+    }
+  } else if (m->tag == OP_BOUND) {
+    var e: AlphRegEntry[4];
+    var ok: bool = alph_reg_register(ctx, treg_u, "bound", 11);
+    ok = ok && alph_reg_whereis(ctx, treg_u, "bound") == ctx->self;
+    ok = ok && alph_reg_whereis(ctx, treg_u, "a") == m->arg;
+    ok = ok && alph_reg_lookup(ctx, treg_u, "a", &e[0], 4) == 1;
+    ok = ok && e[0].pid == m->arg && e[0].value == 9;
+    r = treg_i(ok);
+  } else if (m->tag == OP_GET) {
+    r = w->got;
+  } else if (m->tag == OP_STOP) {
+    return alph_stop(ctx, ALPH_NORMAL);
+  } else if (m->tag == OP_CRASH) {
+    var zero: int64 = m->arg;
+    alph_send(ctx, m->from, 100 / zero, 0);
+  } else {
+    return ALPH_CONTINUE;
+  }
+  alph_send(ctx, m->from, TREG_R, r);
+  return ALPH_CONTINUE;
+}
+
+// ---- coordinator -------------------------------------------------------------
+
+struct TregCoord {
+  step: int64;
+  a: int64;
+  b: int64;
+  c: int64;
+  w: int64;
+  k: int64;
+  pending: int64;
+  res: int64[3];
+  base: int64;
+  dcount: int64;
+}
+
+fn treg_spawn(ctx: AlphCtx*, flags: int64) -> int64 {
+  var w: TregWorker;
+  w.got = 0;
+  var pid: int64 = alph_spawn_value<TregWorker>(ctx, flags, &w, &treg_worker);
+  expect(pid != 0, "a worker could be spawned");
+  return pid;
+}
+
+// Sends one command and moves to the step that handles its reply.
+fn treg_go(ctx: AlphCtx*, c: TregCoord*, to: int64, op: int64, arg: int64) {
+  alph_send(ctx, to, op, arg);
+  c->step = c->step + 1;
+}
+
+// Asks A, B and C how many TREG_DATA messages they got; the step runs once
+// all three have answered, with the counts in c->res.
+fn treg_get_all(ctx: AlphCtx*, c: TregCoord*) {
+  c->pending = 3;
+  alph_send(ctx, c->a, OP_GET, 0);
+  alph_send(ctx, c->b, OP_GET, 0);
+  alph_send(ctx, c->c, OP_GET, 0);
+  c->step = c->step + 1;
+}
+
+// One holder with this pid and value, by lookup.
+fn treg_holds(ctx: AlphCtx*, reg: int64, key: string, pid: int64, value: int64) -> bool {
+  var e: AlphRegEntry[4];
+  var n: int64 = alph_reg_lookup(ctx, reg, key, &e[0], 4);
+  return n == 1 && e[0].pid == pid && e[0].value == value;
+}
+
+fn treg_check_duplicates(ctx: AlphCtx*, c: TregCoord*) {
+  var two: AlphRegEntry[2];
+  var all: AlphRegEntry[8];
+  two[0].pid = 0;
+  two[1].pid = 0;
+  expect(alph_reg_lookup(ctx, treg_d, "topic", &two[0], 2) == 4, "a small cap still counts every holder");
+  expect(two[0].pid != 0 && two[1].pid != 0 && two[0].pid != two[1].pid, "a small cap fills cap entries");
+  var n: int64 = alph_reg_lookup(ctx, treg_d, "topic", &all[0], 8);
+  expect(n == 4, "four holders of topic");
+  var na: int64 = 0;
+  var nb: int64 = 0;
+  var nc: int64 = 0;
+  var sa: int64 = 0;
+  var sb: int64 = 0;
+  var sc: int64 = 0;
+  for i: int64 in 0..n {
+    if (all[i].pid == c->a) {
+      na = na + 1;
+      sa = sa + all[i].value;
+    } else if (all[i].pid == c->b) {
+      nb = nb + 1;
+      sb = sb + all[i].value;
+    } else if (all[i].pid == c->c) {
+      nc = nc + 1;
+      sc = sc + all[i].value;
+    }
+  }
+  expect(na == 2 && nb == 1 && nc == 1, "pids are A, A, B, C");
+  expect(sa == 9 && sb == 2 && sc == 4, "values are 1 and 8, 2, 4");
+  expect(alph_node_reg_count(ctx->node, treg_d) == 4, "the duplicate registry counts four entries");
+}
+
+// Runs when the reply (or DOWN) to the command of step c->step arrives.
+fn treg_step(ctx: AlphCtx*, c: TregCoord*, m: AlphMsg*) -> int64 {
+  var s: int64 = c->step;
+  if (s == 1) {
+    expect(m->arg == 1, "A registers a in U");
+    treg_go(ctx, c, c->a, OP_REG_U, 7);
+  } else if (s == 2) {
+    expect(m->arg == 1, "A registering again succeeds");
+    treg_go(ctx, c, c->b, OP_REG_U, 5);
+  } else if (s == 3) {
+    expect(m->arg == 0, "B cannot take a");
+    expect(alph_reg_whereis(ctx, treg_u, "a") == c->a, "whereis finds A");
+    expect(treg_holds(ctx, treg_u, "a", c->a, 7), "lookup returns A with 7, one entry");
+    treg_go(ctx, c, c->a, OP_UPD_U, 9);
+  } else if (s == 4) {
+    expect(m->arg == 1, "A updates its value");
+    expect(treg_holds(ctx, treg_u, "a", c->a, 9), "lookup returns value 9");
+    treg_go(ctx, c, c->b, OP_UPD_U, 5);
+  } else if (s == 5) {
+    expect(m->arg == 0, "B cannot update A's entry");
+    expect(treg_holds(ctx, treg_u, "a", c->a, 9), "B's update changed nothing");
+    treg_go(ctx, c, c->b, OP_REG_UB, 3);
+  } else if (s == 6) {
+    expect(m->arg == 1 && alph_reg_whereis(ctx, treg_u, "b") == c->b, "B holds b in U");
+    treg_go(ctx, c, c->a, OP_REG_NAME, 0);
+  } else if (s == 7) {
+    expect(m->arg == 1, "A takes a in the default names");
+    expect(alph_whereis(ctx, "a") == c->a, "alph_whereis finds A");
+    expect(alph_reg_whereis(ctx, treg_u, "a") == c->a, "U is unaffected by names");
+    treg_go(ctx, c, c->b, OP_REG_U2, 0);
+  } else if (s == 8) {
+    expect(m->arg == 1 && alph_reg_whereis(ctx, treg_u2, "a") == c->b, "U2 accepts a from B");
+    expect(alph_reg_whereis(ctx, treg_u, "a") == c->a && alph_whereis(ctx, "a") == c->a, "the three namespaces are independent");
+    treg_go(ctx, c, c->a, OP_REG_D, 1);
+  } else if (s == 9) {
+    expect(m->arg == 1, "A joins topic with 1");
+    treg_go(ctx, c, c->b, OP_REG_D, 2);
+  } else if (s == 10) {
+    expect(m->arg == 1, "B joins topic with 2");
+    treg_go(ctx, c, c->c, OP_REG_D, 4);
+  } else if (s == 11) {
+    expect(m->arg == 1, "C joins topic with 4");
+    treg_go(ctx, c, c->a, OP_REG_D, 8);
+  } else if (s == 12) {
+    expect(m->arg == 1, "A adds a second topic entry");
+    treg_check_duplicates(ctx, c);
+    expect(alph_reg_send(ctx, treg_d, "topic", TREG_DATA, 5) == 4, "send reaches four entries");
+    treg_get_all(ctx, c);
+  } else if (s == 13) {
+    expect(c->res[0] == 2 && c->res[1] == 1 && c->res[2] == 1, "A got 2 messages, B and C 1");
+    expect(alph_reg_dispatch(ctx, treg_d, "topic", 2 | 4, TREG_DATA, 6) == 2, "dispatch with mask 6 reaches B and C");
+    expect(alph_reg_dispatch(ctx, treg_d, "topic", 16, TREG_DATA, 6) == ALPH_GONE, "dispatch with mask 16 reaches nobody");
+    expect(alph_reg_send(ctx, treg_d, "nothing", TREG_DATA, 6) == ALPH_GONE, "send to a key with no holder is gone");
+    treg_get_all(ctx, c);
+  } else if (s == 14) {
+    expect(c->res[0] == 2 && c->res[1] == 2 && c->res[2] == 2, "only B and C got the dispatch");
+    treg_go(ctx, c, c->a, OP_UNREG_D, 0);
+  } else if (s == 15) {
+    var e: AlphRegEntry[4];
+    expect(alph_reg_lookup(ctx, treg_d, "topic", &e[0], 4) == 2, "A's two entries are gone");
+    expect(e[0].pid != c->a && e[1].pid != c->a, "the rest are B and C");
+    expect(alph_node_reg_count(ctx->node, treg_d) == 2, "the count dropped by 2");
+    treg_go(ctx, c, c->b, OP_STOP, 0);
+  } else if (s == 16) {
+    expect(m->tag == ALPH_TAG_DOWN && m->from == c->b, "B stopped");
+    expect(treg_holds(ctx, treg_d, "topic", c->c, 4), "B left topic");
+    expect(alph_reg_whereis(ctx, treg_u, "b") == 0, "B's key in U is gone");
+    expect(alph_reg_whereis(ctx, treg_u2, "a") == 0, "B's key in U2 is gone");
+    expect(alph_reg_whereis(ctx, treg_u, "a") == c->a, "A's key is still there");
+    treg_go(ctx, c, c->a, OP_REG_UB, 4);
+  } else if (s == 17) {
+    expect(m->arg == 1 && alph_reg_whereis(ctx, treg_u, "b") == c->a, "another worker takes b");
+    treg_go(ctx, c, c->c, OP_CRASH, 0);
+  } else if (s == 18) {
+    expect(m->tag == ALPH_TAG_DOWN && m->from == c->c && m->arg == ALPH_CRASHED, "C crashed");
+    var e: AlphRegEntry[4];
+    expect(alph_reg_lookup(ctx, treg_d, "topic", &e[0], 4) == 0, "a crashed holder is gone from D");
+    expect(alph_node_reg_count(ctx->node, treg_d) == 0, "D is empty");
+    c->w = treg_spawn(ctx, ALPH_BOUND | ALPH_MONITOR);
+    treg_go(ctx, c, c->w, OP_BOUND, c->a);
+  } else if (s == 19) {
+    expect(m->arg == 1, "a bound actor registers and looks up");
+    expect(alph_reg_whereis(ctx, treg_u, "bound") == c->w, "its key is visible to others");
+    c->base = alph_node_reg_count(ctx->node, treg_u);
+    treg_go(ctx, c, c->k, OP_BULK, 0);
+  } else if (s == 20) {
+    expect(m->arg == KEYS, "every key registered");
+    expect(alph_node_reg_count(ctx->node, treg_u) == c->base + KEYS, "the count includes every key");
+    treg_go(ctx, c, c->a, OP_FIND, c->k);
+  } else if (s == 21) {
+    expect(m->arg == KEYS, "another worker finds every key");
+    treg_go(ctx, c, c->k, OP_STOP, 0);
+  } else if (s == 22) {
+    expect(m->tag == ALPH_TAG_DOWN && m->from == c->k, "the key holder stopped");
+    expect(alph_node_reg_count(ctx->node, treg_u) == c->base, "the count dropped back");
+    expect(alph_reg_whereis(ctx, treg_u, "k0") == 0 && alph_reg_whereis(ctx, treg_u, "k4999") == 0, "keys are gone");
+    treg_go(ctx, c, c->a, OP_FIND, 0);
+  } else if (s == 23) {
+    expect(m->arg == KEYS, "no key is found any more");
+    alph_halt(ctx, 0);
+  }
+  return ALPH_CONTINUE;
+}
+
+fn coord(ctx: AlphCtx*, m: AlphMsg*) -> int64 {
+  var c: TregCoord* = (TregCoord*)ctx->state;
+  if (m->tag == ALPH_TAG_INIT) {
+    c->a = treg_spawn(ctx, 0);
+    c->b = treg_spawn(ctx, ALPH_MONITOR);
+    c->c = treg_spawn(ctx, ALPH_MONITOR);
+    c->k = treg_spawn(ctx, ALPH_MONITOR);
+    treg_go(ctx, c, c->a, OP_REG_U, 7);
+    return ALPH_CONTINUE;
+  }
+  if (m->tag != TREG_R && m->tag != ALPH_TAG_DOWN) {
+    return ALPH_CONTINUE;
+  }
+  if (c->pending > 0) {
+    var at: int64 = 2;
+    if (m->from == c->a) {
+      at = 0;
+    } else if (m->from == c->b) {
+      at = 1;
+    }
+    c->res[at] = m->arg;
+    c->pending = c->pending - 1;
+    if (c->pending > 0) {
+      return ALPH_CONTINUE;
+    }
+  }
+  return treg_step(ctx, c, m);
+}
+
+fn main() -> int32 {
+  var cfg: AlphConfig;
+  alph_config(&cfg);
+  cfg.schedulers = 2;
+  cfg.max_actors = 64;
+  expect(alph_node_start(&g_node, &cfg), "node started");
+  treg_u = alph_node_reg_new(&g_node, ALPH_REG_UNIQUE);
+  treg_u2 = alph_node_reg_new(&g_node, ALPH_REG_UNIQUE);
+  treg_d = alph_node_reg_new(&g_node, ALPH_REG_DUPLICATE);
+  expect(treg_u != 0 && treg_u2 != 0 && treg_d != 0, "registries made");
+  var c: TregCoord;
+  memset((rawptr)&c, 0, (int64)sizeof(TregCoord));
+  alph_node_spawn_value<TregCoord>(&g_node, 0, &c, &coord);
+  alph_node_wait(&g_node);
+  if (g_failures != 0) {
+    return 1;
+  }
+  println("registry ok");
+  return 0;
+}

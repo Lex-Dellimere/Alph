@@ -127,6 +127,24 @@ export const ALPH_BOUND: int64 = 4;    // the new actor gets a thread of its own
 export const ALPH_PROXY: int64 = 8;
 ```
 
+Registry kinds, for alph_node_reg_new.
+
+```mettle
+export const ALPH_REG_UNIQUE: int64 = 0;     // a key has at most one holder
+export const ALPH_REG_DUPLICATE: int64 = 1;  // a key has any number of holders
+```
+
+### `AlphRegEntry`
+
+```mettle
+export struct AlphRegEntry {
+  pid: int64;
+  value: int64;
+}
+```
+
+One holder of a registry key, as alph_reg_lookup returns it.
+
 ### `AlphConfig`
 
 ```mettle
@@ -212,9 +230,9 @@ export struct AlphNode {
   io_free_stack: int64;
   io_free_top: int64;
   io_lock: int64;
-  names: int64;         // AlphTable of registered names
+  names: int64;         // AlphReg: the default registry, for alph_register
   groups: int64;        // AlphTable of process groups
-  names_lock: int64;    // guards names, groups and every group's members
+  names_lock: int64;    // guards groups and every group's members
   env: int64;           // the environment the process started with, for children
   env_lock: int64;
   roots: int64;         // AlphVec of top-level pids, in spawn order
@@ -774,6 +792,107 @@ export fn alph_node_spawn_bytes(node: AlphNode*, flags: int64, state: rawptr, si
 Spawns an actor whose state starts as a copy of size bytes at state, from
 outside the node. Otherwise as alph_node_spawn. Thread: any.
 
+### `alph_node_reg_new`
+
+```mettle
+export fn alph_node_reg_new(node: AlphNode*, kind: int64) -> int64
+```
+
+Makes a registry: a table of keys held by actors, each holder with a
+value, like Elixir's Registry. Lookups from handlers take no lock and
+never wait for a writer; a holder's keys are dropped when it exits, crash
+included, before its links and monitors are told.
+
+```text
+kind  ALPH_REG_UNIQUE: a key has at most one holder (names, sessions);
+      ALPH_REG_DUPLICATE: any number (subscribers, roles)
+```
+
+Returns the registry, to pass to the alph_reg_ functions, or 0 when out
+of memory. A registry lives as long as the node. Thread: any.
+
+### `alph_reg_register`
+
+```mettle
+export fn alph_reg_register(ctx: AlphCtx*, reg: int64, key: string, value: int64) -> bool
+```
+
+Registers key for the calling actor with value, in registry reg. The key
+is copied. In a unique registry it fails when another live actor holds
+key, and succeeds without change when the caller already does; in a
+duplicate one every call adds an entry, so an actor may hold a key twice.
+
+Returns true when registered, false when taken, key is empty, or memory
+runs out. Thread: a handler.
+
+### `alph_reg_unregister`
+
+```mettle
+export fn alph_reg_unregister(ctx: AlphCtx*, reg: int64, key: string)
+```
+
+Drops every entry the calling actor holds for key in reg; does nothing
+when it holds none. Thread: a handler.
+
+### `alph_reg_update`
+
+```mettle
+export fn alph_reg_update(ctx: AlphCtx*, reg: int64, key: string, value: int64) -> bool
+```
+
+Sets the value of every entry the calling actor holds for key in reg.
+Returns false when it holds none. Thread: a handler.
+
+### `alph_reg_lookup`
+
+```mettle
+export fn alph_reg_lookup(ctx: AlphCtx*, reg: int64, key: string, out: AlphRegEntry*, cap: int64) -> int64
+```
+
+The holders of key in reg: copies up to cap of them into out and returns
+how many there are, which may be more than cap. Each may exit at any
+time after. Takes no lock. Thread: a handler.
+
+### `alph_reg_whereis`
+
+```mettle
+export fn alph_reg_whereis(ctx: AlphCtx*, reg: int64, key: string) -> int64
+```
+
+The holder of key in reg (the first one, in a duplicate registry), or 0.
+Takes no lock. Thread: a handler.
+
+### `alph_reg_send`
+
+```mettle
+export fn alph_reg_send(ctx: AlphCtx*, reg: int64, key: string, tag: int64, arg: int64) -> int64
+```
+
+Sends a tag and one word to every holder of key in reg, each as
+alph_send, with no lock held while sending. Returns how many got it, or
+ALPH_GONE when key has no holder. Thread: a handler.
+
+### `alph_reg_dispatch`
+
+```mettle
+export fn alph_reg_dispatch(ctx: AlphCtx*, reg: int64, key: string, mask: int64, tag: int64,
+                            arg: int64) -> int64
+```
+
+As alph_reg_send, but only to holders whose value has a bit of mask set,
+so a value can carry roles or interests (Elixir's dispatch). mask -1
+reaches every holder. Returns how many got it, or ALPH_GONE when none
+matched. Thread: a handler.
+
+### `alph_node_reg_count`
+
+```mettle
+export fn alph_node_reg_count(node: AlphNode*, reg: int64) -> int64
+```
+
+Entries in reg: one per holder per key, roughly while actors come and
+go. Thread: any.
+
 ### `alph_register`
 
 ```mettle
@@ -813,8 +932,8 @@ Thread: any.
 export fn alph_whereis(ctx: AlphCtx*, name: string) -> int64
 ```
 
-The pid registered as name, or 0; as alph_node_whereis.
-Thread: a handler.
+The pid registered as name, or 0; as alph_node_whereis, but from a
+handler it takes no lock. Thread: a handler.
 
 ### `alph_group_join`
 
