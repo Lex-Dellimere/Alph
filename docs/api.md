@@ -568,6 +568,7 @@ your own tags start at ALPH_TAG_USER.
 
 ```mettle
 export const ALPH_TAG_INIT: int64 = 1;     // the first message; from = parent (0 if none); arg = restarts so far under a supervisor, else 0
+export const ALPH_TAG_BUSY: int64 = 60;
 export const ALPH_TAG_EXIT: int64 = 2;     // a linked actor exited; only with alph_trap_exits on. from = it, arg = reason
 export const ALPH_TAG_DOWN: int64 = 3;     // a monitored actor exited. from = it, ref = the monitor, arg = reason
 export const ALPH_TAG_TIMEOUT: int64 = 4;  // a request got no reply in time. ref = the request, arg = the server
@@ -695,6 +696,7 @@ export struct AlphStats {
   spawned: int64;
   crashed: int64;
   healed: int64;
+  shed: int64;
 }
 ```
 
@@ -705,6 +707,7 @@ live     actors alive now
 spawned  actors started since the node started
 crashed  crashes that ended an actor
 healed   crashes a medic repaired, unseen by anyone else
+shed     messages dropped by alph_mailbox_shed for waiting too long
 ```
 
 ### `AlphNode`
@@ -758,6 +761,7 @@ export struct AlphNode {
   low_streak: int64;    // looks in a row that asked for fewer active schedulers
   low_max: int64;       //   and the most any of them asked for
   rise_at: int64;       // when a busy scheduler last activated another (ns)
+  shed: int64;          // messages dropped by alph_mailbox_shed
   epoch: int64;         // bumped by every retire
   retired: AlphVec;     // pairs: block (bit 0 set: a plain block, else an AlphEntry*), epoch
   retire_lock: int64;
@@ -884,6 +888,8 @@ the reply           tag and payload as the server sent them
 ALPH_TAG_DOWN       the server exited first, or was already gone;
                     arg = its exit reason
 ALPH_TAG_TIMEOUT    no reply within timeout_ms; arg = the server
+ALPH_TAG_BUSY       the server shed it unhandled for waiting too long
+                    (alph_mailbox_shed): overloaded, try later
 ```
 
 Anything later for that ref is dropped, so a late reply never surprises
@@ -1137,6 +1143,23 @@ Delivers tag and arg to this actor before any message already in its
 mailbox, as OTP's handle_continue: INIT can answer quickly and finish its
 setup next, before other work gets in. Signals (exits, timers) may still
 come first. Thread: a handler.
+
+### `alph_mailbox_shed`
+
+```mettle
+export fn alph_mailbox_shed(ctx: AlphCtx*, target_us: int64, interval_us: int64)
+```
+
+Sheds load by waiting time, as CoDel does for packet queues: once the
+messages this actor takes have waited longer than target_us continuously
+for interval_us, it drops them unhandled until one arrives under the
+target again, so its queueing delay stays near target_us and its time
+goes to work that can still succeed. A dropped request is answered at
+once with ALPH_TAG_BUSY (ref = the request's), and every drop counts in
+alph_node_stats' shed. Senders stamp their messages with the time while
+this is on: one clock read per send. target_us 0 turns it off.
+For example alph_mailbox_shed(ctx, 5000, 100000): 5 ms, 100 ms.
+Thread: a handler.
 
 ### `alph_send_after`
 
@@ -2149,6 +2172,7 @@ export struct AlphMailbox {
   head: int64;   // the segment the receiver reads
   limit: int64;  // messages it holds before senders are refused
   spare: int64;  // an emptied segment kept for reuse, or 0
+  stamp: int64;  // 1: senders note when each message was sent (alph_mailbox_stamp)
   // enq and tail are written by every sender, deq by the receiver for every
   // message. On one cache line, each write would take the line from the
   // other side; the padding keeps them 64 bytes apart.
@@ -2214,6 +2238,16 @@ As alph_mailbox_push, but past the limit too: for messages the receiver
 asked for, such as replies, which its own outstanding requests already
 bound. Returns false only when memory runs out. Thread: any.
 
+### `alph_mailbox_stamp`
+
+```mettle
+export fn alph_mailbox_stamp(mb: AlphMailbox*, on: bool)
+```
+
+Makes senders note when each message was sent (on true), so the receiver
+can see how long it waited (alph_mailbox_pop_at). Costs a clock read per
+send. Thread: any.
+
 ### `alph_mailbox_pop`
 
 ```mettle
@@ -2223,6 +2257,16 @@ export fn alph_mailbox_pop(mb: AlphMailbox*, out: AlphMsg*) -> bool
 Moves the oldest message into *out. Returns false when there is none, or
 when the oldest is still being written by its sender.
 Thread: the mailbox's one consumer.
+
+### `alph_mailbox_pop_at`
+
+```mettle
+export fn alph_mailbox_pop_at(mb: AlphMailbox*, out: AlphMsg*, sent_at: int64*) -> bool
+```
+
+As alph_mailbox_pop, and stores in *sent_at when the message was sent (ns), or
+0 when the mailbox was not stamping then. Thread: the mailbox's one
+consumer.
 
 ## alph/heal/supervisor
 

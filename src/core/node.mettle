@@ -54,6 +54,10 @@ export const ALPH_REASON_USER: int64 = 100;
 // Tags the runtime delivers. Tags below ALPH_TAG_USER belong to the runtime;
 // your own tags start at ALPH_TAG_USER.
 export const ALPH_TAG_INIT: int64 = 1;     // the first message; from = parent (0 if none); arg = restarts so far under a supervisor, else 0
+// The answer to a request that the server's mailbox shed for waiting too
+// long (alph_mailbox_shed); ref = the request's. Treat it as "overloaded, try
+// later".
+export const ALPH_TAG_BUSY: int64 = 60;
 export const ALPH_TAG_EXIT: int64 = 2;     // a linked actor exited; only with alph_trap_exits on. from = it, arg = reason
 export const ALPH_TAG_DOWN: int64 = 3;     // a monitored actor exited. from = it, ref = the monitor, arg = reason
 export const ALPH_TAG_TIMEOUT: int64 = 4;  // a request got no reply in time. ref = the request, arg = the server
@@ -205,11 +209,13 @@ export struct AlphConfig {
 //   spawned  actors started since the node started
 //   crashed  crashes that ended an actor
 //   healed   crashes a medic repaired, unseen by anyone else
+//   shed     messages dropped by alph_mailbox_shed for waiting too long
 export struct AlphStats {
   live: int64;
   spawned: int64;
   crashed: int64;
   healed: int64;
+  shed: int64;
 }
 
 // A node. Declare one, start it with alph_node_start, and keep it in place
@@ -262,6 +268,7 @@ export struct AlphNode {
   low_streak: int64;    // looks in a row that asked for fewer active schedulers
   low_max: int64;       //   and the most any of them asked for
   rise_at: int64;       // when a busy scheduler last activated another (ns)
+  shed: int64;          // messages dropped by alph_mailbox_shed
   epoch: int64;         // bumped by every retire
   retired: AlphVec;     // pairs: block (bit 0 set: a plain block, else an AlphEntry*), epoch
   retire_lock: int64;
@@ -330,6 +337,9 @@ struct AlphProc {
   ref_pids: AlphVec;      //   and the actor each one watches, or 0
   ref_timers: AlphVec;    //   and its pending timer (an AlphSignal*), or 0
   sig_closed: int64;      // the actor exited: senders answer their own late signals
+  shed_target: int64;     // alph_mailbox_shed: longest wait wanted (ns), 0 when off
+  shed_interval: int64;   //   how long waits must stay above it before shedding (ns)
+  shed_above: int64;      //   when shedding may start, if waits are above target; else 0
   drain_lock: int64;      // held while a late signal queue is drained, and at reuse
   deferred: AlphVec;      // exits and downs waiting for earlier messages
   io_handles: AlphVec;    // handles this actor owns, closed when it exits
@@ -1150,6 +1160,8 @@ fn alph_request_raw(ctx: AlphCtx*, to: int64, tag: int64, arg: int64, data: rawp
 //   ALPH_TAG_DOWN       the server exited first, or was already gone;
 //                       arg = its exit reason
 //   ALPH_TAG_TIMEOUT    no reply within timeout_ms; arg = the server
+//   ALPH_TAG_BUSY       the server shed it unhandled for waiting too long
+//                       (alph_mailbox_shed): overloaded, try later
 //
 // Anything later for that ref is dropped, so a late reply never surprises
 // the requester. alph_demonitor(ctx, ref) gives up on a request: nothing
@@ -1498,6 +1510,30 @@ export fn alph_continue(ctx: AlphCtx*, tag: int64, arg: int64) {
   alph_signal(ctx->node, ALPH_SIG_TIMER, ctx->self, ctx->self, 0, arg, tag);
 }
 
+// Sheds load by waiting time, as CoDel does for packet queues: once the
+// messages this actor takes have waited longer than target_us continuously
+// for interval_us, it drops them unhandled until one arrives under the
+// target again, so its queueing delay stays near target_us and its time
+// goes to work that can still succeed. A dropped request is answered at
+// once with ALPH_TAG_BUSY (ref = the request's), and every drop counts in
+// alph_node_stats' shed. Senders stamp their messages with the time while
+// this is on: one clock read per send. target_us 0 turns it off.
+// For example alph_mailbox_shed(ctx, 5000, 100000): 5 ms, 100 ms.
+// Thread: a handler.
+export fn alph_mailbox_shed(ctx: AlphCtx*, target_us: int64, interval_us: int64) {
+  var p: AlphProc* = alph_me(ctx);
+  if (target_us <= 0) {
+    p->shed_target = 0;
+    p->shed_above = 0;
+    alph_mailbox_stamp(&p->mailbox, false);
+    return;
+  }
+  p->shed_target = target_us * 1000;
+  p->shed_interval = interval_us * 1000;
+  p->shed_above = 0;
+  alph_mailbox_stamp(&p->mailbox, true);
+}
+
 // Sends a tag and one word to `to` after ms milliseconds. It cannot be
 // cancelled; use alph_start_timer for that. Like every signal it is never
 // dropped for a full mailbox. Thread: a handler.
@@ -1629,6 +1665,9 @@ fn alph_spawn_raw(node: AlphNode*, parent: int64, flags: int64, monitor_ref: int
     p->inited = 1;
   }
   alph_mailbox_set_limit(&p->mailbox, node->mailbox_size);
+  p->shed_target = 0;
+  p->shed_above = 0;
+  alph_mailbox_stamp(&p->mailbox, false);
   p->has_on_exit = 0;
   // Leftovers sent to the previous owner of the slot are dropped.
   var stale: AlphMsg;
@@ -2697,7 +2736,8 @@ fn alph_run_some(s: AlphSched*, p: AlphProc*) -> int64 {
       }
       sig = alph_queue_pop(&p->signals);
     }
-    if (!alph_mailbox_pop(&p->mailbox, &m)) {
+    var sent_at: int64 = 0;
+    if (!alph_mailbox_pop_at(&p->mailbox, &m, &sent_at)) {
       if (alph_deferred_ready(p)) {
         continue;
       }
@@ -2705,12 +2745,47 @@ fn alph_run_some(s: AlphSched*, p: AlphProc*) -> int64 {
       // sender wakes this actor when the write lands.
       return -1;
     }
+    if (p->shed_target > 0 && sent_at > 0 && alph_shed_now(p, sent_at)) {
+      alph_shed(s, p, &m);
+      continue;
+    }
     var outcome: int64 = alph_handle_message(s, p, &m);
     if (outcome >= 0) {
       return outcome;
     }
   }
   return -2;
+}
+
+// CoDel, simplified: whether the message sent at sent_at should be shed.
+// Waits under the target clear the state; waits that stay above it for a
+// whole interval start shedding, until a message comes in under target.
+fn alph_shed_now(p: AlphProc*, sent_at: int64) -> bool {
+  var now: int64 = alph_now_ns();
+  if (now - sent_at < p->shed_target) {
+    p->shed_above = 0;
+    return false;
+  }
+  if (p->shed_above == 0) {
+    p->shed_above = now + p->shed_interval;
+    return false;
+  }
+  return now >= p->shed_above;
+}
+
+// Drops m unhandled; a request is answered with ALPH_TAG_BUSY at once, so
+// its requester need not wait for a timeout.
+fn alph_shed(s: AlphSched*, p: AlphProc*, m: AlphMsg*) {
+  var node: AlphNode* = (AlphNode*)s->node;
+  alph_atomic_add(&node->shed, 1);
+  if ((m->flags & ALPH_MSG_REQUEST) != 0 && m->from != 0) {
+    var r: AlphMsg;
+    alph_message(&r, p->pid, m->from, ALPH_TAG_BUSY, 0, 0);
+    r.ref = m->ref;
+    r.flags = ALPH_MSG_REPLY;
+    alph_post(node, &r, (rawptr)0);
+  }
+  alph_msg_release(m);
 }
 
 fn alph_run_proc(s: AlphSched*, p: AlphProc*) {
@@ -4445,4 +4520,5 @@ export fn alph_node_stats(node: AlphNode*, stats: AlphStats*) {
   stats->spawned = alph_atomic_load(&node->spawned);
   stats->crashed = alph_atomic_load(&node->crashed);
   stats->healed = alph_atomic_load(&node->healed);
+  stats->shed = alph_atomic_load(&node->shed);
 }

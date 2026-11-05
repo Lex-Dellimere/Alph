@@ -1,0 +1,327 @@
+// Load shedding by waiting time (alph_mailbox_shed). A slow server sheds
+// messages that waited over 1 ms once waits stayed above it for 20 ms; a
+// shed request is answered at once with ALPH_TAG_BUSY, and every drop counts
+// in alph_node_stats' shed. Checks, in order:
+//   1. a flood of requests from 8 clients: every request gets exactly one
+//      answer (reply or BUSY, matched by ref), some of each, and the shed
+//      counter equals the BUSY answers
+//   2. after the flood drained, requests sent one at a time all get replies
+//   3. with shedding off, another flood is served in full, no BUSY
+//   4. with shedding on, a flood of plain sends: the server handles fewer
+//      than were sent, and the shed counter grows by the difference
+
+import "std/io";
+import "std/mem";
+import "std/thread";
+import "alph/sys/atomic";
+import "alph/sys/clock";
+import "alph/alph";
+
+const TSH_REQ: int64 = ALPH_TAG_USER;
+const TSH_REPLY: int64 = ALPH_TAG_USER + 1;
+const TSH_PLAIN: int64 = ALPH_TAG_USER + 2;
+const TSH_OFF: int64 = ALPH_TAG_USER + 3;
+const TSH_ON: int64 = ALPH_TAG_USER + 4;
+const TSH_FIN: int64 = ALPH_TAG_USER + 5;
+const CLIENTS: int64 = 8;
+const PER_CLIENT: int64 = 3000;
+const SEQ_COUNT: int64 = 50;
+const WORK_NS: int64 = 100000;        // the server's time per message
+const TARGET_US: int64 = 1000;
+const INTERVAL_US: int64 = 20000;
+const REQ_TIMEOUT_MS: int64 = 5000;
+const GRACE_MS: int64 = 30;           // wait for duplicates once all answers are in
+
+var g_node: AlphNode;
+var g_failures: int64 = 0;
+var tsh_server: int64 = 0;
+var tsh_ready: int64 = 0;             // the server ran its INIT
+var tsh_ack: int64 = 0;               // control messages the server obeyed
+var tsh_served: int64 = 0;            // requests the server replied to
+var tsh_plain_handled: int64 = 0;     // plain messages the server handled
+var tsh_plain_sent: int64 = 0;        // plain sends accepted
+var tsh_reply: int64 = 0;             // answers the clients saw, by kind
+var tsh_busy: int64 = 0;
+var tsh_bad: int64 = 0;               // a DOWN or TIMEOUT
+var tsh_unknown: int64 = 0;           // an answer with an unknown ref, or a second one
+var tsh_unsent: int64 = 0;            // a request or send the runtime refused
+var tsh_client_bad: int64 = 0;        // clients whose own tally was off
+var tsh_done: int64 = 0;              // clients finished
+
+fn expect(ok: bool, what: string) {
+  if (!ok) {
+    println("FAIL {what}");
+    alph_atomic_add(&g_failures, 1);
+  }
+}
+
+fn tsh_spin(ns: int64) -> int64 {
+  var end: int64 = alph_now_ns() + ns;
+  var spins: int64 = 0;
+  while (alph_now_ns() < end) {
+    spins = spins + 1;
+  }
+  return spins;
+}
+
+// ---- server ------------------------------------------------------------------
+
+fn server(ctx: AlphCtx*, m: AlphMsg*) -> int64 {
+  if (m->tag == ALPH_TAG_INIT) {
+    alph_mailbox_limit(ctx, 100000);
+    alph_mailbox_shed(ctx, TARGET_US, INTERVAL_US);
+    alph_atomic_store(&tsh_ready, 1);
+  } else if (m->tag == TSH_REQ) {
+    tsh_spin(WORK_NS);
+    alph_reply(ctx, m, TSH_REPLY, 0);
+    alph_atomic_add(&tsh_served, 1);
+  } else if (m->tag == TSH_PLAIN) {
+    tsh_spin(WORK_NS);
+    alph_atomic_add(&tsh_plain_handled, 1);
+  } else if (m->tag == TSH_OFF) {
+    alph_mailbox_shed(ctx, 0, 0);
+    alph_atomic_add(&tsh_ack, 1);
+  } else if (m->tag == TSH_ON) {
+    alph_mailbox_shed(ctx, TARGET_US, INTERVAL_US);
+    alph_atomic_add(&tsh_ack, 1);
+  }
+  return ALPH_CONTINUE;
+}
+
+// ---- clients -----------------------------------------------------------------
+
+struct TshClient {
+  mode: int64;          // 0 flood of requests, 1 requests one at a time, 2 flood of plain sends
+  total: int64;
+  server: int64;
+  sent: int64;          // requests sent, refs[0..sent]
+  reply: int64;
+  busy: int64;
+  bad: int64;
+  unknown: int64;
+  fin: int64;
+  refs: int64[3000];    // a ref is set to -1 once answered
+}
+
+fn tsh_fire(ctx: AlphCtx*, c: TshClient*) {
+  var ref: int64 = alph_request(ctx, c->server, TSH_REQ, 0, REQ_TIMEOUT_MS);
+  if (ref <= 0) {
+    alph_atomic_add(&tsh_unsent, 1);
+    return;
+  }
+  c->refs[c->sent] = ref;
+  c->sent = c->sent + 1;
+}
+
+fn tsh_find(c: TshClient*, ref: int64) -> int64 {
+  for i: int64 in 0..c->sent {
+    if (c->refs[i] == ref) {
+      return i;
+    }
+  }
+  return -1;
+}
+
+fn client(ctx: AlphCtx*, m: AlphMsg*) -> int64 {
+  var c: TshClient* = (TshClient*)ctx->state;
+  if (m->tag == ALPH_TAG_INIT) {
+    alph_mailbox_limit(ctx, 8192);
+    if (c->mode == 2) {
+      for i: int64 in 0..c->total {
+        if (alph_send(ctx, c->server, TSH_PLAIN, 0) == ALPH_SENT) {
+          alph_atomic_add(&tsh_plain_sent, 1);
+        } else {
+          alph_atomic_add(&tsh_unsent, 1);
+        }
+      }
+      alph_atomic_add(&tsh_done, 1);
+      return alph_stop(ctx, ALPH_NORMAL);
+    }
+    if (c->mode == 1) {
+      tsh_fire(ctx, c);
+    } else {
+      for i: int64 in 0..c->total {
+        tsh_fire(ctx, c);
+      }
+    }
+    return ALPH_CONTINUE;
+  }
+  if (m->tag == TSH_FIN) {
+    if (c->reply + c->busy + c->bad != c->total || c->unknown != 0) {
+      alph_atomic_add(&tsh_client_bad, 1);
+    }
+    alph_atomic_add(&tsh_done, 1);
+    return alph_stop(ctx, ALPH_NORMAL);
+  }
+  var idx: int64 = tsh_find(c, m->ref);
+  if (m->ref <= 0 || idx < 0) {
+    c->unknown = c->unknown + 1;
+    alph_atomic_add(&tsh_unknown, 1);
+    return ALPH_CONTINUE;
+  }
+  c->refs[idx] = -1;
+  if (m->tag == TSH_REPLY) {
+    c->reply = c->reply + 1;
+    alph_atomic_add(&tsh_reply, 1);
+  } else if (m->tag == ALPH_TAG_BUSY) {
+    c->busy = c->busy + 1;
+    alph_atomic_add(&tsh_busy, 1);
+  } else {
+    c->bad = c->bad + 1;
+    alph_atomic_add(&tsh_bad, 1);
+  }
+  if (c->mode == 1 && c->sent < c->total) {
+    tsh_fire(ctx, c);
+  }
+  if (c->reply + c->busy + c->bad == c->total && c->fin == 0) {
+    c->fin = 1;
+    alph_send_after(ctx, GRACE_MS, ctx->self, TSH_FIN, 0);
+  }
+  return ALPH_CONTINUE;
+}
+
+// ---- main --------------------------------------------------------------------
+
+fn tsh_reset() {
+  alph_atomic_store(&tsh_served, 0);
+  alph_atomic_store(&tsh_plain_handled, 0);
+  alph_atomic_store(&tsh_plain_sent, 0);
+  alph_atomic_store(&tsh_reply, 0);
+  alph_atomic_store(&tsh_busy, 0);
+  alph_atomic_store(&tsh_bad, 0);
+  alph_atomic_store(&tsh_unknown, 0);
+  alph_atomic_store(&tsh_unsent, 0);
+  alph_atomic_store(&tsh_client_bad, 0);
+  alph_atomic_store(&tsh_done, 0);
+}
+
+fn tsh_run(clients: int64, mode: int64, total: int64) {
+  tsh_reset();
+  for i: int64 in 0..clients {
+    var c: TshClient;
+    memset((rawptr)&c, 0, (int64)sizeof(TshClient));
+    c.mode = mode;
+    c.total = total;
+    c.server = tsh_server;
+    expect(alph_node_spawn_value<TshClient>(&g_node, 0, &c, &client) != 0, "a client could be spawned");
+  }
+}
+
+fn wait_done(want: int64, ms: int64) {
+  for i: int64 in 0..ms {
+    if (alph_atomic_load(&tsh_done) >= want) {
+      break;
+    }
+    thread_sleep_ms(1);
+  }
+}
+
+fn shed_count() -> int64 {
+  var st: AlphStats;
+  alph_node_stats(&g_node, &st);
+  return st.shed;
+}
+
+fn control(tag: int64) {
+  var want: int64 = alph_atomic_load(&tsh_ack) + 1;
+  expect(alph_node_send(&g_node, tsh_server, tag, 0) == ALPH_SENT, "a control message could be sent");
+  for i: int64 in 0..2000 {
+    if (alph_atomic_load(&tsh_ack) >= want) {
+      break;
+    }
+    thread_sleep_ms(1);
+  }
+  expect(alph_atomic_load(&tsh_ack) >= want, "the server obeyed a control message");
+}
+
+// What every request-flood phase must satisfy: all answered, once, as
+// replies or BUSY.
+fn check_answers(total: int64, phase: string) {
+  expect(alph_atomic_load(&tsh_unsent) == 0, "{phase}: no request was refused");
+  expect(alph_atomic_load(&tsh_bad) == 0, "{phase}: no DOWN or TIMEOUT");
+  expect(alph_atomic_load(&tsh_unknown) == 0, "{phase}: no duplicate or unknown answer");
+  expect(alph_atomic_load(&tsh_client_bad) == 0, "{phase}: every client got one answer per request");
+  expect(alph_atomic_load(&tsh_reply) + alph_atomic_load(&tsh_busy) == total, "{phase}: every request was answered");
+  expect(alph_atomic_load(&tsh_reply) == alph_atomic_load(&tsh_served), "{phase}: replies match what the server served");
+}
+
+fn main() -> int32 {
+  var cfg: AlphConfig;
+  alph_config(&cfg);
+  cfg.schedulers = 10;
+  cfg.max_actors = 64;
+  expect(alph_node_start(&g_node, &cfg), "node started");
+  tsh_server = alph_node_spawn(&g_node, 0, &server);
+  expect(tsh_server != 0, "server spawned");
+  for i: int64 in 0..2000 {
+    if (alph_atomic_load(&tsh_ready) != 0) {
+      break;
+    }
+    thread_sleep_ms(1);
+  }
+  expect(alph_atomic_load(&tsh_ready) == 1, "server started");
+  var total: int64 = CLIENTS * PER_CLIENT;
+
+  // 1. a flood of requests with shedding on
+  var shed0: int64 = shed_count();
+  tsh_run(CLIENTS, 0, PER_CLIENT);
+  wait_done(CLIENTS, 30000);
+  expect(alph_atomic_load(&tsh_done) == CLIENTS, "flood: every client finished");
+  check_answers(total, "flood");
+  var served: int64 = alph_atomic_load(&tsh_reply);
+  var busy: int64 = alph_atomic_load(&tsh_busy);
+  expect(served > 0, "flood: some requests were served");
+  expect(busy > 0, "flood: some requests were shed");
+  expect(shed_count() - shed0 == busy, "flood: the shed counter equals the BUSY answers");
+
+  // 2. recovery: one request at a time, no BUSY
+  shed0 = shed_count();
+  tsh_run(1, 1, SEQ_COUNT);
+  wait_done(1, 10000);
+  expect(alph_atomic_load(&tsh_done) == 1, "recovery: the client finished");
+  check_answers(SEQ_COUNT, "recovery");
+  expect(alph_atomic_load(&tsh_reply) == SEQ_COUNT, "recovery: every request got a real reply");
+  expect(alph_atomic_load(&tsh_busy) == 0, "recovery: no BUSY after the load is gone");
+  expect(shed_count() == shed0, "recovery: nothing was shed");
+
+  // 3. shedding off: a flood is served in full
+  control(TSH_OFF);
+  shed0 = shed_count();
+  tsh_run(CLIENTS, 0, PER_CLIENT);
+  wait_done(CLIENTS, 30000);
+  expect(alph_atomic_load(&tsh_done) == CLIENTS, "off: every client finished");
+  check_answers(total, "off");
+  expect(alph_atomic_load(&tsh_busy) == 0, "off: no BUSY with shedding off");
+  expect(alph_atomic_load(&tsh_reply) == total, "off: every request was served");
+  expect(shed_count() == shed0, "off: nothing was shed");
+
+  // 4. shedding on again: a flood of plain sends
+  control(TSH_ON);
+  shed0 = shed_count();
+  tsh_run(CLIENTS, 2, PER_CLIENT);
+  wait_done(CLIENTS, 30000);
+  expect(alph_atomic_load(&tsh_done) == CLIENTS, "plain: every client finished");
+  var sent: int64 = alph_atomic_load(&tsh_plain_sent);
+  expect(sent == total && alph_atomic_load(&tsh_unsent) == 0, "plain: every send was accepted");
+  for i: int64 in 0..30000 {
+    if (alph_atomic_load(&tsh_plain_handled) + (shed_count() - shed0) >= sent) {
+      break;
+    }
+    thread_sleep_ms(1);
+  }
+  thread_sleep_ms(50);
+  var handled: int64 = alph_atomic_load(&tsh_plain_handled);
+  var dropped: int64 = shed_count() - shed0;
+  expect(handled < sent, "plain: the server saw fewer messages than were sent");
+  expect(dropped > 0, "plain: some messages were shed");
+  expect(handled + dropped == sent, "plain: handled plus shed equals sent");
+
+  alph_node_halt(&g_node, 0);
+  alph_node_wait(&g_node);
+  if (g_failures != 0) {
+    println("flood: {served} served, {busy} busy; plain: {sent} sent, {handled} handled, {dropped} shed; last phase: reply {tsh_reply}, busy {tsh_busy}, bad {tsh_bad}, unknown {tsh_unknown}, unsent {tsh_unsent}, client_bad {tsh_client_bad}, done {tsh_done}");
+    return 1;
+  }
+  println("shed ok: {served} served, {busy} busy");
+  return 0;
+}

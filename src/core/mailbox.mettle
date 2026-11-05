@@ -10,6 +10,7 @@
 
 import "std/mem";
 import "alph/sys/atomic";
+import "alph/sys/clock";
 
 // Payloads up to this many bytes travel inside the message. Larger ones cost
 // one allocation and are freed after the handler returns.
@@ -75,13 +76,14 @@ const ALPH_LAP: int64 = 9;  // positions per segment: its cells, then an end mar
 
 struct AlphCell {
   seq: int64;  // 1 once a sender wrote msg, 0 while free
+  at: int64;   // when it was sent (ns), while the mailbox stamps; else 0
   msg: AlphMsg;
 }
 
 struct AlphSeg {
   next: int64;  // the segment after this one, linked before its last cell is written
   pad: int64;
-  cells: AlphCell[8];
+  cells: AlphCell[8];  // ALPH_SEG
 }
 
 // A bounded multi-producer, single-consumer queue of messages. Internal to
@@ -95,6 +97,7 @@ export struct AlphMailbox {
   head: int64;   // the segment the receiver reads
   limit: int64;  // messages it holds before senders are refused
   spare: int64;  // an emptied segment kept for reuse, or 0
+  stamp: int64;  // 1: senders note when each message was sent (alph_mailbox_stamp)
   // enq and tail are written by every sender, deq by the receiver for every
   // message. On one cache line, each write would take the line from the
   // other side; the padding keeps them 64 bytes apart.
@@ -210,6 +213,10 @@ fn alph_mailbox_put(mb: AlphMailbox*, m: AlphMsg*, limited: bool) -> bool {
       }
       var cell: AlphCell* = alph_seg_cell(seg, at);
       cell->msg = *m;
+      cell->at = 0;
+      if (alph_atomic_load(&mb->stamp) != 0) {
+        cell->at = alph_now_ns();
+      }
       alph_atomic_store(&cell->seq, 1);
       alph_seg_keep(mb, fresh);
       return true;
@@ -218,10 +225,29 @@ fn alph_mailbox_put(mb: AlphMailbox*, m: AlphMsg*, limited: bool) -> bool {
   return false;
 }
 
+// Makes senders note when each message was sent (on true), so the receiver
+// can see how long it waited (alph_mailbox_pop_at). Costs a clock read per
+// send. Thread: any.
+export fn alph_mailbox_stamp(mb: AlphMailbox*, on: bool) {
+  if (on) {
+    alph_atomic_store(&mb->stamp, 1);
+  } else {
+    alph_atomic_store(&mb->stamp, 0);
+  }
+}
+
 // Moves the oldest message into *out. Returns false when there is none, or
 // when the oldest is still being written by its sender.
 // Thread: the mailbox's one consumer.
 export fn alph_mailbox_pop(mb: AlphMailbox*, out: AlphMsg*) -> bool {
+  var at: int64 = 0;
+  return alph_mailbox_pop_at(mb, out, &at);
+}
+
+// As alph_mailbox_pop, and stores in *sent_at when the message was sent (ns), or
+// 0 when the mailbox was not stamping then. Thread: the mailbox's one
+// consumer.
+export fn alph_mailbox_pop_at(mb: AlphMailbox*, out: AlphMsg*, sent_at: int64*) -> bool {
   var pos: int64 = mb->deq;
   var at: int64 = pos % ALPH_LAP;
   var seg: int64 = mb->head;
@@ -230,6 +256,7 @@ export fn alph_mailbox_pop(mb: AlphMailbox*, out: AlphMsg*) -> bool {
     return false;
   }
   *out = cell->msg;
+  *sent_at = cell->at;
   cell->seq = 0;
   if (at + 1 == ALPH_SEG) {
     // Its last cell: every sender that claimed a cell here has written it,
