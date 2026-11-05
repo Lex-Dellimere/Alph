@@ -38,7 +38,8 @@ export const ALPH_TAG_STARTED: int64 = 12;
 
 const ALPH_TAG_DYN_START: int64 = 13;
 const ALPH_TAG_DYN_TIMER: int64 = 14;
-const ALPH_TAG_DYN_START_WITH: int64 = 15;  // payload: an AlphDynWith, then the state
+const ALPH_TAG_DYN_START_WITH: int64 = 43;  // payload: an AlphDynWith, then the state
+const ALPH_TAG_DYN_RESTART: int64 = 50;     // to self: a backed-off child may restart; arg = its id
 const ALPH_DYN_RING: int64 = 64;
 
 // A dynamic supervisor's definition. Start it with alph_dyn_init, change
@@ -52,29 +53,66 @@ const ALPH_DYN_RING: int64 = 64;
 //   period_ms     default 5000; 0 means no limit: no restart ever counts as
 //                 recent, so the supervisor never gives up
 //   max_children  children at once; 0 (default) is no limit
+//   backoff_ms    wait before restarting a child that keeps failing,
+//                 doubling up to backoff_max_ms; reset once it has run for
+//                 period_ms. 0 (default) restarts at once
+//   backoff_max_ms  cap on the doubling backoff; 0 means no cap
+//   jitter_pct    each backoff is shortened by a random 0..jitter_pct
+//                 percent; 0 (default) is none
 //   handler       the children's handler, set by alph_dyn_init
+//
+// restart and shutdown_ms are defaults: a child started with
+// alph_dyn_start_opts has its own.
 export struct AlphDynSpec {
   restart: int64;
   shutdown_ms: int64;
   max_restarts: int64;
   period_ms: int64;
   max_children: int64;
+  backoff_ms: int64;
+  backoff_max_ms: int64;
+  jitter_pct: int64;
   handler: fn(AlphCtx*, AlphMsg*) -> int64 with alloc, syscall, asm;
 }
 
 // One running child. state is the supervisor's copy of its initial state,
 // kept only when the child may be restarted.
 struct AlphDynChild {
-  pid: int64;
+  pid: int64;       // 0 while it waits out a backoff
   state: rawptr;
   size: int64;
-  starts: int64;  // times started, passed in INIT's arg
+  starts: int64;    // times started, passed in INIT's arg
+  id: int64;        // stable while indexes shift, for the backoff timer
+  restart: int64;
+  shutdown_ms: int64;
+  flags: int64;
+  streak: int64;    // restarts since it last ran for period_ms
+  started_at: int64;
+  stop_to: int64;   // who waits for alph_sup_terminate, or 0
+  stop_ref: int64;
   handler: fn(AlphCtx*, AlphMsg*) -> int64 with alloc, syscall, asm;
 }
 
-// Leads the payload of a start with its own handler.
+// Leads the payload of a start with its own handler and options.
 struct AlphDynWith {
   handler: fn(AlphCtx*, AlphMsg*) -> int64 with alloc, syscall, asm;
+  own: int64;  // 1: the fields below replace the spec's
+  restart: int64;
+  shutdown_ms: int64;
+  flags: int64;
+}
+
+// Options for one child, for alph_dyn_start_opts. Fill with alph_dyn_opts,
+// then change what you need:
+//
+//   restart      ALPH_PERMANENT (default), ALPH_TRANSIENT or ALPH_TEMPORARY
+//   shutdown_ms  how long it gets to stop; 0 kills at once; ALPH_SUP_WAIT
+//                waits as long as it takes. Default 5000
+//   flags        spawn flags besides ALPH_LINK, such as ALPH_BOUND. Default 0
+export struct AlphDynOpts {
+  restart: int64;
+  shutdown_ms: int64;
+  flags: int64;
 }
 
 // A dynamic supervisor's state, for alph_sup_add_dyn. Its fields are the
@@ -89,11 +127,14 @@ export struct AlphDyn {
   timer: int64;
   restarts: int64[64];  // times of recent restarts, a ring
   restart_count: int64;
+  next_id: int64;
+  rng: int64;           // random state for jitter
 }
 
 // Starts a dynamic supervisor definition for children that run handler,
 // with the defaults listed at AlphDynSpec. Thread: any.
 export fn alph_dyn_init(spec: AlphDynSpec*, handler: fn(AlphCtx*, AlphMsg*) -> int64 with alloc, syscall, asm) {
+  memset((rawptr)spec, 0, (int64)sizeof(AlphDynSpec));
   spec->restart = ALPH_PERMANENT;
   spec->shutdown_ms = 5000;
   spec->max_restarts = 3;
@@ -153,14 +194,28 @@ fn alph_dyn_shutdown(ctx: AlphCtx*, d: AlphDyn*, reason: int64) -> int64 {
   if (d->stopping == 0) {
     d->stopping = 1;
     d->exit_reason = reason;
-    var signal: int64 = ALPH_SHUTDOWN;
-    if (d->spec.shutdown_ms <= 0) {
-      signal = ALPH_KILL;
-    } else if (d->count > 0) {
-      d->timer = alph_start_timer(ctx, d->spec.shutdown_ms, ALPH_TAG_DYN_TIMER, 0);
+    // Children waiting out a backoff are not running: forget them.
+    var i: int64 = d->count;
+    while (i > 0) {
+      i = i - 1;
+      if (alph_dyn_at(d, i)->pid == 0) {
+        alph_dyn_remove(ctx, d, i);
+      }
     }
-    for i: int64 in 0..d->count {
-      alph_exit_signal(ctx, alph_dyn_at(d, i)->pid, signal);
+    var longest: int64 = 0;
+    for k: int64 in 0..d->count {
+      var c: AlphDynChild* = alph_dyn_at(d, k);
+      if (c->shutdown_ms == 0) {
+        alph_exit_signal(ctx, c->pid, ALPH_KILL);
+      } else {
+        alph_exit_signal(ctx, c->pid, ALPH_SHUTDOWN);
+        if (c->shutdown_ms > longest) {
+          longest = c->shutdown_ms;
+        }
+      }
+    }
+    if (longest > 0) {
+      d->timer = alph_start_timer(ctx, longest, ALPH_TAG_DYN_TIMER, 0);
     }
   }
   if (d->count == 0) {
@@ -170,6 +225,7 @@ fn alph_dyn_shutdown(ctx: AlphCtx*, d: AlphDyn*, reason: int64) -> int64 {
 }
 
 fn alph_dyn_start_child(ctx: AlphCtx*, d: AlphDyn*, m: AlphMsg*, state: rawptr, size: int64,
+                        restart: int64, shutdown_ms: int64, flags: int64,
                         handler: fn(AlphCtx*, AlphMsg*) -> int64 with alloc, syscall, asm) -> int64 {
   if (d->stopping != 0 || (d->spec.max_children > 0 && d->count >= d->spec.max_children)) {
     alph_reply(ctx, m, ALPH_TAG_STARTED, 0);
@@ -189,7 +245,7 @@ fn alph_dyn_start_child(ctx: AlphCtx*, d: AlphDyn*, m: AlphMsg*, state: rawptr, 
     d->cap = cap;
   }
   var copy: rawptr = (rawptr)0;
-  if (d->spec.restart != ALPH_TEMPORARY && size > 0) {
+  if (restart != ALPH_TEMPORARY && size > 0) {
     copy = alph_alloc(ctx, size);
     if (copy == 0) {
       alph_reply(ctx, m, ALPH_TAG_STARTED, 0);
@@ -197,7 +253,7 @@ fn alph_dyn_start_child(ctx: AlphCtx*, d: AlphDyn*, m: AlphMsg*, state: rawptr, 
     }
     memcpy(copy, state, size);
   }
-  var pid: int64 = alph_spawn_bytes(ctx, ALPH_LINK, state, size, handler);
+  var pid: int64 = alph_spawn_bytes(ctx, ALPH_LINK | flags, state, size, handler);
   if (pid == 0) {
     if (copy != 0) {
       alph_free(ctx, copy);
@@ -211,9 +267,35 @@ fn alph_dyn_start_child(ctx: AlphCtx*, d: AlphDyn*, m: AlphMsg*, state: rawptr, 
   c->size = size;
   c->handler = handler;
   c->starts = 1;
+  d->next_id = d->next_id + 1;
+  c->id = d->next_id;
+  c->restart = restart;
+  c->shutdown_ms = shutdown_ms;
+  c->flags = flags;
+  c->streak = 0;
+  c->started_at = alph_now_ms();
+  c->stop_to = 0;
+  c->stop_ref = 0;
   d->count = d->count + 1;
   alph_reply(ctx, m, ALPH_TAG_STARTED, pid);
   return ALPH_CONTINUE;
+}
+
+// Starts child c again, after a crash or its backoff. Returns false when
+// the node is full.
+fn alph_dyn_respawn(ctx: AlphCtx*, c: AlphDynChild*) -> bool {
+  c->pid = alph_spawn_bytes_arg(ctx, ALPH_LINK | c->flags, c->state, c->size, c->starts, c->handler);
+  c->starts = c->starts + 1;
+  c->started_at = alph_now_ms();
+  return c->pid != 0;
+}
+
+fn alph_dyn_answer(ctx: AlphCtx*, to: int64, ref: int64, tag: int64, arg: int64) {
+  var req: AlphMsg;
+  memset((rawptr)&req, 0, (int64)sizeof(AlphMsg));
+  req.from = to;
+  req.ref = ref;
+  alph_reply(ctx, &req, tag, arg);
 }
 
 fn alph_dyn_exited(ctx: AlphCtx*, d: AlphDyn*, from: int64, reason: int64) -> int64 {
@@ -226,8 +308,18 @@ fn alph_dyn_exited(ctx: AlphCtx*, d: AlphDyn*, from: int64, reason: int64) -> in
     }
     return ALPH_CONTINUE;
   }
-  var restart: bool = d->stopping == 0 && (d->spec.restart == ALPH_PERMANENT ||
-      (d->spec.restart == ALPH_TRANSIENT && reason != ALPH_NORMAL && reason != ALPH_SHUTDOWN));
+  var c: AlphDynChild* = alph_dyn_at(d, i);
+  if (c->stop_to != 0) {
+    // Stopped by alph_sup_terminate: answer, and forget it.
+    alph_dyn_answer(ctx, c->stop_to, c->stop_ref, ALPH_TAG_SUP_ANSWER, 1);
+    alph_dyn_remove(ctx, d, i);
+    if (d->stopping != 0 && d->count == 0) {
+      return alph_stop(ctx, d->exit_reason);
+    }
+    return ALPH_CONTINUE;
+  }
+  var restart: bool = d->stopping == 0 && (c->restart == ALPH_PERMANENT ||
+      (c->restart == ALPH_TRANSIENT && reason != ALPH_NORMAL && reason != ALPH_SHUTDOWN));
   if (!restart) {
     alph_dyn_remove(ctx, d, i);
     if (d->stopping != 0 && d->count == 0) {
@@ -239,10 +331,29 @@ fn alph_dyn_exited(ctx: AlphCtx*, d: AlphDyn*, from: int64, reason: int64) -> in
     alph_dyn_remove(ctx, d, i);
     return alph_dyn_shutdown(ctx, d, ALPH_SHUTDOWN);
   }
-  var c: AlphDynChild* = alph_dyn_at(d, i);
-  c->pid = alph_spawn_bytes_arg(ctx, ALPH_LINK, c->state, c->size, c->starts, c->handler);
-  c->starts = c->starts + 1;
-  if (c->pid == 0) {
+  if (d->spec.backoff_ms > 0) {
+    var now: int64 = alph_now_ms();
+    if (now - c->started_at >= d->spec.period_ms) {
+      c->streak = 0;
+    }
+    c->streak = c->streak + 1;
+    var shift: int64 = c->streak - 1;
+    if (shift > 16) {
+      shift = 16;
+    }
+    var delay: int64 = d->spec.backoff_ms << shift;
+    if (d->spec.backoff_max_ms > 0 && delay > d->spec.backoff_max_ms) {
+      delay = d->spec.backoff_max_ms;
+    }
+    if (d->spec.jitter_pct > 0 && d->spec.jitter_pct <= 100) {
+      d->rng = (d->rng * (int64)1103515245 + (int64)12345) & (int64)2147483647;
+      delay = delay - (delay * d->spec.jitter_pct / 100) * (d->rng % 1001) / 1000;
+    }
+    c->pid = 0;
+    alph_send_after(ctx, delay, ctx->self, ALPH_TAG_DYN_RESTART, c->id);
+    return ALPH_CONTINUE;
+  }
+  if (!alph_dyn_respawn(ctx, c)) {
     alph_dyn_remove(ctx, d, i);
     return alph_dyn_shutdown(ctx, d, ALPH_SHUTDOWN);
   }
@@ -255,6 +366,7 @@ export fn alph_dyn_handle(ctx: AlphCtx*, m: AlphMsg*) -> int64 {
   var d: AlphDyn* = (AlphDyn*)ctx->state;
   if (m->tag == ALPH_TAG_INIT) {
     alph_trap_exits(ctx, true);
+    d->rng = (ctx->self ^ alph_now_ns()) & (int64)2147483647;
     return ALPH_CONTINUE;
   }
   if (m->tag == ALPH_TAG_EXIT) {
@@ -263,7 +375,8 @@ export fn alph_dyn_handle(ctx: AlphCtx*, m: AlphMsg*) -> int64 {
   if (m->tag == ALPH_TAG_DYN_START) {
     var size: int64 = 0;
     var state: rawptr = alph_msg_bytes(m, &size);
-    return alph_dyn_start_child(ctx, d, m, state, size, d->spec.handler);
+    return alph_dyn_start_child(ctx, d, m, state, size, d->spec.restart, d->spec.shutdown_ms, 0,
+                                d->spec.handler);
   }
   if (m->tag == ALPH_TAG_DYN_START_WITH) {
     var size: int64 = 0;
@@ -275,13 +388,83 @@ export fn alph_dyn_handle(ctx: AlphCtx*, m: AlphMsg*) -> int64 {
     }
     var with: AlphDynWith;
     memcpy((rawptr)&with, data, head);
-    return alph_dyn_start_child(ctx, d, m, (rawptr)((int64)data + head), size - head, with.handler);
+    if (with.own == 0) {
+      with.restart = d->spec.restart;
+      with.shutdown_ms = d->spec.shutdown_ms;
+      with.flags = 0;
+    }
+    return alph_dyn_start_child(ctx, d, m, (rawptr)((int64)data + head), size - head, with.restart,
+                                with.shutdown_ms, with.flags, with.handler);
+  }
+  if (m->tag == ALPH_TAG_DYN_RESTART) {
+    for i: int64 in 0..d->count {
+      var c: AlphDynChild* = alph_dyn_at(d, i);
+      if (c->id == m->arg && c->pid == 0) {
+        if (d->stopping != 0) {
+          break;
+        }
+        if (!alph_dyn_respawn(ctx, c)) {
+          alph_dyn_remove(ctx, d, i);
+          return alph_dyn_shutdown(ctx, d, ALPH_SHUTDOWN);
+        }
+        break;
+      }
+    }
+    return ALPH_CONTINUE;
+  }
+  if (m->tag == ALPH_TAG_SUP_WHICH) {
+    var info: AlphChildInfo* = (AlphChildInfo*)alph_scratch(ctx, d->count * (int64)sizeof(AlphChildInfo) + 8);
+    if (info == 0) {
+      alph_reply(ctx, m, ALPH_TAG_CHILDREN, 0);
+      return ALPH_CONTINUE;
+    }
+    for i: int64 in 0..d->count {
+      var c: AlphDynChild* = alph_dyn_at(d, i);
+      info[i].pid = c->pid;
+      info[i].index = -1;
+      info[i].starts = c->starts;
+    }
+    alph_reply_full(ctx, m, ALPH_TAG_CHILDREN, d->count, (rawptr)info, d->count * (int64)sizeof(AlphChildInfo));
+    return ALPH_CONTINUE;
+  }
+  if (m->tag == ALPH_TAG_SUP_STOP) {
+    var i: int64 = alph_dyn_find(d, m->arg);
+    if (i < 0 || d->stopping != 0 || alph_dyn_at(d, i)->stop_to != 0) {
+      alph_reply(ctx, m, ALPH_TAG_SUP_ANSWER, 0);
+      return ALPH_CONTINUE;
+    }
+    var c: AlphDynChild* = alph_dyn_at(d, i);
+    c->stop_to = m->from;
+    c->stop_ref = m->ref;
+    if (c->shutdown_ms == 0) {
+      alph_exit_signal(ctx, c->pid, ALPH_KILL);
+    } else {
+      alph_exit_signal(ctx, c->pid, ALPH_SHUTDOWN);
+      if (c->shutdown_ms > 0) {
+        alph_send_after(ctx, c->shutdown_ms, ctx->self, ALPH_TAG_SUP_KILL, c->pid);
+      }
+    }
+    return ALPH_CONTINUE;
+  }
+  if (m->tag == ALPH_TAG_SUP_RESTART) {
+    alph_reply(ctx, m, ALPH_TAG_SUP_ANSWER, 0);  // a dynamic supervisor forgets stopped children
+    return ALPH_CONTINUE;
+  }
+  if (m->tag == ALPH_TAG_SUP_KILL) {
+    var i: int64 = alph_dyn_find(d, m->arg);
+    if (i >= 0 && alph_dyn_at(d, i)->stop_to != 0) {
+      alph_exit_signal(ctx, m->arg, ALPH_KILL);
+    }
+    return ALPH_CONTINUE;
   }
   if (m->tag == ALPH_TAG_DYN_TIMER && m->ref == d->timer) {
     // Children that ignored the shutdown; their EXITs follow the kill.
     d->timer = 0;
     for i: int64 in 0..d->count {
-      alph_exit_signal(ctx, alph_dyn_at(d, i)->pid, ALPH_KILL);
+      var c: AlphDynChild* = alph_dyn_at(d, i);
+      if (c->shutdown_ms >= 0) {  // ALPH_SUP_WAIT children are waited for
+        alph_exit_signal(ctx, c->pid, ALPH_KILL);
+      }
     }
   }
   return ALPH_CONTINUE;
@@ -349,13 +532,51 @@ export fn alph_dyn_start(ctx: AlphCtx*, sup: int64, arg: int64, timeout_ms: int6
 // Otherwise as alph_dyn_start_bytes. Thread: a handler.
 export fn alph_dyn_start_with(ctx: AlphCtx*, sup: int64, data: rawptr, size: int64, timeout_ms: int64,
                               handler: fn(AlphCtx*, AlphMsg*) -> int64 with alloc, syscall, asm) -> int64 {
+  return alph_dyn_start_full(ctx, sup, data, size, (AlphDynOpts*)0, timeout_ms, handler);
+}
+
+// Fills opts with the defaults listed at AlphDynOpts. Thread: any.
+export fn alph_dyn_opts(opts: AlphDynOpts*) {
+  opts->restart = ALPH_PERMANENT;
+  opts->shutdown_ms = 5000;
+  opts->flags = 0;
+}
+
+// Asks sup to start a child that runs handler, with its own restart type,
+// shutdown_ms and spawn flags from opts instead of the spec's: one
+// supervisor can then hold permanent workers and temporary jobs, or
+// children on their own thread (ALPH_BOUND). Otherwise as
+// alph_dyn_start_with. Thread: a handler.
+export fn alph_dyn_start_opts(ctx: AlphCtx*, sup: int64, data: rawptr, size: int64, opts: AlphDynOpts*,
+                              timeout_ms: int64,
+                              handler: fn(AlphCtx*, AlphMsg*) -> int64 with alloc, syscall, asm) -> int64 {
+  return alph_dyn_start_full(ctx, sup, data, size, opts, timeout_ms, handler);
+}
+
+// Starts a child from outside the node: as alph_dyn_start_bytes with the
+// spec's handler, but nobody hears the answer. Returns ALPH_SENT, or as
+// alph_node_send. Thread: any.
+export fn alph_node_dyn_start_bytes(node: AlphNode*, sup: int64, data: rawptr, size: int64) -> int64 {
+  return alph_node_send_bytes(node, sup, ALPH_TAG_DYN_START, data, size);
+}
+
+fn alph_dyn_start_full(ctx: AlphCtx*, sup: int64, data: rawptr, size: int64, opts: AlphDynOpts*,
+                       timeout_ms: int64,
+                       handler: fn(AlphCtx*, AlphMsg*) -> int64 with alloc, syscall, asm) -> int64 {
   var head: int64 = (int64)sizeof(AlphDynWith);
   var buf: rawptr = alph_scratch(ctx, head + size);
   if (buf == 0) {
     return 0;
   }
   var with: AlphDynWith;
+  memset((rawptr)&with, 0, head);
   with.handler = handler;
+  if (opts != 0) {
+    with.own = 1;
+    with.restart = opts->restart;
+    with.shutdown_ms = opts->shutdown_ms;
+    with.flags = opts->flags;
+  }
   memcpy(buf, (rawptr)&with, head);
   if (size > 0) {
     memcpy((rawptr)((int64)buf + head), data, size);

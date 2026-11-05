@@ -1,0 +1,466 @@
+// Managing running supervisors: alph_sup_which, alph_sup_terminate and
+// alph_sup_restart, and the per-child options of a dynamic supervisor. The
+// test checks that:
+//   - a static supervisor lists its children (pid, index, starts); a child
+//     stopped with alph_sup_terminate answers only after it exited, stays
+//     stopped while its siblings restart, and alph_sup_restart starts it
+//     again; a stranger's pid and a running index answer 0;
+//   - a child that ignores the shutdown is killed after shutdown_ms and the
+//     terminate still answers 1;
+//   - a dynamic supervisor lists its children with index -1, forgets a
+//     terminated one, and answers 0 to alph_sup_restart;
+//   - a temporary child (alph_dyn_start_opts) is not restarted while a
+//     permanent one is, and an ALPH_BOUND child may block;
+//   - consecutive restarts back off, doubling: backoff_ms, then twice that;
+//   - alph_node_dyn_start_bytes starts a child from the main thread.
+// Each scenario has a coordinator actor that sends one request at a time
+// and checks each answer; the main thread waits for it with a deadline.
+
+import "std/io";
+import "std/mem";
+import "std/thread";
+import "alph/sys/atomic";
+import "alph/sys/clock";
+import "alph/alph";
+
+const TM_CRASH: int64 = ALPH_TAG_USER;
+const TM_HELLO: int64 = ALPH_TAG_USER + 1;  // child to boss on INIT, arg: starts before
+const TM_PING: int64 = ALPH_TAG_USER + 2;   // the bound child blocks, then answers
+const TM_PONG: int64 = ALPH_TAG_USER + 3;
+const TM_TICK: int64 = ALPH_TAG_USER + 4;   // a coordinator's note to itself
+
+// Worker kinds, the index into tm_starts and tm_exits.
+const K_STATIC: int64 = 0;    // 0..2
+const K_STUBBORN: int64 = 3;
+const K_DYN: int64 = 4;
+const K_TEMP: int64 = 5;
+const K_PERM: int64 = 6;
+const K_BOUND: int64 = 7;
+const K_BACKOFF: int64 = 8;
+const K_NODE: int64 = 9;
+
+struct TmKid {
+  idx: int64;
+  boss: int64;
+}
+
+struct TmCo {
+  sup: int64;
+  step: int64;
+  ref: int64;
+  n: int64;
+  t0: int64;
+  keep: int64[4];
+  refs: int64[4];
+  pids: int64[8];
+  starts: int64[8];
+}
+
+var g_node: AlphNode;
+var g_failures: int64 = 0;
+var tm_done: int64 = 0;
+var tm_starts: int64[16];
+var tm_exits: int64[16];
+var tm_init_at: int64[4];   // K_BACKOFF: time of each start, by starts before it
+var tm_crash_at: int64[4];  // K_BACKOFF: time of each exit
+
+fn expect(ok: bool, what: string) {
+  if (!ok) {
+    println("FAIL {what}");
+    alph_atomic_add(&g_failures, 1);
+  }
+}
+
+// ---- children ----
+
+fn tm_exit_hook(ctx: AlphCtx*, reason: int64) -> int64 {
+  var k: TmKid* = (TmKid*)ctx->state;
+  var n: int64 = alph_atomic_load(&tm_exits[k->idx]);
+  if (k->idx == K_BACKOFF && n < 4) {
+    alph_atomic_store(&tm_crash_at[n], alph_now_ms());
+  }
+  alph_atomic_add(&tm_exits[k->idx], 1);
+  return 0;
+}
+
+// Counts its starts and exits, says hello to its boss, crashes on TM_CRASH
+// and blocks for 30 ms on TM_PING.
+fn tm_work(ctx: AlphCtx*, m: AlphMsg*) -> int64 {
+  var k: TmKid* = (TmKid*)ctx->state;
+  if (m->tag == ALPH_TAG_INIT) {
+    alph_on_exit(ctx, &tm_exit_hook);
+    if (k->idx == K_BACKOFF && m->arg < 4) {
+      alph_atomic_store(&tm_init_at[m->arg], alph_now_ms());
+    }
+    alph_atomic_add(&tm_starts[k->idx], 1);
+    if (k->boss != 0) {
+      alph_send(ctx, k->boss, TM_HELLO, m->arg);
+    }
+  } else if (m->tag == TM_CRASH) {
+    var p: int64* = (int64*)(m->tag - m->tag);
+    *p = 1;
+  } else if (m->tag == TM_PING) {
+    thread_sleep_ms(30);
+    alph_send(ctx, m->from, TM_PONG, 0);
+  }
+  return ALPH_CONTINUE;
+}
+
+// Ignores the shutdown, so it has to be killed.
+fn tm_stubborn(ctx: AlphCtx*, m: AlphMsg*) -> int64 {
+  if (m->tag == ALPH_TAG_INIT) {
+    alph_trap_exits(ctx, true);
+    alph_atomic_add(&tm_starts[K_STUBBORN], 1);
+  }
+  return ALPH_CONTINUE;
+}
+
+// ---- coordinator helpers ----
+
+fn tm_finish(ctx: AlphCtx*) -> int64 {
+  alph_atomic_store(&tm_done, 1);
+  return alph_stop(ctx, ALPH_NORMAL);
+}
+
+// True at this step when m is the answer to the outstanding request, with
+// the tag wanted. Any other answer with that ref ends the scenario.
+fn tm_is(co: TmCo*, m: AlphMsg*, step: int64, tag: int64) -> bool {
+  if (co->step != step || m->ref == 0 || m->ref != co->ref) {
+    return false;
+  }
+  if (m->tag != tag) {
+    println("  wanted tag {tag}, got {m->tag} (arg {m->arg})");
+    expect(false, "the request got its answer");
+    alph_atomic_store(&tm_done, 1);
+    return false;
+  }
+  return true;
+}
+
+// As tm_is for a which answer that lists n children (all of them dynamic, with
+// index -1, or static, with their spec index); copies their pids and starts.
+fn tm_list(co: TmCo*, m: AlphMsg*, step: int64, n: int64, dyn: bool) -> bool {
+  if (!tm_is(co, m, step, ALPH_TAG_CHILDREN)) {
+    return false;
+  }
+  var size: int64 = 0;
+  var info: AlphChildInfo* = (AlphChildInfo*)alph_msg_bytes(m, &size);
+  if (m->arg != n || size != n * (int64)sizeof(AlphChildInfo)) {
+    println("  which listed {m->arg} children, {size} bytes; wanted {n}");
+    expect(false, "which lists the children");
+    alph_atomic_store(&tm_done, 1);
+    return false;
+  }
+  for i: int64 in 0..n {
+    co->pids[i] = info[i].pid;
+    co->starts[i] = info[i].starts;
+    expect(info[i].index == i || (dyn && info[i].index == -1), "a child has its spec index, or -1 in a dynamic one");
+  }
+  return true;
+}
+
+fn tm_ask(co: TmCo*, ref: int64, step: int64) {
+  expect(ref > 0, "the request was sent");
+  co->ref = ref;
+  co->step = step;
+}
+
+fn tm_lists(co: TmCo*, n: int64, pid: int64) -> bool {
+  for i: int64 in 0..n {
+    if (co->pids[i] == pid) {
+      return true;
+    }
+  }
+  return false;
+}
+
+fn starts(idx: int64) -> int64 {
+  return alph_atomic_load(&tm_starts[idx]);
+}
+
+fn exits(idx: int64) -> int64 {
+  return alph_atomic_load(&tm_exits[idx]);
+}
+
+// ---- coordinators ----
+
+// Static supervisor with three workers: stop one, crash another, restart.
+fn tm_static(ctx: AlphCtx*, m: AlphMsg*) -> int64 {
+  var co: TmCo* = (TmCo*)ctx->state;
+  if (m->tag == ALPH_TAG_INIT) {
+    tm_ask(co, alph_sup_which(ctx, co->sup, 1000), 1);
+  } else if (tm_list(co, m, 1, 3, false)) {
+    for i: int64 in 0..3 {
+      co->keep[i] = co->pids[i];
+      expect(co->pids[i] != 0 && co->starts[i] == 1, "every child runs, started once");
+    }
+    tm_ask(co, alph_sup_terminate(ctx, co->sup, co->keep[1], 1000), 2);
+  } else if (tm_is(co, m, 2, ALPH_TAG_SUP_ANSWER)) {
+    expect(m->arg == 1, "terminate answers 1");
+    expect(exits(K_STATIC + 1) == 1, "terminate answers after the child exited");
+    alph_send_after(ctx, 100, ctx->self, TM_TICK, 0);  // long enough for a wrong restart
+    co->step = 3;
+  } else if (co->step == 3 && m->tag == TM_TICK) {
+    tm_ask(co, alph_sup_which(ctx, co->sup, 1000), 5);
+  } else if (tm_list(co, m, 5, 3, false)) {
+    expect(co->pids[1] == 0 && co->starts[1] == 1, "the terminated child is not running, nor restarted");
+    expect(co->pids[0] == co->keep[0] && co->pids[2] == co->keep[2], "its siblings are untouched");
+    alph_send(ctx, co->keep[0], TM_CRASH, 0);
+    alph_send_after(ctx, 100, ctx->self, TM_TICK, 0);
+    co->step = 6;
+  } else if (co->step == 6 && m->tag == TM_TICK) {
+    tm_ask(co, alph_sup_which(ctx, co->sup, 1000), 7);
+  } else if (tm_list(co, m, 7, 3, false)) {
+    expect(co->pids[0] != 0 && co->pids[0] != co->keep[0] && co->starts[0] == 2, "the crashed child restarts");
+    expect(co->pids[1] == 0 && co->starts[1] == 1, "the stopped child stays stopped");
+    tm_ask(co, alph_sup_restart(ctx, co->sup, 1, 1000), 8);
+  } else if (tm_is(co, m, 8, ALPH_TAG_SUP_ANSWER)) {
+    expect(m->arg != 0, "restart answers the new pid");
+    co->keep[1] = m->arg;
+    tm_ask(co, alph_sup_which(ctx, co->sup, 1000), 9);
+  } else if (tm_list(co, m, 9, 3, false)) {
+    expect(co->pids[1] == co->keep[1] && co->starts[1] == 2, "the restarted child runs, started twice");
+    tm_ask(co, alph_sup_terminate(ctx, co->sup, ctx->self, 1000), 10);
+  } else if (tm_is(co, m, 10, ALPH_TAG_SUP_ANSWER)) {
+    expect(m->arg == 0, "terminate answers 0 for a pid that is not a child");
+    tm_ask(co, alph_sup_restart(ctx, co->sup, 1, 1000), 11);
+  } else if (tm_is(co, m, 11, ALPH_TAG_SUP_ANSWER)) {
+    expect(m->arg == 0, "restart answers 0 for a running child");
+    return tm_finish(ctx);
+  }
+  return ALPH_CONTINUE;
+}
+
+// A child that ignores the shutdown is killed after shutdown_ms.
+fn tm_kill(ctx: AlphCtx*, m: AlphMsg*) -> int64 {
+  var co: TmCo* = (TmCo*)ctx->state;
+  if (m->tag == ALPH_TAG_INIT) {
+    tm_ask(co, alph_sup_which(ctx, co->sup, 1000), 1);
+  } else if (tm_list(co, m, 1, 1, false)) {
+    expect(co->pids[0] != 0, "the stubborn child runs");
+    co->t0 = alph_now_ms();
+    tm_ask(co, alph_sup_terminate(ctx, co->sup, co->pids[0], 3000), 2);
+  } else if (tm_is(co, m, 2, ALPH_TAG_SUP_ANSWER)) {
+    var took: int64 = alph_now_ms() - co->t0;
+    expect(m->arg == 1, "terminate answers 1 once the child is killed");
+    expect(took >= 90 && took < 2000, "the child was killed after about shutdown_ms");
+    tm_ask(co, alph_sup_which(ctx, co->sup, 1000), 3);
+  } else if (tm_list(co, m, 3, 1, false)) {
+    expect(co->pids[0] == 0, "the killed child is not running");
+    return tm_finish(ctx);
+  }
+  return ALPH_CONTINUE;
+}
+
+// Collects the pids of the three STARTED answers into co->keep, by ref.
+// True once all three are in.
+fn tm_started(co: TmCo*, m: AlphMsg*) -> bool {
+  if (co->step != 1 || m->tag != ALPH_TAG_STARTED) {
+    return false;
+  }
+  for i: int64 in 0..3 {
+    if (co->refs[i] == m->ref) {
+      co->keep[i] = m->arg;
+      co->n = co->n + 1;
+    }
+  }
+  return co->n == 3;
+}
+
+// Dynamic supervisor: three children, terminate one, restart is refused.
+fn tm_dynamic(ctx: AlphCtx*, m: AlphMsg*) -> int64 {
+  var co: TmCo* = (TmCo*)ctx->state;
+  if (m->tag == ALPH_TAG_INIT) {
+    var k: TmKid;
+    k.idx = K_DYN;
+    k.boss = 0;
+    for i: int64 in 0..3 {
+      co->refs[i] = alph_dyn_start_value<TmKid>(ctx, co->sup, &k, 1000);
+    }
+    co->step = 1;
+  } else if (tm_started(co, m)) {
+    tm_ask(co, alph_sup_which(ctx, co->sup, 1000), 2);
+  } else if (tm_list(co, m, 2, 3, true)) {
+    for i: int64 in 0..3 {
+      expect(co->keep[i] != 0 && tm_lists(co, 3, co->keep[i]) && co->starts[i] == 1, "every child is listed");
+    }
+    tm_ask(co, alph_sup_terminate(ctx, co->sup, co->keep[1], 1000), 3);
+  } else if (tm_is(co, m, 3, ALPH_TAG_SUP_ANSWER)) {
+    expect(m->arg == 1 && exits(K_DYN) == 1, "terminate answers 1 after the child exited");
+    tm_ask(co, alph_sup_which(ctx, co->sup, 1000), 4);
+  } else if (tm_list(co, m, 4, 2, true)) {
+    expect(!tm_lists(co, 2, co->keep[1]) && tm_lists(co, 2, co->keep[0]) && tm_lists(co, 2, co->keep[2]),
+           "a terminated dynamic child is forgotten");
+    tm_ask(co, alph_sup_restart(ctx, co->sup, 0, 1000), 5);
+  } else if (tm_is(co, m, 5, ALPH_TAG_SUP_ANSWER)) {
+    expect(m->arg == 0 && starts(K_DYN) == 3, "a dynamic supervisor refuses restart");
+    return tm_finish(ctx);
+  }
+  return ALPH_CONTINUE;
+}
+
+// A temporary child is not restarted, a permanent one is; a bound one blocks.
+fn tm_opts(ctx: AlphCtx*, m: AlphMsg*) -> int64 {
+  var co: TmCo* = (TmCo*)ctx->state;
+  if (m->tag == ALPH_TAG_INIT) {
+    var k: TmKid;
+    var o: AlphDynOpts;
+    k.boss = 0;
+    alph_dyn_opts(&o);
+    o.restart = ALPH_TEMPORARY;
+    k.idx = K_TEMP;
+    co->refs[0] = alph_dyn_start_opts(ctx, co->sup, (rawptr)&k, (int64)sizeof(TmKid), &o, 1000, &tm_work);
+    k.idx = K_PERM;
+    co->refs[1] = alph_dyn_start_value<TmKid>(ctx, co->sup, &k, 1000);
+    alph_dyn_opts(&o);
+    o.flags = ALPH_BOUND;
+    k.idx = K_BOUND;
+    co->refs[2] = alph_dyn_start_opts(ctx, co->sup, (rawptr)&k, (int64)sizeof(TmKid), &o, 1000, &tm_work);
+    co->step = 1;
+  } else if (tm_started(co, m)) {
+    expect(co->keep[0] != 0 && co->keep[1] != 0 && co->keep[2] != 0, "all three children started");
+    co->t0 = alph_now_ms();
+    alph_send(ctx, co->keep[2], TM_PING, 0);
+    co->step = 2;
+  } else if (co->step == 2 && m->tag == TM_PONG) {
+    expect(m->from == co->keep[2] && alph_now_ms() - co->t0 >= 25, "the bound child blocked, then answered");
+    alph_send(ctx, co->keep[0], TM_CRASH, 0);
+    alph_send(ctx, co->keep[1], TM_CRASH, 0);
+    alph_send_after(ctx, 150, ctx->self, TM_TICK, 0);
+    co->step = 3;
+  } else if (co->step == 3 && m->tag == TM_TICK) {
+    tm_ask(co, alph_sup_which(ctx, co->sup, 1000), 4);
+  } else if (tm_list(co, m, 4, 2, true)) {
+    expect(!tm_lists(co, 2, co->keep[0]), "the crashed temporary child is gone");
+    expect(!tm_lists(co, 2, co->keep[1]) && tm_lists(co, 2, co->keep[2]), "the permanent child has a new pid");
+    expect(starts(K_TEMP) == 1 && starts(K_PERM) == 2 && starts(K_BOUND) == 1, "only the permanent child restarted");
+    return tm_finish(ctx);
+  }
+  return ALPH_CONTINUE;
+}
+
+// Crashes its child twice in a row and reads the gaps before each restart.
+fn tm_backoff(ctx: AlphCtx*, m: AlphMsg*) -> int64 {
+  var co: TmCo* = (TmCo*)ctx->state;
+  if (m->tag == ALPH_TAG_INIT) {
+    var k: TmKid;
+    k.idx = K_BACKOFF;
+    k.boss = ctx->self;
+    alph_dyn_start_value<TmKid>(ctx, co->sup, &k, 1000);
+  } else if (m->tag == TM_HELLO && m->arg < 2) {
+    alph_send(ctx, m->from, TM_CRASH, 0);
+  } else if (m->tag == TM_HELLO) {
+    var first: int64 = alph_atomic_load(&tm_init_at[1]) - alph_atomic_load(&tm_crash_at[0]);
+    var second: int64 = alph_atomic_load(&tm_init_at[2]) - alph_atomic_load(&tm_crash_at[1]);
+    expect(first >= 40 && first < 500, "the first restart waits about backoff_ms");
+    expect(second >= 80 && second < 800, "the second restart waits about twice that");
+    return tm_finish(ctx);
+  }
+  return ALPH_CONTINUE;
+}
+
+// ---- main thread ----
+
+fn wait_for(flag: int64*, what: string) -> bool {
+  for i: int64 in 0..10000 {
+    if (alph_atomic_load(flag) != 0) {
+      return true;
+    }
+    thread_sleep_ms(1);
+  }
+  println("  waited for {what}");
+  return false;
+}
+
+fn wait_live(n: int64) -> bool {
+  var stats: AlphStats;
+  for i: int64 in 0..3000 {
+    alph_node_stats(&g_node, &stats);
+    if (stats.live <= n) {
+      return true;
+    }
+    thread_sleep_ms(1);
+  }
+  println("  waited for {n} live actors, have {stats.live}");
+  return false;
+}
+
+// Runs the coordinator h against supervisor sup, then stops both.
+fn tm_run(name: string, sup: int64, h: fn(AlphCtx*, AlphMsg*) -> int64 with alloc, syscall, asm) {
+  expect(sup != 0, "{name}: the supervisor started");
+  var co: TmCo;
+  memset((rawptr)&co, 0, (int64)sizeof(TmCo));
+  co.sup = sup;
+  alph_atomic_store(&tm_done, 0);
+  var boss: int64 = alph_node_spawn_value<TmCo>(&g_node, 0, &co, h);
+  expect(boss != 0, "{name}: the coordinator started");
+  expect(wait_for(&tm_done, name), "{name}: the coordinator finished");
+  alph_node_exit_signal(&g_node, boss, ALPH_KILL);  // still there if a check failed
+  alph_node_exit_signal(&g_node, sup, ALPH_SHUTDOWN);
+  expect(wait_live(0), "{name}: everything stopped");
+}
+
+fn kid_spec(idx: int64) -> TmKid {
+  var k: TmKid;
+  k.idx = idx;
+  k.boss = 0;
+  return k;
+}
+
+fn main() -> int32 {
+  var cfg: AlphConfig;
+  alph_config(&cfg);
+  cfg.schedulers = 2;
+  cfg.max_actors = 256;
+  expect(alph_node_start(&g_node, &cfg), "node started");
+
+  var spec: AlphSupSpec;
+  alph_sup_init(&spec, ALPH_ONE_FOR_ONE);
+  spec.max_restarts = 5;
+  var kids: TmKid[3];  // read when the supervisor is spawned
+  for i: int64 in 0..3 {
+    kids[i] = kid_spec(K_STATIC + i);
+    alph_sup_add_value<TmKid>(&spec, &kids[i], &tm_work);
+  }
+  tm_run("static", alph_node_spawn_sup(&g_node, &spec), &tm_static);
+
+  alph_sup_init(&spec, ALPH_ONE_FOR_ONE);
+  var c: AlphChildSpec* = alph_sup_add(&spec, &tm_stubborn);
+  c->shutdown_ms = 100;
+  tm_run("kill", alph_node_spawn_sup(&g_node, &spec), &tm_kill);
+
+  var dspec: AlphDynSpec;
+  alph_dyn_init(&dspec, &tm_work);
+  dspec.max_restarts = 10;
+  dspec.backoff_ms = 0;
+  dspec.backoff_max_ms = 0;
+  dspec.jitter_pct = 0;
+  tm_run("dynamic", alph_node_spawn_dyn(&g_node, &dspec), &tm_dynamic);
+  tm_run("opts", alph_node_spawn_dyn(&g_node, &dspec), &tm_opts);
+
+  dspec.backoff_ms = 50;
+  tm_run("backoff", alph_node_spawn_dyn(&g_node, &dspec), &tm_backoff);
+
+  var dyn: int64 = alph_node_spawn_dyn(&g_node, &dspec);
+  var nk: TmKid = kid_spec(K_NODE);
+  expect(alph_node_dyn_start_bytes(&g_node, dyn, (rawptr)&nk, (int64)sizeof(TmKid)) == ALPH_SENT, "the node start was sent");
+  var seen: int64 = 0;
+  for i: int64 in 0..3000 {
+    if (starts(K_NODE) >= 1) {
+      seen = 1;
+      break;
+    }
+    thread_sleep_ms(1);
+  }
+  expect(seen == 1, "a child started from the main thread ran");
+  alph_node_exit_signal(&g_node, dyn, ALPH_SHUTDOWN);
+  expect(wait_live(0), "the last supervisor stopped");
+
+  alph_node_halt(&g_node, 0);
+  alph_node_wait(&g_node);
+  if (g_failures != 0) {
+    return 1;
+  }
+  println("manage ok");
+  return 0;
+}

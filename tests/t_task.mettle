@@ -1,0 +1,268 @@
+// Tasks, agents and alph_continue. One coordinator actor runs the cases in
+// turn and checks each answer. The test checks that:
+//   - alph_task answers ALPH_TAG_TASK_DONE with the ref it returned and the
+//     function's result; a task that crashes answers ALPH_TAG_DOWN; one that
+//     runs past its timeout answers ALPH_TAG_TIMEOUT and its late answer is
+//     dropped;
+//   - alph_task_map runs 1000 items with at most 8 tasks at once and answers
+//     once, with a result per item in order and a count of the failed ones;
+//     a map over no items answers at once;
+//   - an agent holds state: update answers with the function's result, cast
+//     then get sees the change, and an update that crashes answers DOWN;
+//   - alph_continue's message is handled before one already in the mailbox.
+// A watchdog timer ends the run if an answer never comes.
+
+import "std/io";
+import "std/mem";
+import "alph/sys/atomic";
+import "alph/sys/clock";
+import "alph/alph";
+
+const TT_TICK: int64 = ALPH_TAG_USER;
+const TT_WATCHDOG: int64 = ALPH_TAG_USER + 1;
+const TT_M1: int64 = ALPH_TAG_USER + 2;   // the cont actor's normal message
+const TT_C: int64 = ALPH_TAG_USER + 3;    // its continue message
+const TT_SEQ: int64 = ALPH_TAG_USER + 4;  // cont to coordinator, arg: 1 for TT_C, 2 for TT_M1
+const ITEMS: int64 = 1000;
+const MAX_TASKS: int64 = 8;
+
+struct TtCo {
+  step: int64;
+  ref: int64;
+  want: int64;   // the tag the answer to ref should have
+  slow: int64;   // the ref of the task that timed out
+  agent: int64;
+  seen: int64;
+}
+
+struct TtCont {
+  boss: int64;
+}
+
+var g_node: AlphNode;
+var g_failures: int64 = 0;
+var tt_items: int64[1000];
+var tt_running: int64 = 0;  // map tasks inside their function now
+var tt_peak: int64 = 0;     // the most there have been at once
+
+fn expect(ok: bool, what: string) {
+  if (!ok) {
+    println("FAIL {what}");
+    alph_atomic_add(&g_failures, 1);
+  }
+}
+
+// ---- work functions ----
+
+fn tt_square(ctx: AlphCtx*, data: rawptr, size: int64) -> int64 {
+  var x: int64 = *(int64*)data;
+  return x * x;
+}
+
+// Divides by the item, so item 0 crashes it.
+fn tt_div(ctx: AlphCtx*, data: rawptr, size: int64) -> int64 {
+  var z: int64 = *(int64*)data;
+  return 100 / z;
+}
+
+// Runs 200 ms without yielding, well past a 50 ms timeout.
+fn tt_slow(ctx: AlphCtx*, data: rawptr, size: int64) -> int64 {
+  var end: int64 = alph_now_ms() + 200;
+  while (alph_now_ms() < end) {
+    alph_cpu_relax();
+  }
+  return 1;
+}
+
+// Doubles the item; crashes on x % 100 == 7. Counts how many run at once.
+fn tt_map_work(ctx: AlphCtx*, data: rawptr, size: int64) -> int64 {
+  var x: int64 = *(int64*)data;
+  var now: int64 = alph_atomic_add(&tt_running, 1) + 1;
+  var peak: int64 = alph_atomic_load(&tt_peak);
+  while (now > peak) {
+    var seen: int64 = alph_atomic_cas(&tt_peak, peak, now);
+    if (seen == peak) {
+      break;
+    }
+    peak = seen;
+  }
+  var end: int64 = alph_now_ns() + 500000;
+  while (alph_now_ns() < end) {
+    alph_cpu_relax();
+  }
+  alph_atomic_add(&tt_running, -1);
+  if (x % 100 == 7) {
+    var z: int64 = x % 100 - 7;
+    return x / z;
+  }
+  return x * 2;
+}
+
+fn tt_add(state: rawptr, size: int64, arg: int64) -> int64 {
+  var p: int64* = (int64*)state;
+  *p = *p + arg;
+  return *p;
+}
+
+fn tt_agent_div(state: rawptr, size: int64, arg: int64) -> int64 {
+  return 100 / arg;
+}
+
+// ---- the continue actor ----
+
+fn tt_cont(ctx: AlphCtx*, m: AlphMsg*) -> int64 {
+  var c: TtCont* = (TtCont*)ctx->state;
+  if (m->tag == ALPH_TAG_INIT) {
+    alph_send(ctx, ctx->self, TT_M1, 0);
+    alph_continue(ctx, TT_C, 0);
+  } else if (m->tag == TT_C) {
+    alph_send(ctx, c->boss, TT_SEQ, 1);
+  } else if (m->tag == TT_M1) {
+    alph_send(ctx, c->boss, TT_SEQ, 2);
+    return alph_stop(ctx, ALPH_NORMAL);
+  }
+  return ALPH_CONTINUE;
+}
+
+// ---- the coordinator ----
+
+fn tt_halt(ctx: AlphCtx*) -> int64 {
+  alph_halt(ctx, 0);
+  return ALPH_CONTINUE;
+}
+
+// Waits for the answer to ref, which should have tag want, and moves to step.
+fn tt_ask(co: TtCo*, ref: int64, want: int64, step: int64) {
+  expect(ref > 0, "the request was sent");
+  co->ref = ref;
+  co->want = want;
+  co->step = step;
+}
+
+fn tt_check_map(m: AlphMsg*) {
+  var size: int64 = 0;
+  var res: AlphTaskResult* = (AlphTaskResult*)alph_msg_bytes(m, &size);
+  expect(m->arg == 10, "ten items failed");
+  expect(size == ITEMS * (int64)sizeof(AlphTaskResult), "a result per item");
+  if (size != ITEMS * (int64)sizeof(AlphTaskResult)) {
+    return;
+  }
+  var bad: int64 = 0;
+  for i: int64 in 0..ITEMS {
+    if (i % 100 == 7) {
+      if (res[i].ok != 0 || res[i].value != 0) {
+        bad = bad + 1;
+      }
+    } else if (res[i].ok != 1 || res[i].value != i * 2) {
+      bad = bad + 1;
+    }
+  }
+  expect(bad == 0, "every result is in order, ok and double");
+  expect(alph_atomic_load(&tt_peak) <= MAX_TASKS && alph_atomic_load(&tt_peak) >= 2, "up to 8 tasks ran at once, never more");
+}
+
+// Handles the answer to co->ref, then asks the next question.
+fn tt_next(ctx: AlphCtx*, co: TtCo*, m: AlphMsg*) -> int64 {
+  var one: int64 = 12;
+  var zero: int64 = 0;
+  if (co->step == 0) {
+    expect(m->arg == 144, "the task squared 12");
+    tt_ask(co, alph_task(ctx, (rawptr)&zero, 8, 1000, &tt_div), ALPH_TAG_DOWN, 1);
+  } else if (co->step == 1) {
+    tt_ask(co, alph_task(ctx, (rawptr)&one, 8, 50, &tt_slow), ALPH_TAG_TIMEOUT, 2);
+  } else if (co->step == 2) {
+    co->slow = co->ref;
+    co->ref = 0;
+    alph_send_after(ctx, 400, ctx->self, TT_TICK, 0);
+    co->step = 3;
+  } else if (co->step == 4) {
+    tt_check_map(m);
+    tt_ask(co, alph_task_map(ctx, (rawptr)&tt_items[0], 0, 8, 4, 0, 1000, &tt_map_work), ALPH_TAG_TASK_ALL, 5);
+  } else if (co->step == 5) {
+    var size: int64 = 0;
+    alph_msg_bytes(m, &size);
+    expect(m->arg == 0 && size == 0, "a map over no items answers at once with nothing");
+    co->agent = alph_spawn_agent(ctx, ALPH_LINK, (rawptr)&zero, 8);
+    expect(co->agent != 0, "the agent started");
+    tt_ask(co, alph_agent_update(ctx, co->agent, 5, 1000, &tt_add), ALPH_TAG_AGENT_DONE, 6);
+  } else if (co->step == 6) {
+    expect(m->arg == 5, "the update answers the new count");
+    expect(alph_agent_cast(ctx, co->agent, 3, &tt_add) == ALPH_SENT, "the cast was sent");
+    tt_ask(co, alph_agent_get(ctx, co->agent, 1000), ALPH_TAG_AGENT_STATE, 7);
+  } else if (co->step == 7) {
+    var size: int64 = 0;
+    var p: int64* = (int64*)alph_msg_bytes(m, &size);
+    expect(size == 8 && *p == 8, "the state is 5 + 3 after the cast");
+    tt_ask(co, alph_agent_update(ctx, co->agent, 0, 1000, &tt_agent_div), ALPH_TAG_DOWN, 8);
+  } else if (co->step == 8) {
+    var c: TtCont;
+    c.boss = ctx->self;
+    expect(alph_spawn_value<TtCont>(ctx, 0, &c, &tt_cont) != 0, "the cont actor started");
+    co->ref = 0;
+    co->step = 9;
+  }
+  return ALPH_CONTINUE;
+}
+
+fn tt_co(ctx: AlphCtx*, m: AlphMsg*) -> int64 {
+  var co: TtCo* = (TtCo*)ctx->state;
+  if (m->tag == ALPH_TAG_INIT) {
+    alph_trap_exits(ctx, true);  // the agent is linked and ends in a crash
+    alph_send_after(ctx, 15000, ctx->self, TT_WATCHDOG, 0);
+    var n: int64 = 12;
+    tt_ask(co, alph_task(ctx, (rawptr)&n, 8, 1000, &tt_square), ALPH_TAG_TASK_DONE, 0);
+    return ALPH_CONTINUE;
+  }
+  if (m->tag == TT_WATCHDOG) {
+    println("  stuck at step {co->step}");
+    expect(false, "the run finished in time");
+    return tt_halt(ctx);
+  }
+  if (m->tag == ALPH_TAG_TASK_DONE && co->slow != 0 && m->ref == co->slow) {
+    expect(false, "the late answer of a timed out task is dropped");
+    return ALPH_CONTINUE;
+  }
+  if (m->tag == TT_TICK && co->step == 3) {
+    for i: int64 in 0..ITEMS {
+      tt_items[i] = i;
+    }
+    tt_ask(co, alph_task_map(ctx, (rawptr)&tt_items[0], ITEMS, 8, MAX_TASKS, 5000, 20000, &tt_map_work),
+           ALPH_TAG_TASK_ALL, 4);
+    return ALPH_CONTINUE;
+  }
+  if (m->tag == TT_SEQ && co->step == 9) {
+    co->seen = co->seen + 1;
+    expect(m->arg == co->seen, "alph_continue is handled before the earlier message");
+    if (co->seen == 2) {
+      return tt_halt(ctx);
+    }
+    return ALPH_CONTINUE;
+  }
+  if (m->ref != 0 && m->ref == co->ref) {
+    if (m->tag != co->want) {
+      println("  step {co->step}: wanted tag {co->want}, got {m->tag} (arg {m->arg})");
+      expect(false, "the request got the answer it should");
+      return tt_halt(ctx);
+    }
+    return tt_next(ctx, co, m);
+  }
+  return ALPH_CONTINUE;
+}
+
+fn main() -> int32 {
+  var cfg: AlphConfig;
+  alph_config(&cfg);
+  cfg.schedulers = 10;
+  cfg.max_actors = 4096;
+  cfg.mailbox_size = 256;
+  expect(alph_node_start(&g_node, &cfg), "node started");
+  var co: TtCo;
+  memset((rawptr)&co, 0, (int64)sizeof(TtCo));
+  expect(alph_node_spawn_value<TtCo>(&g_node, 0, &co, &tt_co) != 0, "the coordinator started");
+  alph_node_wait(&g_node);
+  if (g_failures != 0) {
+    return 1;
+  }
+  println("task ok");
+  return 0;
+}

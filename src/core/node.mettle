@@ -1354,6 +1354,14 @@ export fn alph_on_exit(ctx: AlphCtx*, hook: fn(AlphCtx*, int64) -> int64 with al
   p->has_on_exit = 1;
 }
 
+// Delivers tag and arg to this actor before any message already in its
+// mailbox, as OTP's handle_continue: INIT can answer quickly and finish its
+// setup next, before other work gets in. Signals (exits, timers) may still
+// come first. Thread: a handler.
+export fn alph_continue(ctx: AlphCtx*, tag: int64, arg: int64) {
+  alph_signal(ctx->node, ALPH_SIG_TIMER, ctx->self, ctx->self, 0, arg, tag);
+}
+
 // Sends a tag and one word to `to` after ms milliseconds. It cannot be
 // cancelled; use alph_start_timer for that. Like every signal it is never
 // dropped for a full mailbox. Thread: a handler.
