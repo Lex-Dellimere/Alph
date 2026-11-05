@@ -134,6 +134,9 @@ const ALPH_BUDGET: int64 = 64;
 // messages), so a run of many medium-cost messages cannot hold its
 // scheduler for a millisecond: 64 messages of 20 us did.
 const ALPH_RUN_NS: int64 = 100000;
+// Signals an actor handles before its next message; the rest wait for the
+// next step of its run, or its next run.
+const ALPH_SIGNALS_PER_STEP: int64 = 16;
 // Messages cheaper than this on average are checked against ALPH_RUN_NS
 // every 4; costlier ones after each.
 const ALPH_CHEAP_NS: int64 = 2000;
@@ -249,6 +252,9 @@ export struct AlphConfig {
 //   yields   actor runs cut short after ALPH_RUN_NS, with mail left
 //   isolated  actors cut short twice in a row and so moved to a scheduler
 //            of their own, away from the work queued behind them
+//   io_hup_rearms  arms answered at once with only a hang-up or error that
+//            was already reported: an owner arming again without closing
+//            the handle, which spins
 export struct AlphStats {
   live: int64;
   spawned: int64;
@@ -262,6 +268,7 @@ export struct AlphStats {
   refused: int64;
   yields: int64;
   isolated: int64;
+  io_hup_rearms: int64;
 }
 
 // A node. Declare one, start it with alph_node_start, and keep it in place
@@ -327,6 +334,7 @@ export struct AlphNode {
   rt_offset: int64;     // CLOCK_REALTIME minus CLOCK_MONOTONIC (ns), refreshed by the watchdog
   yields: int64;        // runs cut short by ALPH_RUN_NS
   isolated: int64;      // CPU-bound actors moved off a busy scheduler after such cuts
+  io_hup_rearms: int64; // arms answered at once with nothing but a hang-up or error already reported
   epoch: int64;         // bumped by every retire
   retired: AlphVec;     // pairs: block (bit 0 set: a plain block, else an AlphEntry*), epoch
   retire_lock: int64;
@@ -2937,7 +2945,12 @@ fn alph_run_some(s: AlphSched*, p: AlphProc*) -> int64 {
         return reason;
       }
     }
+    // At most ALPH_SIGNALS_PER_STEP signals per step: a handler can make
+    // more (an alph_io_arm that reports at once), and an unbounded drain
+    // would never end its run, nor let the scheduler see a halt.
     var sig: int64 = alph_queue_pop(&p->signals);
+    var sigs: int64 = 0;
+    var more: bool = false;
     while (sig != 0) {
       var sg: AlphSignal* = (AlphSignal*)sig;
       if (alph_signal_ordered(sg->kind, sg->arg) &&
@@ -2949,12 +2962,20 @@ fn alph_run_some(s: AlphSched*, p: AlphProc*) -> int64 {
           return reason;
         }
       }
+      sigs = sigs + 1;
+      if (sigs >= ALPH_SIGNALS_PER_STEP) {
+        more = true;  // the queue may hold more: this run must not end idle
+        break;
+      }
       sig = alph_queue_pop(&p->signals);
     }
     var sent_at: int64 = 0;
     if (!alph_mailbox_pop_at(&p->mailbox, &m, &sent_at)) {
       if (alph_deferred_ready(p)) {
         continue;
+      }
+      if (more) {
+        continue;  // signals left over: the next step takes them
       }
       // Anything deferred waits on a message still being written; its
       // sender wakes this actor when the write lands.
@@ -3377,6 +3398,11 @@ export fn alph_io_arm(ctx: AlphCtx*, h: int64, events: int64) -> int64 {
       // Ready since the last delivery: hand it over, and keep ERR and HUP.
       var next: int64 = ready & ~(hit & (ALPH_IO_IN | ALPH_IO_OUT));
       if (alph_atomic_cas(&slot->state, old, next) == old) {
+        if ((hit & (ALPH_IO_IN | ALPH_IO_OUT)) == 0) {
+          // Only a hang-up or error it was told of before: an owner that
+          // keeps arming without closing spins on it.
+          alph_atomic_add(&ctx->node->io_hup_rearms, 1);
+        }
         alph_signal(ctx->node, ALPH_SIG_IO, 0, ctx->self, h, hit, 0);
         return 0;
       }
@@ -5355,4 +5381,5 @@ export fn alph_node_stats(node: AlphNode*, stats: AlphStats*) {
   stats->refused = alph_atomic_load(&node->refused);
   stats->yields = alph_atomic_load(&node->yields);
   stats->isolated = alph_atomic_load(&node->isolated);
+  stats->io_hup_rearms = alph_atomic_load(&node->io_hup_rearms);
 }

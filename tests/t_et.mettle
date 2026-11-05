@@ -13,6 +13,10 @@
 //      and over: a few messages, not thousands
 //   6. 1-byte reads of a 256 KB burst through alph_io_read: every byte
 //   7. a write that stops at EAGAIN finishes once the peer reads
+//   8. the peer closes; an owner that ignores ALPH_TAG_IO and does not arm
+//      again is told once, not over and over: the runtime never re-posts
+//      by itself. One that does arm again is told each time, which
+//      io_hup_rearms counts
 
 import "std/io";
 import "std/thread";
@@ -123,8 +127,11 @@ fn owner(ctx: AlphCtx*, m: AlphMsg*) -> int64 {
       if (n3 > 0) {
         alph_atomic_add(&g_bytes, n3);
       }
-    } else if (mode == 3) {
+    } else if (mode == 3 || mode == 5) {
       // Ignore it.
+    }
+    if (mode == 5) {
+      return ALPH_CONTINUE;  // and do not arm again
     }
     if (alph_outq_pending(&o->q) > 0) {
       alph_io_arm(ctx, o->h, ALPH_IO_IN | ALPH_IO_OUT);
@@ -325,6 +332,22 @@ fn main() -> int32 {
   }
   expect(got == 4194304 && alph_atomic_load(&g_sent_all) == 1, "the write finished once the peer read ({got} of 4194304)");
   syscall(3, far7);
+
+  // 8
+  var far8: int64 = setup(&p, 5);
+  syscall(3, far8);
+  thread_sleep_ms(100);
+  var ios8: int64 = alph_atomic_load(&g_ios);
+  expect(ios8 == 1, "an owner told of a close and not arming again was told once ({ios8})");
+  var far9: int64 = setup(&p, 3);
+  var st2: AlphStats;
+  alph_node_stats(&g_node, &st2);
+  syscall(3, far9);
+  thread_sleep_ms(50);
+  var st3: AlphStats;
+  alph_node_stats(&g_node, &st3);
+  expect(st3.io_hup_rearms - st2.io_hup_rearms > 100,
+         "one arming again after a close spins, and io_hup_rearms shows it ({st3.io_hup_rearms - st2.io_hup_rearms})");
 
   alph_node_halt(&g_node, 0);
   alph_node_wait(&g_node);
