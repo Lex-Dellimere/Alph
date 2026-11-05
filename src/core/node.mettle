@@ -130,6 +130,9 @@ const ALPH_MSG_REPLY: int64 = 2;    // answers the request with the same ref
 
 // Messages handled before the scheduler moves on to another actor.
 const ALPH_BUDGET: int64 = 64;
+// alph_outq_send writes before the end of the run once this much is held.
+export const ALPH_OUTQ_HOLD_BYTES: int64 = 16384;
+export const ALPH_OUTQ_HOLD_SENDS: int64 = 32;
 const ALPH_SHED_IDLE: int64 = 0;
 const ALPH_SHED_ARMING: int64 = 1;
 const ALPH_SHED_DROPPING: int64 = 2;
@@ -389,6 +392,7 @@ struct AlphProc {
   drain_lock: int64;      // held while a late signal queue is drained, and at reuse
   deferred: AlphVec;      // exits and downs waiting for earlier messages
   io_handles: AlphVec;    // handles this actor owns, closed when it exits
+  flushq: AlphVec;        // AlphOutq* with alph_outq_send bytes to write when this run ends
   names: AlphVec;         // entries of the names registered to this actor
   groups: AlphVec;        // groups this actor joined (AlphEntry*)
   medic: int64;           // pid of the medic watching this actor, or 0
@@ -1861,6 +1865,7 @@ fn alph_spawn_raw(node: AlphNode*, parent: int64, flags: int64, monitor_ref: int
   p->ref_timers.len = 0;
   p->deferred.len = 0;
   p->io_handles.len = 0;
+  p->flushq.len = 0;
   p->names.len = 0;
   p->groups.len = 0;
   p->medic = 0;
@@ -3019,6 +3024,12 @@ fn alph_run_proc(s: AlphSched*, p: AlphProc*) {
     // the actor is read back from memory.
     var crashed: AlphProc* = (AlphProc*)s->current;
     s->current = 0;
+    if (crashed->flushq.len > 0) {
+      // What it sent before the crash goes out, as a write would have.
+      var cctx: AlphCtx;
+      alph_ctx_for(s, crashed, &cctx);
+      alph_outq_write_all(&cctx, crashed, 0, true);
+    }
     alph_scratch_reset(&s->scratch, &s->pool);
     if (s->exit_request != 0) {
       // Not a crash: alph_exit_now jumped here to end the actor.
@@ -3032,6 +3043,11 @@ fn alph_run_proc(s: AlphSched*, p: AlphProc*) {
     return;
   }
   var outcome: int64 = alph_run_some(s, p);
+  if (p->flushq.len > 0) {
+    var fctx: AlphCtx;
+    alph_ctx_for(s, p, &fctx);
+    alph_outq_write_all(&fctx, p, 0, false);
+  }
   alph_recover_disarm(r);
   s->current = 0;
   if (outcome >= 0) {
@@ -3297,6 +3313,20 @@ export fn alph_io_arm(ctx: AlphCtx*, h: int64, events: int64) -> int64 {
   return 0;
 }
 
+// As alph_io_arm, but adds events to what h is armed for instead of
+// replacing it: a write that must wait keeps the owner's read armed too.
+fn alph_io_arm_also(ctx: AlphCtx*, h: int64, events: int64) -> int64 {
+  var slot: AlphIoSlot* = alph_io_mine(ctx, h);
+  if (slot == 0) {
+    return -9;
+  }
+  if (slot->oneshot != 0) {
+    return alph_io_arm(ctx, h, slot->armed | events);
+  }
+  var armed: int64 = (alph_atomic_load(&slot->state) >> 8) & (ALPH_IO_IN | ALPH_IO_OUT);
+  return alph_io_arm(ctx, h, armed | events);
+}
+
 // Reads up to size bytes from handle h into buf, without blocking.
 // Returns the count, 0 at end of stream (the peer closed), ALPH_IO_AGAIN
 // when nothing is there yet (arm ALPH_IO_IN and try again), or a negative
@@ -3342,6 +3372,9 @@ export fn alph_io_close(ctx: AlphCtx*, h: int64) {
     return;
   }
   var p: AlphProc* = alph_me(ctx);
+  if (p->flushq.len > 0) {
+    alph_outq_write_all(ctx, p, h, false);  // what was sent goes out before the close
+  }
   var at: int64 = alph_vec_find(&p->io_handles, h);
   if (at >= 0) {
     alph_vec_remove_at(&p->io_handles, at);
@@ -3381,6 +3414,9 @@ export fn alph_io_give(ctx: AlphCtx*, h: int64, to: int64) -> int64 {
     return ALPH_GONE;
   }
   var p: AlphProc* = alph_me(ctx);
+  if (p->flushq.len > 0) {
+    alph_outq_write_all(ctx, p, h, false);  // what was sent goes out before the hand-off
+  }
   var at: int64 = alph_vec_find(&p->io_handles, h);
   if (at >= 0) {
     alph_vec_remove_at(&p->io_handles, at);
@@ -3570,6 +3606,9 @@ export struct AlphOutq {
   sent: int64;   // bytes of data already written
   cap: int64;
   limit: int64;
+  h: int64;      // alph_outq_send: the handle it writes to at the end of the run
+  held: int64;   //   sends since the last write
+  listed: int64; //   1 while on its actor's list to write at the end of the run
 }
 
 // Starts q empty, holding at most limit bytes. Thread: any.
@@ -3579,6 +3618,95 @@ export fn alph_outq_init(q: AlphOutq*, limit: int64) {
   q->sent = 0;
   q->cap = 0;
   q->limit = limit;
+  q->h = 0;
+  q->held = 0;
+  q->listed = 0;
+}
+
+// Queues size bytes at data on q for handle h, and writes them when this
+// run of the actor ends, together with everything else sent through q
+// meanwhile: many answers to one connection go out in one write, as Go's
+// buffered writers and the BEAM's iolists do. It writes early once
+// ALPH_OUTQ_HOLD_BYTES or ALPH_OUTQ_HOLD_SENDS are held, and before h is
+// closed or given away; when the handler crashes or the actor exits, what
+// it queued is still written. Use alph_outq_push and alph_outq_flush to
+// write at once instead. Returns ALPH_SENT, ALPH_FULL (nothing queued) or
+// ALPH_NOMEM, or a negative errno from an early write.
+// Thread: the handler of the actor whose state holds q.
+export fn alph_outq_send(ctx: AlphCtx*, q: AlphOutq*, h: int64, data: rawptr, size: int64) -> int64 {
+  var r: int64 = alph_outq_push(ctx, q, data, size);
+  if (r != ALPH_SENT) {
+    return r;
+  }
+  q->held = q->held + 1;
+  if (q->listed == 0 || q->h != h) {
+    if (q->listed != 0 && q->h != h) {
+      alph_outq_write_held(ctx, q);
+    }
+    q->h = h;
+    if (q->listed == 0) {
+      q->listed = 1;
+      alph_vec_push(&alph_me(ctx)->flushq, (int64)q);
+    }
+  }
+  if (alph_outq_pending(q) >= ALPH_OUTQ_HOLD_BYTES || q->held >= ALPH_OUTQ_HOLD_SENDS) {
+    var w: int64 = alph_outq_write_held(ctx, q);
+    if (w < 0) {
+      return w;
+    }
+  }
+  return ALPH_SENT;
+}
+
+// Writes what q holds now (staying listed); a negative errno on failure.
+fn alph_outq_write_held(ctx: AlphCtx*, q: AlphOutq*) -> int64 {
+  q->held = 0;
+  if (q->h == 0 || alph_outq_pending(q) == 0) {
+    return 0;
+  }
+  var w: int64 = alph_outq_flush(ctx, q, q->h);
+  if (w < 0) {
+    return w;
+  }
+  return 0;
+}
+
+// Writes what every alph_outq_send queue of p holds, at the end of a run or
+// when only those for handle h (h above 0) are due: before h closes or
+// moves. checked: after a crash, a queue is written only if it still looks
+// whole (inside the actor's state, its counters in order).
+fn alph_outq_write_all(ctx: AlphCtx*, p: AlphProc*, h: int64, checked: bool) {
+  var i: int64 = 0;
+  while (i < p->flushq.len) {
+    var q: AlphOutq* = (AlphOutq*)alph_vec_get(&p->flushq, i);
+    if (h > 0 && q->h != h) {
+      i = i + 1;
+      continue;
+    }
+    var ok: bool = true;
+    if (checked) {
+      var lo: int64 = (int64)p->state;
+      ok = (int64)q >= lo && (int64)q + (int64)sizeof(AlphOutq) <= lo + p->state_size &&
+           q->sent >= 0 && q->sent <= q->len && q->len <= q->cap;
+    }
+    if (ok) {
+      alph_outq_write_held(ctx, q);
+      q->listed = 0;
+    }
+    alph_vec_remove_at(&p->flushq, i);
+  }
+}
+
+// The handler context alph_deliver gives p, for runtime work done in its
+// name between messages.
+fn alph_ctx_for(s: AlphSched*, p: AlphProc*, ctx: AlphCtx*) {
+  ctx->self = p->pid;
+  ctx->state = (rawptr)p->state;
+  ctx->state_size = p->state_size;
+  ctx->node = (AlphNode*)s->node;
+  ctx->proc = (int64)p;
+  ctx->sched = (int64)s;
+  ctx->stop_reason = ALPH_NORMAL;
 }
 
 // Bytes waiting in q. Thread: any.
@@ -3629,7 +3757,7 @@ export fn alph_outq_flush(ctx: AlphCtx*, q: AlphOutq*, h: int64) -> int64 {
   while (alph_outq_pending(q) > 0) {
     var n: int64 = alph_io_write(ctx, h, (rawptr)((int64)q->data + q->sent), alph_outq_pending(q));
     if (n == ALPH_IO_AGAIN) {
-      alph_io_arm(ctx, h, ALPH_IO_OUT);
+      alph_io_arm_also(ctx, h, ALPH_IO_OUT);
       return alph_outq_pending(q);
     }
     if (n < 0) {

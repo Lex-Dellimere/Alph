@@ -632,6 +632,13 @@ export const ALPH_BOUND: int64 = 4;    // the new actor gets a thread of its own
 export const ALPH_PROXY: int64 = 8;
 ```
 
+alph_outq_send writes before the end of the run once this much is held.
+
+```mettle
+export const ALPH_OUTQ_HOLD_BYTES: int64 = 16384;
+export const ALPH_OUTQ_HOLD_SENDS: int64 = 32;
+```
+
 Registry kinds, for alph_node_reg_new.
 
 ```mettle
@@ -1815,6 +1822,9 @@ export struct AlphOutq {
   sent: int64;   // bytes of data already written
   cap: int64;
   limit: int64;
+  h: int64;      // alph_outq_send: the handle it writes to at the end of the run
+  held: int64;   //   sends since the last write
+  listed: int64; //   1 while on its actor's list to write at the end of the run
 }
 ```
 
@@ -1835,6 +1845,23 @@ export fn alph_outq_init(q: AlphOutq*, limit: int64)
 ```
 
 Starts q empty, holding at most limit bytes. Thread: any.
+
+### `alph_outq_send`
+
+```mettle
+export fn alph_outq_send(ctx: AlphCtx*, q: AlphOutq*, h: int64, data: rawptr, size: int64) -> int64
+```
+
+Queues size bytes at data on q for handle h, and writes them when this
+run of the actor ends, together with everything else sent through q
+meanwhile: many answers to one connection go out in one write, as Go's
+buffered writers and the BEAM's iolists do. It writes early once
+ALPH_OUTQ_HOLD_BYTES or ALPH_OUTQ_HOLD_SENDS are held, and before h is
+closed or given away; when the handler crashes or the actor exits, what
+it queued is still written. Use alph_outq_push and alph_outq_flush to
+write at once instead. Returns ALPH_SENT, ALPH_FULL (nothing queued) or
+ALPH_NOMEM, or a negative errno from an early write.
+Thread: the handler of the actor whose state holds q.
 
 ### `alph_outq_pending`
 

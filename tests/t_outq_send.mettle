@@ -1,0 +1,244 @@
+// alph_outq_send: answers queued for a handle go out together when the
+// actor's run ends. Each case writes to one end of a socket pair and the
+// test reads the other end. Checks, in order:
+//   1. 20 sends in one handler reach the peer, in order, with fewer write
+//      system calls than sends (the process's write count, /proc/self/io)
+//   2. 40 sends in one handler: early writes at ALPH_OUTQ_HOLD_SENDS, all 40
+//      arrive
+//   3. sends then alph_io_close in one handler: the peer reads every byte,
+//      then the end of the stream
+//   4. sends then a crash in the same handler: what was sent still arrives
+//   5. sends then alph_io_give to another actor: the bytes arrive before the
+//      new owner's
+
+import "std/io";
+import "std/thread";
+import "alph/sys/atomic";
+import "alph/alph";
+
+const GO: int64 = ALPH_TAG_USER;
+const FRAME: int64 = 16;
+
+var g_node: AlphNode;
+var g_failures: int64 = 0;
+var g_done: int64 = 0;
+var g_taker: int64 = 0;
+
+fn expect(ok: bool, what: string) {
+  if (!ok) {
+    println("FAIL {what}");
+    alph_atomic_add(&g_failures, 1);
+  }
+}
+
+struct Writer {
+  fd: int64;
+  h: int64;
+  q: AlphOutq;
+}
+
+// What each case does on GO; arg = how many frames, mode in the state.
+var g_mode: int64 = 0;   // 0 plain, 1 then close, 2 then crash, 3 then give
+
+fn crash() {
+  var p: int64* = (int64*)0;
+  *p = 1;
+}
+
+fn writer(ctx: AlphCtx*, m: AlphMsg*) -> int64 {
+  var w: Writer* = (Writer*)ctx->state;
+  if (m->tag == ALPH_TAG_INIT) {
+    alph_outq_init(&w->q, 1048576);
+    w->h = alph_io_open(ctx, w->fd);
+  } else if (m->tag == GO) {
+    for i: int64 in 0..m->arg {
+      var frame: int64[2];
+      frame[0] = i;
+      frame[1] = 7;
+      alph_outq_send(ctx, &w->q, w->h, (rawptr)&frame[0], FRAME);
+    }
+    if (g_mode == 1) {
+      alph_io_close(ctx, w->h);
+    } else if (g_mode == 2) {
+      alph_atomic_store(&g_done, 1);
+      crash();
+    } else if (g_mode == 3) {
+      alph_io_give(ctx, w->h, g_taker);
+    }
+    alph_atomic_store(&g_done, 1);
+  }
+  return ALPH_CONTINUE;
+}
+
+// Gets the handle and writes one marker frame (id -1) of its own.
+fn taker(ctx: AlphCtx*, m: AlphMsg*) -> int64 {
+  if (m->tag == ALPH_TAG_IO_GIVEN) {
+    var frame: int64[2];
+    frame[0] = -1;
+    frame[1] = 7;
+    alph_io_write(ctx, m->ref, (rawptr)&frame[0], FRAME);
+  }
+  return ALPH_CONTINUE;
+}
+
+fn syscw() -> int64 {
+  var buf: uint8[512];
+  var fd: int64 = syscall(2, (int64)"/proc/self/io\0".chars, 0, 0);
+  var n: int64 = syscall(0, fd, (int64)&buf[0], 511);
+  syscall(3, fd);
+  // the line "syscw: N"
+  var i: int64 = 0;
+  while (i + 6 < n) {
+    if (buf[i] == 115 && buf[i + 1] == 121 && buf[i + 2] == 115 && buf[i + 3] == 99 && buf[i + 4] == 119) {
+      var v: int64 = 0;
+      var j: int64 = i + 7;
+      while (j < n && buf[j] >= 48 && buf[j] <= 57) {
+        v = v * 10 + ((int64)buf[j] - 48);
+        j = j + 1;
+      }
+      return v;
+    }
+    i = i + 1;
+  }
+  return -1;
+}
+
+// Reads frames from fd until want arrived, the stream ended, or 2 s passed.
+// Returns the frames read; *eof is set at the end of the stream; *order is
+// false when ids came out of order (marker frames, id -1, excepted).
+fn read_frames(fd: int64, want: int64, eof: bool*, order: bool*, last_marker: bool*) -> int64 {
+  var buf: uint8[4096];
+  var have: int64 = 0;
+  var bytes: int64 = 0;
+  var next: int64 = 0;
+  *eof = false;
+  *order = true;
+  *last_marker = false;
+  var tries: int64 = 0;
+  while (tries < 2000) {
+    var n: int64 = syscall(0, fd, (int64)&buf[bytes % FRAME], 4096 - FRAME);
+    if (n == 0) {
+      *eof = true;
+      return have;
+    }
+    if (n < 0) {
+      if (have >= want) {
+        return have;
+      }
+      thread_sleep_ms(1);
+      tries = tries + 1;
+      continue;
+    }
+    var at: int64 = 0;
+    var total: int64 = (bytes % FRAME) + n;
+    while (total - at >= FRAME) {
+      var id: int64 = *(int64*)&buf[at];
+      if (id == -1) {
+        *last_marker = true;
+      } else {
+        if (id != next || *last_marker) {
+          *order = false;
+        }
+        next = next + 1;
+      }
+      have = have + 1;
+      at = at + FRAME;
+    }
+    bytes = bytes + n;
+  }
+  return have;
+}
+
+fn pair(fds: int32*) {
+  fds[0] = -1;
+  fds[1] = -1;
+  syscall(53, 1, 1, 0, (int64)fds);           // socketpair(AF_UNIX, SOCK_STREAM)
+  syscall(72, (int64)fds[1], 4, 2048);         // fcntl(F_SETFL, O_NONBLOCK) on the test's end
+}
+
+fn start(fds: int32*) -> int64 {
+  var w: Writer;
+  w.fd = (int64)fds[0];
+  w.h = 0;
+  var pid: int64 = alph_node_spawn_value<Writer>(&g_node, 0, &w, &writer);
+  thread_sleep_ms(10);
+  return pid;
+}
+
+fn go(pid: int64, frames: int64) {
+  alph_atomic_store(&g_done, 0);
+  alph_node_send(&g_node, pid, GO, frames);
+  for i: int64 in 0..2000 {
+    if (alph_atomic_load(&g_done) != 0) {
+      break;
+    }
+    thread_sleep_ms(1);
+  }
+}
+
+fn main() -> int32 {
+  var cfg: AlphConfig;
+  alph_config(&cfg);
+  cfg.schedulers = 2;
+  cfg.max_actors = 64;
+  expect(alph_node_start(&g_node, &cfg), "node started");
+  var fds: int32[2];
+  var eof: bool = false;
+  var order: bool = true;
+  var marker: bool = false;
+
+  // 1
+  pair(&fds[0]);
+  var w1: int64 = start(&fds[0]);
+  g_mode = 0;
+  var c0: int64 = syscw();
+  go(w1, 20);
+  thread_sleep_ms(20);
+  var c1: int64 = syscw();
+  var got: int64 = read_frames((int64)fds[1], 20, &eof, &order, &marker);
+  expect(got == 20 && order, "20 sends arrived in order ({got})");
+  expect(c1 - c0 < 10, "20 sends took fewer writes ({c1 - c0} write calls in the process)");
+
+  // 2
+  go(w1, 40);
+  got = read_frames((int64)fds[1], 40, &eof, &order, &marker);
+  expect(got == 40 && order, "40 sends arrived in order ({got})");
+
+  // 3
+  pair(&fds[0]);
+  var w3: int64 = start(&fds[0]);
+  g_mode = 1;
+  go(w3, 10);
+  got = read_frames((int64)fds[1], 10, &eof, &order, &marker);
+  expect(got == 10 && order, "sends before a close arrived ({got})");
+  thread_sleep_ms(10);
+  got = read_frames((int64)fds[1], 0, &eof, &order, &marker);
+  expect(eof, "then the stream ended");
+
+  // 4
+  pair(&fds[0]);
+  var w4: int64 = start(&fds[0]);
+  g_mode = 2;
+  go(w4, 5);
+  thread_sleep_ms(20);
+  got = read_frames((int64)fds[1], 5, &eof, &order, &marker);
+  expect(got == 5 && order, "sends before a crash arrived ({got})");
+
+  // 5
+  pair(&fds[0]);
+  g_taker = alph_node_spawn(&g_node, 0, &taker);
+  var w5: int64 = start(&fds[0]);
+  g_mode = 3;
+  go(w5, 8);
+  thread_sleep_ms(20);
+  got = read_frames((int64)fds[1], 9, &eof, &order, &marker);
+  expect(got == 9 && order && marker, "sends before a hand-off arrived first, then the new owner's ({got})");
+
+  alph_node_halt(&g_node, 0);
+  alph_node_wait(&g_node);
+  if (g_failures != 0) {
+    return 1;
+  }
+  println("outq send ok: 20 sends in {c1 - c0} write calls");
+  return 0;
+}
