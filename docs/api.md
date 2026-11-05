@@ -718,6 +718,7 @@ export struct AlphStats {
   io_hup_rearms: int64;
   stolen: int64;
   moves_held: int64;
+  timers_heaped: int64;
 }
 ```
 
@@ -747,6 +748,8 @@ moves_held  optional moves (rehome, isolate) not made because the actor
 io_hup_rearms  arms answered at once with only a hang-up or error that
          was already reported: an owner arming again without closing
          the handle, which spins
+timers_heaped  timers no lane took, as all 8 on their scheduler held
+         timers of other spans: they went to the slower timer heap
 ```
 
 ### `AlphNode`

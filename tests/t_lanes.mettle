@@ -1,0 +1,505 @@
+// Timer lanes: timers of one span fall due in start order from a FIFO per
+// span, a ninth span goes to the heap, and stopped timers leave no trace.
+// Part A runs on one scheduler, so the timing is deterministic; part B on
+// four. Checks, in order:
+//   A1. 300 requests (timeout 40 ms) to a server that never answers, sent in
+//       one handler: exactly 300 TIMEOUTs, in ref order, the first no earlier
+//       than 40 ms after the sends began, the last within 100 ms more
+//   A2. 1000 requests (timeout 30 ms) to a server that answers at once:
+//       1000 answers and no TIMEOUT
+//   A3. 12 timers of 12 distinct spans started in one handler (more than the
+//       8 lanes, so some go to the heap), then the handler sleeps until all
+//       are due: they arrive in deadline order across lanes and heap; the
+//       two lanes A1 and A2 left empty are claimed again, so exactly 4 go
+//       to the heap (stats: timers_heaped), and none before
+//   A4. a timer cancelled at once, and one cancelled while due and the
+//       scheduler busy, never arrive; an uncancelled control timer does
+//   A5. all 8 lanes claimed by spans of 500 ms and cancelled, then a timer of
+//       a new 11 ms span: it arrives after 11 ms, not after the old
+//       deadlines; the same again once the stopped timers have been popped
+//       and the lanes are empty (a new 13 ms span)
+//   A6. a request sent after a handler that slept 100 ms times out 20 ms
+//       after it was sent, not at once
+//   A7. an actor that exits with 500 requests and 50 timers pending, and its
+//       slot reused by new actors: the new actors get none of the old
+//       timeouts or timers, and the node still answers requests
+//   B.  8 clients send 2000 requests each (timeout 100 ms) over 4 servers on 4
+//       schedulers, each server ignoring every 7th request: per client,
+//       answers + TIMEOUTs == 2000 exactly, and the TIMEOUTs in all equal the
+//       requests the servers ignored
+
+import "std/io";
+import "std/thread";
+import "alph/sys/atomic";
+import "alph/sys/clock";
+import "alph/alph";
+
+const REQ: int64 = ALPH_TAG_USER;
+const ANS: int64 = ALPH_TAG_USER + 1;
+const GO: int64 = ALPH_TAG_USER + 2;
+const TICK: int64 = ALPH_TAG_USER + 3;
+const CTRL: int64 = ALPH_TAG_USER + 4;
+const VICTIM: int64 = ALPH_TAG_USER + 5;
+const MS: int64 = 1000000;
+
+var g_node: AlphNode;
+var g_failures: int64 = 0;
+var g_mute: int64 = 0;
+var g_echo: int64 = 0;
+
+// A1
+var g_a1_t0: int64 = 0;
+var g_a1_n: int64 = 0;
+var g_a1_prev: int64 = 0;
+var g_a1_disorder: int64 = 0;
+var g_a1_first: int64 = 0;
+var g_a1_last: int64 = 0;
+var g_a1_sent: int64 = 0;
+// A2
+var g_answers: int64 = 0;
+var g_timeouts: int64 = 0;
+// A3
+var g_a3_n: int64 = 0;
+var g_a3_args: int64[16];
+// A4
+var g_victims: int64 = 0;
+var g_ctrls: int64 = 0;
+// A5
+var g_a5_t0: int64 = 0;
+var g_a5_at: int64 = 0;
+var g_a5_got: int64 = 0;
+// A6
+var g_a6_ts: int64 = 0;
+var g_a6_at: int64 = 0;
+var g_a6_got: int64 = 0;
+// A7
+var g_a7_done: int64 = 0;
+var g_stray: int64 = 0;
+// B
+var g_srv: int64[4];
+var g_c_ans: int64[8];
+var g_c_to: int64[8];
+var g_c_fail: int64[8];
+var g_s_ign: int64[4];
+
+fn expect(ok: bool, what: string) {
+  if (!ok) {
+    println("FAIL {what}");
+    alph_atomic_add(&g_failures, 1);
+  }
+}
+
+fn wait_for(v: int64*, want: int64, ms: int64) {
+  for i: int64 in 0..ms {
+    if (alph_atomic_load(v) >= want) {
+      return;
+    }
+    thread_sleep_ms(1);
+  }
+}
+
+// ---- part A actors ----------------------------------------------------------
+
+fn mute(ctx: AlphCtx*, m: AlphMsg*) -> int64 {
+  return ALPH_CONTINUE;
+}
+
+fn echo(ctx: AlphCtx*, m: AlphMsg*) -> int64 {
+  if (m->tag == REQ) {
+    alph_reply(ctx, m, ANS, m->arg);
+  }
+  return ALPH_CONTINUE;
+}
+
+// A1
+fn a1_client(ctx: AlphCtx*, m: AlphMsg*) -> int64 {
+  if (m->tag == GO) {
+    alph_atomic_store(&g_a1_t0, alph_now_ns());
+    for i: int64 in 0..300 {
+      if (alph_request(ctx, g_mute, REQ, i, 40) > 0) {
+        alph_atomic_add(&g_a1_sent, 1);
+      }
+    }
+  } else if (m->tag == ALPH_TAG_TIMEOUT) {
+    var now: int64 = alph_now_ns();
+    var n: int64 = alph_atomic_load(&g_a1_n);
+    if (n == 0) {
+      alph_atomic_store(&g_a1_first, now);
+    } else if (m->ref <= alph_atomic_load(&g_a1_prev)) {
+      alph_atomic_add(&g_a1_disorder, 1);
+    }
+    alph_atomic_store(&g_a1_prev, m->ref);
+    alph_atomic_store(&g_a1_last, now);
+    alph_atomic_store(&g_a1_n, n + 1);
+  }
+  return ALPH_CONTINUE;
+}
+
+// A2, and the check after A7: GO sends arg requests to the echo server
+fn a2_client(ctx: AlphCtx*, m: AlphMsg*) -> int64 {
+  if (m->tag == GO) {
+    for i: int64 in 0..m->arg {
+      alph_request(ctx, g_echo, REQ, i, 30);
+    }
+  } else if (m->tag == ANS) {
+    alph_atomic_add(&g_answers, 1);
+  } else if (m->tag == ALPH_TAG_TIMEOUT) {
+    alph_atomic_add(&g_timeouts, 1);
+  }
+  return ALPH_CONTINUE;
+}
+
+// A3
+fn a3_actor(ctx: AlphCtx*, m: AlphMsg*) -> int64 {
+  if (m->tag == GO) {
+    var spans: int64[12];
+    spans[0] = 26;
+    spans[1] = 14;
+    spans[2] = 31;
+    spans[3] = 9;
+    spans[4] = 22;
+    spans[5] = 17;
+    spans[6] = 35;
+    spans[7] = 12;
+    spans[8] = 28;
+    spans[9] = 19;
+    spans[10] = 33;
+    spans[11] = 24;
+    for i: int64 in 0..12 {
+      alph_start_timer(ctx, spans[i], TICK, spans[i]);
+    }
+    thread_sleep_ms(60);
+  } else if (m->tag == TICK) {
+    var n: int64 = alph_atomic_load(&g_a3_n);
+    if (n < 16) {
+      alph_atomic_store(&g_a3_args[n], m->arg);
+    }
+    alph_atomic_store(&g_a3_n, n + 1);
+  }
+  return ALPH_CONTINUE;
+}
+
+// A4: GO 1 starts a timer and cancels it at once; GO 2 lets one fall due
+// while the handler sleeps, then cancels it. Both start a control.
+fn a4_actor(ctx: AlphCtx*, m: AlphMsg*) -> int64 {
+  if (m->tag == GO) {
+    if (m->arg == 1) {
+      var t: int64 = alph_start_timer(ctx, 20, VICTIM, 1);
+      alph_cancel_timer(ctx, t);
+      alph_start_timer(ctx, 15, CTRL, 1);
+    } else {
+      var t: int64 = alph_start_timer(ctx, 10, VICTIM, 2);
+      alph_start_timer(ctx, 15, CTRL, 2);
+      thread_sleep_ms(30);
+      alph_cancel_timer(ctx, t);
+    }
+  } else if (m->tag == VICTIM) {
+    alph_atomic_add(&g_victims, 1);
+  } else if (m->tag == CTRL) {
+    alph_atomic_add(&g_ctrls, 1);
+  }
+  return ALPH_CONTINUE;
+}
+
+// A5: GO 1 claims every lane with a 500 ms span and cancels all; GO 2 and
+// GO 3 start one timer of a new span each (arg = ms) and time it.
+fn a5_actor(ctx: AlphCtx*, m: AlphMsg*) -> int64 {
+  if (m->tag == GO) {
+    if (m->arg == 1) {
+      var refs: int64[8];
+      for i: int64 in 0..8 {
+        refs[i] = alph_start_timer(ctx, 500 + i, TICK, 0);
+      }
+      for i: int64 in 0..8 {
+        alph_cancel_timer(ctx, refs[i]);
+      }
+    } else {
+      alph_atomic_store(&g_a5_t0, alph_now_ns());
+      alph_start_timer(ctx, m->arg, TICK, m->arg);
+    }
+  } else if (m->tag == TICK) {
+    alph_atomic_store(&g_a5_at, alph_now_ns());
+    alph_atomic_store(&g_a5_got, 1);
+  }
+  return ALPH_CONTINUE;
+}
+
+// A6
+fn a6_actor(ctx: AlphCtx*, m: AlphMsg*) -> int64 {
+  if (m->tag == GO) {
+    thread_sleep_ms(100);
+    alph_atomic_store(&g_a6_ts, alph_now_ns());
+    alph_request(ctx, g_mute, REQ, 0, 20);
+  } else if (m->tag == ALPH_TAG_TIMEOUT) {
+    alph_atomic_store(&g_a6_at, alph_now_ns());
+    alph_atomic_store(&g_a6_got, 1);
+  }
+  return ALPH_CONTINUE;
+}
+
+// A7
+fn a7_exiter(ctx: AlphCtx*, m: AlphMsg*) -> int64 {
+  if (m->tag == GO) {
+    for i: int64 in 0..500 {
+      alph_request(ctx, g_mute, REQ, i, 30);
+    }
+    for i: int64 in 0..50 {
+      alph_start_timer(ctx, 30, TICK, i);
+    }
+    alph_atomic_store(&g_a7_done, 1);
+    return alph_stop(ctx, ALPH_NORMAL);
+  }
+  return ALPH_CONTINUE;
+}
+
+fn a7_probe(ctx: AlphCtx*, m: AlphMsg*) -> int64 {
+  if (m->tag != ALPH_TAG_INIT) {
+    alph_atomic_add(&g_stray, 1);
+  }
+  return ALPH_CONTINUE;
+}
+
+// ---- part B actors ----------------------------------------------------------
+
+struct BServer {
+  idx: int64;
+  seen: int64;
+}
+
+struct BClient {
+  idx: int64;
+  sent: int64;
+}
+
+fn b_server(ctx: AlphCtx*, m: AlphMsg*) -> int64 {
+  if (m->tag == REQ) {
+    var s: BServer* = (BServer*)ctx->state;
+    s->seen = s->seen + 1;
+    if (s->seen % 7 == 0) {
+      alph_atomic_add(&g_s_ign[s->idx], 1);
+    } else {
+      alph_reply(ctx, m, ANS, m->arg);
+    }
+  }
+  return ALPH_CONTINUE;
+}
+
+fn b_client(ctx: AlphCtx*, m: AlphMsg*) -> int64 {
+  var c: BClient* = (BClient*)ctx->state;
+  if (m->tag == GO) {
+    for i: int64 in 0..50 {
+      var to: int64 = alph_atomic_load(&g_srv[(c->idx + c->sent) % 4]);
+      if (alph_request(ctx, to, REQ, c->sent, 100) <= 0) {
+        alph_atomic_add(&g_c_fail[c->idx], 1);
+      }
+      c->sent = c->sent + 1;
+    }
+    if (c->sent < 2000) {
+      alph_send(ctx, ctx->self, GO, 0);
+    }
+  } else if (m->tag == ANS) {
+    alph_atomic_add(&g_c_ans[c->idx], 1);
+  } else if (m->tag == ALPH_TAG_TIMEOUT) {
+    alph_atomic_add(&g_c_to[c->idx], 1);
+  }
+  return ALPH_CONTINUE;
+}
+
+fn b_settled(want: int64) -> bool {
+  for c: int64 in 0..8 {
+    if (alph_atomic_load(&g_c_ans[c]) + alph_atomic_load(&g_c_to[c]) != want) {
+      return false;
+    }
+  }
+  return true;
+}
+
+fn config(schedulers: int64, max_actors: int64) -> AlphConfig {
+  var cfg: AlphConfig;
+  alph_config(&cfg);
+  cfg.schedulers = schedulers;
+  cfg.max_actors = max_actors;
+  cfg.mailbox_size = 4096;
+  return cfg;
+}
+
+fn main() -> int32 {
+  // ---- part A: one scheduler
+  var cfg: AlphConfig = config(1, 16);
+  expect(alph_node_start(&g_node, &cfg), "node started");
+  g_mute = alph_node_spawn(&g_node, 0, &mute);
+  g_echo = alph_node_spawn(&g_node, 0, &echo);
+  var a1: int64 = alph_node_spawn(&g_node, 0, &a1_client);
+  var a2: int64 = alph_node_spawn(&g_node, 0, &a2_client);
+  var a3: int64 = alph_node_spawn(&g_node, 0, &a3_actor);
+  var a4: int64 = alph_node_spawn(&g_node, 0, &a4_actor);
+  var a5: int64 = alph_node_spawn(&g_node, 0, &a5_actor);
+  var a6: int64 = alph_node_spawn(&g_node, 0, &a6_actor);
+  expect(g_mute != 0 && g_echo != 0 && a1 != 0 && a2 != 0 && a3 != 0 && a4 != 0 && a5 != 0 && a6 != 0, "actors spawned");
+  thread_sleep_ms(10);
+
+  // A1
+  alph_node_send(&g_node, a1, GO, 0);
+  wait_for(&g_a1_n, 300, 3000);
+  thread_sleep_ms(50);
+  var n1: int64 = alph_atomic_load(&g_a1_n);
+  var first_us: int64 = (g_a1_first - g_a1_t0) / 1000;
+  var last_us: int64 = (g_a1_last - g_a1_t0) / 1000;
+  expect(alph_atomic_load(&g_a1_sent) == 300, "A1: all 300 requests sent ({g_a1_sent})");
+  expect(n1 == 300, "A1: exactly 300 TIMEOUTs ({n1})");
+  expect(alph_atomic_load(&g_a1_disorder) == 0, "A1: TIMEOUTs in ref order ({g_a1_disorder} out of order)");
+  expect(g_a1_first >= g_a1_t0 + 40 * MS, "A1: the first TIMEOUT no earlier than 40 ms ({first_us} us)");
+  expect(g_a1_last <= g_a1_t0 + 140 * MS, "A1: the last TIMEOUT within 100 ms more ({last_us} us)");
+
+  // A2
+  for b: int64 in 0..10 {
+    alph_node_send(&g_node, a2, GO, 100);
+  }
+  wait_for(&g_answers, 1000, 3000);
+  thread_sleep_ms(100);
+  var ans2: int64 = alph_atomic_load(&g_answers);
+  var to2: int64 = alph_atomic_load(&g_timeouts);
+  expect(ans2 == 1000, "A2: 1000 answers ({ans2})");
+  expect(to2 == 0, "A2: no TIMEOUT for an answered request ({to2})");
+  var st: AlphStats;
+  alph_node_stats(&g_node, &st);
+  expect(st.timers_heaped == 0, "A2: every timer so far took a lane ({st.timers_heaped} heaped)");
+
+  // A3
+  alph_node_send(&g_node, a3, GO, 0);
+  wait_for(&g_a3_n, 12, 3000);
+  thread_sleep_ms(20);
+  expect(alph_atomic_load(&g_a3_n) == 12, "A3: 12 timers arrived ({g_a3_n})");
+  var want3: int64[12];
+  want3[0] = 9;
+  want3[1] = 12;
+  want3[2] = 14;
+  want3[3] = 17;
+  want3[4] = 19;
+  want3[5] = 22;
+  want3[6] = 24;
+  want3[7] = 26;
+  want3[8] = 28;
+  want3[9] = 31;
+  want3[10] = 33;
+  want3[11] = 35;
+  for i: int64 in 0..12 {
+    var got: int64 = alph_atomic_load(&g_a3_args[i]);
+    expect(got == want3[i], "A3: timer {i} has span {got}, wanted {want3[i]}");
+  }
+  alph_node_stats(&g_node, &st);
+  expect(st.timers_heaped == 4, "A3: 4 of the 12 went to the heap ({st.timers_heaped})");
+
+  // A4
+  alph_node_send(&g_node, a4, GO, 1);
+  alph_node_send(&g_node, a4, GO, 2);
+  thread_sleep_ms(100);
+  expect(alph_atomic_load(&g_victims) == 0, "A4: cancelled timers never arrive ({g_victims})");
+  expect(alph_atomic_load(&g_ctrls) == 2, "A4: the control timers arrived ({g_ctrls})");
+
+  // A5
+  alph_atomic_store(&g_a5_got, 0);
+  alph_node_send(&g_node, a5, GO, 1);
+  alph_node_send(&g_node, a5, GO, 11);
+  wait_for(&g_a5_got, 1, 1000);
+  var late5: int64 = (g_a5_at - g_a5_t0) / 1000;
+  expect(alph_atomic_load(&g_a5_got) == 1, "A5: the 11 ms timer arrived");
+  expect(g_a5_at - g_a5_t0 >= 11 * MS, "A5: not before 11 ms ({late5} us)");
+  expect(g_a5_at - g_a5_t0 <= 80 * MS, "A5: within 80 ms, not near 500 ms ({late5} us)");
+  thread_sleep_ms(30);
+  alph_atomic_store(&g_a5_got, 0);
+  alph_node_send(&g_node, a5, GO, 13);
+  wait_for(&g_a5_got, 1, 1000);
+  var late5b: int64 = (g_a5_at - g_a5_t0) / 1000;
+  expect(alph_atomic_load(&g_a5_got) == 1, "A5: the 13 ms timer arrived");
+  expect(g_a5_at - g_a5_t0 >= 13 * MS, "A5: empty lane: not before 13 ms ({late5b} us)");
+  expect(g_a5_at - g_a5_t0 <= 80 * MS, "A5: empty lane: within 80 ms ({late5b} us)");
+
+  // A6
+  alph_node_send(&g_node, a6, GO, 0);
+  wait_for(&g_a6_got, 1, 1000);
+  var late6: int64 = (g_a6_at - g_a6_ts) / 1000;
+  expect(alph_atomic_load(&g_a6_got) == 1, "A6: the request timed out");
+  expect(g_a6_at - g_a6_ts >= 20 * MS, "A6: not before 20 ms ({late6} us)");
+  expect(g_a6_at - g_a6_ts <= 120 * MS, "A6: within 120 ms ({late6} us)");
+
+  // A7: 9 actors alive (mute, echo, a1..a6, and the exiter) of 16 slots; the
+  // 8 probes cannot all fit unless they reuse the exiter's slot.
+  var ex: int64 = alph_node_spawn(&g_node, 0, &a7_exiter);
+  expect(ex != 0, "A7: exiter spawned");
+  alph_node_send(&g_node, ex, GO, 0);
+  wait_for(&g_a7_done, 1, 1000);
+  var probes: int64 = 0;
+  for p: int64 in 0..8 {
+    var pid: int64 = 0;
+    for t: int64 in 0..200 {
+      pid = alph_node_spawn(&g_node, 0, &a7_probe);
+      if (pid != 0) {
+        break;
+      }
+      thread_sleep_ms(1);
+    }
+    if (pid != 0) {
+      probes = probes + 1;
+    }
+  }
+  expect(probes == 8, "A7: 8 probes spawned ({probes})");
+  thread_sleep_ms(150);
+  expect(alph_atomic_load(&g_stray) == 0, "A7: the probes got no message of the dead actor ({g_stray})");
+  var before: int64 = alph_atomic_load(&g_answers);
+  alph_node_send(&g_node, a2, GO, 20);
+  wait_for(&g_answers, before + 20, 1000);
+  expect(alph_atomic_load(&g_answers) == before + 20, "A7: the node still answers ({g_answers} of {before + 20})");
+
+  alph_node_halt(&g_node, 0);
+  alph_node_wait(&g_node);
+
+  // ---- part B: four schedulers
+  cfg = config(4, 64);
+  expect(alph_node_start(&g_node, &cfg), "second node started");
+  for s: int64 in 0..4 {
+    var st: BServer;
+    st.idx = s;
+    st.seen = 0;
+    alph_atomic_store(&g_srv[s], alph_node_spawn_value<BServer>(&g_node, 0, &st, &b_server));
+  }
+  var clients: int64[8];
+  for c: int64 in 0..8 {
+    var st: BClient;
+    st.idx = c;
+    st.sent = 0;
+    clients[c] = alph_node_spawn_value<BClient>(&g_node, 0, &st, &b_client);
+  }
+  thread_sleep_ms(10);
+  for c: int64 in 0..8 {
+    alph_node_send(&g_node, clients[c], GO, 0);
+  }
+  for i: int64 in 0..8000 {
+    if (b_settled(2000)) {
+      break;
+    }
+    thread_sleep_ms(1);
+  }
+  thread_sleep_ms(100);
+  var total_to: int64 = 0;
+  var total_ign: int64 = 0;
+  for c: int64 in 0..8 {
+    var a: int64 = alph_atomic_load(&g_c_ans[c]);
+    var t: int64 = alph_atomic_load(&g_c_to[c]);
+    total_to = total_to + t;
+    expect(a + t == 2000, "B: client {c} settled {a} answers + {t} TIMEOUTs, wanted 2000");
+    expect(alph_atomic_load(&g_c_fail[c]) == 0, "B: client {c} had requests refused ({g_c_fail[c]})");
+  }
+  for s: int64 in 0..4 {
+    total_ign = total_ign + alph_atomic_load(&g_s_ign[s]);
+  }
+  expect(total_to == total_ign, "B: TIMEOUTs {total_to} equal ignored requests {total_ign}");
+  alph_node_halt(&g_node, 0);
+  alph_node_wait(&g_node);
+
+  if (g_failures != 0) {
+    return 1;
+  }
+  println("lanes ok: A1 TIMEOUTs {first_us}..{last_us} us after the sends (due 40000), timers of 11 ms and requests of 20 ms arrived {late5} and {late6} us after start, B {total_to} of 16000 timed out");
+  return 0;
+}

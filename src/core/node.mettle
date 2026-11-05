@@ -277,6 +277,8 @@ export struct AlphConfig {
 //   io_hup_rearms  arms answered at once with only a hang-up or error that
 //            was already reported: an owner arming again without closing
 //            the handle, which spins
+//   timers_heaped  timers no lane took, as all 8 on their scheduler held
+//            timers of other spans: they went to the slower timer heap
 export struct AlphStats {
   live: int64;
   spawned: int64;
@@ -293,6 +295,7 @@ export struct AlphStats {
   io_hup_rearms: int64;
   stolen: int64;
   moves_held: int64;
+  timers_heaped: int64;
 }
 
 // A node. Declare one, start it with alph_node_start, and keep it in place
@@ -457,6 +460,28 @@ struct AlphProc {
   on_exit: fn(AlphCtx*, int64) -> int64 with alloc, syscall, asm;
 }
 
+// A timer in a lane (see alph_lane_for): what it delivers, and its state.
+struct AlphLaneTimer {
+  next: int64;   // deadline (ns)
+  to: int64;
+  from: int64;
+  ref: int64;
+  tag: int64;
+  arg: int64;
+  state: int64;  // its ref (-1 without one) while pending; 0 once cancelled or fired
+}
+
+// A FIFO of the timers of one span on one scheduler, oldest first, in
+// blocks of ALPH_LANE_BLOCK timers chained by their first word.
+struct AlphLane {
+  span: int64;     // the timeout (ns) of every timer in it; 0 while unused
+  head: int64;     // the block holding the oldest timer, or 0 before the first
+  head_at: int64;  //   and its index there
+  tail: int64;     // the block being filled
+  tail_at: int64;  //   and its next free index
+  last: int64;     // the latest deadline queued: a later timer never gets an earlier one
+}
+
 struct AlphSched {
   runq: AlphQueue;
   wake: int64;      // futex word, bumped on every push
@@ -464,8 +489,13 @@ struct AlphSched {
   index: int64;
   node: int64;
   current: int64;   // actor being run; read back from memory after a crash
-  timers: AlphVec;  // binary heap of AlphSignal, by deadline
-  pool: AlphPool;   // chunks for the heaps of actors that live here
+  timers: AlphVec;  // binary heap of AlphSignal, by deadline, for timers no lane takes
+  lanes: AlphLane[8];  // ALPH_LANES: FIFOs of timers by span
+  lanes_hi: int64;     // lanes claimed so far: only lanes[0..lanes_hi] are looked at
+  lane_count: int64;   // timers in the lanes, cancelled ones not yet popped included
+  lane_free: int64;    // blocks the lanes gave back, chained by their first word
+  heaped: int64;       // timers of 1 ms or more that found no lane (stats: timers_heaped)
+  pool: AlphPool;  // chunks for the heaps of actors that live here
   scratch: AlphScratch;  // alph_scratch memory, reset after every handler call
   thread: AlphThread;
   handle: int64;
@@ -680,9 +710,13 @@ fn alph_hold_ref(p: AlphProc*, ref: int64, pid: int64) {
   alph_vec_push(&p->ref_timers, 0);
 }
 
-// Notes that ref's timeout or timer is sig, so dropping ref kills it.
+// Notes that ref's timeout or timer is sig (from alph_timer), so dropping
+// ref kills it. The ref is nearly always the one held last.
 fn alph_hold_timer(p: AlphProc*, ref: int64, sig: int64) {
-  var at: int64 = alph_vec_find(&p->ref_ids, ref);
+  var at: int64 = p->ref_ids.len - 1;
+  if (at < 0 || alph_vec_get(&p->ref_ids, at) != ref) {
+    at = alph_vec_find(&p->ref_ids, ref);
+  }
   if (at >= 0 && at < p->ref_timers.len) {
     alph_vec_set(&p->ref_timers, at, sig);
   }
@@ -703,12 +737,26 @@ fn alph_take_ref(p: AlphProc*, ref: int64) -> int64 {
   }
   alph_vec_remove_at(&p->ref_ids, at);
   alph_vec_remove_at(&p->ref_pids, at);
-  if (timer != 0) {
-    // Still in a scheduler's timer heap, or queued to p: either way alive.
-    // Its owner frees it when due without waking anyone.
-    alph_atomic_store(&((AlphSignal*)timer)->dead, 1);
-  }
+  alph_timer_kill(timer, ref);
   return pid;
+}
+
+// Stops a timer from alph_timer, held for ref, from any thread. Firing it
+// later, or having fired it already, does nothing more.
+fn alph_timer_kill(timer: int64, ref: int64) {
+  if (timer == 0) {
+    return;
+  }
+  if ((timer & 1) != 0) {
+    // In a lane: its scheduler pops it unfired. If it fired, or its block
+    // was reused, the state holds 0 or another ref and stays.
+    var t: AlphLaneTimer* = (AlphLaneTimer*)(timer - 1);
+    alph_atomic_cas(&t->state, ref, 0);
+    return;
+  }
+  // Still in a scheduler's timer heap, or queued to p: either way alive.
+  // Its owner frees it when due without waking anyone.
+  alph_atomic_store(&((AlphSignal*)timer)->dead, 1);
 }
 
 // Frees a message's payload if it has its own allocation.
@@ -1030,8 +1078,11 @@ fn alph_sched_working(s: AlphSched*) {
   if (s->work_at == 0) {
     // Sequentially consistent, paired with the watchdog's store to
     // sysmon_idle and its look at work_at: one of the two sees the other.
-    var t: int64 = alph_now_ns();
-    s->run_hint = t;  // the run about to start begins now: no second reading
+    var t: int64 = s->run_hint;  // the timer pass's, taken just now
+    if (t == 0) {
+      t = alph_now_ns();
+      s->run_hint = t;  // the run about to start begins now: no second reading
+    }
     alph_atomic_store_sc(&s->work_at, t);
     var node: AlphNode* = (AlphNode*)s->node;
     if (alph_atomic_load(&node->sysmon_idle) != 0 && alph_atomic_cas(&node->sysmon_idle, 1, 0) == 1) {
@@ -1735,17 +1786,207 @@ fn alph_timers_pop(h: AlphVec*) -> AlphSignal* {
   return (AlphSignal*)top;
 }
 
+// ---- timer lanes ----------------------------------------------------------
+//
+// Most timers come from a few call sites, each with a constant span: a
+// request's timeout, a periodic tick. Timers of one span started on one
+// scheduler fall due in the order they were started, so each span keeps
+// them in a FIFO, its lane, whose oldest pending timer is the lane's next
+// due. Starting one appends it: no allocation, no heap. Stopping one clears
+// its state word, from any thread, and the scheduler pops stopped timers
+// off the front whenever it looks, so a lane holds about the timers still
+// pending. The scheduler's next deadline is the earliest of its lanes'
+// oldest and its heap's top. A span with no lane free, of ALPH_LANES, and
+// a timer of 0 ms or less, go to the heap.
+//
+// Lane blocks are reused and never freed while the node runs, so a stop
+// from another thread (its actor moved) never writes to freed memory; refs
+// are unique, so a stop that comes after its timer fired, and its block
+// was reused, finds another ref, or 0, and changes nothing.
+
+const ALPH_LANES: int64 = 8;         // the size of AlphSched.lanes
+const ALPH_LANE_BLOCK: int64 = 128;  // timers per lane block
+
+fn alph_lane_slot(block: int64, i: int64) -> AlphLaneTimer* {
+  return (AlphLaneTimer*)(block + 16 + i * (int64)sizeof(AlphLaneTimer));
+}
+
+// A block for a lane: one given back, or a new one. 0 when out of memory.
+fn alph_lane_block(s: AlphSched*) -> int64 {
+  var b: int64 = s->lane_free;
+  if (b != 0) {
+    s->lane_free = *(int64*)b;
+  } else {
+    b = (int64)malloc(16 + ALPH_LANE_BLOCK * (int64)sizeof(AlphLaneTimer));
+    if (b == 0) {
+      return 0;
+    }
+  }
+  *(int64*)b = 0;
+  return b;
+}
+
+// The lane's oldest pending timer, after popping stopped ones off its
+// front, or 0 when it holds none. Thread: the lane's scheduler.
+fn alph_lane_oldest(s: AlphSched*, lane: AlphLane*) -> AlphLaneTimer* {
+  while (lane->head != 0) {
+    if (lane->head_at == ALPH_LANE_BLOCK) {
+      var next: int64 = *(int64*)lane->head;
+      if (next == 0) {
+        return 0;  // empty, its one block used up: the next push chains a new one
+      }
+      *(int64*)lane->head = s->lane_free;
+      s->lane_free = lane->head;
+      lane->head = next;
+      lane->head_at = 0;
+      continue;
+    }
+    if (lane->head == lane->tail && lane->head_at == lane->tail_at) {
+      return 0;
+    }
+    var t: AlphLaneTimer* = alph_lane_slot(lane->head, lane->head_at);
+    if (alph_atomic_load(&t->state) != 0) {
+      return t;
+    }
+    lane->head_at = lane->head_at + 1;
+    s->lane_count = s->lane_count - 1;
+  }
+  return 0;
+}
+
+// The lane for timers of span ns on s: the one that has it, else one
+// unused or empty, claimed for it. 0 when all ALPH_LANES hold other spans.
+// Thread: s's.
+fn alph_lane_for(s: AlphSched*, span: int64) -> AlphLane* {
+  for i: int64 in 0..s->lanes_hi {
+    if (s->lanes[i].span == span) {
+      return &s->lanes[i];
+    }
+  }
+  var lane: AlphLane* = 0;
+  if (s->lanes_hi < ALPH_LANES) {
+    lane = &s->lanes[s->lanes_hi];
+    s->lanes_hi = s->lanes_hi + 1;
+  } else {
+    for i: int64 in 0..ALPH_LANES {
+      if (alph_lane_oldest(s, &s->lanes[i]) == 0) {
+        lane = &s->lanes[i];
+        break;
+      }
+    }
+    if (lane == 0) {
+      return 0;
+    }
+  }
+  lane->span = span;
+  lane->last = 0;  // nothing is queued: no order to keep with the old span's
+  return lane;
+}
+
+// Appends a timer due at deadline, or at the lane's last if that is later,
+// so the lane stays in order: late by at most a clock step, never early.
+// Returns it with only next set, or 0 when out of memory.
+fn alph_lane_push(s: AlphSched*, lane: AlphLane*, deadline: int64) -> AlphLaneTimer* {
+  if (lane->tail == 0 || lane->tail_at == ALPH_LANE_BLOCK) {
+    var b: int64 = alph_lane_block(s);
+    if (b == 0) {
+      return 0;
+    }
+    if (lane->tail == 0) {
+      lane->head = b;
+      lane->head_at = 0;
+    } else {
+      *(int64*)lane->tail = b;
+    }
+    lane->tail = b;
+    lane->tail_at = 0;
+  }
+  if (deadline < lane->last) {
+    deadline = lane->last;
+  }
+  lane->last = deadline;
+  var t: AlphLaneTimer* = alph_lane_slot(lane->tail, lane->tail_at);
+  lane->tail_at = lane->tail_at + 1;
+  s->lane_count = s->lane_count + 1;
+  t->next = deadline;
+  return t;
+}
+
+// Fires the lane's oldest timer, which is due: pops it, and unless it was
+// stopped meanwhile, or its actor is gone, queues it to that actor as a
+// timer signal. Returns false, popping nothing, when out of memory.
+fn alph_lane_fire(node: AlphNode*, s: AlphSched*, lane: AlphLane*) -> bool {
+  var t: AlphLaneTimer* = alph_lane_slot(lane->head, lane->head_at);
+  var st: int64 = alph_atomic_load(&t->state);
+  if (st != 0) {
+    var sig: AlphSignal* = (AlphSignal*)malloc((int64)sizeof(AlphSignal));
+    if (sig == 0) {
+      return false;
+    }
+    // Whoever clears the state first, this or a stop, decides.
+    if (alph_atomic_cas(&t->state, st, 0) != st) {
+      free((rawptr)sig);
+    } else {
+      var p: AlphProc* = alph_resolve(node, t->to);
+      if (p == 0) {
+        free((rawptr)sig);
+      } else {
+        sig->dead = 0;
+        sig->next = t->next;
+        sig->kind = ALPH_SIG_TIMER;
+        sig->from = t->from;
+        sig->to = t->to;
+        sig->ref = t->ref;
+        sig->arg = t->arg;
+        sig->tag = t->tag;
+        sig->mark = 0;
+        alph_queue_push(&p->signals, (rawptr)sig);
+        alph_wake(node, p);
+      }
+    }
+  }
+  lane->head_at = lane->head_at + 1;
+  s->lane_count = s->lane_count - 1;
+  return true;
+}
+
 // Delivers a message with tag, ref and arg to `to` after ms milliseconds,
 // from the caller's scheduler. A timer that carries a ref is dropped if the
-// receiver stopped waiting on that ref.
-// Returns the timer (an AlphSignal*), or 0 when out of memory.
+// receiver stopped waiting on that ref (alph_timer_kill).
+// Returns the timer, for alph_timer_kill: an AlphLaneTimer* + 1 or an
+// AlphSignal*; or 0 when out of memory.
 fn alph_timer(ctx: AlphCtx*, ms: int64, to: int64, tag: int64, ref: int64, arg: int64) -> int64 {
+  var s: AlphSched* = alph_here(ctx);
+  var now: int64 = alph_now_ns();
+  if (ms > 0) {
+    var lane: AlphLane* = alph_lane_for(s, ms * ALPH_NS_PER_MS);
+    if (lane != 0) {
+      var t: AlphLaneTimer* = alph_lane_push(s, lane, now + ms * ALPH_NS_PER_MS);
+      if (t == 0) {
+        return 0;
+      }
+      t->to = to;
+      t->from = ctx->self;
+      t->ref = ref;
+      t->tag = tag;
+      t->arg = arg;
+      if (ref != 0) {
+        alph_atomic_store(&t->state, ref);
+      } else {
+        alph_atomic_store(&t->state, -1);
+      }
+      return (int64)t + 1;
+    }
+  }
+  if (ms > 0) {
+    s->heaped = s->heaped + 1;
+  }
   var sig: AlphSignal* = (AlphSignal*)malloc((int64)sizeof(AlphSignal));
   if (sig == 0) {
     return 0;
   }
   sig->dead = 0;
-  sig->next = alph_now_ns() + ms * ALPH_NS_PER_MS;
+  sig->next = now + ms * ALPH_NS_PER_MS;
   sig->kind = ALPH_SIG_TIMER;
   sig->from = ctx->self;
   sig->to = to;
@@ -1754,37 +1995,80 @@ fn alph_timer(ctx: AlphCtx*, ms: int64, to: int64, tag: int64, ref: int64, arg: 
   sig->tag = tag;
   sig->mark = 0;
   var at: int64 = (int64)sig;  // kept before the heap may take it
-  if (!alph_timers_add(&alph_here(ctx)->timers, sig)) {
+  if (!alph_timers_add(&s->timers, sig)) {
     return 0;
   }
   return at;
 }
 
-// Fires due timers. Returns nanoseconds until the next one, or -1 if none.
-fn alph_timers_fire(node: AlphNode*, h: AlphVec*) -> int64 {
-  if (h->len == 0) {
-    return -1;  // nothing pending: no clock read on every pass of the loop
+// Fires s's due timers. Returns nanoseconds until the next one, or -1 if
+// none. With none pending it reads no clock; with some, the reading it
+// takes becomes the next run's start (s->run_hint), as Go's checkTimers
+// hands its now to the scheduler: one clock read per pass, not two.
+fn alph_timers_fire(node: AlphNode*, s: AlphSched*) -> int64 {
+  if (s->timers.len == 0) {
+    if (s->lane_count == 0) {
+      return -1;
+    }
+    var any: bool = false;
+    for i: int64 in 0..s->lanes_hi {
+      if (alph_lane_oldest(s, &s->lanes[i]) != 0) {
+        any = true;
+        break;
+      }
+    }
+    if (!any) {
+      return -1;  // only stopped timers were left: popped, and no reading
+    }
   }
-  return alph_timers_fire_at(node, h, alph_now_ns());
+  var now: int64 = alph_now_ns();
+  s->run_hint = now;
+  return alph_timers_fire_at(node, s, now);
 }
 
-// As alph_timers_fire, for a time already read.
-fn alph_timers_fire_at(node: AlphNode*, h: AlphVec*, now: int64) -> int64 {
-  if (h->len == 0) {
-    return -1;
-  }
-  while (h->len > 0) {
-    var wait: int64 = alph_timer_deadline(alph_vec_get(h, 0)) - now;
+// As alph_timers_fire, for a time already read. Due timers fire in
+// deadline order across the lanes and the heap.
+fn alph_timers_fire_at(node: AlphNode*, s: AlphSched*, now: int64) -> int64 {
+  var h: AlphVec* = &s->timers;
+  while (true) {
+    var best: int64 = -1;  // a lane's index, or ALPH_LANES for the heap
+    var best_at: int64 = 0;
+    if (s->lane_count > 0) {
+      for i: int64 in 0..s->lanes_hi {
+        var t: AlphLaneTimer* = alph_lane_oldest(s, &s->lanes[i]);
+        if (t != 0 && (best < 0 || t->next < best_at)) {
+          best = i;
+          best_at = t->next;
+        }
+      }
+    }
+    if (h->len > 0) {
+      var d: int64 = alph_timer_deadline(alph_vec_get(h, 0));
+      if (best < 0 || d < best_at) {
+        best = ALPH_LANES;
+        best_at = d;
+      }
+    }
+    if (best < 0) {
+      return -1;
+    }
+    var wait: int64 = best_at - now;
     if (wait > 0) {
       return wait;
     }
-    var sig: AlphSignal* = alph_timers_pop(h);
-    var p: AlphProc* = alph_resolve(node, sig->to);
-    if (p == 0 || alph_atomic_load(&sig->dead) != 0) {
-      free((rawptr)sig);
+    if (best < ALPH_LANES) {
+      if (!alph_lane_fire(node, s, &s->lanes[best])) {
+        return ALPH_NS_PER_MS;  // out of memory: try again in a while
+      }
     } else {
-      alph_queue_push(&p->signals, (rawptr)sig);
-      alph_wake(node, p);
+      var sig: AlphSignal* = alph_timers_pop(h);
+      var p: AlphProc* = alph_resolve(node, sig->to);
+      if (p == 0 || alph_atomic_load(&sig->dead) != 0) {
+        free((rawptr)sig);
+      } else {
+        alph_queue_push(&p->signals, (rawptr)sig);
+        alph_wake(node, p);
+      }
     }
   }
   return -1;
@@ -2280,6 +2564,10 @@ fn alph_proc_exit(node: AlphNode*, p: AlphProc*, reason: int64) {
   alph_vec_release(&p->links);
   alph_vec_release(&p->mon_refs);
   alph_vec_release(&p->mon_watchers);
+  // Its pending timers are stopped, so their lanes pop them at once.
+  for i: int64 in 0..p->ref_timers.len {
+    alph_timer_kill(alph_vec_get(&p->ref_timers, i), alph_vec_get(&p->ref_ids, i));
+  }
   alph_vec_release(&p->ref_ids);
   alph_vec_release(&p->ref_pids);
   alph_vec_release(&p->ref_timers);
@@ -5201,7 +5489,9 @@ fn alph_sched_main(arg: int64) -> int64 {
     // A real reading: one handler may have run for as long as it liked
     // since the last, and a timer due meanwhile must fire before the
     // messages that came after it (no clock read when none is pending).
-    var wait: int64 = alph_timers_fire(node, &s->timers);
+    // The reading is the next run's start, if one follows at once.
+    s->run_hint = 0;
+    var wait: int64 = alph_timers_fire(node, s);
     var p: int64 = alph_runq_pop(s);
     if (p != 0) {
       if (!alph_sched_take(s, node, (AlphProc*)p)) {
@@ -5227,6 +5517,7 @@ fn alph_sched_main(arg: int64) -> int64 {
     // Out of work: offer to take some, and before sleeping keep checking
     // for a while, so work sent meanwhile is picked up with no eventfd
     // write and no epoll wake-up. A draining scheduler does neither.
+    s->run_hint = 0;  // a run after a spin or a sleep starts from its own reading
     alph_sched_resting(s, node);
     if (alph_sched_active(node, s)) {
       alph_sched_hungry(s, node);
@@ -5557,6 +5848,7 @@ export fn alph_node_stats(node: AlphNode*, stats: AlphStats*) {
   stats->isolated = 0;
   stats->stolen = 0;
   stats->moves_held = 0;
+  stats->timers_heaped = 0;
   for i: int64 in 0..node->sched_count {
     var ps: AlphSched* = alph_sched_at(node, i);
     stats->rehomed = stats->rehomed + ps->moves[ALPH_PLACE_REHOME];
@@ -5564,6 +5856,7 @@ export fn alph_node_stats(node: AlphNode*, stats: AlphStats*) {
     stats->stolen = stats->stolen + ps->moves[ALPH_PLACE_STEAL];
 
     stats->moves_held = stats->moves_held + ps->held[ALPH_PLACE_REHOME] + ps->held[ALPH_PLACE_ISOLATE];
+    stats->timers_heaped = stats->timers_heaped + ps->heaped;
   }
   stats->rescued = alph_atomic_load(&node->rescued);
   stats->io_demoted = alph_atomic_load(&node->io_demoted);
