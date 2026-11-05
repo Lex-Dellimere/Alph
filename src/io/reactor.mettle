@@ -235,6 +235,21 @@ export fn alph_rx_init(r: AlphReactor*) -> bool {
   return true;
 }
 
+// Makes the reactor as new for its next owner, keeping its descriptors
+// open: drops every timer, disarms the timerfd and drains a pending wake.
+// A descriptor that stays open is never reused by the kernel for another
+// file, so a late wake from a thread that still holds the reactor lands
+// here, harmlessly. Thread: its owner, with no other thread waiting on it.
+export fn alph_rx_reset(r: AlphReactor*) {
+  while (r->heap_len > 0) {
+    alph_rx_drop(r, alph_rx_heap_at(r, 0));
+  }
+  alph_rx_arm_timerfd(r, 0);
+  var v: int64 = 0;
+  syscall(ALPH_SYS_READ, r->wakefd, (int64)&v, 8);
+  alph_atomic_store(&r->woken, 0);
+}
+
 // Closes the reactor's own descriptors and frees its memory. The
 // descriptors it watched stay open; close them yourself. Thread: its owner.
 export fn alph_rx_free(r: AlphReactor*) {

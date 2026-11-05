@@ -323,7 +323,11 @@ export struct AlphNode {
   halt_code: int64;
   heap_limit: int64;
   stack_size: int64;
-  bound_list: int64;    // every bound scheduler, for alph_node_wait
+  bound_list: int64;    // bound schedulers running an actor
+  bound_spare: int64;   // bound schedulers whose actor exited, their threads parked for the next one
+  bound_dead: int64;    // bound schedulers whose thread ended (the node halts), for alph_node_wait
+  lane_pool: int64;     // lane blocks no scheduler keeps, chained by their first word (never freed)
+  lane_pool_lock: int64;
   sysmon: AlphThread;   // the watchdog, alph_sysmon_main
   sysmon_handle: int64;
   sysmon_word: int64;   // futex word it sleeps on; bumped to wake it
@@ -511,6 +515,7 @@ struct AlphSched {
   lanes_hi: int64;     // lanes claimed so far: only lanes[0..lanes_hi] are looked at
   lane_count: int64;   // timers in the lanes, cancelled ones not yet popped included
   lane_free: int64;    // blocks the lanes gave back, chained by their first word
+  lane_free_n: int64;  //   how many: past ALPH_LANE_KEEP they go to the node's pool
   heaped: int64;       // timers of 1 ms or more that found no lane (stats: timers_heaped)
   timer_inbox: AlphQueue;  // scheduler 0 only: parcels handed to it
   parcels: int64;      // scheduler 0 only: parcels it took, draining, chained by link
@@ -1825,17 +1830,50 @@ fn alph_timers_pop(h: AlphVec*) -> AlphSignal* {
 
 const ALPH_LANES: int64 = 8;         // the size of AlphSched.lanes
 const ALPH_LANE_BLOCK: int64 = 128;  // timers per lane block
+// Lane blocks a scheduler keeps for itself; more go to the node's pool, so
+// blocks that travel (handed to scheduler 0 with a parcel) come back into
+// use instead of piling up where they drained.
+const ALPH_LANE_KEEP: int64 = 8;
 
 fn alph_lane_slot(block: int64, i: int64) -> AlphLaneTimer* {
   return (AlphLaneTimer*)(block + 16 + i * (int64)sizeof(AlphLaneTimer));
 }
 
-// A block for a lane: one given back, or a new one. 0 when out of memory.
+// Gives block b back: to s's own list, or past ALPH_LANE_KEEP to the
+// node's pool. Blocks are never freed while the node runs.
+fn alph_lane_give(s: AlphSched*, b: int64) {
+  if (s->lane_free_n < ALPH_LANE_KEEP) {
+    *(int64*)b = s->lane_free;
+    s->lane_free = b;
+    s->lane_free_n = s->lane_free_n + 1;
+    return;
+  }
+  var node: AlphNode* = (AlphNode*)s->node;
+  alph_spin_lock(&node->lane_pool_lock);
+  *(int64*)b = node->lane_pool;
+  node->lane_pool = b;
+  alph_spin_unlock(&node->lane_pool_lock);
+}
+
+// A block for a lane: one of s's own, one from the node's pool, or a new
+// one. 0 when out of memory.
 fn alph_lane_block(s: AlphSched*) -> int64 {
   var b: int64 = s->lane_free;
   if (b != 0) {
     s->lane_free = *(int64*)b;
+    s->lane_free_n = s->lane_free_n - 1;
   } else {
+    var node: AlphNode* = (AlphNode*)s->node;
+    if (alph_atomic_load(&node->lane_pool) != 0) {
+      alph_spin_lock(&node->lane_pool_lock);
+      b = node->lane_pool;
+      if (b != 0) {
+        node->lane_pool = *(int64*)b;
+      }
+      alph_spin_unlock(&node->lane_pool_lock);
+    }
+  }
+  if (b == 0) {
     b = (int64)malloc(16 + ALPH_LANE_BLOCK * (int64)sizeof(AlphLaneTimer));
     if (b == 0) {
       return 0;
@@ -1854,8 +1892,7 @@ fn alph_lane_oldest(s: AlphSched*, lane: AlphLane*) -> AlphLaneTimer* {
       if (next == 0) {
         return 0;  // empty, its one block used up: the next push chains a new one
       }
-      *(int64*)lane->head = s->lane_free;
-      s->lane_free = lane->head;
+      alph_lane_give(s, lane->head);
       lane->head = next;
       lane->head_at = 0;
       continue;
@@ -2028,8 +2065,7 @@ fn alph_lane_release(s: AlphSched*, lane: AlphLane*) {
   var b: int64 = lane->head;
   while (b != 0) {
     var next: int64 = *(int64*)b;
-    *(int64*)b = s->lane_free;
-    s->lane_free = b;
+    alph_lane_give(s, b);
     b = next;
   }
   lane->span = 0;
@@ -5415,8 +5451,33 @@ export fn alph_node_signals(node: AlphNode*, pid: int64, tag: int64) {
 
 // Starts a scheduler of its own for one ALPH_BOUND actor. Returns 0 when
 // memory or threads ran out.
+// A bound scheduler for a new bound actor: a spare one, whose thread is
+// parked since its last actor exited, or a new one with a thread of its own.
+// Spares are never freed while the node runs and keep their descriptors
+// open: a thread that resolved an actor just before it exited may still
+// read its scheduler, or wake it, and must find a scheduler, not freed
+// memory or a descriptor the kernel gave to another file. Their bound flag
+// never drops, so nobody mistakes one for a shared scheduler. Reusing the
+// thread also spares each bound actor a thread start and its stack, as Go
+// keeps idle threads for reuse. Returns 0 when memory, descriptors or
+// threads run out.
 fn alph_sched_bound(node: AlphNode*) -> AlphSched* {
-  var s: AlphSched* = (AlphSched*)calloc(1, (int64)sizeof(AlphSched));
+  var s: AlphSched* = (AlphSched*)0;
+  alph_spin_lock(&node->bound_lock);
+  if (node->bound_spare != 0) {
+    s = (AlphSched*)node->bound_spare;
+    node->bound_spare = s->next_bound;
+    s->next_bound = node->bound_list;
+    node->bound_list = (int64)s;
+  }
+  alph_spin_unlock(&node->bound_lock);
+  if (s != 0) {
+    // Its thread reset everything before it parked: wake it for the actor.
+    alph_atomic_store_sc(&s->done, 0);
+    alph_futex_wake(&s->done, 1);
+    return s;
+  }
+  s = (AlphSched*)calloc(1, (int64)sizeof(AlphSched));
   if (s == 0) {
     return (AlphSched*)0;
   }
@@ -5426,20 +5487,83 @@ fn alph_sched_bound(node: AlphNode*) -> AlphSched* {
   s->node = (int64)node;
   s->bound = 1;
   if (!alph_sched_init_io(s)) {
+    alph_rx_free(&s->rx);  // nobody has seen it: its descriptors may go
+    free((rawptr)s->events);
+    free((rawptr)s->rxev);
     free((rawptr)s);
     return (AlphSched*)0;
   }
   s->thread.recover.owner = (int64)s;
-  s->handle = alph_thread_start(&s->thread, &alph_sched_main, (int64)s, node->stack_size);
-  if (s->handle == 0) {
-    free((rawptr)s);
-    return (AlphSched*)0;
-  }
+  // On the running list before the thread starts, so its exit finds it there.
   alph_spin_lock(&node->bound_lock);
   s->next_bound = node->bound_list;
   node->bound_list = (int64)s;
   alph_spin_unlock(&node->bound_lock);
+  s->handle = alph_thread_start(&s->thread, &alph_sched_main, (int64)s, node->stack_size);
+  if (s->handle == 0) {
+    alph_spin_lock(&node->bound_lock);
+    alph_bound_unlink(&node->bound_list, s);
+    alph_spin_unlock(&node->bound_lock);
+    alph_rx_free(&s->rx);
+    free((rawptr)s->events);
+    free((rawptr)s->rxev);
+    free((rawptr)s);
+    return (AlphSched*)0;
+  }
   return s;
+}
+
+// Takes s off the list at head. Thread: any, holding bound_lock.
+fn alph_bound_unlink(head: int64*, s: AlphSched*) {
+  var at: int64* = head;
+  while (*at != 0 && *at != (int64)s) {
+    at = &((AlphSched*)*at)->next_bound;
+  }
+  if (*at == (int64)s) {
+    *at = s->next_bound;
+  }
+}
+
+// A bound scheduler whose actor exited readies itself for the next one,
+// then parks as a spare until alph_sched_bound hands it one (true) or the
+// node halts (false). Only its own thread writes these fields; bound stays
+// 1 throughout. Thread: s's.
+fn alph_bound_park(s: AlphSched*, node: AlphNode*) -> bool {
+  s->exit_request = 0;
+  s->exit_reason = 0;
+  alph_atomic_store(&s->current, 0);
+  alph_atomic_store(&s->sleeping, 0);
+  alph_atomic_store(&s->qlen, 0);
+  alph_atomic_store(&s->io_count, 0);
+  s->runs = 0;
+  s->run_hint = 0;
+  alph_atomic_store(&s->work_at, 0);
+  alph_atomic_store(&s->exiting, 0);
+  alph_rx_reset(&s->rx);
+  alph_atomic_store_sc(&s->quiet, alph_quiet_parked());
+  alph_spin_lock(&node->bound_lock);
+  alph_bound_unlink(&node->bound_list, s);
+  s->next_bound = node->bound_spare;
+  node->bound_spare = (int64)s;
+  alph_spin_unlock(&node->bound_lock);
+  while (alph_atomic_load(&s->done) != 0 && alph_atomic_load(&node->halted) == 0) {
+    alph_futex_wait(&s->done, 1, -1);
+  }
+  return alph_atomic_load(&s->done) == 0;
+}
+
+// Joins the bound schedulers whose thread ended. Thread: alph_node_wait.
+fn alph_bound_reap(node: AlphNode*) {
+  alph_spin_lock(&node->bound_lock);
+  var dead: int64 = node->bound_dead;
+  node->bound_dead = 0;
+  alph_spin_unlock(&node->bound_lock);
+  while (dead != 0) {
+    var s: AlphSched* = (AlphSched*)dead;
+    dead = s->next_bound;
+    alph_thread_join(s->handle, &s->thread);
+    alph_rx_free(&s->rx);  // every scheduler thread has stopped: nobody wakes it now
+  }
 }
 
 // After an actor exits: a bound scheduler stops with it.
@@ -5661,6 +5785,35 @@ fn alph_sched_main(arg: int64) -> int64 {
   var s: AlphSched* = (AlphSched*)arg;
   var node: AlphNode* = (AlphNode*)s->node;
   alph_sched_name(s);
+  while (true) {
+    alph_sched_loop(s, node);
+    if (s->bound == 0) {
+      return 0;
+    }
+    // Its actor exited, but timers it started for others, as alph_send_after,
+    // are still due: scheduler 0 fires them. Then it waits for the next
+    // bound actor.
+    if (alph_atomic_load(&node->halted) != 0) {
+      break;
+    }
+    alph_timers_handoff(s, node);
+    if (!alph_bound_park(s, node)) {
+      break;
+    }
+  }
+  // The node halts: off whichever list holds it, on to alph_node_wait's.
+  alph_spin_lock(&node->bound_lock);
+  alph_bound_unlink(&node->bound_list, s);
+  alph_bound_unlink(&node->bound_spare, s);
+  s->next_bound = node->bound_dead;
+  node->bound_dead = (int64)s;
+  alph_spin_unlock(&node->bound_lock);
+  alph_futex_wake(&node->bound_list, 1);
+  return 0;
+}
+
+// Runs actors until the node halts, or s's bound actor exits.
+fn alph_sched_loop(s: AlphSched*, node: AlphNode*) {
   while (alph_atomic_load(&node->halted) == 0 && alph_atomic_load(&s->done) == 0) {
     alph_sched_quiet(s, node);
     // A real reading: one handler may have run for as long as it liked
@@ -5733,15 +5886,6 @@ fn alph_sched_main(arg: int64) -> int64 {
     }
     alph_atomic_store(&s->sleeping, 0);
   }
-  if (s->bound != 0) {
-    // Its actor exited, but timers it started for others, as alph_send_after,
-    // are still due: scheduler 0 fires them.
-    if (alph_atomic_load(&node->halted) == 0) {
-      alph_timers_handoff(s, node);
-    }
-    alph_rx_free(&s->rx);
-  }
-  return 0;
 }
 
 // Names s's thread for ps, top and /proc: alph-s<index>, or alph-bound.
@@ -6031,6 +6175,12 @@ export fn alph_node_halt(node: AlphNode*, code: int64) {
     alph_sched_notify(s);
     bound = s->next_bound;
   }
+  var spare: int64 = node->bound_spare;
+  while (spare != 0) {
+    var s: AlphSched* = (AlphSched*)spare;
+    alph_futex_wake(&s->done, 1);
+    spare = s->next_bound;
+  }
   alph_spin_unlock(&node->bound_lock);
 }
 
@@ -6053,11 +6203,21 @@ export fn alph_node_wait(node: AlphNode*) -> int64 {
     var s: AlphSched* = alph_sched_at(node, i);
     alph_thread_join(s->handle, &s->thread);
   }
-  var bound: int64 = node->bound_list;
-  while (bound != 0) {
-    var s: AlphSched* = (AlphSched*)bound;
-    alph_thread_join(s->handle, &s->thread);
-    bound = s->next_bound;
+  // Each bound scheduler moves itself from the running list to the dead
+  // one as it stops; then each is joined once.
+  while (true) {
+    alph_spin_lock(&node->bound_lock);
+    var first: int64 = node->bound_list | node->bound_spare;
+    alph_spin_unlock(&node->bound_lock);
+    if (first == 0) {
+      break;
+    }
+    alph_futex_wait(&node->bound_list, node->bound_list, 1000000);
+  }
+  alph_bound_reap(node);
+  // Every scheduler thread has stopped: their descriptors go.
+  for i: int64 in 0..node->sched_count {
+    alph_rx_free(&alph_sched_at(node, i)->rx);
   }
   return node->halt_code;
 }

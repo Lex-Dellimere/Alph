@@ -128,6 +128,18 @@ export fn alph_rx_init(r: AlphReactor*) -> bool
 Starts a reactor. Returns false when the kernel refuses an epoll set, an
 eventfd or a timerfd, or memory runs out. Thread: any, before use.
 
+### `alph_rx_reset`
+
+```mettle
+export fn alph_rx_reset(r: AlphReactor*)
+```
+
+Makes the reactor as new for its next owner, keeping its descriptors
+open: drops every timer, disarms the timerfd and drains a pending wake.
+A descriptor that stays open is never reused by the kernel for another
+file, so a late wake from a thread that still holds the reactor lands
+here, harmlessly. Thread: its owner, with no other thread waiting on it.
+
 ### `alph_rx_free`
 
 ```mettle
@@ -778,7 +790,11 @@ export struct AlphNode {
   halt_code: int64;
   heap_limit: int64;
   stack_size: int64;
-  bound_list: int64;    // every bound scheduler, for alph_node_wait
+  bound_list: int64;    // bound schedulers running an actor
+  bound_spare: int64;   // bound schedulers whose actor exited, their threads parked for the next one
+  bound_dead: int64;    // bound schedulers whose thread ended (the node halts), for alph_node_wait
+  lane_pool: int64;     // lane blocks no scheduler keeps, chained by their first word (never freed)
+  lane_pool_lock: int64;
   sysmon: AlphThread;   // the watchdog, alph_sysmon_main
   sysmon_handle: int64;
   sysmon_word: int64;   // futex word it sleeps on; bumped to wake it

@@ -1,11 +1,15 @@
 // ALPH_BOUND and alph_exit_now: a bound actor blocks while the only shared
-// scheduler keeps running other actors; bound actors start and stop their
-// own threads; alph_exit_now ends an actor from deep in its call stack with
-// a chosen reason; a crash in a bound actor is contained.
+// scheduler keeps running other actors; bound actors get threads of their
+// own, which are kept, parked, for the next bound actor; alph_exit_now ends
+// an actor from deep in its call stack with a chosen reason; a crash in a
+// bound actor is contained. B1 to B3 churn bound actors: descriptors and
+// memory stay flat, late senders find a scheduler, and a node that is
+// waited on closes every descriptor it opened.
 
 import "std/io";
 import "std/thread";
 import "alph/sys/atomic";
+import "alph/sys/clock";
 import "alph/alph";
 
 const TAG_BLOCK: int64 = ALPH_TAG_USER;
@@ -15,11 +19,38 @@ const TAG_CRASH: int64 = ALPH_TAG_USER + 3;
 const TAG_DONE: int64 = ALPH_TAG_USER + 4;
 const REASON_DEEP: int64 = ALPH_REASON_USER + 5;
 const BOUND_ACTORS: int64 = 50;
+const LATE: int64 = ALPH_TAG_USER + 10;
+const POKE: int64 = ALPH_TAG_USER + 11;
+const PING: int64 = ALPH_TAG_USER + 12;
+const B1_ACTORS: int64 = 10000;
+const B1_WARMUP: int64 = 1000;
+const B2_ACTORS: int64 = 2000;
+const BATCH: int64 = 10;
+const HAMMERS: int64 = 8;
+const PIPES: int64 = 4;
 
 var g_node: AlphNode;
 var g_failures: int64 = 0;
 var g_ticks: int64 = 0;
 var g_ticks_while_blocked: int64 = -1;
+var g_collector: int64 = 0;
+var g_late: int64 = 0;
+var g_live: int64 = 0;
+var g_seq: int64 = 0;
+var g_unnamed: int64 = 0;
+var g_pings: int64 = 0;
+var g_last: int64 = 0;
+var g_prev: int64 = 0;
+var g_hammering: int64 = 0;
+var g_send_sent: int64 = 0;
+var g_send_gone: int64 = 0;
+var g_send_full: int64 = 0;
+var g_send_other: int64 = 0;
+var g_odd: int64 = 0;
+var g_fwd_sent: int64 = 0;
+var g_fwd_gone: int64 = 0;
+var g_fwd_full: int64 = 0;
+var g_fwd_other: int64 = 0;
 
 fn expect(ok: bool, what: string) {
   if (!ok) {
@@ -133,6 +164,287 @@ fn boss(ctx: AlphCtx*, m: AlphMsg*) -> int64 {
   return ALPH_CONTINUE;
 }
 
+// ---- churn: B1 to B3 ------------------------------------------------------
+
+// Counts what the bound actors send after they are gone, and pings.
+fn collector(ctx: AlphCtx*, m: AlphMsg*) -> int64 {
+  if (m->tag == LATE) {
+    alph_atomic_add(&g_late, 1);
+  } else if (m->tag == PING) {
+    alph_atomic_add(&g_pings, 1);
+  }
+  return ALPH_CONTINUE;
+}
+
+// B1: a timer for the collector, a name of its own, then out.
+fn churner(ctx: AlphCtx*, m: AlphMsg*) -> int64 {
+  if (m->tag == ALPH_TAG_INIT) {
+    alph_send_after(ctx, 5, g_collector, LATE, 1);
+    var seq: int64 = alph_atomic_add(&g_seq, 1);
+    var name: string = "churn-{seq}";
+    if (!alph_register(ctx, name)) {
+      alph_atomic_add(&g_unnamed, 1);
+    }
+    alph_atomic_add(&g_live, -1);
+    return alph_stop(ctx, ALPH_NORMAL);
+  }
+  return ALPH_CONTINUE;
+}
+
+// B2: out at once.
+fn leaver(ctx: AlphCtx*, m: AlphMsg*) -> int64 {
+  if (m->tag == ALPH_TAG_INIT) {
+    alph_atomic_add(&g_live, -1);
+    return alph_stop(ctx, ALPH_NORMAL);
+  }
+  return ALPH_CONTINUE;
+}
+
+// Descriptors open in this process (fcntl F_GETFD over 0..4096).
+fn fd_count() -> int64 {
+  var n: int64 = 0;
+  for i: int64 in 0..4097 {
+    if (syscall(72, i, 1, 0) >= 0) {
+      n = n + 1;
+    }
+  }
+  return n;
+}
+
+// Resident memory in KB, from /proc/self/statm.
+fn rss_kb() -> int64 {
+  var buf: uint8[4096];
+  var path: string = "/proc/self/statm\0";
+  var fd: int64 = syscall(2, (int64)path.chars, 0, 0);
+  if (fd < 0) {
+    return -1;
+  }
+  var n: int64 = syscall(0, fd, (int64)&buf[0], 4000);
+  syscall(3, fd);
+  var i: int64 = 0;
+  while (i < n && buf[i] != 32) {
+    i = i + 1;
+  }
+  i = i + 1;
+  var v: int64 = 0;
+  while (i < n && buf[i] >= 48 && buf[i] <= 57) {
+    v = v * 10 + (int64)buf[i] - 48;
+    i = i + 1;
+  }
+  return v * 4;
+}
+
+fn wait_for(v: int64*, want: int64, ms: int64) {
+  for i: int64 in 0..ms {
+    if (alph_atomic_load(v) >= want) {
+      return;
+    }
+    thread_sleep_ms(1);
+  }
+}
+
+// Spawns a bound actor, trying again for a moment if the node has no room.
+fn spawn_bound(handler: fn(AlphCtx*, AlphMsg*) -> int64 with alloc, syscall, asm) -> int64 {
+  var pid: int64 = 0;
+  for t: int64 in 0..500 {
+    pid = alph_node_spawn(&g_node, ALPH_BOUND, handler);
+    if (pid != 0) {
+      return pid;
+    }
+    thread_sleep_ms(1);
+  }
+  return 0;
+}
+
+// Starts count bound actors in batches of BATCH, waiting (at most 2 s) for
+// each batch to run its INIT before the next. Returns how many started.
+// publish: remember the newest two pids for the hammering threads.
+fn churn(handler: fn(AlphCtx*, AlphMsg*) -> int64 with alloc, syscall, asm, count: int64,
+         publish: bool) -> int64 {
+  var spawned: int64 = 0;
+  for round: int64 in 0..count / BATCH {
+    for k: int64 in 0..BATCH {
+      alph_atomic_add(&g_live, 1);
+      var pid: int64 = spawn_bound(handler);
+      if (pid != 0) {
+        spawned = spawned + 1;
+        if (publish) {
+          alph_atomic_store(&g_prev, alph_atomic_load(&g_last));
+          alph_atomic_store(&g_last, pid);
+        }
+      } else {
+        alph_atomic_add(&g_live, -1);
+      }
+    }
+    for w: int64 in 0..2000 {
+      if (alph_atomic_load(&g_live) == 0) {
+        break;
+      }
+      thread_sleep_ms(1);
+    }
+  }
+  return spawned;
+}
+
+// B2: pokes the newest bound pid, sends and forwards, until told to stop.
+fn hammer(arg: cstring) -> uint32 {
+  var ss: int64 = 0;
+  var sg: int64 = 0;
+  var sf: int64 = 0;
+  var so: int64 = 0;
+  var fs: int64 = 0;
+  var fg: int64 = 0;
+  var ff: int64 = 0;
+  var fo: int64 = 0;
+  while (alph_atomic_load(&g_hammering) != 0) {
+    var to: int64 = alph_atomic_load(&g_last);
+    var other: int64 = alph_atomic_load(&g_prev);
+    if (to == 0) {
+      continue;
+    }
+    var r: int64 = alph_node_send(&g_node, to, POKE, 1);
+    if (r == ALPH_SENT) {
+      ss = ss + 1;
+    } else if (r == ALPH_GONE) {
+      sg = sg + 1;
+    } else if (r == ALPH_FULL) {
+      sf = sf + 1;
+    } else {
+      so = so + 1;
+      g_odd = r;
+    }
+    r = alph_node_forward(&g_node, to, other, POKE, 2, 0, 0, 0, 0);
+    if (r == ALPH_SENT) {
+      fs = fs + 1;
+    } else if (r == ALPH_GONE) {
+      fg = fg + 1;
+    } else if (r == ALPH_FULL) {
+      ff = ff + 1;
+    } else {
+      fo = fo + 1;
+      g_odd = r;
+    }
+  }
+  alph_atomic_add(&g_send_sent, ss);
+  alph_atomic_add(&g_send_gone, sg);
+  alph_atomic_add(&g_send_full, sf);
+  alph_atomic_add(&g_send_other, so);
+  alph_atomic_add(&g_fwd_sent, fs);
+  alph_atomic_add(&g_fwd_gone, fg);
+  alph_atomic_add(&g_fwd_full, ff);
+  alph_atomic_add(&g_fwd_other, fo);
+  return 0;
+}
+
+fn churn_cases() {
+  var f_start: int64 = fd_count();
+  var cfg: AlphConfig;
+  alph_config(&cfg);
+  cfg.schedulers = 4;
+  cfg.max_actors = 4096;
+  // A control: a node of the same size that never ran a bound actor leaves
+  // no descriptor behind once waited on.
+  expect(alph_node_start(&g_node, &cfg), "B: control node started");
+  thread_sleep_ms(20);
+  alph_node_halt(&g_node, 0);
+  alph_node_wait(&g_node);
+  var f_ctrl: int64 = fd_count();
+  expect(alph_node_start(&g_node, &cfg), "B: node started");
+  g_collector = alph_node_spawn(&g_node, 0, &collector);
+  expect(g_collector != 0, "B: collector spawned");
+  thread_sleep_ms(20);
+
+  // B1
+  var t_b1: int64 = alph_now_ns();
+  var spawned: int64 = churn(&churner, B1_WARMUP, false);
+  thread_sleep_ms(50);
+  var f_warm: int64 = fd_count();
+  var r_warm: int64 = rss_kb();
+  spawned = spawned + churn(&churner, B1_ACTORS - B1_WARMUP, false);
+  wait_for(&g_late, B1_ACTORS, 2000);
+  thread_sleep_ms(50);
+  var f_end: int64 = fd_count();
+  var r_end: int64 = rss_kb();
+  var late: int64 = alph_atomic_load(&g_late);
+  var b1_ms: int64 = (alph_now_ns() - t_b1) / 1000000;
+  expect(spawned == B1_ACTORS, "B1: {B1_ACTORS} bound actors spawned ({spawned})");
+  expect(f_end <= f_warm + 3, "B1: descriptors {f_warm} after 1000 exits, {f_end} at the end");
+  expect(r_end - r_warm < 2048, "B1: resident memory grew {r_end - r_warm} KB from {r_warm} KB (limit 2048)");
+  expect(late == B1_ACTORS, "B1: {B1_ACTORS} LATE timers arrived ({late})");
+  expect(g_unnamed == 0, "B1: every bound actor registered its name ({g_unnamed} did not)");
+  var name_left: int64 = alph_node_whereis(&g_node, "churn-1");
+  expect(name_left == 0, "B1: the name of an exited actor is gone ({name_left})");
+
+  // B2
+  var pipes: int64[8];
+  var pf: int32[2];
+  for i: int64 in 0..PIPES {
+    expect(syscall(293, (int64)&pf[0], 2048) == 0, "B2: pipe {i} opened");
+    pipes[2 * i] = (int64)pf[0];
+    pipes[2 * i + 1] = (int64)pf[1];
+  }
+  var f_b2: int64 = fd_count();
+  alph_atomic_store(&g_hammering, 1);
+  var handles: int64[8];
+  for i: int64 in 0..HAMMERS {
+    handles[i] = CreateThread(0, 0, &hammer, 0, 0, 0);
+    expect(handles[i] != 0, "B2: hammer thread {i} started");
+  }
+  var t_b2: int64 = alph_now_ns();
+  var spawned2: int64 = churn(&leaver, B2_ACTORS, true);
+  var b2_ms: int64 = (alph_now_ns() - t_b2) / 1000000;
+  alph_atomic_store(&g_hammering, 0);
+  for i: int64 in 0..HAMMERS {
+    thread_join_infinite(handles[i]);
+    thread_close(handles[i]);
+  }
+  var f_b2_end: int64 = fd_count();
+  var stray: int64 = 0;
+  var buf: uint8[64];
+    for i: int64 in 0..PIPES {
+    var n: int64 = syscall(0, pipes[2 * i], (int64)&buf[0], 64);
+    if (n > 0) {
+      stray = stray + n;
+    } else if (n != -11 && n != 0) {
+      stray = stray - 1000;  // an unexpected error is a failure too
+    }
+  }
+  for i: int64 in 0..PIPES {
+    syscall(3, pipes[2 * i]);
+    syscall(3, pipes[2 * i + 1]);
+  }
+  var sent: int64 = g_send_sent + g_fwd_sent;
+  var gone: int64 = g_send_gone + g_fwd_gone;
+  var full: int64 = g_send_full + g_fwd_full;
+  var other: int64 = g_send_other + g_fwd_other;
+  expect(spawned2 == B2_ACTORS, "B2: {B2_ACTORS} bound actors spawned ({spawned2})");
+  expect(sent + gone + full > 1000, "B2: the threads made {sent + gone + full} sends");
+  expect(other == 0, "B2: {other} sends returned something but ALPH_SENT, ALPH_GONE or ALPH_FULL (last {g_odd})");
+  expect(stray == 0, "B2: the pipes held {stray} stray bytes (negative: a read error)");
+  var f_b2_closed: int64 = fd_count();
+  expect(f_b2_end <= f_b2 + 3, "B2: descriptors {f_b2} before the churn, {f_b2_end} after");
+  expect(f_b2_closed <= f_end + 3, "B2: descriptors {f_end} after B1, {f_b2_closed} after B2 and the pipes");
+  var pings0: int64 = alph_atomic_load(&g_pings);
+  var normal: int64 = alph_node_spawn(&g_node, 0, &collector);
+  expect(normal != 0, "B2: a normal actor spawned after the churn");
+  expect(alph_node_send(&g_node, normal, PING, 0) == ALPH_SENT, "B2: the normal actor takes a message");
+  wait_for(&g_pings, pings0 + 1, 1000);
+  expect(alph_atomic_load(&g_pings) == pings0 + 1, "B2: the node still answers after the churn");
+
+  // B3
+  var t_halt: int64 = alph_now_ns();
+  alph_node_halt(&g_node, 0);
+  alph_node_wait(&g_node);
+  var halt_ms: int64 = (alph_now_ns() - t_halt) / 1000000;
+  var f_halt: int64 = fd_count();
+  expect(halt_ms < 1000, "B3: halt and wait took {halt_ms} ms (limit 1000)");
+  expect(f_ctrl == f_start, "B3: a waited node closed its descriptors ({f_start} before, {f_ctrl} after)");
+  expect(f_halt <= f_start + 3,
+         "B3: descriptors {f_start} before the node, {f_halt} after the node with spares");
+
+  println("churn ok: B1 {B1_ACTORS} exits in {b1_ms} ms, fds {f_warm} -> {f_end}, rss {r_warm} -> {r_end} KB, LATE {late} of {B1_ACTORS}; B2 {spawned2} exits in {b2_ms} ms, sends {g_send_sent} sent {g_send_gone} gone {g_send_full} full {g_send_other} other, forwards {g_fwd_sent} sent {g_fwd_gone} gone {g_fwd_full} full {g_fwd_other} other, pipes {stray} bytes, fds {f_b2} -> {f_b2_end}; B3 halt+wait {halt_ms} ms, fds {f_start} -> {f_ctrl} (control node, no bound actors) -> {f_halt}");
+}
+
 fn main() -> int32 {
   var cfg: AlphConfig;
   alph_config(&cfg);
@@ -148,6 +460,7 @@ fn main() -> int32 {
   var stats: AlphStats;
   alph_node_stats(&g_node, &stats);
   expect(stats.crashed == 1, "exit_now is not counted as a crash");
+  churn_cases();
   if (g_failures != 0) {
     return 1;
   }
