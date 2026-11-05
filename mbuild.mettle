@@ -1,13 +1,13 @@
 // alph's build for mbuild. alph is a library; the examples are its bins.
 // Imports of "alph/..." start in src/. Every profile builds with -s
 // (stack-trace; debug has it by default): alph catches failed checks only
-// in -s builds. The crypto package is only for the opt-in alph/net/noise
+// in -s builds. The cryptex package is only for the opt-in alph/net/noise
 // and alph/net/dist; a program that does not import them uses none of it.
 
 import "mbuild/api";
 
 fn project() {
-  mb_package("alph", "0.1.0");
+  mb_package("alph", "0.1.1");
   mb_import_root("src");
   mb_targets("linux");
   mb_bin("counter", "examples/counter.mettle");
@@ -22,5 +22,5 @@ fn project() {
 }
 
 fn deps() {
-  mb_dep_path("crypto", "../cryptex");
+  mb_dep_path("cryptex", "../cryptex");
 }

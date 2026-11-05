@@ -3660,7 +3660,7 @@ Thread: a handler.
 ## alph/net/noise
 
 The Noise_XXpsk3_25519_ChaChaPoly_SHA256 handshake and
-transport ciphers (noiseprotocol.org, revision 34), on the crypto package.
+transport ciphers (noiseprotocol.org, revision 34), on the cryptex package.
 
 ```text
 -> e
@@ -3736,7 +3736,7 @@ s_sk       this node's static secret key
 psk        32 bytes both sides share
 ```
 
-Returns false when the crypto package fails. Thread: any.
+Returns false when the cryptex package fails. Thread: any.
 
 ### `alph_noise_set_ephemeral`
 
@@ -3755,7 +3755,7 @@ export fn alph_noise_write(n: AlphNoise*, out: uint8*, cap: int64, out_len: int6
 
 Writes this side's next handshake message to out (cap at least 96
 bytes) and its length to *out_len. Returns false when it is not this
-side's turn or the crypto package fails. Thread: the state's owner.
+side's turn or the cryptex package fails. Thread: the state's owner.
 
 ### `alph_noise_read`
 

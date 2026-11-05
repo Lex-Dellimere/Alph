@@ -40,7 +40,7 @@
 // starts. Treat the cookie as a secret, and make it long and random.
 
 import "std/mem";
-import "crypto/crypto";
+import "cryptex/cryptex";
 import "alph/core/mailbox";
 import "alph/core/node";
 import "alph/net/noise";

@@ -31,7 +31,7 @@ if [ -n "$foreign" ]; then
 fi
 
 if [ ! -f mettle.deps ]; then
-  printf '# >>> mbuild: generated, edits inside this block are overwritten\nalph=./src\ncrypto=../cryptex/src\n# <<< mbuild\n' > mettle.deps
+  printf '# >>> mbuild: generated, edits inside this block are overwritten\nalph=./src\ncryptex=../cryptex/src\n# <<< mbuild\n' > mettle.deps
 fi
 
 if [ ! -x "$METTLE" ]; then

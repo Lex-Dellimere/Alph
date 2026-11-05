@@ -1,5 +1,5 @@
 // alph/net/noise: the Noise_XXpsk3_25519_ChaChaPoly_SHA256 handshake and
-// transport ciphers (noiseprotocol.org, revision 34), on the crypto package.
+// transport ciphers (noiseprotocol.org, revision 34), on the cryptex package.
 //
 //   -> e
 //   <- e, ee, s, es
@@ -16,7 +16,7 @@
 // state.
 
 import "std/mem";
-import "crypto/crypto";
+import "cryptex/cryptex";
 
 // The longest Noise message, and the most plaintext one transport message
 // can carry.
@@ -234,7 +234,7 @@ fn alph_noise_read_e(n: AlphNoise*, msg: uint8*) -> bool {
 //   s_sk       this node's static secret key
 //   psk        32 bytes both sides share
 //
-// Returns false when the crypto package fails. Thread: any.
+// Returns false when the cryptex package fails. Thread: any.
 export fn alph_noise_init(n: AlphNoise*, initiator: bool, s_sk: CrX25519Secret*, psk: uint8*) -> bool {
   memset((rawptr)n, 0, (int64)sizeof(AlphNoise));
   if (initiator) {
@@ -265,7 +265,7 @@ export fn alph_noise_set_ephemeral(n: AlphNoise*, e_sk: CrX25519Secret*) -> bool
 
 // Writes this side's next handshake message to out (cap at least 96
 // bytes) and its length to *out_len. Returns false when it is not this
-// side's turn or the crypto package fails. Thread: the state's owner.
+// side's turn or the cryptex package fails. Thread: the state's owner.
 export fn alph_noise_write(n: AlphNoise*, out: uint8*, cap: int64, out_len: int64*) -> bool {
   if (cap < 96) {
     return false;

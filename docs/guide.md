@@ -538,11 +538,11 @@ A **proxy** is a local actor that stands for an actor on another node. Send to i
 
 The **cookie** names the cluster, and it is the Noise pre-shared key: its SHA-256 keys the handshake, and it is never sent. Connections are encrypted and authenticated (`Noise_XXpsk3_25519_ChaChaPoly_SHA256`). A node with another cookie cannot connect and cannot read or change traffic, so `alph_dist_connect` answers 0. Whoever has the cookie can join the cluster, so keep it secret, long and random. Each node makes a new static key when its manager starts.
 
-`alph/net/dist` and `alph/net/noise` are opt-in. They are not in `alph/alph`, and a program that never imports them carries no crypto. Import `alph/net/dist` yourself, and map the crypto package in your app's `mettle.deps` beside alph:
+`alph/net/dist` and `alph/net/noise` are opt-in. They are not in `alph/alph`, and a program that never imports them carries no crypto. Import `alph/net/dist` yourself, and map the cryptex package in your app's `mettle.deps` beside alph:
 
 ```text
 alph=<path>/alph/src
-crypto=<path>/cryptex/src
+cryptex=<path>/cryptex/src
 ```
 
 Names and groups are still local to a node, so you find a remote actor with `alph_dist_whereis`, not `alph_whereis`.

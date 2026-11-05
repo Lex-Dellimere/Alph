@@ -4,8 +4,8 @@
 // it three requests through the proxy it gets back. A watchdog fails the run
 // instead of letting it hang.
 //
-// alph/net/dist is not part of alph/alph. It needs the crypto package mapped
-// in mettle.deps (crypto=<path>/cryptex/src).
+// alph/net/dist is not part of alph/alph. It needs the cryptex package mapped
+// in mettle.deps (cryptex=<path>/cryptex/src).
 
 import "std/io";
 import "std/mem";

@@ -74,7 +74,7 @@ Build with the dev compiler from the Mettle repo, always with `-s`:
 
 Without `-s`, the compiler turns failed checks (bounds, divide) into an inline exit that alph cannot catch.
 
-To use distribution, also `import "alph/net/dist"` and map the crypto package in `mettle.deps` (`crypto=<path>/cryptex/src`).
+To use distribution, also `import "alph/net/dist"` and map the cryptex package in `mettle.deps` (`cryptex=<path>/cryptex/src`).
 
 - [Guide](docs/guide.md): how to use the runtime, from starting a node to healing, IO, child processes, pools, shutdown and distribution.
 - [API reference](docs/api.md): every function, type and constant, with its inputs, outputs and which thread may call it.
