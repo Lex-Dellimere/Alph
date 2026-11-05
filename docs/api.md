@@ -1670,6 +1670,7 @@ export struct AlphSupSpec {
   period_ms: int64;
   backoff_ms: int64;
   backoff_max_ms: int64;
+  jitter_pct: int64;
   start_timeout_ms: int64;
   count: int64;
   children: AlphChildSpec[64];
@@ -1687,6 +1688,9 @@ period_ms         default 5000; 0 means no limit, never give up
 backoff_ms        wait before the first of consecutive restarts; 0
                   (default) restarts at once
 backoff_max_ms    cap on the doubling backoff; 0 means no cap
+jitter_pct        each backoff is shortened by a random 0..jitter_pct
+                  percent, so supervisors hit by one failure do not all
+                  restart in step; 0 (default) is none, 20 is typical
 start_timeout_ms  how long a sync_start child has to ack; default 5000
 ```
 

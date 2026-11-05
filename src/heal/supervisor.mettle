@@ -101,6 +101,9 @@ export struct AlphChildSpec {
 //   backoff_ms        wait before the first of consecutive restarts; 0
 //                     (default) restarts at once
 //   backoff_max_ms    cap on the doubling backoff; 0 means no cap
+//   jitter_pct        each backoff is shortened by a random 0..jitter_pct
+//                     percent, so supervisors hit by one failure do not all
+//                     restart in step; 0 (default) is none, 20 is typical
 //   start_timeout_ms  how long a sync_start child has to ack; default 5000
 //
 // count and children are filled by alph_sup_add.
@@ -110,6 +113,7 @@ export struct AlphSupSpec {
   period_ms: int64;
   backoff_ms: int64;
   backoff_max_ms: int64;
+  jitter_pct: int64;
   start_timeout_ms: int64;
   count: int64;
   children: AlphChildSpec[64];
@@ -135,6 +139,7 @@ struct AlphSup {
   restart_count: int64;
   streak: int64;
   last_restart: int64;
+  rng: int64;           // random state for jitter, seeded at INIT
 }
 
 // ---- building a spec -------------------------------------------------------
@@ -282,6 +287,12 @@ fn alph_sup_restart_later(ctx: AlphCtx*, s: AlphSup*) -> int64 {
   var delay: int64 = s->spec.backoff_ms << shift;
   if (s->spec.backoff_max_ms > 0 && delay > s->spec.backoff_max_ms) {
     delay = s->spec.backoff_max_ms;
+  }
+  if (s->spec.jitter_pct > 0 && s->spec.jitter_pct <= 100) {
+    // A 31-bit linear congruential step: plenty for spreading restarts.
+    s->rng = (s->rng * (int64)1103515245 + (int64)12345) & (int64)2147483647;
+    var r: int64 = s->rng;
+    delay = delay - (delay * s->spec.jitter_pct / 100) * (r % 1001) / 1000;
   }
   s->phase = ALPH_SUP_WAITING;
   s->timer = alph_start_timer(ctx, delay, ALPH_TAG_SUP_TIMER, 0);
@@ -446,6 +457,7 @@ export fn alph_sup_handle(ctx: AlphCtx*, m: AlphMsg*) -> int64 {
   var s: AlphSup* = (AlphSup*)ctx->state;
   if (m->tag == ALPH_TAG_INIT) {
     alph_trap_exits(ctx, true);
+    s->rng = (ctx->self ^ alph_now_ns()) & (int64)2147483647;
     // The children's initial states were copied in behind the AlphSup.
     for i: int64 in 0..s->spec.count {
       var c: AlphChildSpec* = &s->spec.children[i];

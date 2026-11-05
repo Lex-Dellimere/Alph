@@ -1663,13 +1663,15 @@ fn alph_entry_is(e: AlphEntry*, name: string) -> bool {
   return memcmp((rawptr)e->chars, (rawptr)name.chars, e->len) == 0;
 }
 
-// FNV-1a over the name's bytes.
+// FNV-1a style over the name's bytes, in 64-bit arithmetic with constants
+// that fit Mettle's 32-bit literals, then the high bits folded down so the
+// table's low-bit mask sees them.
 fn alph_name_hash(name: string) -> int64 {
-  var h: int64 = (int64)0xcbf29ce484222325;
+  var h: int64 = (int64)1469598103;
   for i: int64 in 0..(int64)name.length {
-    h = (h ^ (int64)name.chars[i]) * (int64)0x100000001b3;
+    h = (h ^ (int64)name.chars[i]) * (int64)16777619;
   }
-  return h;
+  return h ^ (h >> 29) ^ (h >> 47);
 }
 
 fn alph_tab_init(t: AlphTable*) -> bool {
