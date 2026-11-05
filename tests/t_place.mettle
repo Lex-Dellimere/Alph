@@ -4,9 +4,16 @@
 // sleeps moves to its waker's scheduler (rehome), so wherever the hog goes
 // it soon has company, which made move-isolation move it about 2000 times
 // a second before damping. Checks:
-//   1. it is isolated at all in the first part
-//   2. in the last 600 ms it is isolated at most a few times, and optional
-//      moves are being held back (moves_held grows)
+//   1. damping engaged: some optional move was held back (moves_held).
+//      Every move, steals included, adds to an actor's penalty, and steals
+//      are never damped: they can leave the hog alone from the start, with
+//      nothing to isolate it from, or move actors too rarely for any to
+//      pass the cut (about 1 run in 8). Then the scenario runs again on a
+//      fresh node, up to 4 times. Damping that never holds anything fails
+//      all 4: with the cut disabled, runs made 3 to 159 isolations and held
+//      none
+//   2. once it engaged, the hog was held still: in the last 600 ms it is
+//      isolated at most a few times
 //   3. the plain actors' messages still all run
 // Steals are never damped, so work behind a busy scheduler is still taken
 // (t_rescue, t_fair).
@@ -87,11 +94,16 @@ fn stats() -> AlphStats {
   return st;
 }
 
-fn main() -> int32 {
+// Runs the scenario once on a fresh node. Returns whether damping engaged;
+// if it did, the checks ran.
+fn scenario(attempt: int64) -> bool {
   var cfg: AlphConfig;
   alph_config(&cfg);
   cfg.schedulers = 4;
   cfg.max_actors = 64;
+  alph_atomic_store(&g_stop, 0);
+  alph_atomic_store(&g_pings, 0);
+  alph_atomic_store(&g_sent, 0);
   expect(alph_node_start(&g_node, &cfg), "node started");
   var ids: int64[9];
   for i: int64 in 0..9 {
@@ -104,17 +116,34 @@ fn main() -> int32 {
   var b: AlphStats = stats();
   alph_atomic_store(&g_stop, 1);
   thread_sleep_ms(100);
-  var late: int64 = b.isolated - a.isolated;
-  expect(a.isolated > 0, "the hog was isolated at all ({a.isolated})");
-  expect(late <= 10, "then it was held still: {late} isolations in the last 600 ms");
-  expect(b.moves_held > 0, "optional moves were held back ({b.moves_held})");
-  var sent: int64 = alph_atomic_load(&g_sent);
-  expect(alph_atomic_load(&g_pings) == sent, "every plain message ran ({g_pings} of {sent})");
+  var flapped: bool = b.moves_held > 0;
+  if (flapped) {
+    var late: int64 = b.isolated - a.isolated;
+    expect(late <= 10, "then it was held still: {late} isolations in the last 600 ms");
+    var sent: int64 = alph_atomic_load(&g_sent);
+    expect(alph_atomic_load(&g_pings) == sent, "every plain message ran ({g_pings} of {sent})");
+    if (g_failures == 0) {
+      println("place ok (attempt {attempt}): {a.isolated} isolations, then {late}; {b.moves_held} moves held, {b.rehomed} rehomes, {b.isolate_no_spare} with no spare, {b.stolen} steals");
+    }
+  } else {
+    println("attempt {attempt}: damping did not engage ({b.isolated} isolations, {b.rehomed} rehomes, {b.isolate_no_spare} with no spare, {b.stolen} steals): again");
+  }
   alph_node_halt(&g_node, 0);
   alph_node_wait(&g_node);
+  return flapped;
+}
+
+fn main() -> int32 {
+  var flapped: bool = false;
+  for attempt: int64 in 1..5 {
+    if (scenario(attempt)) {
+      flapped = true;
+      break;
+    }
+  }
+  expect(flapped, "damping held nothing back in 4 attempts");
   if (g_failures != 0) {
     return 1;
   }
-  println("place ok: {a.isolated} isolations, then {late}; {b.moves_held} moves held, {b.stolen} steals");
   return 0;
 }

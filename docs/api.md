@@ -732,6 +732,7 @@ export struct AlphStats {
   moves_held: int64;
   timers_heaped: int64;
   timers_handed: int64;
+  isolate_no_spare: int64;
 }
 ```
 
@@ -763,6 +764,10 @@ io_hup_rearms  arms answered at once with only a hang-up or error that
          the handle, which spins
 timers_heaped  timers no lane took, as all 8 on their scheduler held
          timers of other spans: they went to the slower timer heap
+isolate_no_spare  CPU-bound actors that would have been isolated (cut
+         short twice with others waiting) but found every scheduler
+         awake and active: they stay and yield. The node wants more
+         capacity than it has
 timers_handed  times a scheduler handed its pending timers to
          scheduler 0, as compaction left it idle or its bound actor
          exited: they fire there, on time, and it sleeps
