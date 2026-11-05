@@ -924,8 +924,10 @@ request  the request message as the handler received it
 ```
 
 The reply goes to the requester with the request's ref. Returns as
-alph_send. A requester that already timed out or exited drops it.
-Thread: a handler.
+alph_send, except that a full mailbox never refuses a reply: the
+requester's own outstanding requests bound how many it can get, so
+replies get through even when it is flooded with other work. A requester
+that already timed out or exited drops it. Thread: a handler.
 
 ### `alph_reply_value`
 
@@ -2201,6 +2203,16 @@ export fn alph_mailbox_push(mb: AlphMailbox*, m: AlphMsg*) -> bool
 
 Copies *m into the mailbox. Returns false when it holds its limit, or
 when a new segment was needed and memory ran out. Thread: any.
+
+### `alph_mailbox_push_any`
+
+```mettle
+export fn alph_mailbox_push_any(mb: AlphMailbox*, m: AlphMsg*) -> bool
+```
+
+As alph_mailbox_push, but past the limit too: for messages the receiver
+asked for, such as replies, which its own outstanding requests already
+bound. Returns false only when memory runs out. Thread: any.
 
 ### `alph_mailbox_pop`
 

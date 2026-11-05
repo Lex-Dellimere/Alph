@@ -165,6 +165,17 @@ export fn alph_mailbox_count(mb: AlphMailbox*) -> int64 {
 // Copies *m into the mailbox. Returns false when it holds its limit, or
 // when a new segment was needed and memory ran out. Thread: any.
 export fn alph_mailbox_push(mb: AlphMailbox*, m: AlphMsg*) -> bool {
+  return alph_mailbox_put(mb, m, true);
+}
+
+// As alph_mailbox_push, but past the limit too: for messages the receiver
+// asked for, such as replies, which its own outstanding requests already
+// bound. Returns false only when memory runs out. Thread: any.
+export fn alph_mailbox_push_any(mb: AlphMailbox*, m: AlphMsg*) -> bool {
+  return alph_mailbox_put(mb, m, false);
+}
+
+fn alph_mailbox_put(mb: AlphMailbox*, m: AlphMsg*, limited: bool) -> bool {
   var fresh: int64 = 0;  // the next segment, when this sender may link it
   while (true) {
     var pos: int64 = alph_atomic_load(&mb->enq);
@@ -173,7 +184,7 @@ export fn alph_mailbox_push(mb: AlphMailbox*, m: AlphMsg*) -> bool {
       alph_cpu_relax();  // the end mark: the next segment is being linked
       continue;
     }
-    if (alph_mb_count(pos) - alph_mb_count(alph_atomic_load(&mb->deq)) >= alph_atomic_load(&mb->limit)) {
+    if (limited && alph_mb_count(pos) - alph_mb_count(alph_atomic_load(&mb->deq)) >= alph_atomic_load(&mb->limit)) {
       alph_seg_keep(mb, fresh);
       return false;
     }

@@ -1042,7 +1042,17 @@ fn alph_post(node: AlphNode*, m: AlphMsg*, payload: rawptr) -> int64 {
   } else if (m->size > 0) {
     memcpy((rawptr)&m->data[0], payload, m->size);
   }
-  if (!alph_mailbox_push(&p->mailbox, m)) {
+  // A reply is never refused for a full mailbox: the requester asked for it,
+  // and its own outstanding requests bound how many can come. Refusing it
+  // would leave the request waiting for its timeout, and under overload a
+  // busy requester would stop getting any answers at all.
+  var pushed: bool = false;
+  if ((m->flags & ALPH_MSG_REPLY) != 0) {
+    pushed = alph_mailbox_push_any(&p->mailbox, m);
+  } else {
+    pushed = alph_mailbox_push(&p->mailbox, m);
+  }
+  if (!pushed) {
     alph_msg_release(m);
     return ALPH_FULL;
   }
@@ -1177,8 +1187,10 @@ fn alph_reply_raw(ctx: AlphCtx*, request: AlphMsg*, tag: int64, arg: int64, data
 //   request  the request message as the handler received it
 //
 // The reply goes to the requester with the request's ref. Returns as
-// alph_send. A requester that already timed out or exited drops it.
-// Thread: a handler.
+// alph_send, except that a full mailbox never refuses a reply: the
+// requester's own outstanding requests bound how many it can get, so
+// replies get through even when it is flooded with other work. A requester
+// that already timed out or exited drops it. Thread: a handler.
 export fn alph_reply(ctx: AlphCtx*, request: AlphMsg*, tag: int64, arg: int64) -> int64 {
   return alph_reply_raw(ctx, request, tag, arg, (rawptr)0, 0);
 }
