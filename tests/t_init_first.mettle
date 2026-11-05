@@ -1,0 +1,101 @@
+// ALPH_TAG_INIT is the first message every actor gets, even when signals
+// reach it before it first runs. A parent spawns a child and at once gives
+// it a socket that already has data, and sends it a timer for 0 ms; the
+// child must see INIT, then IO_GIVEN, and only then ALPH_TAG_IO. Many rounds,
+// since it was a race.
+
+import "std/io";
+import "std/thread";
+import "alph/sys/atomic";
+import "alph/alph";
+
+const ROUNDS: int64 = 300;
+const TICK: int64 = ALPH_TAG_USER;
+
+var g_node: AlphNode;
+var g_failures: int64 = 0;
+var g_done: int64 = 0;
+var g_bad_first: int64 = 0;     // children whose first message was not INIT
+var g_io_early: int64 = 0;      // children that got ALPH_TAG_IO before IO_GIVEN
+var g_heard: int64 = 0;         // children that got their socket's data
+
+fn expect(ok: bool, what: string) {
+  if (!ok) {
+    println("FAIL {what}");
+    alph_atomic_add(&g_failures, 1);
+  }
+}
+
+struct Kid {
+  seen: int64;     // messages so far
+  given: int64;    // IO_GIVEN came
+  h: int64;
+}
+
+fn child(ctx: AlphCtx*, m: AlphMsg*) -> int64 {
+  var k: Kid* = (Kid*)ctx->state;
+  if (k->seen == 0 && m->tag != ALPH_TAG_INIT) {
+    alph_atomic_add(&g_bad_first, 1);
+  }
+  k->seen = k->seen + 1;
+  if (m->tag == ALPH_TAG_IO_GIVEN) {
+    k->given = 1;
+    k->h = m->ref;
+    alph_io_arm(ctx, k->h, ALPH_IO_IN);
+  } else if (m->tag == ALPH_TAG_IO) {
+    if (k->given == 0) {
+      alph_atomic_add(&g_io_early, 1);
+    }
+    alph_atomic_add(&g_heard, 1);
+    alph_atomic_add(&g_done, 1);
+    return alph_stop(ctx, ALPH_NORMAL);
+  }
+  return ALPH_CONTINUE;
+}
+
+fn parent(ctx: AlphCtx*, m: AlphMsg*) -> int64 {
+  if (m->tag == ALPH_TAG_INIT || m->tag == TICK) {
+    var fds: int32[2];
+    syscall(53, 1, 1, 0, (int64)&fds[0]);  // socketpair(AF_UNIX, SOCK_STREAM)
+    var one: uint8 = 7;
+    syscall(1, (int64)fds[1], (int64)&one, 1);  // data waiting before the child exists
+    var h: int64 = alph_io_open(ctx, (int64)fds[0]);
+    var k: Kid;
+    k.seen = 0;
+    k.given = 0;
+    k.h = 0;
+    var kid: int64 = alph_spawn_value<Kid>(ctx, 0, &k, &child);
+    alph_send_after(ctx, 0, kid, TICK, 0);
+    alph_io_give(ctx, h, kid);
+    syscall(3, (int64)fds[1]);
+    if (m->arg + 1 < ROUNDS) {
+      alph_send(ctx, ctx->self, TICK, m->arg + 1);
+    }
+  }
+  return ALPH_CONTINUE;
+}
+
+fn main() -> int32 {
+  var cfg: AlphConfig;
+  alph_config(&cfg);
+  cfg.schedulers = 4;
+  cfg.max_actors = 1024;
+  expect(alph_node_start(&g_node, &cfg), "node started");
+  alph_node_spawn(&g_node, 0, &parent);
+  for i: int64 in 0..10000 {
+    if (alph_atomic_load(&g_done) >= ROUNDS) {
+      break;
+    }
+    thread_sleep_ms(1);
+  }
+  expect(alph_atomic_load(&g_done) == ROUNDS, "every child heard its socket ({g_done} of {ROUNDS})");
+  expect(alph_atomic_load(&g_bad_first) == 0, "every child got INIT first ({g_bad_first} did not)");
+  expect(alph_atomic_load(&g_io_early) == 0, "no child got ALPH_TAG_IO before its handle");
+  alph_node_halt(&g_node, 0);
+  alph_node_wait(&g_node);
+  if (g_failures != 0) {
+    return 1;
+  }
+  println("init first ok: {ROUNDS} children");
+  return 0;
+}

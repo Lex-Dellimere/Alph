@@ -224,6 +224,10 @@ export struct AlphConfig {
 //   shed     messages dropped by alph_mailbox_shed for waiting too long
 //   rehomed  wakes that moved an actor to its sender's scheduler, as its
 //            own was asleep
+//   rescued  schedulers the watchdog woke, or activated, for work stuck
+//            behind a long handler
+//   io_demoted  handles watched one-shot since their fd was taken with
+//            alph_io_fd
 export struct AlphStats {
   live: int64;
   spawned: int64;
@@ -231,6 +235,8 @@ export struct AlphStats {
   healed: int64;
   shed: int64;
   rehomed: int64;
+  rescued: int64;
+  io_demoted: int64;
 }
 
 // A node. Declare one, start it with alph_node_start, and keep it in place
@@ -291,6 +297,7 @@ export struct AlphNode {
   rehomed: int64;       // wakes that moved an actor to its sender's scheduler
   rescued: int64;       // schedulers the watchdog woke for work stuck behind a long run
   sysmon_looks: int64;  // times the watchdog woke to look
+  io_demoted: int64;    // handles turned one-shot because their fd was taken (alph_io_fd)
   epoch: int64;         // bumped by every retire
   retired: AlphVec;     // pairs: block (bit 0 set: a plain block, else an AlphEntry*), epoch
   retire_lock: int64;
@@ -363,6 +370,7 @@ struct AlphProc {
   shed_interval: int64;   //   how long waits must stay above it before shedding (ns)
   shed_above: int64;      //   when shedding may start, if waits are above target; else 0
   shed_casts: int64;      //   1: plain sends may be shed too, not only requests
+  fresh: int64;           // spawned and INIT not yet handled: it goes before any signal
   drain_lock: int64;      // held while a late signal queue is drained, and at reuse
   deferred: AlphVec;      // exits and downs waiting for earlier messages
   io_handles: AlphVec;    // handles this actor owns, closed when it exits
@@ -427,7 +435,17 @@ struct AlphIoSlot {
   pollable: int64;  // epoll accepted it (regular files are not)
   child: int64;     // a process handle: the child's OS pid until it is reaped
   kill_to: int64;   // what kill() targets for it: -pid (its group) or pid
-  armed: int64;     // events asked for and not yet delivered, to re-arm on a move
+  armed: int64;     // one-shot slots: events asked for and not yet delivered, to re-arm on a move
+  // Edge-triggered slots (the default) are registered once for reading and
+  // writing; readiness is tracked here. ready: bits 0-4 (ALPH_IO_ bits that
+  // fired and were not yet delivered; ERR and HUP stay), armed: bits 8-12.
+  // One CAS moves both, from the polling thread or the owner.
+  state: int64;
+  oneshot: int64;   // 1: level one-shot, re-armed by epoll_ctl (process handles, and
+                    //    any handle whose fd was taken with alph_io_fd)
+  stream: int64;    // 1: a TCP stream, where a short read means the socket is drained
+  drained: int64;   // the owner's last read or accept found nothing more (owner only)
+  full: int64;      // the owner's last write did not fit (owner only)
 }
 
 // A registered name, or a process group and its members. The name is a
@@ -801,7 +819,7 @@ fn alph_io_move(node: AlphNode*, p: AlphProc*, to: AlphSched*) {
       alph_rx_remove(&old->rx, slot->fd);
       alph_atomic_add(&old->io_count, -1);
       slot->sched = (int64)to;
-      if (alph_rx_add(&to->rx, slot->fd, slot->armed, ALPH_RX_ONESHOT, slot->handle) == 0) {
+      if (alph_io_watch(slot, to) == 0) {
         alph_atomic_add(&to->io_count, 1);
       } else {
         slot->pollable = 0;
@@ -845,7 +863,9 @@ fn alph_sched_rise(s: AlphSched*, node: AlphNode*) {
 // scheduler finds work after being idle, and ends when it runs out.
 fn alph_sched_working(s: AlphSched*) {
   if (s->work_at == 0) {
-    alph_atomic_store(&s->work_at, alph_now_ns());
+    // Sequentially consistent, paired with the watchdog's store to
+    // sysmon_idle and its look at work_at: one of the two sees the other.
+    alph_atomic_store_sc(&s->work_at, alph_now_ns());
     var node: AlphNode* = (AlphNode*)s->node;
     if (alph_atomic_load(&node->sysmon_idle) != 0 && alph_atomic_cas(&node->sysmon_idle, 1, 0) == 1) {
       // The watchdog backed off while the node idled: it looks again now.
@@ -1827,6 +1847,7 @@ fn alph_spawn_raw(node: AlphNode*, parent: int64, flags: int64, monitor_ref: int
   alph_atomic_add(&node->live, 1);
   alph_atomic_add(&node->spawned, 1);
   alph_atomic_store(&p->status, ALPH_P_IDLE);
+  p->fresh = 1;
   alph_atomic_store_sc(&p->pid, pid);
   alph_send_raw(node, parent, pid, ALPH_TAG_INIT, init_arg, (rawptr)0, 0);
   return pid;
@@ -2799,6 +2820,19 @@ fn alph_run_some(s: AlphSched*, p: AlphProc*) -> int64 {
       return again;
     }
   }
+  if (p->fresh != 0) {
+    // INIT was queued before the pid got out, so it is the mailbox's first
+    // message; signals sent since (a handle given, an IO event, a timer)
+    // must not come before it.
+    p->fresh = 0;
+    var at0: int64 = 0;
+    if (alph_mailbox_pop_at(&p->mailbox, &m, &at0)) {
+      var first: int64 = alph_handle_message(s, p, &m);
+      if (first >= 0) {
+        return first;
+      }
+    }
+  }
   for n: int64 in 0..ALPH_BUDGET {
     while (alph_deferred_ready(p)) {
       var reason: int64 = alph_handle_and_free(s, p, alph_vec_shift(&p->deferred));
@@ -3005,10 +3039,81 @@ fn alph_io_register(slot: AlphIoSlot*, s: AlphSched*) {
   slot->sched = (int64)s;
   slot->pollable = 0;
   slot->armed = 0;
-  if (alph_rx_add(&s->rx, slot->fd, 0, ALPH_RX_ONESHOT, slot->handle) == 0) {
+  alph_atomic_store(&slot->state, 0);
+  slot->drained = 1;
+  slot->full = 1;
+  if (alph_io_watch(slot, s) == 0) {
     slot->pollable = 1;
     alph_atomic_add(&s->io_count, 1);
   }
+}
+
+// Puts slot's fd on s's epoll set: edge-triggered for reading and writing,
+// once for good, or one-shot with the events it has armed.
+fn alph_io_watch(slot: AlphIoSlot*, s: AlphSched*) -> int64 {
+  if (slot->oneshot != 0) {
+    return alph_rx_add(&s->rx, slot->fd, slot->armed, ALPH_RX_ONESHOT, slot->handle);
+  }
+  return alph_rx_add(&s->rx, slot->fd, ALPH_RX_READ | ALPH_RX_WRITE, ALPH_RX_EDGE, slot->handle);
+}
+
+// Turns an edge-triggered slot into a one-shot one for good, keeping what
+// it has armed: its owner may now read the fd without alph_io_read, which
+// the edge bookkeeping relies on.
+fn alph_io_to_oneshot(node: AlphNode*, slot: AlphIoSlot*) {
+  if (slot->oneshot != 0) {
+    return;
+  }
+  slot->oneshot = 1;
+  alph_atomic_add(&node->io_demoted, 1);
+  var st: int64 = alph_atomic_swap(&slot->state, 0);
+  slot->armed = (st >> 8) & (ALPH_IO_IN | ALPH_IO_OUT);
+  if (slot->pollable != 0) {
+    var home: AlphSched* = (AlphSched*)slot->sched;
+    alph_rx_modify(&home->rx, slot->fd, slot->armed, ALPH_RX_ONESHOT, slot->handle);
+  }
+}
+
+// The poller (a scheduler, a rescuer or the watchdog) saw mask on slot,
+// for handle h. A one-shot slot fired and is disarmed. An edge-triggered
+// one delivers what is armed, and disarms every direction at once, as a
+// one-shot does: the owner arms again after each ALPH_TAG_IO. What is not
+// armed is kept as ready, for the next arm.
+fn alph_io_event(node: AlphNode*, slot: AlphIoSlot*, h: int64, mask: int64) {
+  if (slot->oneshot != 0) {
+    slot->armed = 0;
+    alph_signal(node, ALPH_SIG_IO, 0, slot->owner, h, mask, 0);
+    return;
+  }
+  while (true) {
+    var old: int64 = alph_atomic_load(&slot->state);
+    var ready: int64 = old & 255;
+    var armed: int64 = (old >> 8) & 255;
+    var give: int64 = 0;
+    if (armed != 0) {
+      give = mask & (armed | ALPH_IO_ERR | ALPH_IO_HUP);
+    }
+    var next: int64 = old | mask;
+    if (give != 0) {
+      next = (ready | mask) & ~(give & (ALPH_IO_IN | ALPH_IO_OUT));  // ERR and HUP stay
+    }
+    if (alph_atomic_cas(&slot->state, old, next) == old) {
+      if (give != 0) {
+        alph_signal(node, ALPH_SIG_IO, 0, slot->owner, h, give, 0);
+      }
+      return;
+    }
+  }
+}
+
+// alph_io_open for a TCP stream socket: a read shorter than asked for
+// means it is drained.
+fn alph_io_open_stream(ctx: AlphCtx*, fd: int64) -> int64 {
+  var h: int64 = alph_io_open(ctx, fd);
+  if (h > 0) {
+    alph_io_slot(ctx->node, h)->stream = 1;
+  }
+  return h;
 }
 
 // Makes the calling actor the owner of fd: it is made non-blocking, put on
@@ -3044,6 +3149,8 @@ export fn alph_io_open(ctx: AlphCtx*, fd: int64) -> int64 {
   slot->fd = fd;
   slot->child = 0;
   slot->kill_to = 0;
+  slot->oneshot = 0;
+  slot->stream = 0;
   slot->owner = ctx->self;
   alph_atomic_store_sc(&slot->handle, (slot->serial << 32) | (index + 1));
   alph_io_register(slot, (AlphSched*)alph_me(ctx)->sched);
@@ -3054,7 +3161,16 @@ export fn alph_io_open(ctx: AlphCtx*, fd: int64) -> int64 {
 // Asks for one ALPH_TAG_IO message the next time handle h is ready for
 // events (ALPH_IO_IN, ALPH_IO_OUT, or both). The message's ref is h and its
 // arg says what is ready, which may include ALPH_IO_ERR or ALPH_IO_HUP. Arm
-// again after each message to hear about the next time.
+// again after each message to hear about the next time: one message
+// disarms every direction, as an epoll one-shot does.
+//
+// Arming costs no system call: the handle stays on its epoll set,
+// edge-triggered, and what became ready while unarmed is kept and reported
+// at once. After a read through alph_io_read that left data behind (or a
+// write through alph_io_write that wrote everything), it is reported at
+// once as well, so reading part of what is there and arming again works as
+// with a level. A message may then find nothing after all: the read returns
+// ALPH_IO_AGAIN, and arming again waits for more.
 //
 // Returns 0, or a negative errno: -9 when this actor does not own h, -1
 // when h cannot be watched (a regular file). Thread: a handler.
@@ -3066,9 +3182,46 @@ export fn alph_io_arm(ctx: AlphCtx*, h: int64, events: int64) -> int64 {
   if (slot->pollable == 0) {
     return -1;
   }
-  var s: AlphSched* = (AlphSched*)slot->sched;
-  slot->armed = events & (ALPH_IO_IN | ALPH_IO_OUT);
-  return alph_rx_modify(&s->rx, slot->fd, events & (ALPH_IO_IN | ALPH_IO_OUT), ALPH_RX_ONESHOT, h);
+  var want: int64 = events & (ALPH_IO_IN | ALPH_IO_OUT);
+  if (slot->oneshot != 0) {
+    var s: AlphSched* = (AlphSched*)slot->sched;
+    slot->armed = want;
+    return alph_rx_modify(&s->rx, slot->fd, want, ALPH_RX_ONESHOT, h);
+  }
+  if (want == 0) {
+    return 0;
+  }
+  while (true) {
+    var old: int64 = alph_atomic_load(&slot->state);
+    var ready: int64 = old & 255;
+    var hit: int64 = ready & (want | ALPH_IO_ERR | ALPH_IO_HUP);
+    if (hit != 0) {
+      // Ready since the last delivery: hand it over, and keep ERR and HUP.
+      var next: int64 = ready & ~(hit & (ALPH_IO_IN | ALPH_IO_OUT));
+      if (alph_atomic_cas(&slot->state, old, next) == old) {
+        alph_signal(ctx->node, ALPH_SIG_IO, 0, ctx->self, h, hit, 0);
+        return 0;
+      }
+      continue;
+    }
+    // No edge since, but the last read or write left more to do: there is
+    // no edge to wait for, so report it at once, as a level would.
+    var maybe: int64 = 0;
+    if ((want & ALPH_IO_IN) != 0 && slot->drained == 0) {
+      maybe = maybe | ALPH_IO_IN;
+    }
+    if ((want & ALPH_IO_OUT) != 0 && slot->full == 0) {
+      maybe = maybe | ALPH_IO_OUT;
+    }
+    if (maybe != 0) {
+      alph_signal(ctx->node, ALPH_SIG_IO, 0, ctx->self, h, maybe, 0);
+      return 0;
+    }
+    if (alph_atomic_cas(&slot->state, old, ready | (want << 8)) == old) {
+      return 0;
+    }
+  }
+  return 0;
 }
 
 // Reads up to size bytes from handle h into buf, without blocking.
@@ -3080,7 +3233,14 @@ export fn alph_io_read(ctx: AlphCtx*, h: int64, buf: rawptr, size: int64) -> int
   if (slot == 0) {
     return -9;
   }
-  return alph_sys_read(slot->fd, buf, size);
+  var n: int64 = alph_sys_read(slot->fd, buf, size);
+  // Whether an arm must wait for the next edge, or may report at once.
+  if (n == ALPH_IO_AGAIN || (n > 0 && n < size && slot->stream != 0)) {
+    slot->drained = 1;
+  } else if (n >= 0) {
+    slot->drained = 0;  // a full read, or the end of the stream, which stays readable
+  }
+  return n;
 }
 
 // Writes up to size bytes from buf to handle h, without blocking. Returns
@@ -3092,7 +3252,13 @@ export fn alph_io_write(ctx: AlphCtx*, h: int64, buf: rawptr, size: int64) -> in
   if (slot == 0) {
     return -9;
   }
-  return alph_sys_write(slot->fd, buf, size);
+  var n: int64 = alph_sys_write(slot->fd, buf, size);
+  if (n == ALPH_IO_AGAIN || (n >= 0 && n < size)) {
+    slot->full = 1;
+  } else if (n == size) {
+    slot->full = 0;
+  }
+  return n;
 }
 
 // Closes handle h and its descriptor now. Does nothing when this actor does
@@ -3112,12 +3278,16 @@ export fn alph_io_close(ctx: AlphCtx*, h: int64) {
 
 // The descriptor behind handle h, for calls alph has no wrapper for, or -9
 // when this actor does not own h. Do not close it yourself; use
-// alph_io_close. Thread: a handler.
+// alph_io_close. From then on h is watched one-shot, re-armed by a system
+// call on each alph_io_arm, since reads and writes alph does not see would
+// break its edge bookkeeping (alph_node_stats counts these as io_demoted).
+// Thread: a handler.
 export fn alph_io_fd(ctx: AlphCtx*, h: int64) -> int64 {
   var slot: AlphIoSlot* = alph_io_mine(ctx, h);
   if (slot == 0) {
     return -9;
   }
+  alph_io_to_oneshot(ctx->node, slot);
   return slot->fd;
 }
 
@@ -3219,9 +3389,13 @@ export fn alph_tcp_accept(ctx: AlphCtx*, listener: int64) -> int64 {
   }
   var fd: int64 = syscall(ALPH_SYS_ACCEPT4, slot->fd, 0, 0, ALPH_SOCK_NONBLOCK | ALPH_SOCK_CLOEXEC);
   if (fd < 0) {
+    if (fd == ALPH_IO_AGAIN) {
+      slot->drained = 1;
+    }
     return fd;
   }
-  return alph_io_open(ctx, fd);
+  slot->drained = 0;  // more may be waiting
+  return alph_io_open_stream(ctx, fd);
 }
 
 // Starts connecting to ip4:port. Returns the handle at once, still
@@ -3240,7 +3414,7 @@ export fn alph_tcp_connect(ctx: AlphCtx*, ip4: int64, port: int64) -> int64 {
     alph_sys_close(fd);
     return err;
   }
-  return alph_io_open(ctx, fd);
+  return alph_io_open_stream(ctx, fd);
 }
 
 // The local port of a socket handle: the port a listener opened with port
@@ -3786,6 +3960,7 @@ export fn alph_proc_spawn(ctx: AlphCtx*, spec: AlphProcSpec*) -> int64 {
     } else {
       alph_io_slot(ctx->node, h)->child = pid;
       alph_io_slot(ctx->node, h)->kill_to = kill_to;
+      alph_io_to_oneshot(ctx->node, alph_io_slot(ctx->node, h));
       alph_io_arm(ctx, h, ALPH_IO_IN);
     }
   }
@@ -4245,8 +4420,7 @@ fn alph_sched_poll(s: AlphSched*, timeout_ns: int64) {
       var slot: AlphIoSlot* = alph_io_slot(node, ev[i].data);
       if (slot != 0) {
         var mask: int64 = ev[i].events & (ALPH_IO_IN | ALPH_IO_OUT | ALPH_IO_ERR | ALPH_IO_HUP);
-        slot->armed = 0;  // one-shot: it fired, and is disarmed until armed again
-        alph_signal(node, ALPH_SIG_IO, 0, slot->owner, ev[i].data, mask, 0);
+        alph_io_event(node, slot, ev[i].data, mask);
       }
     }
   }
@@ -4287,8 +4461,7 @@ fn alph_rescue_poll(node: AlphNode*, v: AlphSched*, buf: int64) -> int64 {
       if (slot != 0) {
         var mask: int64 = alph_sys_event_mask((rawptr)buf, k) &
                           (ALPH_IO_IN | ALPH_IO_OUT | ALPH_IO_ERR | ALPH_IO_HUP);
-        slot->armed = 0;
-        alph_signal(node, ALPH_SIG_IO, 0, slot->owner, data, mask, 0);
+        alph_io_event(node, slot, data, mask);
       }
     }
   }
@@ -4633,9 +4806,10 @@ fn alph_sysmon_main(arg: int64) -> int64 {
     var word: int64 = alph_atomic_load(&node->sysmon_word);
     if (delay > ALPH_SYSMON_BUSY_NS) {
       alph_atomic_store_sc(&node->sysmon_idle, 1);
-      // Anything that started meanwhile has missed the flag: look at once.
+      // A scheduler that started working before the flag was up missed
+      // it: look at once.
       for i: int64 in 0..node->sched_count {
-        if (alph_atomic_load(&alph_sched_at(node, i)->current) != 0) {
+        if (alph_atomic_load(&alph_sched_at(node, i)->work_at) != 0) {
           delay = ALPH_SYSMON_NS;
         }
       }
@@ -4769,4 +4943,6 @@ export fn alph_node_stats(node: AlphNode*, stats: AlphStats*) {
   stats->healed = alph_atomic_load(&node->healed);
   stats->shed = alph_atomic_load(&node->shed);
   stats->rehomed = alph_atomic_load(&node->rehomed);
+  stats->rescued = alph_atomic_load(&node->rescued);
+  stats->io_demoted = alph_atomic_load(&node->io_demoted);
 }

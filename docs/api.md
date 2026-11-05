@@ -701,6 +701,8 @@ export struct AlphStats {
   healed: int64;
   shed: int64;
   rehomed: int64;
+  rescued: int64;
+  io_demoted: int64;
 }
 ```
 
@@ -714,6 +716,10 @@ healed   crashes a medic repaired, unseen by anyone else
 shed     messages dropped by alph_mailbox_shed for waiting too long
 rehomed  wakes that moved an actor to its sender's scheduler, as its
          own was asleep
+rescued  schedulers the watchdog woke, or activated, for work stuck
+         behind a long handler
+io_demoted  handles watched one-shot since their fd was taken with
+         alph_io_fd
 ```
 
 ### `AlphNode`
@@ -775,6 +781,7 @@ export struct AlphNode {
   rehomed: int64;       // wakes that moved an actor to its sender's scheduler
   rescued: int64;       // schedulers the watchdog woke for work stuck behind a long run
   sysmon_looks: int64;  // times the watchdog woke to look
+  io_demoted: int64;    // handles turned one-shot because their fd was taken (alph_io_fd)
   epoch: int64;         // bumped by every retire
   retired: AlphVec;     // pairs: block (bit 0 set: a plain block, else an AlphEntry*), epoch
   retire_lock: int64;
@@ -1604,7 +1611,16 @@ export fn alph_io_arm(ctx: AlphCtx*, h: int64, events: int64) -> int64
 Asks for one ALPH_TAG_IO message the next time handle h is ready for
 events (ALPH_IO_IN, ALPH_IO_OUT, or both). The message's ref is h and its
 arg says what is ready, which may include ALPH_IO_ERR or ALPH_IO_HUP. Arm
-again after each message to hear about the next time.
+again after each message to hear about the next time: one message
+disarms every direction, as an epoll one-shot does.
+
+Arming costs no system call: the handle stays on its epoll set,
+edge-triggered, and what became ready while unarmed is kept and reported
+at once. After a read through alph_io_read that left data behind (or a
+write through alph_io_write that wrote everything), it is reported at
+once as well, so reading part of what is there and arming again works as
+with a level. A message may then find nothing after all: the read returns
+ALPH_IO_AGAIN, and arming again waits for more.
 
 Returns 0, or a negative errno: -9 when this actor does not own h, -1
 when h cannot be watched (a regular file). Thread: a handler.
@@ -1648,7 +1664,10 @@ export fn alph_io_fd(ctx: AlphCtx*, h: int64) -> int64
 
 The descriptor behind handle h, for calls alph has no wrapper for, or -9
 when this actor does not own h. Do not close it yourself; use
-alph_io_close. Thread: a handler.
+alph_io_close. From then on h is watched one-shot, re-armed by a system
+call on each alph_io_arm, since reads and writes alph does not see would
+break its edge bookkeeping (alph_node_stats counts these as io_demoted).
+Thread: a handler.
 
 ### `alph_io_give`
 
