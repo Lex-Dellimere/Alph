@@ -24,6 +24,7 @@ const TSH_PLAIN: int64 = ALPH_TAG_USER + 2;
 const TSH_OFF: int64 = ALPH_TAG_USER + 3;
 const TSH_ON: int64 = ALPH_TAG_USER + 4;
 const TSH_FIN: int64 = ALPH_TAG_USER + 5;
+const TSH_NEXT: int64 = ALPH_TAG_USER + 6;
 const CLIENTS: int64 = 8;
 const PER_CLIENT: int64 = 3000;
 const SEQ_COUNT: int64 = 50;
@@ -105,8 +106,23 @@ struct TshClient {
   refs: int64[3000];    // a ref is set to -1 once answered
 }
 
+var tsh_refused: int64 = 0;           // requests refused at once with ALPH_BUSY
+
 fn tsh_fire(ctx: AlphCtx*, c: TshClient*) {
   var ref: int64 = alph_request(ctx, c->server, TSH_REQ, 0, REQ_TIMEOUT_MS);
+  if (ref == ALPH_BUSY) {
+    // Refused by the sender side: an answer too, with no ref.
+    c->busy = c->busy + 1;
+    alph_atomic_add(&tsh_busy, 1);
+    alph_atomic_add(&tsh_refused, 1);
+    if (c->reply + c->busy + c->bad == c->total && c->fin == 0) {
+      c->fin = 1;
+      alph_send_after(ctx, GRACE_MS, ctx->self, TSH_FIN, 0);
+    } else if (c->mode == 1) {
+      alph_send_after(ctx, 1, ctx->self, TSH_NEXT, 0);  // no answer will come to fire the next
+    }
+    return;
+  }
   if (ref <= 0) {
     alph_atomic_add(&tsh_unsent, 1);
     return;
@@ -148,6 +164,10 @@ fn client(ctx: AlphCtx*, m: AlphMsg*) -> int64 {
     }
     return ALPH_CONTINUE;
   }
+  if (m->tag == TSH_NEXT) {
+    tsh_fire(ctx, c);
+    return ALPH_CONTINUE;
+  }
   if (m->tag == TSH_FIN) {
     if (c->reply + c->busy + c->bad != c->total || c->unknown != 0) {
       alph_atomic_add(&tsh_client_bad, 1);
@@ -172,7 +192,7 @@ fn client(ctx: AlphCtx*, m: AlphMsg*) -> int64 {
     c->bad = c->bad + 1;
     alph_atomic_add(&tsh_bad, 1);
   }
-  if (c->mode == 1 && c->sent < c->total) {
+  if (c->mode == 1 && c->reply + c->busy + c->bad < c->total) {
     tsh_fire(ctx, c);
   }
   if (c->reply + c->busy + c->bad == c->total && c->fin == 0) {
@@ -195,6 +215,7 @@ fn tsh_reset() {
   alph_atomic_store(&tsh_unsent, 0);
   alph_atomic_store(&tsh_client_bad, 0);
   alph_atomic_store(&tsh_done, 0);
+  alph_atomic_store(&tsh_refused, 0);
 }
 
 fn tsh_run(clients: int64, mode: int64, total: int64) {
@@ -274,7 +295,9 @@ fn main() -> int32 {
   var busy: int64 = alph_atomic_load(&tsh_busy);
   expect(served > 0, "flood: some requests were served");
   expect(busy > 0, "flood: some requests were shed");
-  expect(shed_count() - shed0 == busy, "flood: the shed counter equals the BUSY answers");
+  var refused: int64 = alph_atomic_load(&tsh_refused);
+  expect(shed_count() - shed0 + refused == busy,
+         "flood: shed by the server plus refused by senders equals the BUSY answers");
 
   // 2. recovery: one request at a time, no BUSY
   shed0 = shed_count();
@@ -324,6 +347,6 @@ fn main() -> int32 {
     println("flood: {served} served, {busy} busy; plain: {sent} sent, {handled} handled, {dropped} shed; last phase: reply {tsh_reply}, busy {tsh_busy}, bad {tsh_bad}, unknown {tsh_unknown}, unsent {tsh_unsent}, client_bad {tsh_client_bad}, done {tsh_done}");
     return 1;
   }
-  println("shed ok: {served} served, {busy} busy");
+  println("shed ok: {served} served, {busy} busy ({refused} refused by their senders)");
   return 0;
 }

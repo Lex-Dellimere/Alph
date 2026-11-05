@@ -598,6 +598,7 @@ export const ALPH_SENT: int64 = 0;   // in the receiver's mailbox
 export const ALPH_FULL: int64 = -1;  // the receiver's mailbox is full; nothing was sent
 export const ALPH_GONE: int64 = -2;  // the receiver has exited; nothing was sent
 export const ALPH_NOMEM: int64 = -3; // no memory for a large payload; nothing was sent
+export const ALPH_BUSY: int64 = -4;  // alph_request only: the server sheds load (alph_mailbox_shed); nothing was sent
 ```
 
 What a handle is ready for, in alph_io_arm and in m->arg of ALPH_TAG_IO.
@@ -703,6 +704,8 @@ export struct AlphStats {
   rehomed: int64;
   rescued: int64;
   io_demoted: int64;
+  active: int64;
+  refused: int64;
 }
 ```
 
@@ -720,6 +723,9 @@ rescued  schedulers the watchdog woke, or activated, for work stuck
          behind a long handler
 io_demoted  handles watched one-shot since their fd was taken with
          alph_io_fd
+active   schedulers taking work now (compaction leaves the rest idle)
+refused  requests their sender refused at once with ALPH_BUSY, as the
+         server was shedding
 ```
 
 ### `AlphNode`
@@ -780,6 +786,7 @@ export struct AlphNode {
   shed: int64;          // messages dropped by alph_mailbox_shed
   rehomed: int64;       // wakes that moved an actor to its sender's scheduler
   rescued: int64;       // schedulers the watchdog woke for work stuck behind a long run
+  refused: int64;       // requests refused at once with ALPH_BUSY by their senders
   sysmon_looks: int64;  // times the watchdog woke to look
   io_demoted: int64;    // handles turned one-shot because their fd was taken (alph_io_fd)
   epoch: int64;         // bumped by every retire
@@ -886,6 +893,16 @@ export fn alph_node_send_bytes(node: AlphNode*, to: int64, tag: int64, data: raw
 Sends size bytes from outside the node. Returns as alph_send_value.
 Thread: any.
 
+### `alph_backlog`
+
+```mettle
+export fn alph_backlog(ctx: AlphCtx*) -> int64
+```
+
+How many messages wait in this actor's mailbox, not counting the one
+being handled: a handler can batch work (one write for many answers)
+while more is queued, and finish it with the last. Thread: a handler.
+
 ### `alph_request`
 
 ```mettle
@@ -901,7 +918,10 @@ timeout_ms  how long to wait for the reply, or 0 to wait for ever
 ```
 
 Returns the request's ref (above 0), or ALPH_FULL or ALPH_NOMEM when the
-request was not sent. Exactly one of these then arrives, carrying the ref:
+request was not sent, or ALPH_BUSY when the server sheds load
+(alph_mailbox_shed) and refusing it here costs the server nothing:
+answer your own client at once, or try later or elsewhere. After a ref,
+exactly one of these arrives, carrying it:
 
 ```text
 the reply           tag and payload as the server sent them
@@ -1177,7 +1197,10 @@ it drops every one still above the target unhandled, so its queueing
 delay stays near target_us and its time goes to work that can still
 succeed. A dropped request is answered at once with ALPH_TAG_BUSY (ref =
 the request's, arg = how long it waited in us), and every drop counts in
-alph_node_stats' shed. Only requests are shed: plain sends need
+alph_node_stats' shed. While it drops, or while its waits are above the
+target and it has taken nothing for longer than that, alph_request to it
+returns ALPH_BUSY at once without sending (stats: refused), so turning
+requests away costs the overloaded actor nothing. Only requests are shed: plain sends need
 alph_mailbox_shed_casts, and replies, DOWN, TIMEOUT and EXIT messages
 never are. Senders stamp their messages with the time while this is on:
 one clock read per send. target_us 0 turns it off.

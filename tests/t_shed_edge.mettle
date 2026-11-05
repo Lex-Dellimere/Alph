@@ -9,6 +9,10 @@
 //      waited above the target is served, not shed: shedding needs a whole
 //      interval of standing delay first
 //   4. a kill reaches an actor shedding a backlog of stale requests at once
+//   5. a request to a server whose waits are above target and that has been
+//      in one handler longer than the target is refused by its sender at
+//      once (ALPH_BUSY, nothing sent); once the server is idle again,
+//      requests go through
 
 import "std/io";
 import "std/thread";
@@ -26,6 +30,8 @@ const HOG: int64 = ALPH_TAG_USER + 6;
 const ASK: int64 = ALPH_TAG_USER + 7;
 const FLOOD: int64 = ALPH_TAG_USER + 8;
 const ROUNDS: int64 = 3;
+const PROBE: int64 = ALPH_TAG_USER + 9;
+const SLOWREQ: int64 = ALPH_TAG_USER + 10;
 
 var g_node: AlphNode;
 var g_solo: AlphNode;          // one scheduler, for check 3
@@ -46,6 +52,9 @@ var c_ready: int64 = 0;
 var c_handled: int64 = 0;
 var c_down_at: int64 = 0;
 var c_reason: int64 = -1;
+var d_result: int64 = 0;      // what alph_request returned to the probe
+var d_ready: int64 = 0;
+var d_probed: int64 = 0;
 
 fn expect(ok: bool, what: string) {
   if (!ok) {
@@ -161,6 +170,31 @@ fn server_c(ctx: AlphCtx*, m: AlphMsg*) -> int64 {
   return ALPH_CONTINUE;
 }
 
+// Check 5: each request costs 2 ms; waits above 0.5 ms count.
+fn server_d(ctx: AlphCtx*, m: AlphMsg*) -> int64 {
+  if (m->tag == ALPH_TAG_INIT) {
+    alph_mailbox_shed(ctx, 500, 100000);
+    alph_atomic_store(&d_ready, 1);
+  } else if (m->tag == SLOWREQ) {
+    spin(2000000);
+    alph_reply(ctx, m, ANS, 0);
+  }
+  return ALPH_CONTINUE;
+}
+
+// Fills server_d's queue on FLOOD, and tries one more request on PROBE.
+fn prober(ctx: AlphCtx*, m: AlphMsg*) -> int64 {
+  if (m->tag == FLOOD) {
+    for i: int64 in 0..m->arg {
+      alph_request(ctx, g_server, SLOWREQ, 0, 0);
+    }
+  } else if (m->tag == PROBE) {
+    alph_atomic_store(&d_result, alph_request(ctx, g_server, SLOWREQ, 0, 0));
+    alph_atomic_store(&d_probed, 1);
+  }
+  return ALPH_CONTINUE;
+}
+
 fn watcher(ctx: AlphCtx*, m: AlphMsg*) -> int64 {
   if (m->tag == ALPH_TAG_INIT) {
     alph_monitor(ctx, g_server);
@@ -258,6 +292,29 @@ fn main() -> int32 {
   expect(alph_atomic_load(&c_reason) == ALPH_KILLED, "kill while shedding: the server was killed");
   expect(alph_atomic_load(&c_down_at) != 0 && took_us < 20000,
          "kill while shedding: DOWN within 20 ms ({took_us} us)");
+
+  // 5
+  alph_atomic_store(&d_ready, 0);
+  g_server = alph_node_spawn(&g_node, 0, &server_d);
+  wait_for(&d_ready, 1, 1000);
+  // Bound: on a thread of its own, it runs while the server is in a handler.
+  var pr: int64 = alph_node_spawn(&g_node, ALPH_BOUND, &prober);
+  var st0: AlphStats;
+  alph_node_stats(&g_node, &st0);
+  alph_node_send(&g_node, pr, FLOOD, 10);
+  thread_sleep_ms(7);  // the server is in its third 2 ms request, waits above target
+  alph_atomic_store(&d_probed, 0);
+  alph_node_send(&g_node, pr, PROBE, 0);
+  wait_for(&d_probed, 1, 1000);
+  expect(alph_atomic_load(&d_result) == ALPH_BUSY, "a request to a stuck, shedding server was refused at once ({d_result})");
+  var st1: AlphStats;
+  alph_node_stats(&g_node, &st1);
+  expect(st1.refused > st0.refused, "the refusal was counted");
+  thread_sleep_ms(80);  // the backlog drains or is shed, the server idles
+  alph_atomic_store(&d_probed, 0);
+  alph_node_send(&g_node, pr, PROBE, 0);
+  wait_for(&d_probed, 1, 1000);
+  expect(alph_atomic_load(&d_result) > 0, "once idle, a request went through ({d_result})");
 
   alph_node_halt(&g_solo, 0);
   alph_node_wait(&g_solo);
