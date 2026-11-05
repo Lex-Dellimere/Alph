@@ -700,6 +700,7 @@ export struct AlphStats {
   crashed: int64;
   healed: int64;
   shed: int64;
+  rehomed: int64;
 }
 ```
 
@@ -711,6 +712,8 @@ spawned  actors started since the node started
 crashed  crashes that ended an actor
 healed   crashes a medic repaired, unseen by anyone else
 shed     messages dropped by alph_mailbox_shed for waiting too long
+rehomed  wakes that moved an actor to its sender's scheduler, as its
+         own was asleep
 ```
 
 ### `AlphNode`
@@ -736,6 +739,9 @@ export struct AlphNode {
   heap_limit: int64;
   stack_size: int64;
   bound_list: int64;    // every bound scheduler, for alph_node_wait
+  sysmon: AlphThread;   // the watchdog, alph_sysmon_main
+  sysmon_handle: int64;
+  sysmon_word: int64;   // futex word it sleeps on; bumped to wake it at halt
   bound_lock: int64;
   ios: int64;           // AlphIoSlot table
   io_capacity: int64;
@@ -765,6 +771,8 @@ export struct AlphNode {
   low_max: int64;       //   and the most any of them asked for
   rise_at: int64;       // when a busy scheduler last activated another (ns)
   shed: int64;          // messages dropped by alph_mailbox_shed
+  rehomed: int64;       // wakes that moved an actor to its sender's scheduler
+  rescued: int64;       // schedulers the watchdog woke for work stuck behind a long run
   epoch: int64;         // bumped by every retire
   retired: AlphVec;     // pairs: block (bit 0 set: a plain block, else an AlphEntry*), epoch
   retire_lock: int64;

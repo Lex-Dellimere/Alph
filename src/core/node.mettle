@@ -129,6 +129,11 @@ const ALPH_MSG_REPLY: int64 = 2;    // answers the request with the same ref
 
 // Messages handled before the scheduler moves on to another actor.
 const ALPH_BUDGET: int64 = 64;
+// The watchdog looks every ALPH_SYSMON_NS while actors run, so work stuck
+// behind a long handler waits at most about twice that; idle, it backs off
+// to ALPH_SYSMON_IDLE_NS.
+const ALPH_SYSMON_NS: int64 = 1000000;
+const ALPH_SYSMON_IDLE_NS: int64 = 50000000;
 // A scheduler out of work spins only while at least this many of 1024 of its
 // recent spins found work: below it, spinning costs more than the sleeps and
 // wake-ups it saves. In the sim a spin caught work 1.5%
@@ -215,12 +220,15 @@ export struct AlphConfig {
 //   crashed  crashes that ended an actor
 //   healed   crashes a medic repaired, unseen by anyone else
 //   shed     messages dropped by alph_mailbox_shed for waiting too long
+//   rehomed  wakes that moved an actor to its sender's scheduler, as its
+//            own was asleep
 export struct AlphStats {
   live: int64;
   spawned: int64;
   crashed: int64;
   healed: int64;
   shed: int64;
+  rehomed: int64;
 }
 
 // A node. Declare one, start it with alph_node_start, and keep it in place
@@ -245,6 +253,9 @@ export struct AlphNode {
   heap_limit: int64;
   stack_size: int64;
   bound_list: int64;    // every bound scheduler, for alph_node_wait
+  sysmon: AlphThread;   // the watchdog, alph_sysmon_main
+  sysmon_handle: int64;
+  sysmon_word: int64;   // futex word it sleeps on; bumped to wake it at halt
   bound_lock: int64;
   ios: int64;           // AlphIoSlot table
   io_capacity: int64;
@@ -274,6 +285,8 @@ export struct AlphNode {
   low_max: int64;       //   and the most any of them asked for
   rise_at: int64;       // when a busy scheduler last activated another (ns)
   shed: int64;          // messages dropped by alph_mailbox_shed
+  rehomed: int64;       // wakes that moved an actor to its sender's scheduler
+  rescued: int64;       // schedulers the watchdog woke for work stuck behind a long run
   epoch: int64;         // bumped by every retire
   retired: AlphVec;     // pairs: block (bit 0 set: a plain block, else an AlphEntry*), epoch
   retire_lock: int64;
@@ -384,6 +397,8 @@ struct AlphSched {
   io_count: int64;      // handles registered here
   runs: int64;          // actor runs, to poll IO now and then while busy
   spin_hits: int64;     // how often its recent spins found work, of 1024 (an average)
+  run_seq: int64;       // bumped as each actor run starts, for the watchdog
+  run_seen: int64;      // run_seq as the watchdog last saw it
   spin_skips: int64;    // idle stretches it slept through without spinning
   qlen: int64;          // actors in runq, roughly: pushes counted after, pops after
   pop_lock: int64;      // taken to pop runq: the owner and thieves are its consumers
@@ -902,6 +917,29 @@ fn alph_balance(node: AlphNode*, t: int64) {
 }
 
 fn alph_wake(node: AlphNode*, p: AlphProc*) {
+  alph_wake_from(node, p, 0);
+}
+
+// The scheduler the actor from is running on, when it is running: the
+// thread that is sending for it. Else 0.
+fn alph_sender_sched(node: AlphNode*, from: int64) -> AlphSched* {
+  if (from == 0) {
+    return (AlphSched*)0;
+  }
+  var q: AlphProc* = alph_resolve(node, from);
+  if (q == 0 || alph_atomic_load(&q->status) != ALPH_P_RUNNING) {
+    return (AlphSched*)0;
+  }
+  return (AlphSched*)q->sched;
+}
+
+// As alph_wake, for work sent by the actor from (0: by no actor). When p
+// owns no sockets, is not bound to a thread of its own, and its home is
+// asleep, it moves to from's scheduler, if that has nothing else queued,
+// instead, as Go's ready() puts a woken goroutine on the waker's P: from's
+// thread is awake and runs it after from, where waking the home would cost
+// an eventfd write, a context switch and a cold cache.
+fn alph_wake_from(node: AlphNode*, p: AlphProc*, from: int64) {
   alph_atomic_fence();
   while (true) {
     var status: int64 = alph_atomic_load(&p->status);
@@ -914,6 +952,15 @@ fn alph_wake(node: AlphNode*, p: AlphProc*) {
           // owners move on their old home's thread, with their sockets.
           s = alph_sched_pick(node, p);
           p->sched = (int64)s;
+        } else if (from != 0 && s->bound == 0 && p->io_handles.len == 0 &&
+                   alph_atomic_load(&s->sleeping) != 0) {
+          var here: AlphSched* = alph_sender_sched(node, from);
+          if (here != 0 && here != s && here->bound == 0 && alph_sched_active(node, here) &&
+              alph_atomic_load(&here->qlen) == 0) {
+            s = here;
+            p->sched = (int64)s;
+            alph_atomic_add(&node->rehomed, 1);
+          }
         }
         alph_runq_push(s, p);
         alph_sched_notify(s);
@@ -1014,7 +1061,7 @@ fn alph_signal(node: AlphNode*, kind: int64, from: int64, to: int64, ref: int64,
     alph_drain_late(node, p);
     return true;
   }
-  alph_wake(node, p);
+  alph_wake_from(node, p, from);
   return true;
 }
 
@@ -1074,7 +1121,7 @@ fn alph_post(node: AlphNode*, m: AlphMsg*, payload: rawptr) -> int64 {
     alph_msg_release(m);
     return ALPH_FULL;
   }
-  alph_wake(node, p);
+  alph_wake_from(node, p, m->from);
   return ALPH_SENT;
 }
 
@@ -2846,6 +2893,7 @@ fn alph_run_proc(s: AlphSched*, p: AlphProc*) {
   var node: AlphNode* = (AlphNode*)s->node;
   alph_atomic_store_sc(&p->status, ALPH_P_RUNNING);  // pairs with the fence in alph_wake
   s->current = (int64)p;
+  alph_atomic_store(&s->run_seq, s->run_seq + 1);
   var r: AlphRecover* = &s->thread.recover;
   alph_recover_arm(r);
   if (alph_recover_save(&r->regs[0]) != 0) {
@@ -4542,7 +4590,58 @@ export fn alph_node_start(node: AlphNode*, cfg: AlphConfig*) -> bool {
       return false;
     }
   }
-  return true;
+  node->sysmon_handle = alph_thread_start(&node->sysmon, &alph_sysmon_main, (int64)node, 65536);
+  return node->sysmon_handle != 0;
+}
+
+// The watchdog, as Go's sysmon: actors are never preempted, so one long
+// handler holds its scheduler, and whatever waits in that scheduler's run
+// queue waits with it, while the node's other schedulers may sleep and
+// never look (an actor woken onto its sender's scheduler, alph_wake_from,
+// lands there by design). Every ALPH_SYSMON_NS while anything runs, it
+// looks for a scheduler still in the run it was in last time with work
+// queued behind it, and wakes a sleeping scheduler to steal that work.
+// While nothing runs it sleeps longer and longer, up to ALPH_SYSMON_IDLE_NS.
+fn alph_sysmon_main(arg: int64) -> int64 {
+  var node: AlphNode* = (AlphNode*)arg;
+  var delay: int64 = ALPH_SYSMON_NS;
+  while (alph_atomic_load(&node->halted) == 0) {
+    var word: int64 = alph_atomic_load(&node->sysmon_word);
+    alph_futex_wait(&node->sysmon_word, word, delay);
+    var busy: bool = false;
+    for i: int64 in 0..node->sched_count {
+      var s: AlphSched* = alph_sched_at(node, i);
+      var seq: int64 = alph_atomic_load(&s->run_seq);
+      if (alph_atomic_load(&s->current) != 0) {
+        busy = true;
+        if (seq == s->run_seen && alph_atomic_load(&s->qlen) > 0) {
+          alph_sysmon_rescue(node, s);
+        }
+      }
+      s->run_seen = seq;
+    }
+    if (busy) {
+      delay = ALPH_SYSMON_NS;
+    } else if (delay < ALPH_SYSMON_IDLE_NS) {
+      delay = delay * 2;
+    }
+  }
+  return 0;
+}
+
+// Wakes a sleeping active scheduler other than stuck, which then steals
+// from stuck's run queue; when every active one is awake, they will find
+// the work themselves once their own runs end.
+fn alph_sysmon_rescue(node: AlphNode*, stuck: AlphSched*) {
+  var active: int64 = alph_atomic_load(&node->active);
+  for i: int64 in 0..active {
+    var s: AlphSched* = alph_sched_at(node, i);
+    if (s != stuck && alph_atomic_load(&s->sleeping) != 0) {
+      alph_atomic_add(&node->rescued, 1);
+      alph_sched_notify(s);
+      return;
+    }
+  }
 }
 
 // Stops the node: each scheduler finishes the actor it is running and
@@ -4551,6 +4650,8 @@ export fn alph_node_start(node: AlphNode*, cfg: AlphConfig*) -> bool {
 export fn alph_node_halt(node: AlphNode*, code: int64) {
   node->halt_code = code;
   alph_atomic_store_sc(&node->halted, 1);
+  alph_atomic_add(&node->sysmon_word, 1);
+  alph_futex_wake(&node->sysmon_word, 1);
   for i: int64 in 0..node->sched_count {
     alph_sched_notify(alph_sched_at(node, i));
   }
@@ -4575,6 +4676,10 @@ export fn alph_halt(ctx: AlphCtx*, code: int64) {
 // Thread: any thread that is not one of the node's schedulers, typically
 // main, once.
 export fn alph_node_wait(node: AlphNode*) -> int64 {
+  if (node->sysmon_handle != 0) {
+    alph_thread_join(node->sysmon_handle, &node->sysmon);
+    node->sysmon_handle = 0;
+  }
   for i: int64 in 0..node->sched_count {
     var s: AlphSched* = alph_sched_at(node, i);
     alph_thread_join(s->handle, &s->thread);
@@ -4596,4 +4701,5 @@ export fn alph_node_stats(node: AlphNode*, stats: AlphStats*) {
   stats->crashed = alph_atomic_load(&node->crashed);
   stats->healed = alph_atomic_load(&node->healed);
   stats->shed = alph_atomic_load(&node->shed);
+  stats->rehomed = alph_atomic_load(&node->rehomed);
 }
