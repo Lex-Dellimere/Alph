@@ -20,7 +20,7 @@ import "alph/sys/linux";
 
 const ALPH_HEADER: int64 = 16;           // before every block; keeps 16-byte alignment
 const ALPH_CLASSES: int64 = 11;          // blocks of 32 << class bytes, 32 B to 32 KiB
-const ALPH_CHUNK_SIZES: int64 = 3;       // 1 KiB, 8 KiB, 64 KiB
+const ALPH_CHUNK_SIZES: int64 = 3;       // 2 KiB, 8 KiB, 64 KiB
 const ALPH_SLAB_SIZE: int64 = 1048576;   // pools map slabs of 1 MiB
 const ALPH_CHUNK_HEADER: int64 = 16;     // next chunk, chunk size
 const ALPH_LARGE_MARK: int64 = -1;       // header class of a block mapped on its own
@@ -58,9 +58,12 @@ export struct AlphScratch {
   extra: int64;     // further chunks, returned on reset
 }
 
+// The first chunk holds a 1 KiB block (a state of 497 to 1008 bytes rounds up to
+// one) with room left: a 1 KiB first chunk could not, so every such actor
+// skipped to 8 KiB.
 fn alph_chunk_size(index: int64) -> int64 {
   if (index == 0) {
-    return 1024;
+    return 2048;
   }
   if (index == 1) {
     return 8192;
