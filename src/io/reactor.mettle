@@ -82,7 +82,7 @@ struct AlphRxTimer {
 export struct AlphReactor {
   epfd: int64;
   wakefd: int64;
-  timerfd: int64;
+  timerfd: int64;    // only on kernels without epoll_pwait2, made at the first wait that needs it; -1 until then
   sigfd: int64;
   woken: int64;      // a wake is pending in wakefd
   buf: int64;        // epoll_event[ALPH_RX_BATCH]
@@ -197,8 +197,9 @@ fn alph_rx_grow(r: AlphReactor*) -> bool {
 }
 
 // Sets timerfd to fire at deadline (CLOCK_MONOTONIC ns), or disarms it for 0.
+// Without a timerfd there is nothing to arm.
 fn alph_rx_arm_timerfd(r: AlphReactor*, deadline: int64) {
-  if (deadline == r->armed) {
+  if (r->timerfd < 0 || deadline == r->armed) {
     return;
   }
   var spec: int64[4];
@@ -214,24 +215,44 @@ fn alph_rx_arm_timerfd(r: AlphReactor*, deadline: int64) {
   r->armed = deadline;
 }
 
-// Starts a reactor. Returns false when the kernel refuses an epoll set, an
-// eventfd or a timerfd, or memory runs out. Thread: any, before use.
+// Starts a reactor: an epoll set and an eventfd, two descriptors. Returns
+// false when the kernel refuses either, or memory runs out. Thread: any,
+// before use.
 export fn alph_rx_init(r: AlphReactor*) -> bool {
   memset((rawptr)r, 0, (int64)sizeof(AlphReactor));
   r->sigfd = -1;
+  r->timerfd = -1;
   r->epfd = alph_sys_epoll();
   r->wakefd = alph_sys_eventfd();
-  r->timerfd = syscall(ALPH_SYS_TIMERFD_CREATE, ALPH_CLOCK_MONOTONIC, ALPH_O_NONBLOCK | ALPH_O_CLOEXEC);
   r->buf = (int64)malloc(ALPH_RX_BATCH * 12);
-  if (r->epfd < 0 || r->wakefd < 0 || r->timerfd < 0 || r->buf == 0 || !alph_rx_grow(r)) {
+  if (r->epfd < 0 || r->wakefd < 0 || r->buf == 0 || !alph_rx_grow(r)) {
     alph_rx_free(r);
     return false;
   }
-  if (alph_sys_epoll_ctl(r->epfd, ALPH_EPOLL_CTL_ADD, r->wakefd, ALPH_EPOLLIN, ALPH_RX_TAG_WAKE) != 0 ||
-      alph_sys_epoll_ctl(r->epfd, ALPH_EPOLL_CTL_ADD, r->timerfd, ALPH_EPOLLIN, ALPH_RX_TAG_TIMER) != 0) {
+  if (alph_sys_epoll_ctl(r->epfd, ALPH_EPOLL_CTL_ADD, r->wakefd, ALPH_EPOLLIN, ALPH_RX_TAG_WAKE) != 0) {
     alph_rx_free(r);
     return false;
   }
+  return true;
+}
+
+// Makes the timerfd the waits use on kernels without epoll_pwait2. Returns
+// false when the kernel refuses one: waits then round deadlines up to
+// epoll's milliseconds.
+fn alph_rx_need_timerfd(r: AlphReactor*) -> bool {
+  if (r->timerfd >= 0) {
+    return true;
+  }
+  var fd: int64 = syscall(ALPH_SYS_TIMERFD_CREATE, ALPH_CLOCK_MONOTONIC, ALPH_O_NONBLOCK | ALPH_O_CLOEXEC);
+  if (fd < 0) {
+    return false;
+  }
+  if (alph_sys_epoll_ctl(r->epfd, ALPH_EPOLL_CTL_ADD, fd, ALPH_EPOLLIN, ALPH_RX_TAG_TIMER) != 0) {
+    alph_sys_close(fd);
+    return false;
+  }
+  r->timerfd = fd;
+  r->armed = 0;
   return true;
 }
 
@@ -253,16 +274,17 @@ export fn alph_rx_reset(r: AlphReactor*) {
 // Closes the reactor's own descriptors and frees its memory. The
 // descriptors it watched stay open; close them yourself. Thread: its owner.
 export fn alph_rx_free(r: AlphReactor*) {
-  if (r->epfd > 0) {
+  // -1 marks a descriptor it does not have; 0 is a valid one.
+  if (r->epfd >= 0) {
     alph_sys_close(r->epfd);
   }
-  if (r->wakefd > 0) {
+  if (r->wakefd >= 0) {
     alph_sys_close(r->wakefd);
   }
-  if (r->timerfd > 0) {
+  if (r->timerfd >= 0) {
     alph_sys_close(r->timerfd);
   }
-  if (r->sigfd > 0) {
+  if (r->sigfd >= 0) {
     alph_sys_close(r->sigfd);
   }
   free((rawptr)r->buf);
@@ -487,12 +509,24 @@ export fn alph_rx_wait(r: AlphReactor*, out: AlphRxEvent*, cap: int64, timeout_n
   }
   if (got == -38 && r->pwait2 < 0) {
     var wait_ms: int64 = -1;
+    var now2: int64 = 0;
     if (timeout == 0) {
       wait_ms = 0;
     } else if (timeout > 0) {
-      var until: int64 = alph_now_ns() + timeout;
+      now2 = alph_now_ns();
+      var until: int64 = now2 + timeout;
       if (deadline == 0 || until < deadline) {
         deadline = until;
+      }
+    }
+    if (wait_ms != 0 && deadline != 0 && !alph_rx_need_timerfd(r)) {
+      // No timerfd: the wait itself takes the deadline, rounded up.
+      if (now2 == 0) {
+        now2 = alph_now_ns();
+      }
+      wait_ms = 0;
+      if (deadline > now2) {
+        wait_ms = (deadline - now2 + 999999) / 1000000;
       }
     }
     alph_rx_arm_timerfd(r, deadline);

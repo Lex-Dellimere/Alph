@@ -101,7 +101,7 @@ One event from alph_rx_wait.
 export struct AlphReactor {
   epfd: int64;
   wakefd: int64;
-  timerfd: int64;
+  timerfd: int64;    // only on kernels without epoll_pwait2, made at the first wait that needs it; -1 until then
   sigfd: int64;
   woken: int64;      // a wake is pending in wakefd
   buf: int64;        // epoll_event[ALPH_RX_BATCH]
@@ -125,8 +125,9 @@ its fields are its own.
 export fn alph_rx_init(r: AlphReactor*) -> bool
 ```
 
-Starts a reactor. Returns false when the kernel refuses an epoll set, an
-eventfd or a timerfd, or memory runs out. Thread: any, before use.
+Starts a reactor: an epoll set and an eventfd, two descriptors. Returns
+false when the kernel refuses either, or memory runs out. Thread: any,
+before use.
 
 ### `alph_rx_reset`
 
@@ -682,6 +683,7 @@ export struct AlphConfig {
   signals: int64;
   spin_us: int64;
   crash_reports: int64;
+  keep_fd_limit: int64;
 }
 ```
 
@@ -709,6 +711,11 @@ crash_reports 1 prints the runtime's full report (stack trace) for every
               a report costs about 60 us of its scheduler's time. Crashes
               are still counted (alph_node_stats) and reach links,
               monitors, medics and supervisors either way
+keep_fd_limit 1 leaves the process's limit on open descriptors as it
+              is. Default 0: the node raises the soft limit to the hard
+              one, as Go does, since a service manager's soft default
+              (often 1024) turns a busy listener's accept into EMFILE.
+              Child processes the node starts get the old limit back
 ```
 
 ### `AlphStats`
@@ -797,7 +804,15 @@ export struct AlphNode {
   stack_size: int64;
   bound_list: int64;    // bound schedulers running an actor
   bound_spare: int64;   // bound schedulers whose actor exited, their threads parked for the next one
-  bound_dead: int64;    // bound schedulers whose thread ended (the node halts), for alph_node_wait
+  bound_dead: int64;    // bound schedulers whose thread ended, not yet joined
+  bound_cold: int64;    // bound schedulers whose thread ended (trimmed), kept with their descriptors (never freed)
+  bound_unjoined: int64; // cold ones whose thread is not joined yet
+  bound_live: int64;    // bound schedulers running an actor
+  bound_warm: int64;    // spares with a parked thread
+  bound_ending: int64;  // trimmed spares whose thread has not reached the cold list yet
+  bound_parking: int64; // bound schedulers whose actor exited and that have not parked yet
+  bound_peak: int64;    // the most bound actors lately live at once, decaying
+  bound_peak_at: int64; //   when it last halved
   lane_pool: int64;     // lane blocks no scheduler keeps, chained by their first word (never freed)
   lane_pool_lock: int64;
   sysmon: AlphThread;   // the watchdog, alph_sysmon_main
@@ -4451,6 +4466,9 @@ export const ALPH_SYS_EPOLL_PWAIT2: int64 = 441;
 export const ALPH_SYS_PRCTL: int64 = 157;
 export const ALPH_PR_SET_TIMERSLACK: int64 = 29;
 export const ALPH_PR_SET_NAME: int64 = 15;
+export const ALPH_SYS_PRLIMIT64: int64 = 302;
+export const ALPH_SYS_SCHED_YIELD: int64 = 24;
+export const ALPH_RLIMIT_NOFILE: int64 = 7;
 export const ALPH_SYS_EPOLL_CTL: int64 = 233;
 export const ALPH_SYS_ACCEPT4: int64 = 288;
 export const ALPH_SYS_EVENTFD2: int64 = 290;

@@ -1,0 +1,188 @@
+// The descriptor limit: alph_node_start raises the soft RLIMIT_NOFILE to the
+// hard one, once per process, unless AlphConfig.keep_fd_limit is 1, and a
+// child process the node starts gets the old soft limit back. The checks, in
+// order: L1 with the soft limit lowered to 1024 (a test cannot do this when
+// the hard limit is 1024 or less: it then passes at once), a node started
+// with keep_fd_limit = 1 leaves the soft limit at 1024; L2 a node with the
+// default config raises the soft limit to the hard one; L3 a child process
+// started from an actor on that node (/bin/sh -c "ulimit -n") prints 1024,
+// the soft limit from before the raise, and afterwards the parent's soft
+// limit is still the hard one; L4 a second default node, started after the
+// first was halted, leaves the soft limit at the hard one.
+
+import "std/io";
+import "std/mem";
+import "alph/sys/atomic";
+import "alph/alph";
+
+const LOW: int64 = 1024;
+
+var g_node: AlphNode;
+var g_failures: int64 = 0;
+var g_soft_in_child_done: int64 = 0;
+var g_out_len: int64 = 0;
+var g_out: uint8[64];
+var g_code: int64 = -1;
+var g_soft_after: int64 = -1;
+
+fn expect(ok: bool, what: string) {
+  if (!ok) {
+    println("FAIL {what}");
+    alph_atomic_add(&g_failures, 1);
+  }
+}
+
+// The process's RLIMIT_NOFILE through prlimit64(0, 7, 0, &lim). Returns the
+// soft limit and stores the hard one in *hard, or returns -1 on an error.
+fn limits(hard: int64*) -> int64 {
+  var lim: int64[2];
+  lim[0] = 0;
+  lim[1] = 0;
+  if (syscall(ALPH_SYS_PRLIMIT64, 0, ALPH_RLIMIT_NOFILE, 0, (int64)&lim[0]) != 0) {
+    return -1;
+  }
+  *hard = lim[1];
+  return lim[0];
+}
+
+// Sets the soft limit and leaves the hard one. Returns the system call's result.
+fn set_soft(soft: int64, hard: int64) -> int64 {
+  var lim: int64[2];
+  lim[0] = soft;
+  lim[1] = hard;
+  return syscall(ALPH_SYS_PRLIMIT64, 0, ALPH_RLIMIT_NOFILE, (int64)&lim[0], 0);
+}
+
+struct Boss {
+  proc: int64;
+  out: int64;
+  ended: int64;
+  eof: int64;
+}
+
+// L3: runs the shell, reads its one line, and halts the node when the child
+// has ended and its output is read.
+fn boss(ctx: AlphCtx*, m: AlphMsg*) -> int64 {
+  var b: Boss* = (Boss*)ctx->state;
+  if (m->tag == ALPH_TAG_INIT) {
+    var argv: cstring[4];
+    argv[0] = "/bin/sh";
+    argv[1] = "-c";
+    argv[2] = "ulimit -n";
+    argv[3] = (cstring)0;
+    var spec: AlphProcSpec;
+    memset((rawptr)&spec, 0, (int64)sizeof(AlphProcSpec));
+    spec.argv = &argv[0];
+    spec.flags = ALPH_PROC_OUT;
+    b->proc = alph_proc_spawn(ctx, &spec);
+    expect(b->proc > 0, "L3: the child started ({b->proc})");
+    b->out = spec.stdout_h;
+    if (b->proc <= 0 || b->out == 0) {
+      alph_halt(ctx, 1);
+      return ALPH_CONTINUE;
+    }
+    alph_io_arm(ctx, b->out, ALPH_IO_IN);
+    return ALPH_CONTINUE;
+  }
+  if (m->tag == ALPH_TAG_IO && m->ref == b->out) {
+    var room: int64 = 63 - g_out_len;
+    var got: int64 = alph_io_read(ctx, b->out, (rawptr)&g_out[g_out_len], room);
+    if (got > 0) {
+      g_out_len = g_out_len + got;
+      alph_io_arm(ctx, b->out, ALPH_IO_IN);
+    } else if (got == ALPH_IO_AGAIN) {
+      alph_io_arm(ctx, b->out, ALPH_IO_IN);
+    } else {
+      alph_io_close(ctx, b->out);
+      b->eof = 1;
+    }
+  } else if (m->tag == ALPH_TAG_PROC_EXIT) {
+    g_code = m->arg;
+    b->ended = 1;
+  }
+  if (b->ended != 0 && b->eof != 0) {
+    var hard: int64 = 0;
+    alph_atomic_store(&g_soft_after, limits(&hard));
+    alph_atomic_store(&g_soft_in_child_done, 1);
+    alph_halt(ctx, 0);
+  }
+  return ALPH_CONTINUE;
+}
+
+// The decimal number at the start of the child's output, or -1.
+fn child_value() -> int64 {
+  var v: int64 = 0;
+  var i: int64 = 0;
+  while (i < g_out_len && g_out[i] >= 48 && g_out[i] <= 57) {
+    v = v * 10 + (int64)g_out[i] - 48;
+    i = i + 1;
+  }
+  if (i == 0) {
+    return -1;
+  }
+  return v;
+}
+
+fn main() -> int32 {
+  var hard: int64 = 0;
+  var soft0: int64 = limits(&hard);
+  expect(soft0 >= 0, "the limit can be read");
+  if (soft0 < 0) {
+    return 1;
+  }
+  if (hard <= LOW && hard >= 0) {
+    println("limits skipped: the hard limit is {hard}, too low to lower the soft limit meaningfully");
+    return 0;
+  }
+  var cfg: AlphConfig;
+  alph_config(&cfg);
+  cfg.schedulers = 2;
+  cfg.max_actors = 64;
+
+  // L1
+  expect(set_soft(LOW, hard) == 0, "L1: the soft limit is lowered to {LOW}");
+  var s1: int64 = limits(&hard);
+  expect(s1 == LOW, "L1: the soft limit reads {s1} after lowering it");
+  cfg.keep_fd_limit = 1;
+  expect(alph_node_start(&g_node, &cfg), "L1: node started");
+  var s_keep: int64 = limits(&hard);
+  expect(s_keep == LOW, "L1: keep_fd_limit = 1 left the soft limit at {LOW} ({s_keep})");
+  alph_node_halt(&g_node, 0);
+  alph_node_wait(&g_node);
+  var s_keep2: int64 = limits(&hard);
+  expect(s_keep2 == LOW, "L1: the soft limit is still {LOW} after the node ({s_keep2})");
+
+  // L2
+  cfg.keep_fd_limit = 0;
+  expect(alph_node_start(&g_node, &cfg), "L2: node started");
+  var s_raised: int64 = limits(&hard);
+  expect(s_raised == hard, "L2: the default config raised the soft limit to the hard one ({s_raised} of {hard})");
+
+  // L3
+  var b: Boss;
+  memset((rawptr)&b, 0, (int64)sizeof(Boss));
+  expect(alph_node_spawn_value<Boss>(&g_node, 0, &b, &boss) != 0, "L3: actor spawned");
+  alph_node_wait(&g_node);
+  var child: int64 = child_value();
+  expect(alph_atomic_load(&g_soft_in_child_done) == 1, "L3: the child ended and its output was read");
+  expect(g_code == 0, "L3: the child exited with {g_code}");
+  expect(child == LOW, "L3: the child's limit is {child}, the old soft limit {LOW} was expected");
+  expect(g_soft_after == hard, "L3: the parent's soft limit is {g_soft_after} after the child, {hard} expected");
+  var s_after: int64 = limits(&hard);
+  expect(s_after == hard, "L3: the parent's soft limit is {s_after} after the node, {hard} expected");
+
+  // L4
+  expect(alph_node_start(&g_node, &cfg), "L4: second node started");
+  var s_second: int64 = limits(&hard);
+  expect(s_second == hard, "L4: the soft limit is {s_second} after a second node, {hard} expected");
+  alph_node_halt(&g_node, 0);
+  alph_node_wait(&g_node);
+  var s_end: int64 = limits(&hard);
+  expect(s_end == hard, "L4: the soft limit is {s_end} at the end, {hard} expected");
+
+  if (g_failures != 0) {
+    return 1;
+  }
+  println("limits ok: hard {hard}, soft {soft0} -> {LOW} -> kept {s_keep} -> raised {s_raised}, child {child}, parent after child {g_soft_after}, second node {s_second}");
+  return 0;
+}

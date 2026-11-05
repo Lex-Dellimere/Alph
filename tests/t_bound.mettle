@@ -4,7 +4,15 @@
 // an actor from deep in its call stack with a chosen reason; a crash in a
 // bound actor is contained. B1 to B3 churn bound actors: descriptors and
 // memory stay flat, late senders find a scheduler, and a node that is
-// waited on closes every descriptor it opened.
+// waited on closes every descriptor it opened. B4 starts a fresh node and
+// runs two bursts of 200 blocked bound actors: after the first is released
+// the watchdog trims the spare threads down to the kept few (threads fall
+// to the count before the burst plus 8 kept plus 2 of slack, within 4 s)
+// while the cold spares keep their descriptors (the count stays as it was
+// at the peak); the second burst reuses those schedulers (no more
+// descriptors than the first, the thread count back up); a halt and wait
+// then returns both the threads and the descriptors to what they were
+// before the node started.
 
 import "std/io";
 import "std/thread";
@@ -28,6 +36,8 @@ const B2_ACTORS: int64 = 2000;
 const BATCH: int64 = 10;
 const HAMMERS: int64 = 8;
 const PIPES: int64 = 4;
+const B4_ACTORS: int64 = 200;
+const B4_KEEP: int64 = 8;
 
 var g_node: AlphNode;
 var g_failures: int64 = 0;
@@ -51,6 +61,10 @@ var g_fwd_sent: int64 = 0;
 var g_fwd_gone: int64 = 0;
 var g_fwd_full: int64 = 0;
 var g_fwd_other: int64 = 0;
+var g_release: int64 = 0;
+var g_held: int64 = 0;
+var g_b1_in: int64 = 0;    // B1 actors of the batch that reached INIT
+var g_b1_go: int64 = 0;    // B1: the batch may exit
 
 fn expect(ok: bool, what: string) {
   if (!ok) {
@@ -176,7 +190,7 @@ fn collector(ctx: AlphCtx*, m: AlphMsg*) -> int64 {
   return ALPH_CONTINUE;
 }
 
-// B1: a timer for the collector, a name of its own, then out.
+// B1: a timer for the collector, a name of its own, then out once its batch is all live.
 fn churner(ctx: AlphCtx*, m: AlphMsg*) -> int64 {
   if (m->tag == ALPH_TAG_INIT) {
     alph_send_after(ctx, 5, g_collector, LATE, 1);
@@ -184,6 +198,12 @@ fn churner(ctx: AlphCtx*, m: AlphMsg*) -> int64 {
     var name: string = "churn-{seq}";
     if (!alph_register(ctx, name)) {
       alph_atomic_add(&g_unnamed, 1);
+    }
+    // The whole batch is live at once before any exits, so a batch needs
+    // exactly BATCH schedulers, and the spares must cover every later batch.
+    alph_atomic_add(&g_b1_in, 1);
+    while (alph_atomic_load(&g_b1_go) == 0) {
+      thread_sleep_ms(1);
     }
     alph_atomic_add(&g_live, -1);
     return alph_stop(ctx, ALPH_NORMAL);
@@ -257,11 +277,15 @@ fn spawn_bound(handler: fn(AlphCtx*, AlphMsg*) -> int64 with alloc, syscall, asm
 }
 
 // Starts count bound actors in batches of BATCH, waiting (at most 2 s) for
-// each batch to run its INIT before the next. Returns how many started.
+// each batch to run its INIT and exit, as the node counts it, before the
+// next: a bound actor's scheduler is on its way to the spare list from the
+// node's count on, so the next batch reuses it. Returns how many started.
 // publish: remember the newest two pids for the hammering threads.
 fn churn(handler: fn(AlphCtx*, AlphMsg*) -> int64 with alloc, syscall, asm, count: int64,
          publish: bool) -> int64 {
   var spawned: int64 = 0;
+  var base: AlphStats;
+  alph_node_stats(&g_node, &base);
   for round: int64 in 0..count / BATCH {
     for k: int64 in 0..BATCH {
       alph_atomic_add(&g_live, 1);
@@ -276,11 +300,31 @@ fn churn(handler: fn(AlphCtx*, AlphMsg*) -> int64 with alloc, syscall, asm, coun
         alph_atomic_add(&g_live, -1);
       }
     }
+    if (!publish) {
+      // B1: let the batch go once all of it is live.
+      for w: int64 in 0..2000 {
+        if (alph_atomic_load(&g_b1_in) >= BATCH) {
+          break;
+        }
+        thread_sleep_ms(1);
+      }
+      alph_atomic_store(&g_b1_go, 1);
+    }
     for w: int64 in 0..2000 {
       if (alph_atomic_load(&g_live) == 0) {
         break;
       }
       thread_sleep_ms(1);
+    }
+    alph_atomic_store(&g_b1_go, 0);
+    alph_atomic_store(&g_b1_in, 0);
+    for w: int64 in 0..20000 {
+      var st: AlphStats;
+      alph_node_stats(&g_node, &st);
+      if (st.live <= base.live) {
+        break;
+      }
+      syscall(24);  // sched_yield
     }
   }
   return spawned;
@@ -355,6 +399,7 @@ fn churn_cases() {
   thread_sleep_ms(20);
 
   // B1
+  var f_b1: int64 = fd_count();
   var t_b1: int64 = alph_now_ns();
   var spawned: int64 = churn(&churner, B1_WARMUP, false);
   thread_sleep_ms(50);
@@ -368,7 +413,10 @@ fn churn_cases() {
   var late: int64 = alph_atomic_load(&g_late);
   var b1_ms: int64 = (alph_now_ns() - t_b1) / 1000000;
   expect(spawned == B1_ACTORS, "B1: {B1_ACTORS} bound actors spawned ({spawned})");
-  expect(f_end <= f_warm + 3, "B1: descriptors {f_warm} after 1000 exits, {f_end} at the end");
+  // A bound scheduler holds 2 descriptors, its epoll set and its eventfd.
+  expect(f_warm == f_b1 + 2 * BATCH,
+         "B1: {BATCH} actors live at once took {(f_warm - f_b1) / 2} bound schedulers ({f_b1} descriptors before, {f_warm} after 1000 exits)");
+  expect(f_end == f_warm, "B1: descriptors {f_warm} after 1000 exits, {f_end} at the end");
   expect(r_end - r_warm < 2048, "B1: resident memory grew {r_end - r_warm} KB from {r_warm} KB (limit 2048)");
   expect(late == B1_ACTORS, "B1: {B1_ACTORS} LATE timers arrived ({late})");
   expect(g_unnamed == 0, "B1: every bound actor registered its name ({g_unnamed} did not)");
@@ -445,6 +493,139 @@ fn churn_cases() {
   println("churn ok: B1 {B1_ACTORS} exits in {b1_ms} ms, fds {f_warm} -> {f_end}, rss {r_warm} -> {r_end} KB, LATE {late} of {B1_ACTORS}; B2 {spawned2} exits in {b2_ms} ms, sends {g_send_sent} sent {g_send_gone} gone {g_send_full} full {g_send_other} other, forwards {g_fwd_sent} sent {g_fwd_gone} gone {g_fwd_full} full {g_fwd_other} other, pipes {stray} bytes, fds {f_b2} -> {f_b2_end}; B3 halt+wait {halt_ms} ms, fds {f_start} -> {f_ctrl} (control node, no bound actors) -> {f_halt}");
 }
 
+// ---- B4: spare threads are trimmed ---------------------------------------
+
+// Threads in this process, from the Threads line of /proc/self/status.
+fn thread_count() -> int64 {
+  var buf: uint8[4096];
+  var path: string = "/proc/self/status\0";
+  var fd: int64 = syscall(2, (int64)path.chars, 0, 0);
+  if (fd < 0) {
+    return -1;
+  }
+  var n: int64 = syscall(0, fd, (int64)&buf[0], 4000);
+  syscall(3, fd);
+  var i: int64 = 0;
+  while (i + 8 < n) {
+    if (buf[i] == 84 && buf[i + 1] == 104 && buf[i + 2] == 114 && buf[i + 7] == 58) {
+      var j: int64 = i + 8;
+      while (j < n && (buf[j] == 9 || buf[j] == 32)) {
+        j = j + 1;
+      }
+      var v: int64 = 0;
+      while (j < n && buf[j] >= 48 && buf[j] <= 57) {
+        v = v * 10 + (int64)buf[j] - 48;
+        j = j + 1;
+      }
+      return v;
+    }
+    i = i + 1;
+  }
+  return -1;
+}
+
+// B4: holds its thread until g_release is set.
+fn holder(ctx: AlphCtx*, m: AlphMsg*) -> int64 {
+  if (m->tag == ALPH_TAG_INIT) {
+    alph_atomic_add(&g_held, 1);
+    while (alph_atomic_load(&g_release) == 0) {
+      thread_sleep_ms(1);
+    }
+    alph_atomic_add(&g_held, -1);
+    return alph_stop(ctx, ALPH_NORMAL);
+  }
+  return ALPH_CONTINUE;
+}
+
+// Starts B4_ACTORS holders and waits (at most 5 s) until all are live.
+// Returns how many are live.
+fn b4_burst() -> int64 {
+  alph_atomic_store(&g_release, 0);
+  for i: int64 in 0..B4_ACTORS {
+    expect(spawn_bound(&holder) != 0, "B4: holder {i} spawned");
+  }
+  for w: int64 in 0..5000 {
+    if (alph_atomic_load(&g_held) >= B4_ACTORS) {
+      break;
+    }
+    thread_sleep_ms(1);
+  }
+  return alph_atomic_load(&g_held);
+}
+
+// Releases the holders and waits (at most 2 s) until they have all ended.
+fn b4_release() {
+  alph_atomic_store(&g_release, 1);
+  for w: int64 in 0..2000 {
+    if (alph_atomic_load(&g_held) == 0) {
+      break;
+    }
+    thread_sleep_ms(1);
+  }
+}
+
+fn b4_case() {
+  var t_pre: int64 = thread_count();
+  var f_pre: int64 = fd_count();
+  var cfg: AlphConfig;
+  alph_config(&cfg);
+  cfg.schedulers = 4;
+  cfg.max_actors = 4096;
+  expect(alph_node_start(&g_node, &cfg), "B4: node started");
+  thread_sleep_ms(20);
+  var t_node: int64 = thread_count();
+  var f_node: int64 = fd_count();
+  var t0: int64 = alph_now_ns();
+
+  // Burst 1
+  var live1: int64 = b4_burst();
+  var t_peak1: int64 = thread_count();
+  var f_peak1: int64 = fd_count();
+  expect(live1 == B4_ACTORS, "B4: burst 1 has {live1} of {B4_ACTORS} bound actors live");
+  expect(t_peak1 >= t_node + B4_ACTORS - 10, "B4: burst 1 threads {t_node} -> {t_peak1}");
+  b4_release();
+  var t_end1: int64 = thread_count();
+  var settle1: int64 = 0;
+  for w: int64 in 0..40 {
+    t_end1 = thread_count();
+    if (t_end1 <= t_node + B4_KEEP + 2) {
+      break;
+    }
+    thread_sleep_ms(100);
+    settle1 = settle1 + 100;
+  }
+  var f_end1: int64 = fd_count();
+  expect(t_end1 <= t_node + B4_KEEP + 2,
+         "B4: after burst 1 threads {t_peak1} -> {t_end1} in {settle1} ms (limit {t_node + B4_KEEP + 2} within 4000 ms)");
+  expect(f_end1 == f_peak1, "B4: after burst 1 descriptors {f_peak1} at the peak, {f_end1} after the trim");
+
+  // Burst 2: the cold schedulers are reused.
+  var live2: int64 = b4_burst();
+  var t_peak2: int64 = thread_count();
+  var f_peak2: int64 = fd_count();
+  expect(live2 == B4_ACTORS, "B4: burst 2 has {live2} of {B4_ACTORS} bound actors live");
+  expect(f_peak2 <= f_peak1, "B4: burst 2 descriptors {f_peak2}, burst 1 had {f_peak1}");
+  expect(t_peak2 >= t_peak1 - 5 && t_peak2 <= t_peak1 + 10, "B4: burst 2 threads {t_peak2}, burst 1 had {t_peak1}");
+  b4_release();
+  var b4_ms: int64 = (alph_now_ns() - t0) / 1000000;
+
+  // Halt: every thread and descriptor goes.
+  alph_node_halt(&g_node, 0);
+  alph_node_wait(&g_node);
+  var t_halt: int64 = thread_count();
+  for w: int64 in 0..100 {
+    if (t_halt <= t_pre) {
+      break;
+    }
+    thread_sleep_ms(10);
+    t_halt = thread_count();
+  }
+  var f_halt: int64 = fd_count();
+  expect(t_halt == t_pre, "B4: threads {t_pre} before the node, {t_halt} after halt and wait");
+  expect(f_halt == f_pre, "B4: descriptors {f_pre} before the node, {f_halt} after halt and wait");
+  println("trim ok: B4 threads {t_pre} -> {t_node} (node) -> {t_peak1} (peak) -> {t_end1} (+{settle1} ms) -> {t_peak2} (burst 2) -> {t_halt}, fds {f_pre} -> {f_node} -> {f_peak1} -> {f_end1} -> {f_peak2} -> {f_halt}, {b4_ms} ms");
+}
+
 fn main() -> int32 {
   var cfg: AlphConfig;
   alph_config(&cfg);
@@ -461,6 +642,7 @@ fn main() -> int32 {
   alph_node_stats(&g_node, &stats);
   expect(stats.crashed == 1, "exit_now is not counted as a crash");
   churn_cases();
+  b4_case();
   if (g_failures != 0) {
     return 1;
   }
