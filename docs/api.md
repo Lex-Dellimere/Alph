@@ -716,6 +716,8 @@ export struct AlphStats {
   yields: int64;
   isolated: int64;
   io_hup_rearms: int64;
+  stolen: int64;
+  moves_held: int64;
 }
 ```
 
@@ -739,6 +741,9 @@ refused  requests their sender refused at once with ALPH_BUSY, as the
 yields   actor runs cut short after ALPH_RUN_NS, with mail left
 isolated  actors cut short twice in a row and so moved to a scheduler
          of their own, away from the work queued behind them
+stolen   actors an idle scheduler took from another's queue
+moves_held  optional moves (rehome, isolate) not made because the actor
+         moved too often lately (its flap penalty is damping it)
 io_hup_rearms  arms answered at once with only a hang-up or error that
          was already reported: an owner arming again without closing
          the handle, which spins
@@ -800,7 +805,8 @@ export struct AlphNode {
   low_max: int64;       //   and the most any of them asked for
   rise_at: int64;       // when a busy scheduler last activated another (ns)
   shed: int64;          // messages dropped by alph_mailbox_shed
-  rehomed: int64;       // wakes that moved an actor to its sender's scheduler
+  rehomed: int64;       // unused since moves are counted per scheduler (alph_place)
+  moves_other: int64;   // moves made from a thread that is no scheduler
   rescued: int64;       // schedulers the watchdog woke for work stuck behind a long run
   refused: int64;       // requests refused at once with ALPH_BUSY by their senders
   sysmon_looks: int64;  // times the watchdog woke to look

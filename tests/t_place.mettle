@@ -1,0 +1,119 @@
+// Placement damping (alph_place): an actor moved over and over for optional
+// reasons is held still. A hog gets a steady stream of 20 us messages for
+// 1.2 s while plain actors beside it keep waking, which made move-isolation
+// move the hog about 2000 times a second before damping. Checks:
+//   1. it is isolated at all in the first part
+//   2. in the last 600 ms it is isolated at most a few times, and optional
+//      moves are being held back (moves_held grows)
+//   3. the plain actors' messages still all run
+// Steals are never damped, so work behind a busy scheduler is still taken
+// (t_rescue, t_fair).
+
+import "std/io";
+import "std/thread";
+import "alph/sys/atomic";
+import "alph/sys/clock";
+import "alph/alph";
+
+const WORK: int64 = ALPH_TAG_USER;
+const PING: int64 = ALPH_TAG_USER + 1;
+const TICK: int64 = ALPH_TAG_USER + 2;
+const PLAIN: int64 = 8;
+
+var g_node: AlphNode;
+var g_failures: int64 = 0;
+var g_pings: int64 = 0;
+var g_sent: int64 = 0;
+var g_stop: int64 = 0;
+
+fn expect(ok: bool, what: string) {
+  if (!ok) {
+    println("FAIL {what}");
+    alph_atomic_add(&g_failures, 1);
+  }
+}
+
+fn spin(ns: int64) {
+  var end: int64 = alph_now_ns() + ns;
+  while (alph_now_ns() < end) {
+  }
+}
+
+fn hog(ctx: AlphCtx*, m: AlphMsg*) -> int64 {
+  if (m->tag == WORK) {
+    spin(20000);
+  }
+  return ALPH_CONTINUE;
+}
+
+fn plain(ctx: AlphCtx*, m: AlphMsg*) -> int64 {
+  if (m->tag == PING) {
+    alph_atomic_add(&g_pings, 1);
+  }
+  return ALPH_CONTINUE;
+}
+
+// Every 1 ms: 60 messages for the hog (1.2 ms of work, so it never runs
+// dry) and one for each plain actor, all from this scheduler.
+fn feeder(ctx: AlphCtx*, m: AlphMsg*) -> int64 {
+  var ids: int64* = (int64*)ctx->state;
+  if (m->tag == ALPH_TAG_INIT) {
+    ids[0] = alph_spawn(ctx, 0, &hog);
+    for i: int64 in 0..PLAIN {
+      ids[1 + i] = alph_spawn(ctx, 0, &plain);
+    }
+    alph_send(ctx, ctx->self, TICK, 0);
+  } else if (m->tag == TICK) {
+    if (alph_atomic_load(&g_stop) != 0) {
+      return ALPH_CONTINUE;
+    }
+    for i: int64 in 0..60 {
+      alph_send(ctx, ids[0], WORK, 0);
+    }
+    for i: int64 in 0..PLAIN {
+      if (alph_send(ctx, ids[1 + i], PING, 0) == ALPH_SENT) {
+        alph_atomic_add(&g_sent, 1);
+      }
+    }
+    alph_send_after(ctx, 1, ctx->self, TICK, 0);
+  }
+  return ALPH_CONTINUE;
+}
+
+fn stats() -> AlphStats {
+  var st: AlphStats;
+  alph_node_stats(&g_node, &st);
+  return st;
+}
+
+fn main() -> int32 {
+  var cfg: AlphConfig;
+  alph_config(&cfg);
+  cfg.schedulers = 4;
+  cfg.max_actors = 64;
+  expect(alph_node_start(&g_node, &cfg), "node started");
+  var ids: int64[9];
+  for i: int64 in 0..9 {
+    ids[i] = 0;
+  }
+  alph_node_spawn_value<int64[9]>(&g_node, 0, &ids, &feeder);
+  thread_sleep_ms(600);
+  var a: AlphStats = stats();
+  thread_sleep_ms(600);
+  var b: AlphStats = stats();
+  alph_atomic_store(&g_stop, 1);
+  thread_sleep_ms(100);
+  var late: int64 = b.isolated - a.isolated;
+  expect(a.isolated > 0, "the hog was isolated at all ({a.isolated})");
+  expect(late <= 10, "then it was held still: {late} isolations in the last 600 ms");
+  expect(b.moves_held > 0, "optional moves were held back ({b.moves_held})");
+  var sent: int64 = alph_atomic_load(&g_sent);
+  expect(alph_atomic_load(&g_pings) == sent, "every plain message ran ({g_pings} of {sent})");
+  alph_node_halt(&g_node, 0);
+  alph_node_wait(&g_node);
+  if (g_failures != 0) {
+    return 1;
+  }
+  println("place ok: {a.isolated} isolations, then {late}; {b.moves_held} moves held, {b.stolen} steals");
+  return 0;
+}

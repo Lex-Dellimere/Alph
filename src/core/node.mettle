@@ -130,6 +130,25 @@ const ALPH_MSG_REPLY: int64 = 2;    // answers the request with the same ref
 
 // Messages handled before the scheduler moves on to another actor.
 const ALPH_BUDGET: int64 = 64;
+// Why an actor moved to another scheduler (alph_place). Moves that must
+// happen (a steal of queued work, a home that stopped being active) always
+// do. Optional ones (rehome, isolate) are damped as BGP damps flapping
+// routes (RFC 2439): every move adds ALPH_FLAP_UNIT to the actor's penalty,
+// which halves every ALPH_FLAP_HALF_NS; above ALPH_FLAP_CUT optional moves
+// stop until it decays below ALPH_FLAP_REUSE. A one-off move costs
+// nothing; an actor two policies bounce is held still within 3 moves.
+const ALPH_PLACE_STEAL: int64 = 0;
+const ALPH_PLACE_DRAIN: int64 = 1;
+const ALPH_PLACE_REHOME: int64 = 2;
+const ALPH_PLACE_ISOLATE: int64 = 3;
+const ALPH_PLACE_REASONS: int64 = 4;
+const ALPH_FLAP_UNIT: int64 = 1024;
+const ALPH_FLAP_HALF_NS: int64 = 50000000;
+const ALPH_FLAP_CUT: int64 = 3072;
+const ALPH_FLAP_REUSE: int64 = 1536;
+// Decision log entries per scheduler (4 words each: time, what, a, b).
+const ALPH_DLOG: int64 = 64;
+const ALPH_DLOG_DAMPED: int64 = 16;   // an actor's optional moves stop: a = pid, b = penalty
 // An actor's run also ends once it has taken this long (checked every 4
 // messages), so a run of many medium-cost messages cannot hold its
 // scheduler for a millisecond: 64 messages of 20 us did.
@@ -252,6 +271,9 @@ export struct AlphConfig {
 //   yields   actor runs cut short after ALPH_RUN_NS, with mail left
 //   isolated  actors cut short twice in a row and so moved to a scheduler
 //            of their own, away from the work queued behind them
+//   stolen   actors an idle scheduler took from another's queue
+//   moves_held  optional moves (rehome, isolate) not made because the actor
+//            moved too often lately (its flap penalty is damping it)
 //   io_hup_rearms  arms answered at once with only a hang-up or error that
 //            was already reported: an owner arming again without closing
 //            the handle, which spins
@@ -269,6 +291,8 @@ export struct AlphStats {
   yields: int64;
   isolated: int64;
   io_hup_rearms: int64;
+  stolen: int64;
+  moves_held: int64;
 }
 
 // A node. Declare one, start it with alph_node_start, and keep it in place
@@ -326,7 +350,8 @@ export struct AlphNode {
   low_max: int64;       //   and the most any of them asked for
   rise_at: int64;       // when a busy scheduler last activated another (ns)
   shed: int64;          // messages dropped by alph_mailbox_shed
-  rehomed: int64;       // wakes that moved an actor to its sender's scheduler
+  rehomed: int64;       // unused since moves are counted per scheduler (alph_place)
+  moves_other: int64;   // moves made from a thread that is no scheduler
   rescued: int64;       // schedulers the watchdog woke for work stuck behind a long run
   refused: int64;       // requests refused at once with ALPH_BUSY by their senders
   sysmon_looks: int64;  // times the watchdog woke to look
@@ -413,6 +438,9 @@ struct AlphProc {
   shed_pop_at: int64;     //   when it last took a message while not idle (ns, updated every 100 us at most)
   fresh: int64;           // spawned and INIT not yet handled: it goes before any signal
   cut_streak: int64;      // its runs in a row cut short for time: 2 or more, and it is CPU-bound
+  placed_at: int64;       // when its flap penalty was last brought up to date (ns), 0 if never
+  flap: int64;            //   the penalty for moving, ALPH_FLAP_UNIT per move, decaying
+  damped: int64;          //   1 while optional moves are held back
   drain_lock: int64;      // held while a late signal queue is drained, and at reuse
   deferred: AlphVec;      // exits and downs waiting for earlier messages
   io_handles: AlphVec;    // handles this actor owns, closed when it exits
@@ -455,6 +483,12 @@ struct AlphSched {
   run_seq: int64;       // bumped as each actor run starts, for the watchdog
   run_at: int64;        // when the current (or last) actor run started (ns)
   run_seen: int64;      // run_seq as the watchdog last saw it
+  // Counted by this scheduler's own thread only, so plain adds suffice;
+  // alph_node_stats sums them, a moment apart.
+  moves: int64[4];      // ALPH_PLACE_REASONS: moves made from this thread, by reason
+  held: int64[4];       //   optional moves held back by the dwell
+  dlog: int64[256];     // ALPH_DLOG entries of 4 words: a ring of rare decisions
+  dlog_n: int64;        //   entries written so far
   spin_skips: int64;    // idle stretches it slept through without spinning
   qlen: int64;          // actors in runq, roughly: pushes counted after, pops after
   pop_lock: int64;      // taken to pop runq: the owner and thieves are its consumers
@@ -769,7 +803,7 @@ fn alph_sched_steal(s: AlphSched*, node: AlphNode*) -> int64 {
         // reads them when that home stalls. Moving them cost two epoll_ctl
         // per steal. They move when their home stops being active
         // (alph_sched_give).
-        ((AlphProc*)p)->sched = (int64)s;
+        alph_place(node, s, (AlphProc*)p, s, ALPH_PLACE_STEAL);
         return p;
       }
     }
@@ -876,14 +910,96 @@ fn alph_io_move(node: AlphNode*, p: AlphProc*, to: AlphSched*) {
   }
 }
 
+// The one place an actor's home changes. here is the scheduler of the
+// calling thread (0 when not a scheduler); p is QUEUED and on no queue, so
+// only the caller touches it. Returns whether p now belongs to to: optional
+// moves (rehome, isolate) are held back within ALPH_DWELL_NS of p's last
+// move. It does not push p anywhere; the caller does.
+fn alph_place(node: AlphNode*, here: AlphSched*, p: AlphProc*, to: AlphSched*, reason: int64) -> bool {
+  var now: int64 = alph_now_ns();
+  alph_flap_decay(p, now);
+  if (reason == ALPH_PLACE_REHOME || reason == ALPH_PLACE_ISOLATE) {
+    if (p->damped != 0 && p->flap < ALPH_FLAP_REUSE) {
+      p->damped = 0;
+    }
+    if (p->damped != 0) {
+      alph_place_count(node, here, reason, true);
+      return false;
+    }
+  }
+  p->flap = p->flap + ALPH_FLAP_UNIT;
+  if (p->damped == 0 && p->flap > ALPH_FLAP_CUT) {
+    p->damped = 1;
+    if (here != 0) {
+      alph_dlog(here, now, ALPH_DLOG_DAMPED, p->pid, p->flap);
+    }
+  }
+  p->sched = (int64)to;
+  alph_place_count(node, here, reason, false);
+  if (reason == ALPH_PLACE_ISOLATE && here != 0) {
+    alph_dlog(here, now, reason, p->pid, to->index);
+  }
+  return true;
+}
+
+// Brings p's flap penalty up to now: it halves every ALPH_FLAP_HALF_NS
+// (the part of a half-life left over, to first order).
+fn alph_flap_decay(p: AlphProc*, now: int64) {
+  if (p->placed_at != 0 && p->flap > 0) {
+    var dt: int64 = now - p->placed_at;
+    var halvings: int64 = dt / ALPH_FLAP_HALF_NS;
+    if (halvings >= 16) {
+      p->flap = 0;
+    } else {
+      p->flap = p->flap >> halvings;
+      var rest: int64 = dt % ALPH_FLAP_HALF_NS;
+      p->flap = p->flap - p->flap * rest / (2 * ALPH_FLAP_HALF_NS);
+    }
+  }
+  p->placed_at = now;
+}
+
+fn alph_place_count(node: AlphNode*, here: AlphSched*, reason: int64, held: bool) {
+  if (here == 0) {
+    if (!held) {
+      alph_atomic_add(&node->moves_other, 1);
+    }
+    return;
+  }
+  if (held) {
+    here->held[reason] = here->held[reason] + 1;
+  } else {
+    here->moves[reason] = here->moves[reason] + 1;
+  }
+}
+
+// Notes a rare decision in s's ring, from s's own thread.
+fn alph_dlog(s: AlphSched*, now: int64, what: int64, a: int64, b: int64) {
+  var at: int64 = (s->dlog_n % ALPH_DLOG) * 4;
+  s->dlog[at] = now;
+  s->dlog[at + 1] = what;
+  s->dlog[at + 2] = a;
+  s->dlog[at + 3] = b;
+  alph_atomic_store(&s->dlog_n, s->dlog_n + 1);
+}
+
 // Gives p, which s popped, to another scheduler and wakes it.
 fn alph_sched_give(s: AlphSched*, node: AlphNode*, p: AlphProc*, to: AlphSched*) {
-  alph_io_move(node, p, to);
+  alph_sched_give_for(s, node, p, to, ALPH_PLACE_DRAIN);
+}
+
+// As alph_sched_give, for a reason. Returns false when the move was held
+// back (an optional one within the dwell): p is then still s's, unqueued.
+fn alph_sched_give_for(s: AlphSched*, node: AlphNode*, p: AlphProc*, to: AlphSched*, reason: int64) -> bool {
   // QUEUED and off every queue: nobody else touches its home now. Set it
   // before the push makes it visible to the new home.
-  p->sched = (int64)to;
+  if (!alph_place(node, s, p, to, reason)) {
+    return false;
+  }
+  alph_io_move(node, p, to);
   alph_runq_push(to, p);
   alph_sched_notify(to);
+  return true;
 }
 
 // Activates one more scheduler at once when s has a queue and no active
@@ -1034,15 +1150,13 @@ fn alph_wake_from(node: AlphNode*, p: AlphProc*, from: int64) {
           // on no queue, so only this thread touches its home now. Socket
           // owners move on their old home's thread, with their sockets.
           s = alph_sched_pick(node, p);
-          p->sched = (int64)s;
+          alph_place(node, (AlphSched*)0, p, s, ALPH_PLACE_DRAIN);
         } else if (from != 0 && s->bound == 0 && p->io_handles.len == 0 &&
                    alph_atomic_load(&s->sleeping) != 0) {
           var here: AlphSched* = alph_sender_sched(node, from);
           if (here != 0 && here != s && here->bound == 0 && alph_sched_active(node, here) &&
-              alph_atomic_load(&here->qlen) == 0) {
+              alph_atomic_load(&here->qlen) == 0 && alph_place(node, here, p, here, ALPH_PLACE_REHOME)) {
             s = here;
-            p->sched = (int64)s;
-            alph_atomic_add(&node->rehomed, 1);
           }
         }
         alph_runq_push(s, p);
@@ -1943,6 +2057,9 @@ fn alph_spawn_raw(node: AlphNode*, parent: int64, flags: int64, monitor_ref: int
   alph_atomic_add(&node->spawned, 1);
   alph_atomic_store(&p->status, ALPH_P_IDLE);
   p->fresh = 1;
+  p->flap = 0;
+  p->damped = 0;
+  p->placed_at = 0;
   alph_atomic_store_sc(&p->pid, pid);
   alph_send_raw(node, parent, pid, ALPH_TAG_INIT, init_arg, (rawptr)0, 0);
   return pid;
@@ -3156,9 +3273,7 @@ fn alph_run_proc(s: AlphSched*, p: AlphProc*) {
     alph_atomic_store(&p->status, ALPH_P_QUEUED);
     if (s->bound == 0 && p->cut_streak >= 2 && alph_atomic_load(&s->qlen) > 0) {
       var spare: AlphSched* = alph_sched_spare(node, s);
-      if (spare != 0) {
-        alph_atomic_add(&node->isolated, 1);
-        alph_sched_give(s, node, p, spare);
+      if (spare != 0 && alph_sched_give_for(s, node, p, spare, ALPH_PLACE_ISOLATE)) {
         return;
       }
     }
@@ -5379,12 +5494,21 @@ export fn alph_node_stats(node: AlphNode*, stats: AlphStats*) {
   stats->crashed = alph_atomic_load(&node->crashed);
   stats->healed = alph_atomic_load(&node->healed);
   stats->shed = alph_atomic_load(&node->shed);
-  stats->rehomed = alph_atomic_load(&node->rehomed);
+  stats->rehomed = 0;
+  stats->isolated = 0;
+  stats->stolen = 0;
+  stats->moves_held = 0;
+  for i: int64 in 0..node->sched_count {
+    var ps: AlphSched* = alph_sched_at(node, i);
+    stats->rehomed = stats->rehomed + ps->moves[ALPH_PLACE_REHOME];
+    stats->isolated = stats->isolated + ps->moves[ALPH_PLACE_ISOLATE];
+    stats->stolen = stats->stolen + ps->moves[ALPH_PLACE_STEAL];
+    stats->moves_held = stats->moves_held + ps->held[ALPH_PLACE_REHOME] + ps->held[ALPH_PLACE_ISOLATE];
+  }
   stats->rescued = alph_atomic_load(&node->rescued);
   stats->io_demoted = alph_atomic_load(&node->io_demoted);
   stats->active = alph_atomic_load(&node->active);
   stats->refused = alph_atomic_load(&node->refused);
   stats->yields = alph_atomic_load(&node->yields);
-  stats->isolated = alph_atomic_load(&node->isolated);
   stats->io_hup_rearms = alph_atomic_load(&node->io_hup_rearms);
 }
