@@ -318,6 +318,32 @@ fn trx_idle() {
   alph_rx_free(&trx_r);
 }
 
+// More due timers than the event array holds: none may be lost, and the
+// ones left over come on the next wait. (A full array once made the wait
+// call epoll_wait with no room, which failed and dropped the timers.)
+fn trx_full_out() {
+  var r: AlphReactor;
+  expect(alph_rx_init(&r), "init for the full-array check");
+  var now: int64 = alph_now_ns();
+  for i: int64 in 0..40 {
+    alph_rx_timer_at(&r, now - 1000, i);
+  }
+  var ev: AlphRxEvent[8];
+  var seen: int64 = 0;
+  var rounds: int64 = 0;
+  while (seen < 40 && rounds < 20) {
+    var n: int64 = alph_rx_wait(&r, &ev[0], 8, 1000000);
+    expect(n >= 0 && n <= 8, "a wait reports at most its room");
+    if (n > 0) {
+      seen = seen + n;
+    }
+    rounds = rounds + 1;
+  }
+  expect(seen == 40, "all 40 due timers come out through an 8-event array");
+  expect(alph_rx_timers(&r) == 0, "no timer left behind");
+  alph_rx_free(&r);
+}
+
 fn main() -> int32 {
   trx_signals();  // first: it blocks SIGUSR1 for this thread, before any other thread starts
   trx_levels();
@@ -326,6 +352,7 @@ fn main() -> int32 {
   trx_writable();
   trx_remove();
   trx_timers();
+  trx_full_out();
   trx_precision();
   trx_wakes();
   trx_idle();

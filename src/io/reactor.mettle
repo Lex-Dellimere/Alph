@@ -332,6 +332,24 @@ export fn alph_rx_cancel(r: AlphReactor*, id: int64) -> bool {
   return true;
 }
 
+// Cancels timer id as alph_rx_cancel, and stores its data in *data, so a
+// caller that keeps an allocation in the data can free it. Returns false,
+// leaving *data alone, when it already fired or was cancelled.
+// Thread: its owner.
+export fn alph_rx_cancel_data(r: AlphReactor*, id: int64, data: int64*) -> bool {
+  var slot: int64 = (id & (((int64)1 << 32) - 1)) - 1;
+  if (slot < 0 || slot >= r->slot_cap) {
+    return false;
+  }
+  var t: AlphRxTimer* = alph_rx_slot(r, slot);
+  if (t->pos < 0 || t->gen != (id >> 32)) {
+    return false;
+  }
+  *data = t->data;
+  alph_rx_drop(r, slot);
+  return true;
+}
+
 // Timers pending. Thread: its owner.
 export fn alph_rx_timers(r: AlphReactor*) -> int64 {
   return r->heap_len;
@@ -394,7 +412,7 @@ fn alph_rx_fire(r: AlphReactor*, out: AlphRxEvent*, n: int64, cap: int64) -> int
 // came due, a wake, signals. Timers fire with the timerfd's nanosecond
 // precision, not epoll's milliseconds. Returns how many events, 0 on a
 // timeout, or a negative errno (-4 when a signal handler interrupted the
-// wait). Thread: its owner.
+// wait and there was nothing to report). Thread: its owner.
 export fn alph_rx_wait(r: AlphReactor*, out: AlphRxEvent*, cap: int64, timeout_ns: int64) -> int64 {
   if (cap <= 0) {
     return 0;
@@ -420,11 +438,19 @@ export fn alph_rx_wait(r: AlphReactor*, out: AlphRxEvent*, cap: int64, timeout_n
   }
   alph_rx_arm_timerfd(r, deadline);
   var room: int64 = cap - n;
+  if (room == 0) {
+    return n;  // out is full of due timers; epoll_wait refuses a room of 0
+  }
   if (room > ALPH_RX_BATCH) {
     room = ALPH_RX_BATCH;
   }
   var got: int64 = alph_sys_epoll_wait(r->epfd, (rawptr)r->buf, room, wait_ms);
   if (got < 0) {
+    // Timers already taken from the heap are in out: report them rather
+    // than lose them to an interrupted wait.
+    if (n > 0) {
+      return n;
+    }
     return got;
   }
   var signals: bool = false;
