@@ -170,10 +170,8 @@ fn main() -> int32 {
   var first_stamp: int64 = g_to;
   expect(alph_atomic_load(&g_got) == 1, "partial: read one of two bytes");
   read_size(srv, 1);
-  // Both reads come from one packet; its stamp is converted to the
-  // monotonic clock with an offset the watchdog refreshes, so allow for
-  // that refresh moving it by a few microseconds between the reads.
-  expect(g_from >= first_stamp - 100000, "partial: the second read's from is at or after the first's stamp ({(first_stamp - g_from) / 1000} us before)");
+  expect(g_from >= first_stamp, "partial: the second read's from is at or after the first's stamp");
+  expect(g_to >= g_from, "partial: and its to is not before its from");
 
   alph_node_halt(&g_node, 0);
   alph_node_wait(&g_node);

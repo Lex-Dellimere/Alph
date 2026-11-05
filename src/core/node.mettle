@@ -3463,8 +3463,14 @@ export fn alph_io_recv(ctx: AlphCtx*, h: int64, buf: rawptr, size: int64, from_n
     stamp = now;
   }
   var from: int64 = slot->rx_from;
-  if (from == 0 || from > stamp) {
+  if (from == 0) {
     from = stamp;
+  }
+  if (stamp < from) {
+    // TCP order: these bytes came after the last bound. A stamp converted
+    // with a refreshed realtime offset may land a little before it; keep
+    // the bounds in order rather than move from back.
+    stamp = from;
   }
   *from_ns = from;
   *to_ns = stamp;
