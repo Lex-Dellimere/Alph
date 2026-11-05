@@ -33,6 +33,7 @@ import "alph/sys/recover";
 import "alph/sys/thread";
 import "alph/sys/linux";
 import "alph/sys/fd";
+import "alph/io/reactor";
 import "alph/core/queue";
 import "alph/core/mailbox";
 import "alph/core/heap";
@@ -344,9 +345,9 @@ struct AlphSched {
   next_bound: int64;    // the node's list of bound schedulers
   exit_request: int64;  // alph_exit_now asked the current actor to exit
   exit_reason: int64;
-  epfd: int64;          // epoll set of this scheduler's handles and its wake eventfd
-  evfd: int64;          // written to wake the scheduler while it waits in epoll
-  events: int64;        // buffer for epoll_wait
+  rx: AlphReactor;      // its handles, its wake-ups, and the timerfd for its next timer
+  events: int64;        // raw epoll_event buffer, for rescuing another scheduler's handles
+  rxev: int64;          // AlphRxEvent[64], for alph_rx_wait
   io_count: int64;      // handles registered here
   runs: int64;          // actor runs, to poll IO now and then while busy
   qlen: int64;          // actors in runq, roughly: pushes counted after, pops after
@@ -580,7 +581,7 @@ fn alph_sched_notify(s: AlphSched*) {
   alph_atomic_add(&s->wake, 1);
   if (alph_atomic_load(&s->sleeping) != 0) {
     var one: int64 = 1;
-    alph_sys_write(s->evfd, (rawptr)&one, 8);
+    alph_rx_wake(&s->rx);
   }
 }
 
@@ -724,11 +725,10 @@ fn alph_io_move(node: AlphNode*, p: AlphProc*, to: AlphSched*) {
     var slot: AlphIoSlot* = alph_io_slot(node, alph_vec_get(&p->io_handles, i));
     if (slot != 0 && slot->pollable != 0 && slot->sched != (int64)to) {
       var old: AlphSched* = (AlphSched*)slot->sched;
-      alph_sys_epoll_ctl(old->epfd, ALPH_EPOLL_CTL_DEL, slot->fd, 0, 0);
+      alph_rx_remove(&old->rx, slot->fd);
       alph_atomic_add(&old->io_count, -1);
       slot->sched = (int64)to;
-      if (alph_sys_epoll_ctl(to->epfd, ALPH_EPOLL_CTL_ADD, slot->fd,
-                             slot->armed | ALPH_EPOLLONESHOT, slot->handle) == 0) {
+      if (alph_rx_add(&to->rx, slot->fd, slot->armed, ALPH_RX_ONESHOT, slot->handle) == 0) {
         alph_atomic_add(&to->io_count, 1);
       } else {
         slot->pollable = 0;
@@ -2652,7 +2652,7 @@ fn alph_io_drop(node: AlphNode*, h: int64, owner: int64) {
   }
   var s: AlphSched* = (AlphSched*)slot->sched;
   if (slot->pollable != 0) {
-    alph_sys_epoll_ctl(s->epfd, ALPH_EPOLL_CTL_DEL, slot->fd, 0, 0);
+    alph_rx_remove(&s->rx, slot->fd);
     alph_atomic_add(&s->io_count, -1);
   }
   if (slot->child != 0) {
@@ -2677,7 +2677,7 @@ fn alph_io_register(slot: AlphIoSlot*, s: AlphSched*) {
   slot->sched = (int64)s;
   slot->pollable = 0;
   slot->armed = 0;
-  if (alph_sys_epoll_ctl(s->epfd, ALPH_EPOLL_CTL_ADD, slot->fd, ALPH_EPOLLONESHOT, slot->handle) == 0) {
+  if (alph_rx_add(&s->rx, slot->fd, 0, ALPH_RX_ONESHOT, slot->handle) == 0) {
     slot->pollable = 1;
     alph_atomic_add(&s->io_count, 1);
   }
@@ -2740,8 +2740,7 @@ export fn alph_io_arm(ctx: AlphCtx*, h: int64, events: int64) -> int64 {
   }
   var s: AlphSched* = (AlphSched*)slot->sched;
   slot->armed = events & (ALPH_IO_IN | ALPH_IO_OUT);
-  return alph_sys_epoll_ctl(s->epfd, ALPH_EPOLL_CTL_MOD, slot->fd,
-                            (events & (ALPH_IO_IN | ALPH_IO_OUT)) | ALPH_EPOLLONESHOT, h);
+  return alph_rx_modify(&s->rx, slot->fd, events & (ALPH_IO_IN | ALPH_IO_OUT), ALPH_RX_ONESHOT, h);
 }
 
 // Reads up to size bytes from handle h into buf, without blocking.
@@ -2817,7 +2816,7 @@ export fn alph_io_give(ctx: AlphCtx*, h: int64, to: int64) -> int64 {
   }
   if (slot->pollable != 0) {
     var old: AlphSched* = (AlphSched*)slot->sched;
-    alph_sys_epoll_ctl(old->epfd, ALPH_EPOLL_CTL_DEL, slot->fd, 0, 0);
+    alph_rx_remove(&old->rx, slot->fd);
     alph_atomic_add(&old->io_count, -1);
   }
   slot->owner = to;
@@ -3262,7 +3261,7 @@ fn alph_child_ended(s: AlphSched*, p: AlphProc*, slot: AlphIoSlot*, h: int64) ->
   var code: int64 = alph_child_wait(slot->child, true);
   if (code < 0) {
     var home: AlphSched* = (AlphSched*)slot->sched;
-    alph_sys_epoll_ctl(home->epfd, ALPH_EPOLL_CTL_MOD, slot->fd, ALPH_EPOLLIN | ALPH_EPOLLONESHOT, h);
+    alph_rx_modify(&home->rx, slot->fd, ALPH_RX_READ, ALPH_RX_ONESHOT, h);
     return -1;
   }
   slot->child = 0;
@@ -3861,24 +3860,23 @@ fn alph_sched_finish(p: AlphProc*) {
 
 // Turns ready handles into signals for their owners; the eventfd entry
 // (data 0) only wakes the scheduler. timeout_ms 0 polls without waiting.
-fn alph_sched_poll(s: AlphSched*, timeout_ms: int64) {
+fn alph_sched_poll(s: AlphSched*, timeout_ns: int64) {
   var node: AlphNode* = (AlphNode*)s->node;
   alph_atomic_store(&s->polled_at, alph_now_ns());
-  var n: int64 = alph_sys_epoll_wait(s->epfd, (rawptr)s->events, 64, timeout_ms);
+  var ev: AlphRxEvent* = (AlphRxEvent*)s->rxev;
+  var n: int64 = alph_rx_wait(&s->rx, ev, 64, timeout_ns);
   for i: int64 in 0..n {
-    var data: int64 = alph_sys_event_data((rawptr)s->events, i);
-    if (data == 0) {
-      var drained: int64 = 0;
-      alph_sys_read(s->evfd, (rawptr)&drained, 8);
-    } else if (data == -1) {
-      alph_signals_read(node);
+    if (ev[i].kind != ALPH_RX_FD) {
+      continue;  // a wake-up, or the timerfd for the next timer: just return
+    }
+    if (ev[i].data == 0) {
+      alph_signals_read(node);  // the node's signalfd, on scheduler 0
     } else {
-      var slot: AlphIoSlot* = alph_io_slot(node, data);
+      var slot: AlphIoSlot* = alph_io_slot(node, ev[i].data);
       if (slot != 0) {
-        var mask: int64 = alph_sys_event_mask((rawptr)s->events, i) &
-                          (ALPH_IO_IN | ALPH_IO_OUT | ALPH_IO_ERR | ALPH_IO_HUP);
+        var mask: int64 = ev[i].events & (ALPH_IO_IN | ALPH_IO_OUT | ALPH_IO_ERR | ALPH_IO_HUP);
         slot->armed = 0;  // one-shot: it fired, and is disarmed until armed again
-        alph_signal(node, ALPH_SIG_IO, 0, slot->owner, data, mask, 0);
+        alph_signal(node, ALPH_SIG_IO, 0, slot->owner, ev[i].data, mask, 0);
       }
     }
   }
@@ -3902,7 +3900,7 @@ fn alph_sched_rescue(s: AlphSched*, node: AlphNode*) {
     if (t - seen < ALPH_RESCUE_NS || alph_atomic_cas(&v->polled_at, seen, t) != seen) {
       continue;
     }
-    var n: int64 = alph_sys_epoll_wait(v->epfd, (rawptr)s->events, 64, 0);
+    var n: int64 = alph_sys_epoll_wait(v->rx.epfd, (rawptr)s->events, 64, 0);
     for k: int64 in 0..n {
       var data: int64 = alph_sys_event_data((rawptr)s->events, k);
       if (data > 0) {
@@ -4085,32 +4083,25 @@ fn alph_sched_main(arg: int64) -> int64 {
       continue;
     }
     if (alph_atomic_load(&node->halted) == 0 && alph_atomic_load(&s->done) == 0) {
-      var timeout_ms: int64 = -1;
-      if (wait >= 0) {
-        timeout_ms = (wait + ALPH_NS_PER_MS - 1) / ALPH_NS_PER_MS;
-      }
+      // The reactor's timerfd wakes it for the next timer to the
+      // nanosecond, not rounded up to epoll's milliseconds.
       alph_atomic_store_sc(&s->quiet, alph_quiet_parked());
-      alph_sched_poll(s, timeout_ms);
+      alph_sched_poll(s, wait);
       alph_sched_quiet(s, node);
     }
     alph_atomic_store(&s->sleeping, 0);
   }
   if (s->bound != 0) {
-    alph_sys_close(s->epfd);
-    alph_sys_close(s->evfd);
+    alph_rx_free(&s->rx);
   }
   return 0;
 }
 
-// Gives a scheduler its epoll set and wake eventfd. Returns false on failure.
+// Gives a scheduler its reactor and event buffers. Returns false on failure.
 fn alph_sched_init_io(s: AlphSched*) -> bool {
-  s->epfd = alph_sys_epoll();
-  s->evfd = alph_sys_eventfd();
   s->events = (int64)malloc(64 * 12);
-  if (s->epfd < 0 || s->evfd < 0 || s->events == 0) {
-    return false;
-  }
-  return alph_sys_epoll_ctl(s->epfd, ALPH_EPOLL_CTL_ADD, s->evfd, ALPH_EPOLLIN, 0) == 0;
+  s->rxev = (int64)malloc(64 * (int64)sizeof(AlphRxEvent));
+  return s->events != 0 && s->rxev != 0 && alph_rx_init(&s->rx);
 }
 
 // Fills cfg with the defaults: one scheduler per CPU, 65536 actors, 64
@@ -4197,7 +4188,7 @@ export fn alph_node_start(node: AlphNode*, cfg: AlphConfig*) -> bool {
     }
   }
   if (node->sigfd >= 0 &&
-      alph_sys_epoll_ctl(alph_sched_at(node, 0)->epfd, ALPH_EPOLL_CTL_ADD, node->sigfd, ALPH_EPOLLIN, -1) != 0) {
+      alph_rx_add(&alph_sched_at(node, 0)->rx, node->sigfd, ALPH_RX_READ, ALPH_RX_LEVEL, 0) != 0) {
     return false;
   }
   for i: int64 in 0..node->sched_count {
