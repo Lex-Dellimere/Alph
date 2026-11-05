@@ -1,0 +1,181 @@
+// Work stuck behind a long handler, with every other scheduler asleep and
+// nobody spinning: the watchdog must get it moving. Checks, in order:
+//   1. a socket owner whose scheduler is in a 60 ms handler hears about
+//      data on its socket within a few ms: the watchdog reads the socket
+//      for the stuck scheduler, and an idle scheduler steals the owner
+//   2. a plain actor queued behind the same kind of handler runs within a
+//      few ms: an idle scheduler steals it
+// Each runs a few rounds, after an idle pause long enough for every spin to
+// have stopped paying.
+
+import "std/io";
+import "std/thread";
+import "alph/sys/atomic";
+import "alph/sys/clock";
+import "alph/alph";
+
+const HOG: int64 = ALPH_TAG_USER;
+const START: int64 = ALPH_TAG_USER + 1;
+const POKE: int64 = ALPH_TAG_USER + 2;
+const ROUNDS: int64 = 3;
+const HOG_MS: int64 = 60;
+const LIMIT_MS: int64 = 20;     // generous for a 5 ms watchdog pause, far below HOG_MS
+
+var g_node: AlphNode;
+var g_failures: int64 = 0;
+var g_fd: int64 = -1;           // the owner's end of the socket pair
+var g_hog: int64 = 0;
+var g_owner: int64 = 0;
+var g_plain: int64 = 0;
+var g_ready: int64 = 0;         // the owner armed its socket
+var g_heard_at: int64 = 0;      // when the owner got ALPH_TAG_IO, or the plain actor POKE
+var g_hog_from: int64 = 0;      // when the hog started its long handler
+
+fn expect(ok: bool, what: string) {
+  if (!ok) {
+    println("FAIL {what}");
+    alph_atomic_add(&g_failures, 1);
+  }
+}
+
+fn spin(ns: int64) {
+  var end: int64 = alph_now_ns() + ns;
+  while (alph_now_ns() < end) {
+  }
+}
+
+fn hog(ctx: AlphCtx*, m: AlphMsg*) -> int64 {
+  if (m->tag == HOG) {
+    alph_atomic_store(&g_hog_from, alph_now_ns());
+    spin(HOG_MS * 1000000);
+  }
+  return ALPH_CONTINUE;
+}
+
+fn owner(ctx: AlphCtx*, m: AlphMsg*) -> int64 {
+  var h: int64 = *(int64*)ctx->state;
+  if (m->tag == START) {
+    var hh: int64 = alph_io_open(ctx, g_fd);
+    *(int64*)ctx->state = hh;
+    alph_io_arm(ctx, hh, ALPH_IO_IN);
+    alph_atomic_store(&g_ready, 1);
+  } else if (m->tag == ALPH_TAG_IO) {
+    alph_atomic_store(&g_heard_at, alph_now_ns());
+    var buf: uint8[64];
+    while (alph_io_read(ctx, h, (rawptr)&buf[0], 64) > 0) {
+    }
+    alph_io_arm(ctx, h, ALPH_IO_IN);
+  }
+  return ALPH_CONTINUE;
+}
+
+fn plain(ctx: AlphCtx*, m: AlphMsg*) -> int64 {
+  if (m->tag == POKE) {
+    alph_atomic_store(&g_heard_at, alph_now_ns());
+  }
+  return ALPH_CONTINUE;
+}
+
+// Spawns the hog and the others as its siblings, so all start on one
+// scheduler.
+fn parent(ctx: AlphCtx*, m: AlphMsg*) -> int64 {
+  if (m->tag == ALPH_TAG_INIT) {
+    g_hog = alph_spawn(ctx, 0, &hog);
+    var zero: int64 = 0;
+    g_owner = alph_spawn_value<int64>(ctx, 0, &zero, &owner);
+    g_plain = alph_spawn(ctx, 0, &plain);
+    alph_send(ctx, g_owner, START, 0);
+  } else if (m->tag == HOG) {
+    // HOG and then the poke from this scheduler, so both queue here.
+    alph_send(ctx, g_hog, HOG, 0);
+    if (m->arg == 2) {
+      alph_send(ctx, g_plain, POKE, 0);
+    }
+  }
+  return ALPH_CONTINUE;
+}
+
+fn wait_heard(ms: int64) {
+  for i: int64 in 0..ms {
+    if (alph_atomic_load(&g_heard_at) != 0) {
+      return;
+    }
+    thread_sleep_ms(1);
+  }
+}
+
+fn main() -> int32 {
+  var fds: int32[2];
+  fds[0] = -1;
+  fds[1] = -1;
+  syscall(53, 1, 1, 0, (int64)&fds[0]);  // socketpair(AF_UNIX, SOCK_STREAM)
+  g_fd = (int64)fds[0];
+  var peer: int64 = (int64)fds[1];
+  expect(g_fd >= 0 && peer >= 0, "a socket pair was made");
+
+  var cfg: AlphConfig;
+  alph_config(&cfg);
+  cfg.schedulers = 4;
+  cfg.max_actors = 64;
+  expect(alph_node_start(&g_node, &cfg), "node started");
+  var p: int64 = alph_node_spawn(&g_node, 0, &parent);
+  for i: int64 in 0..2000 {
+    if (alph_atomic_load(&g_ready) != 0) {
+      break;
+    }
+    thread_sleep_ms(1);
+  }
+  expect(alph_atomic_load(&g_ready) == 1, "the owner armed its socket");
+
+  // 1: data for the owner while its scheduler is held by the hog
+  var worst1: int64 = 0;
+  for r: int64 in 0..ROUNDS {
+    thread_sleep_ms(100);  // idle: spinning stops paying, schedulers sleep
+    alph_atomic_store(&g_heard_at, 0);
+    alph_atomic_store(&g_hog_from, 0);
+    alph_node_send(&g_node, p, HOG, 1);
+    for i: int64 in 0..1000 {
+      if (alph_atomic_load(&g_hog_from) != 0) {
+        break;
+      }
+      thread_sleep_ms(1);
+    }
+    thread_sleep_ms(5);  // the hog is well inside its handler
+    var one: uint8 = 1;
+    var sent_at: int64 = alph_now_ns();
+    syscall(1, peer, (int64)&one, 1);
+    wait_heard(1000);
+    var took: int64 = (alph_atomic_load(&g_heard_at) - sent_at) / 1000000;
+    if (took > worst1) {
+      worst1 = took;
+    }
+    expect(alph_atomic_load(&g_heard_at) != 0 && took < LIMIT_MS,
+           "socket ready behind a {HOG_MS} ms handler: heard in {took} ms");
+    thread_sleep_ms(HOG_MS);
+  }
+
+  // 2: a plain message queued behind the hog
+  var worst2: int64 = 0;
+  for r: int64 in 0..ROUNDS {
+    thread_sleep_ms(100);
+    alph_atomic_store(&g_heard_at, 0);
+    var sent2: int64 = alph_now_ns();
+    alph_node_send(&g_node, p, HOG, 2);
+    wait_heard(1000);
+    var took2: int64 = (alph_atomic_load(&g_heard_at) - sent2) / 1000000;
+    if (took2 > worst2) {
+      worst2 = took2;
+    }
+    expect(alph_atomic_load(&g_heard_at) != 0 && took2 < LIMIT_MS,
+           "message queued behind a {HOG_MS} ms handler: ran in {took2} ms");
+    thread_sleep_ms(HOG_MS);
+  }
+
+  alph_node_halt(&g_node, 0);
+  alph_node_wait(&g_node);
+  if (g_failures != 0) {
+    return 1;
+  }
+  println("rescue ok: socket {worst1} ms, queued message {worst2} ms behind a {HOG_MS} ms handler");
+  return 0;
+}

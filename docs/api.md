@@ -741,7 +741,8 @@ export struct AlphNode {
   bound_list: int64;    // every bound scheduler, for alph_node_wait
   sysmon: AlphThread;   // the watchdog, alph_sysmon_main
   sysmon_handle: int64;
-  sysmon_word: int64;   // futex word it sleeps on; bumped to wake it at halt
+  sysmon_word: int64;   // futex word it sleeps on; bumped to wake it
+  sysmon_idle: int64;   // 1 while it sleeps long because nothing ran: work starting wakes it
   bound_lock: int64;
   ios: int64;           // AlphIoSlot table
   io_capacity: int64;
@@ -773,6 +774,7 @@ export struct AlphNode {
   shed: int64;          // messages dropped by alph_mailbox_shed
   rehomed: int64;       // wakes that moved an actor to its sender's scheduler
   rescued: int64;       // schedulers the watchdog woke for work stuck behind a long run
+  sysmon_looks: int64;  // times the watchdog woke to look
   epoch: int64;         // bumped by every retire
   retired: AlphVec;     // pairs: block (bit 0 set: a plain block, else an AlphEntry*), epoch
   retire_lock: int64;
