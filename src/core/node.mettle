@@ -2975,7 +2975,12 @@ fn alph_run_some(s: AlphSched*, p: AlphProc*) -> int64 {
         continue;
       }
       if (more) {
-        continue;  // signals left over: the next step takes them
+        // Signals left over: the next step takes them, within the time
+        // budget like messages.
+        if (alph_now_ns() - run_from >= ALPH_RUN_NS) {
+          return -3;
+        }
+        continue;
       }
       // Anything deferred waits on a message still being written; its
       // sender wakes this actor when the write lands.
