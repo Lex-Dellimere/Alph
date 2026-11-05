@@ -657,6 +657,7 @@ export struct AlphConfig {
   max_handles: int64;
   signals: int64;
   spin_us: int64;
+  crash_reports: int64;
 }
 ```
 
@@ -679,6 +680,11 @@ signals       OS signals the node takes over, as bits (1 << ALPH_SIGINT)
 spin_us       how long an idle scheduler keeps checking for work before
               it sleeps; default 2. Work that arrives meanwhile starts
               without a wake-up system call. 0 sleeps at once
+crash_reports 1 prints the runtime's full report (stack trace) for every
+              actor crash, as a debugging aid; default 0, quiet, because
+              a report costs about 60 us of its scheduler's time. Crashes
+              are still counted (alph_node_stats) and reach links,
+              monitors, medics and supervisors either way
 ```
 
 ### `AlphStats`
@@ -751,6 +757,7 @@ export struct AlphNode {
   balanced: int64;      // when the last look was (ns)
   low_streak: int64;    // looks in a row that asked for fewer active schedulers
   low_max: int64;       //   and the most any of them asked for
+  rise_at: int64;       // when a busy scheduler last activated another (ns)
   epoch: int64;         // bumped by every retire
   retired: AlphVec;     // pairs: block (bit 0 set: a plain block, else an AlphEntry*), epoch
   retire_lock: int64;
@@ -3877,6 +3884,17 @@ export fn alph_recover_resume(regs: int64)
 Jumps back to the point saved in regs, where alph_recover_save returns 1.
 Called by alph_recover_hook_jump; do not call it with a frame that has
 returned. Thread: the thread that saved regs.
+
+### `alph_recover_quiet`
+
+```mettle
+export fn alph_recover_quiet(on: bool)
+```
+
+With on true, a crash the hook recovers prints nothing: the runtime asks
+the hook first, and skips the stack trace and report it would otherwise
+build and write, which cost about 60 us per crash. A crash nobody
+recovers is reported as always. Thread: any; it sets a process-wide flag.
 
 ### `alph_recover_hook_point`
 

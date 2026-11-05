@@ -138,6 +138,12 @@ const ALPH_RESCUE_NS: int64 = 1000000;
 const ALPH_BALANCE_NS: int64 = 10000000;
 const ALPH_BUSY_PCT: int64 = 50;
 const ALPH_SHRINK_AFTER: int64 = 5;
+// Rising fast, as BEAM's wakeup_other: a scheduler with at least
+// ALPH_RISE_QLEN actors waiting and nobody idle to share with activates one
+// more scheduler at once, at most once per ALPH_RISE_NS, instead of waiting
+// for the next look at the load.
+const ALPH_RISE_QLEN: int64 = 4;
+const ALPH_RISE_NS: int64 = 100000;
 
 const ALPH_NS_PER_MS: int64 = 1000000;
 
@@ -176,6 +182,11 @@ export struct AlphRegEntry {
 //   spin_us       how long an idle scheduler keeps checking for work before
 //                 it sleeps; default 2. Work that arrives meanwhile starts
 //                 without a wake-up system call. 0 sleeps at once
+//   crash_reports 1 prints the runtime's full report (stack trace) for every
+//                 actor crash, as a debugging aid; default 0, quiet, because
+//                 a report costs about 60 us of its scheduler's time. Crashes
+//                 are still counted (alph_node_stats) and reach links,
+//                 monitors, medics and supervisors either way
 export struct AlphConfig {
   schedulers: int64;
   max_actors: int64;
@@ -185,6 +196,7 @@ export struct AlphConfig {
   max_handles: int64;
   signals: int64;
   spin_us: int64;
+  crash_reports: int64;
 }
 
 // Counters from alph_node_stats.
@@ -249,6 +261,7 @@ export struct AlphNode {
   balanced: int64;      // when the last look was (ns)
   low_streak: int64;    // looks in a row that asked for fewer active schedulers
   low_max: int64;       //   and the most any of them asked for
+  rise_at: int64;       // when a busy scheduler last activated another (ns)
   epoch: int64;         // bumped by every retire
   retired: AlphVec;     // pairs: block (bit 0 set: a plain block, else an AlphEntry*), epoch
   retire_lock: int64;
@@ -290,6 +303,7 @@ struct AlphSignal {
   arg: int64;
   tag: int64;
   mark: int64;  // exits and downs: the receiver's mailbox fill when sent
+  dead: int64;  // a pending timer whose ref was dropped: freed when due, never delivered
 }
 
 struct AlphProc {
@@ -314,6 +328,7 @@ struct AlphProc {
   mon_watchers: AlphVec;  //   and who watches
   ref_ids: AlphVec;       // refs this actor waits on: monitors, requests, timers
   ref_pids: AlphVec;      //   and the actor each one watches, or 0
+  ref_timers: AlphVec;    //   and its pending timer (an AlphSignal*), or 0
   deferred: AlphVec;      // exits and downs waiting for earlier messages
   io_handles: AlphVec;    // handles this actor owns, closed when it exits
   names: AlphVec;         // entries of the names registered to this actor
@@ -525,6 +540,15 @@ fn alph_new_ref(node: AlphNode*) -> int64 {
 fn alph_hold_ref(p: AlphProc*, ref: int64, pid: int64) {
   alph_vec_push(&p->ref_ids, ref);
   alph_vec_push(&p->ref_pids, pid);
+  alph_vec_push(&p->ref_timers, 0);
+}
+
+// Notes that ref's timeout or timer is sig, so dropping ref kills it.
+fn alph_hold_timer(p: AlphProc*, ref: int64, sig: int64) {
+  var at: int64 = alph_vec_find(&p->ref_ids, ref);
+  if (at >= 0 && at < p->ref_timers.len) {
+    alph_vec_set(&p->ref_timers, at, sig);
+  }
 }
 
 // Forgets ref if p was waiting on it. Returns the pid it watched (0 for a
@@ -535,8 +559,18 @@ fn alph_take_ref(p: AlphProc*, ref: int64) -> int64 {
     return -1;
   }
   var pid: int64 = alph_vec_get(&p->ref_pids, at);
+  var timer: int64 = 0;
+  if (at < p->ref_timers.len) {
+    timer = alph_vec_get(&p->ref_timers, at);
+    alph_vec_remove_at(&p->ref_timers, at);
+  }
   alph_vec_remove_at(&p->ref_ids, at);
   alph_vec_remove_at(&p->ref_pids, at);
+  if (timer != 0) {
+    // Still in a scheduler's timer heap, or queued to p: either way alive.
+    // Its owner frees it when due without waking anyone.
+    alph_atomic_store(&((AlphSignal*)timer)->dead, 1);
+  }
   return pid;
 }
 
@@ -745,6 +779,27 @@ fn alph_sched_give(s: AlphSched*, node: AlphNode*, p: AlphProc*, to: AlphSched*)
   p->sched = (int64)to;
   alph_runq_push(to, p);
   alph_sched_notify(to);
+}
+
+// Activates one more scheduler at once when s has a queue and no active
+// scheduler is idle to take a share of it; see ALPH_RISE_QLEN.
+fn alph_sched_rise(s: AlphSched*, node: AlphNode*) {
+  if (s->bound != 0 || alph_atomic_load(&s->qlen) < ALPH_RISE_QLEN || alph_atomic_load(&node->hungry) != 0) {
+    return;
+  }
+  var active: int64 = alph_atomic_load(&node->active);
+  if (active >= node->sched_count) {
+    return;
+  }
+  var t: int64 = alph_now_ns();
+  var last: int64 = alph_atomic_load(&node->rise_at);
+  if (t - last < ALPH_RISE_NS || alph_atomic_cas(&node->rise_at, last, t) != last) {
+    return;
+  }
+  if (alph_atomic_cas(&node->active, active, active + 1) == active) {
+    alph_atomic_store(&node->low_streak, 0);  // a rise starts the wait for a shrink again
+    alph_sched_notify(alph_sched_at(node, active));  // it wakes, goes hungry and steals
+  }
 }
 
 // Busy-time accounting for compaction: a stretch of work starts when a
@@ -1013,7 +1068,7 @@ fn alph_request_raw(ctx: AlphCtx*, to: int64, tag: int64, arg: int64, data: rawp
   }
   // A gone server needs no timer: the monitor delivers DOWN with ALPH_NOPROC.
   if (timeout_ms > 0) {
-    alph_timer(ctx, timeout_ms, ctx->self, ALPH_TAG_TIMEOUT, ref, to);
+    alph_hold_timer(alph_me(ctx), ref, alph_timer(ctx, timeout_ms, ctx->self, ALPH_TAG_TIMEOUT, ref, to));
   }
   return ref;
 }
@@ -1243,10 +1298,12 @@ fn alph_timers_swap(h: AlphVec*, a: int64, b: int64) {
   alph_vec_set(h, b, t);
 }
 
-fn alph_timers_add(h: AlphVec*, sig: AlphSignal*) {
+// Adds sig to the heap h. Returns false, having freed sig, when the heap
+// cannot grow.
+fn alph_timers_add(h: AlphVec*, sig: AlphSignal*) -> bool {
   if (!alph_vec_push(h, 0)) {
     free((rawptr)sig);
-    return;
+    return false;
   }
   var i: int64 = h->len - 1;
   // A typed store, so the memory analyser sees the timer kept.
@@ -1260,6 +1317,7 @@ fn alph_timers_add(h: AlphVec*, sig: AlphSignal*) {
     alph_timers_swap(h, i, parent);
     i = parent;
   }
+  return true;
 }
 
 fn alph_timers_pop(h: AlphVec*) -> AlphSignal* {
@@ -1288,11 +1346,13 @@ fn alph_timers_pop(h: AlphVec*) -> AlphSignal* {
 // Delivers a message with tag, ref and arg to `to` after ms milliseconds,
 // from the caller's scheduler. A timer that carries a ref is dropped if the
 // receiver stopped waiting on that ref.
-fn alph_timer(ctx: AlphCtx*, ms: int64, to: int64, tag: int64, ref: int64, arg: int64) {
+// Returns the timer (an AlphSignal*), or 0 when out of memory.
+fn alph_timer(ctx: AlphCtx*, ms: int64, to: int64, tag: int64, ref: int64, arg: int64) -> int64 {
   var sig: AlphSignal* = (AlphSignal*)malloc((int64)sizeof(AlphSignal));
   if (sig == 0) {
-    return;
+    return 0;
   }
+  sig->dead = 0;
   sig->next = alph_now_ns() + ms * ALPH_NS_PER_MS;
   sig->kind = ALPH_SIG_TIMER;
   sig->from = ctx->self;
@@ -1301,7 +1361,11 @@ fn alph_timer(ctx: AlphCtx*, ms: int64, to: int64, tag: int64, ref: int64, arg: 
   sig->arg = arg;
   sig->tag = tag;
   sig->mark = 0;
-  alph_timers_add(&alph_here(ctx)->timers, sig);
+  var at: int64 = (int64)sig;  // kept before the heap may take it
+  if (!alph_timers_add(&alph_here(ctx)->timers, sig)) {
+    return 0;
+  }
+  return at;
 }
 
 // Fires due timers. Returns nanoseconds until the next one, or -1 if none.
@@ -1314,7 +1378,7 @@ fn alph_timers_fire(node: AlphNode*, h: AlphVec*) -> int64 {
     }
     var sig: AlphSignal* = alph_timers_pop(h);
     var p: AlphProc* = alph_resolve(node, sig->to);
-    if (p == 0) {
+    if (p == 0 || alph_atomic_load(&sig->dead) != 0) {
       free((rawptr)sig);
     } else {
       alph_queue_push(&p->signals, (rawptr)sig);
@@ -1368,7 +1432,7 @@ export fn alph_continue(ctx: AlphCtx*, tag: int64, arg: int64) {
 // cancelled; use alph_start_timer for that. Like every signal it is never
 // dropped for a full mailbox. Thread: a handler.
 export fn alph_send_after(ctx: AlphCtx*, ms: int64, to: int64, tag: int64, arg: int64) {
-  alph_timer(ctx, ms, to, tag, 0, arg);
+  alph_timer(ctx, ms, to, tag, 0, arg);  // no ref: it cannot be cancelled
 }
 
 // Starts a timer for this actor: after ms milliseconds a message with tag
@@ -1378,7 +1442,7 @@ export fn alph_send_after(ctx: AlphCtx*, ms: int64, to: int64, tag: int64, arg: 
 export fn alph_start_timer(ctx: AlphCtx*, ms: int64, tag: int64, arg: int64) -> int64 {
   var ref: int64 = alph_new_ref(ctx->node);
   alph_hold_ref(alph_me(ctx), ref, 0);
-  alph_timer(ctx, ms, ctx->self, tag, ref, arg);
+  alph_hold_timer(alph_me(ctx), ref, alph_timer(ctx, ms, ctx->self, tag, ref, arg));
   return ref;
 }
 
@@ -1536,6 +1600,7 @@ fn alph_spawn_raw(node: AlphNode*, parent: int64, flags: int64, monitor_ref: int
   p->mon_watchers.len = 0;
   p->ref_ids.len = 0;
   p->ref_pids.len = 0;
+  p->ref_timers.len = 0;
   p->deferred.len = 0;
   p->io_handles.len = 0;
   p->names.len = 0;
@@ -1754,6 +1819,7 @@ fn alph_proc_exit(node: AlphNode*, p: AlphProc*, reason: int64) {
   alph_vec_release(&p->mon_watchers);
   alph_vec_release(&p->ref_ids);
   alph_vec_release(&p->ref_pids);
+  alph_vec_release(&p->ref_timers);
   alph_vec_release(&p->deferred);
   alph_vec_release(&p->io_handles);
   alph_vec_release(&p->groups);
@@ -4079,6 +4145,7 @@ fn alph_sched_main(arg: int64) -> int64 {
         continue;
       }
       alph_sched_share(s, node);
+      alph_sched_rise(s, node);
       // A busy scheduler still looks at its handles, and at the load, now
       // and then.
       s->runs = s->runs + 1;
@@ -4154,6 +4221,7 @@ export fn alph_config(cfg: AlphConfig*) {
   cfg->max_handles = 65536;
   cfg->signals = 0;
   cfg->spin_us = 2;
+  cfg->crash_reports = 0;
 }
 
 // Starts a node: its schedulers begin running and actors can be spawned.
@@ -4175,6 +4243,7 @@ export fn alph_node_start(node: AlphNode*, cfg: AlphConfig*) -> bool {
   node->heap_limit = cfg->heap_limit;
   node->stack_size = cfg->stack_size;
   node->spin_ns = cfg->spin_us * 1000;
+  alph_recover_quiet(cfg->crash_reports == 0);
   // Like Go's runtime, only a few idle schedulers spin; the others sleep at
   // once, so light load stays on few threads and costs little CPU.
   node->max_spinners = cfg->schedulers / 8;

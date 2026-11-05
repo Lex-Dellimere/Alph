@@ -24,6 +24,7 @@
 import "alph/sys/atomic";
 
 extern fn mettle_crash_set_live_recovery(point: int64, wait: int64, jump: int64) with none;
+extern fn mettle_crash_set_quiet_recovery(on: int32) with none;
 
 const ALPH_RECOVER_MAX: int64 = 256;
 
@@ -85,6 +86,18 @@ var g_alph_recover_installed: int64 = 0;
     mov r10, [rax + 72]
     mov rax, 1
     jmp r10
+  }
+}
+
+// With on true, a crash the hook recovers prints nothing: the runtime asks
+// the hook first, and skips the stack trace and report it would otherwise
+// build and write, which cost about 60 us per crash. A crash nobody
+// recovers is reported as always. Thread: any; it sets a process-wide flag.
+export fn alph_recover_quiet(on: bool) {
+  if (on) {
+    mettle_crash_set_quiet_recovery(1);
+  } else {
+    mettle_crash_set_quiet_recovery(0);
   }
 }
 
