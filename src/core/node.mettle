@@ -6145,7 +6145,7 @@ fn alph_sched_name(s: AlphSched*) {
   if (s->bound == 0) {
     text = "alph-s";
   }
-  for i: int64 in 0..text.length {
+  for i: int64 in 0..(int64)text.length {
     name[n] = text[i];
     n = n + 1;
   }
@@ -6314,7 +6314,7 @@ fn alph_sysmon_main(arg: int64) -> int64 {
   var node: AlphNode* = (AlphNode*)arg;
   var name: uint8[16];
   var text: string = "alph-sysmon";
-  for i: int64 in 0..text.length {
+  for i: int64 in 0..(int64)text.length {
     name[i] = text[i];
   }
   name[text.length] = 0;
