@@ -4165,6 +4165,11 @@ fn alph_sched_poll(s: AlphSched*, timeout_ns: int64) {
   alph_atomic_store(&s->polled_at, alph_now_ns());
   var ev: AlphRxEvent* = (AlphRxEvent*)s->rxev;
   var n: int64 = alph_rx_wait(&s->rx, ev, 64, timeout_ns);
+  // Awake again before dispatching: the signals below wake actors at home
+  // on s, and with sleeping still set every one of them would write s's
+  // own eventfd, costing a write, a read and another trip through epoll.
+  // The run loop pops the run queue right after this returns.
+  alph_atomic_store_sc(&s->sleeping, 0);
   for i: int64 in 0..n {
     if (ev[i].kind != ALPH_RX_FD) {
       continue;  // a wake-up, or the timerfd for the next timer: just return
