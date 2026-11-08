@@ -1,5 +1,8 @@
 # alph runtime
 
+<img width="3419" height="1389" alt="image" src="https://github.com/user-attachments/assets/f685df06-1016-4a6d-a726-b67c24c767b5" />
+
+
 Erlang-style actors, supervision and self-healing for [Mettle](https://github.com/The-Mettle-Project/Mettle), written in Mettle.
 
 An actor is a state block, a bounded mailbox and a handler that runs one message to completion. A crash inside a handler ends only that actor, and its links and monitors see it.
