@@ -79,7 +79,9 @@ for src in "${tests[@]}"; do
     case " $TIMED " in *" $name "*) tries=3 ;; esac
     try=1
     while true; do
-      if timeout 60 "$exe" >> "$log" 2>&1; then
+      timeout 60 "$exe" >> "$log" 2>&1
+      code=$?
+      if [ "$code" -eq 0 ]; then
         if [ "$try" -eq 1 ]; then
           echo "ok    $name [$mode]"
         else
@@ -87,7 +89,6 @@ for src in "${tests[@]}"; do
         fi
         break
       fi
-      code=$?
       if [ "$try" -ge "$tries" ]; then
         echo "FAIL  $name [$mode] exit $code (see $log)"
         tail -n 8 "$log" | sed 's/^/      /'

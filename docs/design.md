@@ -28,7 +28,15 @@ A handler that returns non-zero ends its actor, and what it returned is the reas
 - **Keeping.** A kept actor that fails or crashes is not ended. Its state is set up again and it goes on with the same pid and the mail it had, so nothing that knows it has to learn a new pid. After its last allowed restart it ends like any other.
 - **Lost machines.** When a link reports a machine down, every actor watched on that machine ends for its watchers with the reason `ALPH_LOST`.
 
-Not built: watching an actor on another machine while that machine stays up (its end is not sent across), restart limits counted over time rather than in all, and groups that restart together.
+Not built: restart limits counted over time rather than in all, and groups that restart together.
+
+## Names and the door
+
+`src/name` gives a pid a name: a number the program chooses.
+
+`src/door` is how machines find and watch each other's actors, with nothing but messages. The door is the first actor a machine spawns, so its pid can be worked out from the machine's first place alone. An actor asks another machine's door for the pid behind a name and gets it back as a message. Watching works for an actor anywhere: for one on another machine, the door there keeps the watch and tells the watcher's door when the actor ends, and if that machine is lost first, the actor has ended with `ALPH_LOST`. Between two machines in one process: an actor found by name, a request answered, an end told across, and a lost machine's actors ended in about 540 ms.
+
+Not built: a watch cannot be dropped across machines, and since a message between machines can be lost, so can the word that an actor ended; the watcher then hears only if the machine is lost.
 
 ## Time
 

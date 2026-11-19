@@ -1,0 +1,203 @@
+// The door (src/door) with names and lives, between two machines in one
+// process over UDP: an actor on another machine is found by name, answers a
+// request, and is watched: its watcher is told when it ends there, when it
+// was already gone, and when its whole machine is lost.
+
+import "std/io";
+import "std/thread";
+import "alph/actor/actor";
+import "alph/cores/cores";
+import "alph/link/link";
+import "alph/name/name";
+import "alph/life/life";
+import "alph/door/door";
+
+const PING: Word = 1;
+const PONG: Word = 2;
+const DIE: Word = 3;
+const SERVICE: Word = 42;  // the name machine B gives its ponger
+
+// Everything one machine needs.
+struct Machine {
+  cores: AlphCores;
+  core: AlphCore[2];
+  actors: AlphActor[8];
+  mail: AlphMsg[64];
+  link: AlphLink;
+  peers: AlphPeer[2];
+  names: AlphNames;
+  name_slots: AlphName[4];
+  life: AlphLife;
+  watches: AlphWatch[4];
+  keeps: AlphKeep[2];
+  door: AlphDoor;
+}
+
+var g_a: Machine;
+var g_b: Machine;
+var g_b_thread: int64 = 0;
+var g_failures: int32 = 0;
+
+fn expect(ok: bool, what: string) {
+  if (!ok) {
+    println("FAIL {what}");
+    g_failures = g_failures + 1;
+  }
+}
+
+fn now_ms() -> Word {
+  var ts: int64[2];
+  syscall(228, 1, (int64)&ts[0]);
+  return (Word)(ts[0] * 1000 + ts[1] / 1000000);
+}
+
+// Sets a machine up as far as its door. first is its first place.
+fn machine(m: Machine*, first: Word, other: Word, other_port: int64) -> Word {
+  m->cores.init(&m->core[0], 2, &m->actors[0], 4, &m->mail[0], 8);
+  m->link.init(&m->cores, first, &m->peers[0], 2);
+  m->link.peer(other, 2, alph_ip4(127, 0, 0, 1), other_port);
+  m->names.init(&m->name_slots[0], 4);
+  m->life.init(&m->cores, &m->watches[0], 4, &m->keeps[0], 2);
+  return m->door.init(&m->cores, &m->link, &m->names, &m->life);
+}
+
+fn ponger(a: AlphActor*, m: AlphMsg*) -> Word {
+  if (m->tag == DIE) {
+    return m->arg;
+  }
+  a->reply(m, PONG, m->arg + 1);
+  return 0;
+}
+
+// On machine A: notes what it is sent and stops the cores at the tag it
+// waits for.
+struct Driver {
+  wait: Word;
+  from: Word;
+  arg: Word;
+  ref: Word;
+  ups: Word;
+  downs: Word;
+  at: Word;
+}
+
+fn driver(a: AlphActor*, m: AlphMsg*) -> Word {
+  var d: Driver* = (Driver*)a->state;
+  if (m->tag == ALPH_UP) {
+    d->ups = d->ups + 1;
+  }
+  if (m->tag == ALPH_DOWN) {
+    d->downs = d->downs + 1;
+  }
+  if (m->tag == d->wait) {
+    d->from = m->from;
+    d->arg = m->arg;
+    d->ref = m->ref;
+    d->at = now_ms();
+    a->cores()->stop();
+  }
+  return 0;
+}
+
+fn b_main(arg: cstring) -> uint32 {
+  g_b.cores.run();
+  return 0;
+}
+
+fn main() -> int32 {
+  var port_a: int64 = 23000 + (syscall(39) % 20000) * 2;
+  var port_b: int64 = port_a + 1;
+  var d: Driver;
+  d.ups = 0;
+  d.downs = 0;
+
+  // Machine A is places 0 and 1, machine B is places 2 and 3.
+  expect(machine(&g_a, 0, 2, port_b) == alph_door_of(0), "A's door is where any machine can work out");
+  var driver_pid: Word = g_a.cores.spawn_on(0, &driver, (rawptr)&d);
+  var me: AlphActor* = &g_a.actors[1];
+  expect(me->pid == driver_pid, "the driver is A's second actor");
+  g_a.door.tell(driver_pid);
+
+  expect(machine(&g_b, 2, 0, port_a) == alph_door_of(2), "B's door too");
+  var service: Word = g_b.cores.spawn_on(1, &ponger, 0);
+  var first_one: Word = g_b.cores.spawn_on(1, &ponger, 0);
+  var second_one: Word = g_b.cores.spawn_on(0, &ponger, 0);
+  expect(g_b.names.set(SERVICE, service) == ALPH_OK, "B names its service");
+
+  expect(g_a.door.watch(driver_pid, first_one) == ALPH_GONE, "an actor on a machine not yet heard cannot be watched");
+  expect(g_a.link.start(port_a) == ALPH_OK && g_b.link.start(port_b) == ALPH_OK, "both machines listen");
+  g_b_thread = CreateThread(0, 0, &b_main, 0, 0, 0);
+  d.wait = ALPH_UP;
+  g_a.cores.run();
+  expect(d.ups == 1 && d.arg == 2, "the door passes on that B is up");
+
+  // Found by name.
+  d.wait = ALPH_HERE;
+  var asked: Word = g_a.door.find(me, 3, SERVICE);
+  g_a.cores.run();
+  expect(asked > 0 && d.ref == asked && d.arg == service, "B's door says where the service is");
+  var found: Word = d.arg;
+  asked = g_a.door.find(me, 2, 77);
+  g_a.cores.run();
+  expect(d.ref == asked && d.arg == 0, "and that a name it does not have is nowhere");
+  expect(g_a.door.find(me, 9, SERVICE) == ALPH_GONE, "a place no machine has cannot be asked");
+
+  // It answers a request.
+  d.wait = PONG;
+  asked = me->ask(found, PING, 41);
+  g_a.cores.run();
+  expect(d.ref == asked && d.arg == 42 && d.from == service, "the service found by name answers");
+
+  // Watched across machines: told when it ends there, and why.
+  d.wait = ALPH_ENDED;
+  var ref: Word = g_a.door.watch(driver_pid, first_one);
+  expect(ref > 0, "an actor on another machine can be watched");
+  var waited: Word = now_ms();
+  while (g_b.watches[0].ref == 0 && (Word)(now_ms() - waited) < 2000) {
+  }
+  expect(g_b.watches[0].ref == ref && g_b.watches[0].far == 1, "B's door keeps the watch, under A's ref");
+  g_b.cores.send(first_one, DIE, 7);
+  g_a.cores.run();
+  expect(d.from == first_one && d.arg == 7 && d.ref == ref, "its watcher is told it ended, and why");
+
+  // Already gone there: told as an end.
+  ref = g_a.door.watch(driver_pid, first_one);
+  g_a.cores.run();
+  expect(ref > 0 && d.from == first_one && d.arg == ALPH_GONE && d.ref == ref, "watching one already gone on its machine is told as an end");
+
+  // A door is a machine's first actor or nothing.
+  var late: AlphDoor;
+  expect(late.init(&g_a.cores, &g_a.link, &g_a.names, &g_a.life) == ALPH_GONE, "a door opened after other actors is refused");
+  expect(g_a.core[0].node.live == 2, "and spawns nothing ({g_a.core[0].node.live} actors on A's first core)");
+
+  // Its machine is lost: ended with ALPH_LOST, within a second.
+  ref = g_a.door.watch(driver_pid, second_one);
+  var quiet: Word = now_ms();
+  g_b.link.stop();
+  g_b.cores.stop();
+  thread_join_infinite(g_b_thread);
+  thread_close(g_b_thread);
+  g_b.link.close();
+  g_a.cores.run();
+  var took: Word = d.at - quiet;
+  expect(d.from == second_one && d.arg == ALPH_LOST && d.ref == ref, "when its machine is lost a watched actor has ended");
+  expect(took < 1000, "within a second ({took} ms)");
+  g_a.core[0].node.turn();
+  expect(d.downs == 1, "and the door passes on that B is down");
+  expect(g_a.door.watch(driver_pid, service) == ALPH_GONE, "an actor on a lost machine cannot be watched");
+  expect(g_a.watches[0].ref == 0 && g_a.watches[1].ref == 0 && g_a.watches[2].ref == 0 && g_a.watches[3].ref == 0, "no watch is left over on A");
+
+  // The other way round: a watch B keeps for a watcher on A is over when A
+  // is lost. B is not running, so its lives are worked by hand here.
+  expect(g_b.life.watch_as(alph_door_of(0), service, 99) == ALPH_OK, "B keeps a watch for A's door");
+  g_b.life.lost(0, 2);
+  expect(g_b.watches[0].ref == 0 && g_b.watches[1].ref == 0 && g_b.watches[2].ref == 0 && g_b.watches[3].ref == 0, "when A is lost B keeps no watch for it");
+
+  g_a.link.stop();
+  g_a.link.close();
+  if (g_failures != 0) {
+    return 1;
+  }
+  println("door ok: found by name, watched across machines, a lost machine ended its actors in {took} ms");
+  return 0;
+}

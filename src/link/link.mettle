@@ -288,6 +288,28 @@ export fn AlphLink_start__ptr(l: AlphLink*, port: int64) -> Word {
   return ALPH_OK;
 }
 
+// The first place of the machine a place is on, this machine included, or
+// -1 when no machine has it.
+export fn AlphLink_first_of__ptr(l: AlphLink*, place: Word) -> Word {
+  if (place >= l->cores->first && place < l->cores->first + l->cores->count) {
+    return l->cores->first;
+  }
+  var p: AlphPeer* = alph_link_peer(l, place);
+  if (p == 0) {
+    return -1;
+  }
+  return p->first;
+}
+
+// How many places the machine starting at first has, 0 when there is none.
+export fn AlphLink_count_of__ptr(l: AlphLink*, first: Word) -> Word {
+  var p: AlphPeer* = alph_link_peer(l, first);
+  if (p == 0) {
+    return 0;
+  }
+  return p->count;
+}
+
 // Whether a place on another machine can be reached now.
 export fn AlphLink_reaches__ptr(l: AlphLink*, place: Word) -> bool {
   var p: AlphPeer* = alph_link_peer(l, place);
