@@ -16,6 +16,8 @@ const PIECES: Word = 1000;
 
 var g_m: AlphMachine;
 var g_batch: AlphBatch;
+var g_slots: AlphBatchSlot[40];
+var g_most: Word = 0;
 var g_failures: int32 = 0;
 
 fn expect(ok: bool, what: string) {
@@ -73,6 +75,11 @@ fn boss(a: AlphActor*, m: AlphMsg*) -> Word {
   if (!g_batch.took(a, m)) {
     s->tally->notes = s->tally->notes + 1;
     return 0;
+  }
+  for i in 0..2 {
+    if (g_m.seats[i].waiting > g_most) {
+      g_most = g_m.seats[i].waiting;
+    }
   }
   if (g_batch.over()) {
     a->cores()->stop();
@@ -147,6 +154,21 @@ fn main() -> int32 {
   g_m.run();
   expect(g_batch.over() && g_batch.back == 0, "a batch of no pieces is over at once");
   expect(g_m.share(8) == ALPH_GONE && g_m.share(-1) == ALPH_GONE, "a kind that is not 0 to 7 cannot be shared");
+
+  // With room for forty out at once, the batch still sends a core only what
+  // it can start soon: no more than two pieces wait at one.
+  clear(&t);
+  s.total = PIECES;
+  g_most = 0;
+  g_batch.wide(&g_slots[0], 40);
+  g_m.cores.send(pid, GO, 0);
+  g_m.run();
+  answered = 0;
+  for i in 0..1000 {
+    answered = answered + (Word)t.seen[i];
+  }
+  expect(answered == PIECES && t.twice == 0 && t.wrong == 0, "with more room every piece is still answered once ({answered} of {PIECES}, {t.twice} twice, {t.wrong} wrong)");
+  expect(g_most >= 1 && g_most <= 2, "and no more than two wait at a core ({g_most})");
 
   g_m.shut();
   if (g_failures != 0) {

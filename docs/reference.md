@@ -46,7 +46,7 @@ export struct AlphMachine {
   shared: Word[8];   // by kind: shared or not
   asked: Word[64];   // by other machine and kind: the ref of the question to its door
   serving: AlphServing[8];
-  taken: AlphTaken[16];
+  taken: AlphTaken[32];
   done: AlphOnce[8];      // by kind: what is remembered of jobs that must not be done twice
   tether: AlphTether;     // the line to the first board on this machine's own lines,
   more: AlphTether[3];    // and to the second, third and fourth
@@ -233,12 +233,31 @@ returned.
 ## alph/batch/batch
 
 A batch: one kind of work in many pieces. The batch hands the pieces to
-the places, a few at a time, takes each answer, asks again for a piece
-that could not be placed, and says when all are back. It is what a
-program would otherwise write around the places every time.
+the places, takes each answer, asks again for a piece that could not be
+placed, and says when all are back. It is what a program would otherwise
+write around the places every time.
+
+A piece goes out only when a place can start it soon (offer), so the
+batch finds by itself how many to have out: about two for each core at
+work, here or on another machine. It has room for sixteen out at once.
+With more cores than about eight in all, give it more room (wide).
 
 An actor owns a batch. It begins it, and passes it every message it gets:
 took says whether the message was the batch's.
+
+### `AlphBatchSlot`
+
+```mettle
+export struct AlphBatchSlot {
+  job: AlphJob;
+  piece: Word;  // the piece the job carries
+  free: Word;   // a list of slots not in use,
+  again: Word;  // and one of pieces to hand out again
+}
+```
+
+Room for one piece that is out: its job, and three words the batch keeps
+its lists in.
 
 ### `AlphBatch`
 
@@ -258,16 +277,15 @@ export struct AlphBatch {
   ctx: rawptr;       // the program's own
   nudged: Word;
   begun: Word;
-  again: Word[16];   // pieces to hand out again
   again_count: Word;
-  piece: Word[16];   // by job: the piece it carries
-  free: Word[16];    // jobs not in use
   free_count: Word;
-  jobs: AlphJob[16];
+  slots: AlphBatchSlot*;  // its own, or the room the program gave (wide)
+  room: Word;
+  own: AlphBatchSlot[16];
 }
 ```
 
-One batch, and the sixteen jobs its pieces go out in.
+One batch, and the sixteen slots its pieces go out in.
 
 ### `AlphBatch_init__ptr`
 
@@ -278,6 +296,18 @@ export fn AlphBatch_init__ptr(b: AlphBatch*, places: AlphPlaces*)
 Call it as `b->init(places)`, or `b.init(places)` on a value.
 
 Ties a batch to the places its pieces will go to. Call it once, before begin.
+
+### `AlphBatch_wide__ptr`
+
+```mettle
+export fn AlphBatch_wide__ptr(b: AlphBatch*, slots: AlphBatchSlot*, count: Word)
+```
+
+Call it as `b->wide(slots, count)`, or `b.wide(slots, count)` on a value.
+
+Gives a batch room for `count` pieces out at once, in place of its own
+sixteen: about two for each core at work on all the machines is enough.
+Call it after init, while no batch is running.
 
 ### `AlphBatch_begin__ptr`
 
@@ -1295,6 +1325,7 @@ export struct AlphPlace {
   workers: Word[16];  // a far place: by kind, the actor on its machine that does it, 0 for none
   looking: Word;      // a timer to look at the open jobs is set
   limit: Word;        // no more jobs than this are here at once, 0 for any number
+  wide: Word;         // how many jobs it does at once, 0 when not known
   answers: Word;      // a far place: answers that have come back,
   answered: Word;     // and when the last one did
   gave_ref: Word[4];  // the last jobs given up on: the ref each went out with,
@@ -1423,6 +1454,21 @@ only when the place has gone quiet or has answered twice its limit of
 later jobs. A job that finds every place that could run it at its limit
 is answered ALPH_FULL. Returns ALPH_GONE when there is no such place.
 
+### `AlphPlaces_wide__ptr`
+
+```mettle
+export fn AlphPlaces_wide__ptr(p: AlphPlaces*, place: Word, jobs: Word) -> Word
+```
+
+Call it as `p->wide(place, jobs)`, or `p.wide(place, jobs)` on a value.
+
+Says how many jobs a place does at once: 1 for a core or a GPU, which is
+what a place starts with, and for another machine the cores it works on.
+A far place is then costed as that many workers before any answer has
+shown its pace, and an offered job (offer) is not left waiting behind
+more than one other at each worker. 0 is for not known. Returns
+ALPH_GONE when there is no such place.
+
 ### `AlphPlaces_own__ptr`
 
 ```mettle
@@ -1522,6 +1568,20 @@ until that answer the job is alph's: leave it where it is and do not read
 or write it. Set its kind, size and home first. Returns ALPH_FULL when that place's
 mailbox is full, ALPH_GONE when no place can run the kind or there is no
 such kind.
+
+### `AlphPlaces_offer__ptr`
+
+```mettle
+export fn AlphPlaces_offer__ptr(p: AlphPlaces*, a: AlphActor*, job: AlphJob*) -> Word
+```
+
+Call it as `p->offer(a, job)`, or `p.offer(a, job)` on a value.
+
+Like ask, for a program with more jobs than places, which a batch is: a
+job that would only wait behind others at every place that could run it
+is not sent, and the answer is ALPH_FULL. Offer it again when an answer
+to another job is back. So jobs are placed late, when it is known which
+place is free, and none sits in a slow place's queue.
 
 ### `alph_place_run`
 

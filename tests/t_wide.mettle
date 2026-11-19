@@ -1,0 +1,133 @@
+// A batch with more room (AlphBatch_wide) and two helpers of eight working
+// cores each: more than sixteen pieces are out at once, never more than two
+// wait for each core at work, and every piece is answered once and rightly.
+
+import "std/io";
+import "std/thread";
+import "alph/actor/actor";
+import "alph/machine/machine";
+import "alph/batch/batch";
+import "port/sys";
+
+const GO: Word = 1;
+const SQUARE: Word = 0;  // out is in times in, after two milliseconds
+const PIECES: Word = 600;
+const WIDE: Word = 9;    // a helper's cores: the first hands out, eight work
+
+var g_m: AlphMachine[3];
+var g_batch: AlphBatch;
+var g_slots: AlphBatchSlot[64];
+var g_seen: uint8[600];
+var g_wrong: Word = 0;
+var g_most: Word = 0;
+var g_deep: Word[3];  // the most that waited at this machine's core and at each helper
+var g_failures: int32 = 0;
+
+fn expect(ok: bool, what: string) {
+  if (!ok) {
+    println("FAIL {what}");
+    g_failures = g_failures + 1;
+  }
+}
+
+fn square(job: AlphJob*) -> Word {
+  var rest: int64[2];
+  rest[0] = 0;
+  rest[1] = 2000000;
+  syscall(ALPH_NR_NANOSLEEP, (int64)&rest[0], 0);
+  job->out = (Word)(job->in * job->in);
+  return 0;
+}
+
+fn fill(b: AlphBatch*, job: AlphJob*, piece: Word) {
+  job->in = piece + 2;
+}
+
+fn took(b: AlphBatch*, job: AlphJob*, piece: Word) {
+  if (job->status != ALPH_OK || job->out != (Word)((piece + 2) * (piece + 2)) || g_seen[piece] != 0) {
+    g_wrong = g_wrong + 1;
+  }
+  g_seen[piece] = 1;
+}
+
+fn boss(a: AlphActor*, m: AlphMsg*) -> Word {
+  if (m->tag == GO) {
+    g_batch.begin(a, SQUARE, PIECES, &fill, &took, 0);
+  } else if (g_batch.took(a, m) && g_batch.over()) {
+    a->cores()->stop();
+  }
+  if (g_batch.out > g_most) {
+    g_most = g_batch.out;
+  }
+  for i in 0..3 {
+    if (g_m[0].seats[i].waiting > g_deep[i]) {
+      g_deep[i] = g_m[0].seats[i].waiting;
+    }
+  }
+  return 0;
+}
+
+fn helper_main(arg: cstring) -> uint32 {
+  var m: AlphMachine* = (AlphMachine*)arg;
+  m->run();
+  return 0;
+}
+
+fn main() -> int32 {
+  var port: int64 = 26000 + (syscall(ALPH_NR_GETPID) % 2000) * 3;
+  var here: uint32 = alph_ip4(127, 0, 0, 1);
+  // The first machine has two cores, one of which works, and places 0 and
+  // 1. Helper h has places 16 * h on and listens on port + h.
+  g_m[0].init(2, 0, false);
+  for h in 1..3 {
+    g_m[0].peer((Word)(h * 16), WIDE, here, port + (int64)h);
+    g_m[h].init(WIDE, (Word)(h * 16), false);
+    g_m[h].peer(0, 2, here, port);
+  }
+  for i in 0..3 {
+    g_m[i].kind(SQUARE, &square, 0);
+    expect(g_m[i].share(SQUARE) == ALPH_OK, "the machine shares the kind");
+    expect(g_m[i].start(port + (int64)i) == ALPH_OK, "the machine listens");
+  }
+  g_batch.init(&g_m[0].places);
+  g_batch.wide(&g_slots[0], 64);
+  var pid: Word = g_m[0].cores.spawn_on(0, &boss, 0);
+  var helper1: int64 = CreateThread(0, 0, &helper_main, (cstring)&g_m[1], 0, 0);
+  var helper2: int64 = CreateThread(0, 0, &helper_main, (cstring)&g_m[2], 0, 0);
+  var waited: int32 = 0;
+  while ((g_m[0].seats[1].workers[SQUARE] == 0 || g_m[0].seats[2].workers[SQUARE] == 0) && waited < 3000) {
+    g_m[0].core[0].node.turn();
+    Sleep(1);
+    waited = waited + 1;
+  }
+  expect(g_m[0].seats[1].workers[SQUARE] != 0 && g_m[0].seats[2].workers[SQUARE] != 0, "the first machine finds a worker on each helper");
+
+  g_m[0].cores.send(pid, GO, 0);
+  g_m[0].run();
+  var answered: Word = 0;
+  for i in 0..600 {
+    answered = answered + (Word)g_seen[i];
+  }
+  var by1: Word = g_m[1].served;
+  var by2: Word = g_m[2].served;
+  expect(g_batch.over() && answered == PIECES && g_wrong == 0, "every piece is answered once and rightly ({answered} of {PIECES}, {g_wrong} wrong)");
+  expect(g_most > 16, "more than sixteen pieces are out at once ({g_most})");
+  expect(g_deep[0] <= 2 && g_deep[1] <= 16 && g_deep[2] <= 16, "and no more than two wait for each core at work ({g_deep[0]} here, {g_deep[1]} and {g_deep[2]} at the helpers)");
+  expect(g_deep[1] > 8 && g_deep[2] > 8, "a helper's eight cores all have work ({g_deep[1]} and {g_deep[2]})");
+  expect(by1 > 100 && by2 > 100, "both helpers did a good part ({by1} and {by2})");
+
+  g_m[1].stop();
+  g_m[2].stop();
+  thread_join_infinite(helper1);
+  thread_close(helper1);
+  thread_join_infinite(helper2);
+  thread_close(helper2);
+  for i in 0..3 {
+    g_m[i].shut();
+  }
+  if (g_failures != 0) {
+    return 1;
+  }
+  println("wide ok: {PIECES} pieces, up to {g_most} out at once, {g_batch.by_way[ALPH_CPU]} done here, {by1} and {by2} on two helpers of eight working cores");
+  return 0;
+}

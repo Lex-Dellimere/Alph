@@ -92,7 +92,16 @@ The sizes are fixed: 32 actors a core, 16 messages a mailbox, 8 kinds. A program
 - Pass the batch every message the actor gets: `took(a, m)` returns true when the message was the batch's. `over()` says when every piece is answered.
 - `b->by_way[ALPH_CPU]`, `[ALPH_GPU]` and `[ALPH_FAR]` count how the pieces were done. A piece no place can run comes back with `job->status == ALPH_GONE`, counted in `b->gone`.
 
-At most 16 pieces are out at once. A piece that could not be placed, or whose machine was lost, is handed out again.
+A piece goes out only when some place can start it soon, so no piece sits in a slow place's queue while another place is free: no more than two wait for each core, here or on another machine. A piece that could not be placed, or whose machine was lost, is handed out again.
+
+A batch has room for 16 pieces out at once. That is enough for about eight cores in all. With more, give it room of your own, about two slots for each core at work on all the machines:
+
+```mettle
+var g_slots: AlphBatchSlot[64];
+
+g_batch.init(&g_m.places);
+g_batch.wide(&g_slots[0], 64);
+```
 
 For the GPU the same two layers do: [examples/tiles.mettle](../examples/tiles.mettle) calls `g_m.init(4, 0, true)`, gives `kind` a function for a core and one for the GPU that both call the same Mettle code, and begins a batch of tiles. See Places and jobs below for how a GPU function is written and how data that stays on the GPU is brought back.
 
@@ -602,7 +611,15 @@ g_places.own(far_place, &g_times[0], 2);     // it keeps its own times for kinds
 g_places.limit(far_place, 4);                // and holds no more than four jobs at once
 ```
 
-`AlphMachine` does all three for every machine and board it is given.
+A bigger machine gets a width in place of a limit: how many jobs it does at once.
+
+```mettle
+g_places.wide(far_place, 8);  // its machine works on eight cores
+```
+
+alph then costs it as eight workers from the first job on. And a job sent with `offer` in place of `ask` is not sent where two already wait for each worker: the answer is `ALPH_FULL`, and the program offers it again when an answer to another job is back. A program with more jobs than places, which a batch is, places its jobs late that way.
+
+`AlphMachine` does all of this for every machine and board it is given.
 
 ## A microcontroller
 
@@ -823,7 +840,7 @@ These are not built yet.
 - A microcontroller joins through a serial line to one machine. What is lost on that line is sent again only when both ends make the line sure.
 - A board's jobs are one word in and one word out, one at a time. A board asks the machine at the other end of its line, not the best of several places.
 - A job of a kind done at most once carries a word and gives a word back. When its worker is lost the program is told `ALPH_LOST`: it cannot know whether the job was done.
-- A batch has 16 pieces out at once and a machine takes 16 jobs for others at once, which is less than a helper with many cores can do.
+- A batch does not find out by itself how much room it needs: with more than about eight cores in all it must be given more (`wide`). A machine takes 32 jobs for others at once, two for each of the 16 cores it can have.
 - Peers are listed by hand.
 - A watch cannot be dropped across machines.
 - Restart limits are counted in all, not over time, and there are no groups that restart together.
