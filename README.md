@@ -187,8 +187,9 @@ mettle --release examples/mcu/two_b.mettle --target riscv32-none --board qemu-vi
 
 ## What it does not do yet
 
-- On ARM Linux a handler that crashes ends the process, and the programs have run under an emulator, not on an ARM machine.
-
+- Nothing here has run on real hardware other than an x86-64 computer. The boards run in QEMU and, for the Pico 2, on the compiler's model of its chip. The ARM Linux programs run under an emulator.
+- On ARM Linux a handler that crashes ends the process.
+- A board cannot ask another board for work done at most once: that needs a number that is new at every start, and a board has no clock or storage to make one.
 - A sealed link has one key for the whole network: any holder can speak as any machine, and someone who gets the key later can read what they recorded before.
 - A job for another machine carries at most 1,024 bytes, and gives back a word and at most 1,016 bytes.
 - Sockets are Linux only, and there is no file IO.
