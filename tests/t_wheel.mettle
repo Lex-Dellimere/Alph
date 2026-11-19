@@ -1,0 +1,252 @@
+// The timer wheel (src/time/wheel): the order timers arrive in, none early,
+// cancel, a full timer array, a full mailbox when one is due, timers a turn
+// or more apart in one spoke, ten thousand at once, equal deadlines, and an
+// actor that sets its own next timer. Then the cost of a set and a cancel
+// with ten thousand waiting, beside AlphTime's.
+
+import "std/io";
+import "alph/actor/actor";
+import "alph/time/time";
+import "alph/time/wheel";
+
+const DUE: Word = 1;
+const NOTE: Word = 2;
+const MANY: Word = 10000;
+const SPOKES: Word = 256;
+
+var g_node: AlphNode;
+var g_actors: AlphActor[4];
+var g_mail: AlphMsg[256];
+var g_wheel: AlphWheel;
+var g_timers: AlphWheelTimer[10000];
+var g_spokes: Word[256];
+var g_small: AlphWheel;
+var g_small_timers: AlphWheelTimer[16];
+var g_small_spokes: Word[8];
+var g_time: AlphTime;
+var g_time_timers: AlphTimer[10000];
+var g_failures: int32 = 0;
+
+fn now_us() -> Word {
+  var ts: int64[2];
+  syscall(228, 1, (int64)&ts[0]);
+  return (Word)(ts[0] * 1000000 + ts[1] / 1000);
+}
+
+fn expect(ok: bool, what: string) {
+  if (!ok) {
+    println("FAIL {what}");
+    g_failures = g_failures + 1;
+  }
+}
+
+// Each DUE's arg is the delay it was set with, in milliseconds.
+struct Log {
+  start: Word;
+  want: Word;
+  got: Word;
+  last: Word;
+  early: Word;
+  out_of_order: Word;
+  notes: Word;
+  notes_before: Word;
+  refs: Word[8];
+}
+
+fn logger(a: AlphActor*, m: AlphMsg*) -> Word {
+  var l: Log* = (Log*)a->state;
+  if (m->tag == NOTE) {
+    l->notes = l->notes + 1;
+    return 0;
+  }
+  if ((Word)(now_us() - l->start) < (Word)(m->arg * 1000)) {
+    l->early = l->early + 1;
+  }
+  if (m->arg < l->last) {
+    l->out_of_order = l->out_of_order + 1;
+  }
+  l->last = m->arg;
+  if (l->got < 8) {
+    l->refs[l->got] = m->ref;
+  }
+  l->notes_before = l->notes;
+  l->got = l->got + 1;
+  if (l->got == l->want) {
+    a->node->stop();
+  }
+  return 0;
+}
+
+fn fresh(l: Log*, want: Word) {
+  l->start = now_us();
+  l->want = want;
+  l->got = 0;
+  l->last = 0;
+  l->early = 0;
+  l->out_of_order = 0;
+  l->notes = 0;
+  l->notes_before = 0;
+}
+
+struct Beat {
+  count: Word;
+}
+
+fn beater(a: AlphActor*, m: AlphMsg*) -> Word {
+  var b: Beat* = (Beat*)a->state;
+  b->count = b->count + 1;
+  if (b->count == 5) {
+    a->node->stop();
+    return 1;
+  }
+  g_wheel.after(2, a->pid, DUE, 0);
+  return 0;
+}
+
+// Nanoseconds per after and cancel with MANY - 1 timers waiting far off.
+fn cost_wheel(pairs: Word, log: Word) -> Word {
+  for i in 0..(MANY - 1) {
+    g_wheel.after(100000, log, DUE, 0);
+  }
+  var began: Word = now_us();
+  for i in 0..pairs {
+    g_wheel.cancel(g_wheel.after(200000, log, DUE, 0));
+  }
+  return (Word)((now_us() - began) * 1000 / pairs);
+}
+
+fn cost_time(pairs: Word, log: Word) -> Word {
+  for i in 0..(MANY - 1) {
+    g_time.after(100000, log, DUE, 0);
+  }
+  var began: Word = now_us();
+  for i in 0..pairs {
+    g_time.cancel(g_time.after(200000, log, DUE, 0));
+  }
+  return (Word)((now_us() - began) * 1000 / pairs);
+}
+
+fn main() -> int32 {
+  g_node.init(&g_actors[0], 4, &g_mail[0], 64);
+  g_wheel.init(&g_node, &g_timers[0], MANY, &g_spokes[0], SPOKES);
+  var l: Log;
+  var log: Word = g_node.spawn(&logger, (rawptr)&l);
+
+  // Set out of order, they arrive soonest first and none early.
+  fresh(&l, 5);
+  var r50: Word = g_wheel.after(50, log, DUE, 50);
+  var r10: Word = g_wheel.after(10, log, DUE, 10);
+  g_wheel.after(30, log, DUE, 30);
+  g_wheel.after(20, log, DUE, 20);
+  g_wheel.after(40, log, DUE, 40);
+  expect(r50 > 0 && r10 > 0 && r50 != r10, "after returns a ref of its own");
+  g_node.run();
+  expect(l.got == 5 && l.out_of_order == 0, "five timers arrive soonest first ({l.out_of_order} out of order)");
+  expect(l.early == 0, "none arrives early ({l.early} did)");
+  expect(l.refs[0] == r10 && l.refs[4] == r50, "each message carries its timer's ref");
+  expect(g_wheel.cancel(r10) == ALPH_GONE, "a timer that was sent cannot be cancelled");
+
+  // A cancelled timer never arrives.
+  fresh(&l, 2);
+  g_wheel.after(5, log, DUE, 5);
+  var gone: Word = g_wheel.after(10, log, DUE, 10);
+  g_wheel.after(15, log, DUE, 15);
+  expect(g_wheel.cancel(gone) == ALPH_OK, "a waiting timer can be cancelled");
+  expect(g_wheel.cancel(gone) == ALPH_GONE, "but only once");
+  expect(g_wheel.cancel(0) == ALPH_GONE, "ref 0 is no timer");
+  expect(g_wheel.cancel(-5) == ALPH_GONE, "nor is a ref below 0");
+  g_node.run();
+  expect(l.got == 2 && l.last == 15, "the other two arrive");
+
+  // Every timer in use.
+  fresh(&l, 0);
+  var first: Word = g_wheel.after(100000, log, DUE, 0);
+  for i in 1..MANY {
+    g_wheel.after(100000, log, DUE, 0);
+  }
+  expect(g_wheel.after(1, log, DUE, 0) == ALPH_FULL, "a full timer array refuses");
+  expect(g_wheel.cancel(first) == ALPH_OK, "the first of many can be cancelled");
+  var again: Word = g_wheel.after(100000, log, DUE, 0);
+  expect(again > 0 && again != first, "and its place used again, under a new ref");
+  expect(g_wheel.cancel(first) == ALPH_GONE, "the old ref does not reach the new timer");
+  g_wheel.stop();
+  g_wheel.init(&g_node, &g_timers[0], MANY, &g_spokes[0], SPOKES);
+
+  // A timer due while its actor's mailbox is full arrives once there is room.
+  fresh(&l, 1);
+  for i in 0..64 {
+    g_node.send(log, NOTE, 0);
+  }
+  g_wheel.after(0, log, DUE, 0);
+  while ((Word)(now_us() - l.start) < 5000) {
+  }
+  g_node.run();
+  expect(l.got == 1 && l.notes_before == 64, "a timer waits for room in a full mailbox ({l.notes_before} notes came first)");
+
+  // On a wheel of 8 spokes, 3, 11 and 19 ms share a spoke a turn apart.
+  g_small.init(&g_node, &g_small_timers[0], 16, &g_small_spokes[0], 8);
+  fresh(&l, 3);
+  g_small.after(19, log, DUE, 19);
+  g_small.after(3, log, DUE, 3);
+  g_small.after(11, log, DUE, 11);
+  g_node.run();
+  expect(l.got == 3 && l.out_of_order == 0 && l.last == 19, "timers turns apart arrive in order ({l.out_of_order} out of order)");
+  expect(l.early == 0, "and none early ({l.early} were)");
+  g_small.stop();
+
+  // Equal deadlines arrive in the order they were set.
+  fresh(&l, 5);
+  var same: Word[5];
+  for i in 0..5 {
+    same[i] = g_wheel.after(10, log, DUE, 1 + (Word)i);
+  }
+  g_node.run();
+  var in_order: bool = l.out_of_order == 0;
+  for i in 0..5 {
+    in_order = in_order && l.refs[i] == same[i];
+  }
+  expect(l.got == 5 && in_order, "equal deadlines arrive in the order they were set");
+
+  // Ten thousand at once, more than the mailbox holds when many fall due.
+  fresh(&l, MANY);
+  var seed: uint64 = 12345;
+  var fit: Word = 0;
+  for i in 0..MANY {
+    seed = seed * 6364136223846793005 + 1442695040888963407;
+    var ms: Word = (Word)((seed >> 33) % 60);
+    if (g_wheel.after(ms, log, DUE, ms) > 0) {
+      fit = fit + 1;
+    }
+  }
+  expect(fit == MANY, "{MANY} timers fit ({fit})");
+  g_node.run();
+  expect(l.got == MANY, "all {MANY} arrive ({l.got})");
+  expect(l.early == 0, "none early ({l.early} were)");
+
+  // An actor that sets its own next timer.
+  var b: Beat;
+  b.count = 0;
+  var beat: Word = g_node.spawn(&beater, (rawptr)&b);
+  var began: Word = now_us();
+  g_wheel.after(2, beat, DUE, 0);
+  g_node.run();
+  var took: Word = (Word)((now_us() - began) / 1000);
+  expect(b.count == 5, "five beats ({b.count})");
+  expect(took >= 10, "2 ms apart: at least 10 ms in all ({took})");
+
+  // What a set and a cancel cost with ten thousand waiting: measured, not checked.
+  g_wheel.stop();
+  g_wheel.init(&g_node, &g_timers[0], MANY, &g_spokes[0], SPOKES);
+  var wheel_ns: Word = cost_wheel(100000, log);
+  g_wheel.stop();
+  g_time.init(&g_node, &g_time_timers[0], MANY);
+  var time_ns: Word = cost_time(2000, log);
+  g_time.stop();
+
+  if (g_failures != 0) {
+    return 1;
+  }
+  println("wheel ok: {MANY} timers at once on {SPOKES} spokes, 3 a turn apart, 5 beats in {took} ms");
+  println("after + cancel with {MANY} waiting: wheel {wheel_ns} ns, time {time_ns} ns");
+  return 0;
+}
