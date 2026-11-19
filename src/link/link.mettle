@@ -767,12 +767,16 @@ export fn AlphLink_reaches__ptr(l: AlphLink*, place: Word) -> bool {
 // port stays open, because an actor may be in the middle of a send: start
 // uses it again, close gives it up.
 export fn AlphLink_stop__ptr(l: AlphLink*) {
+  if (l->thread == 0) {
+    return;  // not started, or stopped already
+  }
   for i in 0..l->count {
     l->peers[i].alive = 0;
   }
   l->stopping = 1;
   thread_join_infinite(l->thread);
   thread_close(l->thread);
+  l->thread = 0;
   for i in 0..l->count {
     l->peers[i].alive = 0;
     l->peers[i].told = 0;

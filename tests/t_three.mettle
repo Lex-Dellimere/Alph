@@ -1,0 +1,128 @@
+// Three machines sharing one kind of work (src/machine): one hands out a
+// batch and the other two both take part. Then one of the helpers is lost
+// in the middle of a second batch, and every piece is still answered.
+
+import "std/io";
+import "std/thread";
+import "alph/actor/actor";
+import "alph/machine/machine";
+import "alph/batch/batch";
+
+const GO: Word = 1;
+const SQUARE: Word = 0;  // out is in times in, after two milliseconds of work
+const PIECES: Word = 300;
+
+var g_m: AlphMachine[3];
+var g_batch: AlphBatch;
+var g_wrong: Word = 0;
+var g_failures: int32 = 0;
+
+fn expect(ok: bool, what: string) {
+  if (!ok) {
+    println("FAIL {what}");
+    g_failures = g_failures + 1;
+  }
+}
+
+fn now_ns() -> Word {
+  var ts: int64[2];
+  syscall(228, 1, (int64)&ts[0]);
+  return (Word)(ts[0] * 1000000000 + ts[1]);
+}
+
+fn square(job: AlphJob*) -> Word {
+  var until: Word = now_ns() + 2000000;
+  while (now_ns() < until) {
+  }
+  job->out = (Word)(job->in * job->in);
+  return 0;
+}
+
+fn fill(b: AlphBatch*, job: AlphJob*, piece: Word) {
+  job->in = piece + 2;
+}
+
+fn took(b: AlphBatch*, job: AlphJob*, piece: Word) {
+  if (job->status != ALPH_OK || job->out != (Word)((piece + 2) * (piece + 2))) {
+    g_wrong = g_wrong + 1;
+  }
+}
+
+fn boss(a: AlphActor*, m: AlphMsg*) -> Word {
+  if (m->tag == GO) {
+    g_batch.begin(a, SQUARE, PIECES, &fill, &took, 0);
+  } else if (g_batch.took(a, m) && g_batch.over()) {
+    a->cores()->stop();
+  }
+  return 0;
+}
+
+fn helper_main(arg: cstring) -> uint32 {
+  var m: AlphMachine* = (AlphMachine*)arg;
+  m->run();
+  return 0;
+}
+
+fn main() -> int32 {
+  var port: int64 = 15000 + (syscall(39) % 2000) * 3;
+  var here: uint32 = alph_ip4(127, 0, 0, 1);
+  // Machine i has places 3 * i to 3 * i + 2 and listens on port + i.
+  for i in 0..3 {
+    g_m[i].init(3, (Word)(i * 3), false);
+    for other in 0..3 {
+      if (other != i) {
+        g_m[i].peer((Word)(other * 3), 3, here, port + (int64)other);
+      }
+    }
+    g_m[i].kind(SQUARE, &square, 0);
+    expect(g_m[i].share(SQUARE) == ALPH_OK, "the machine shares the kind");
+  }
+  g_batch.init(&g_m[0].places);
+  var pid: Word = g_m[0].cores.spawn_on(0, &boss, 0);
+  for i in 0..3 {
+    expect(g_m[i].start(port + (int64)i) == ALPH_OK, "the machine listens");
+  }
+  var helper1: int64 = CreateThread(0, 0, &helper_main, (cstring)&g_m[1], 0, 0);
+  var helper2: int64 = CreateThread(0, 0, &helper_main, (cstring)&g_m[2], 0, 0);
+
+  // Wait until the first machine has found both helpers' workers.
+  var waited: int32 = 0;
+  while ((g_m[0].seats[2].workers[SQUARE] == 0 || g_m[0].seats[3].workers[SQUARE] == 0) && waited < 3000) {
+    g_m[0].core[0].node.turn();
+    Sleep(1);
+    waited = waited + 1;
+  }
+  expect(g_m[0].seats[2].workers[SQUARE] != 0 && g_m[0].seats[3].workers[SQUARE] != 0, "the first machine finds a worker on each of the others");
+
+  // Three hundred pieces: both helpers take part.
+  g_m[0].cores.send(pid, GO, 0);
+  g_m[0].run();
+  var by1: Word = g_m[1].served;
+  var by2: Word = g_m[2].served;
+  expect(g_batch.over() && g_wrong == 0, "every piece is answered rightly ({g_wrong} wrong)");
+  expect(by1 > 0 && by2 > 0, "both other machines did some of it ({by1} and {by2})");
+  expect(by1 + by2 >= g_batch.by_way[ALPH_FAR], "what they did covers what went out ({by1} + {by2} for {g_batch.by_way[ALPH_FAR]})");
+  var here_first: Word = g_batch.by_way[ALPH_CPU];
+
+  // The same again, and one helper is lost on the way.
+  g_m[0].cores.send(pid, GO, 0);
+  g_m[2].link.deaf = 1;
+  g_m[2].link.stop();
+  g_m[0].run();
+  expect(g_batch.over() && g_wrong == 0, "with one helper lost every piece is still answered rightly ({g_wrong} wrong)");
+
+  g_m[1].stop();
+  g_m[2].stop();
+  thread_join_infinite(helper1);
+  thread_close(helper1);
+  thread_join_infinite(helper2);
+  thread_close(helper2);
+  for i in 0..3 {
+    g_m[i].shut();
+  }
+  if (g_failures != 0) {
+    return 1;
+  }
+  println("three ok: {PIECES} pieces, {here_first} done here, {by1} and {by2} on the two other machines; then one was lost and all were still answered");
+  return 0;
+}

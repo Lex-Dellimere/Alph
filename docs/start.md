@@ -77,7 +77,7 @@ Every machine runs the same program. Each says how a kind of job is done (`kind`
 - `init(cores, first, gpu)` sets up `cores` cores (1 to 16) whose places start at `first`. The first core has the door and the program's own actors, and the others take work. With `gpu` true the last core is the GPU's.
 - `peer(first, count, ip, port)` adds another machine, up to eight. `start(port)` joins them. A machine on its own needs neither.
 - `kind(kind, cpu, gpu)` says how a kind of job (0 to 7) is done: a function for a core and one for the GPU, 0 for a way it does not have.
-- `share(kind)` shares a kind with the other machines, both ways. Only a job with no home leaves a machine: one word in, or bytes.
+- `share(kind)` shares a kind with the other machines, both ways. With several, a job goes to whichever is least busy. Only a job with no home leaves a machine: one word in, or bytes.
 - `tell(pid)` names your actor that hears `ALPH_UP` and `ALPH_DOWN`.
 - `run()` runs the cores until `stop()`, and `shut()` ends the timers and the link afterwards.
 - The layers are fields of the machine, for when you want them: `m.cores`, `m.link`, `m.names`, `m.life`, `m.door`, `m.time`, `m.places`.

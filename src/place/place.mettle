@@ -17,10 +17,10 @@
 // by the GPU's own place, the only thread that may touch the GPU.
 //
 // A third way is another machine. A job that is one word in and one word
-// out can be sent to an actor there that does the kind's work and answers.
-// To alph it is one more place with a time of its own, the network
-// included, so work goes to another machine when that is where it will
-// finish first.
+// out, or that carries a few bytes, can be sent to an actor there that does
+// the kind's work and answers. Each other machine is one more place, with
+// its own work waiting, so work goes to another machine when that is where
+// it will finish first, and to the one of several that is least busy.
 //
 // The program writes the two ways. alph only times them, so nothing here
 // knows what a GPU is. x86-64 Linux, like the cores.
@@ -83,7 +83,7 @@ export struct AlphKind {
   cpu: fn(AlphJob*) -> Word;
   gpu: fn(AlphJob*) -> Word;
   bring: fn(AlphJob*) -> Word;
-  far: Word;       // the actor on another machine that does this kind's work, 0 for none
+  far: Word;       // an actor on another machine that does this kind's work, 0 when no machine does
   off: Word[3];    // this way cannot run the kind
   warm: Word[3];   // its first run is over: that one pays for starting up
   // Times are kept by way, by whether the data was at home there or had to
@@ -105,6 +105,7 @@ export struct AlphPlace {
   nudged: Word;       // a nudge is on its way
   open: AlphJob*;     // sent to another machine and not yet answered
   far_refs: Word;
+  workers: Word[16];  // a far place: by kind, the actor on its machine that does it, 0 for none
   looking: Word;      // a timer to look at the open jobs is set
 }
 
@@ -217,17 +218,55 @@ export fn AlphPlaces_bring__ptr(p: AlphPlaces*, kind: Word, bring: fn(AlphJob*) 
   p->kinds[kind].bring = bring;
 }
 
-// Says which actor on another machine does a kind's work. It is sent
+// A far way is open for a kind while some far place has a worker for it.
+// Called inside the gate.
+fn alph_place_far_open(p: AlphPlaces*, kind: Word) {
+  var k: AlphKind* = &p->kinds[kind];
+  k->off[ALPH_FAR] = 1;
+  k->far = 0;
+  for i in 0..p->count {
+    var x: AlphPlace* = &p->places[i];
+    if (x->way == ALPH_FAR && x->workers[kind] != 0) {
+      k->off[ALPH_FAR] = 0;
+      k->far = x->workers[kind];
+    }
+  }
+}
+
+// Says which actor on another machine does a kind's work, for one far
+// place: the place with pid `place` is that machine. The actor is sent
 // ALPH_WORK with the job's in as arg, and answers ALPH_WORKED with the
 // job's out and the same ref, or ALPH_REFUSED with arg ALPH_FULL when it
-// cannot take the job now and ALPH_GONE when it never can. Call it after kind. For the machine's loss to
-// be noticed, have this machine's far place watch the worker: it treats
-// ALPH_ENDED from a worker as the end of that way.
+// cannot take the job now and ALPH_GONE when it never can. A worker of 0
+// takes the kind away from that machine. Call it after kind, with a kind
+// below 16. For the machine's loss to be noticed, have the far place watch
+// the worker: it treats ALPH_ENDED from a worker as the end of its work
+// there. Returns ALPH_GONE when there is no such far place or kind.
+export fn AlphPlaces_far_at__ptr(p: AlphPlaces*, place: Word, kind: Word, worker: Word) -> Word {
+  var out: Word = ALPH_GONE;
+  if (kind < 0 || kind >= 16 || kind >= p->kind_count) {
+    return out;
+  }
+  var was: int32 = p->gate.enter();
+  for i in 0..p->count {
+    var x: AlphPlace* = &p->places[i];
+    if (x->way == ALPH_FAR && x->pid == place) {
+      x->workers[kind] = worker;
+      out = ALPH_OK;
+    }
+  }
+  alph_place_far_open(p, kind);
+  p->gate.leave(was);
+  return out;
+}
+
+// The same for a program with one far place: its first.
 export fn AlphPlaces_far__ptr(p: AlphPlaces*, kind: Word, worker: Word) {
-  p->kinds[kind].far = worker;
-  p->kinds[kind].off[ALPH_FAR] = 0;
-  if (worker == 0) {
-    p->kinds[kind].off[ALPH_FAR] = 1;
+  for i in 0..p->count {
+    if (p->places[i].way == ALPH_FAR) {
+      p->far_at(p->places[i].pid, kind, worker);
+      return;
+    }
   }
 }
 
@@ -265,6 +304,9 @@ export fn AlphPlaces_add__ptr(p: AlphPlaces*, way: Word) -> AlphPlace* {
     x->open = 0;
     x->far_refs = 0;
     x->looking = 0;
+    for k in 0..16 {
+      x->workers[k] = 0;
+    }
     p->count = p->count + 1;
   }
   p->gate.leave(was);
@@ -338,6 +380,9 @@ fn alph_place_pick(p: AlphPlaces*, job: AlphJob*) -> AlphPlace* {
     var x: AlphPlace* = &p->places[i];
     if (!alph_place_can(k, job, x->way)) {
       continue;
+    }
+    if (x->way == ALPH_FAR && (job->kind >= 16 || x->workers[job->kind] == 0)) {
+      continue;  // that machine does not do this kind
     }
     var row: Word = alph_place_row(job, x->way);
     var at: Word = row + size;
@@ -530,9 +575,14 @@ fn alph_place_elsewhere(a: AlphActor*, p: AlphPlaces*, x: AlphPlace*, job: AlphJ
   x->unsent = job;
 }
 
-fn alph_place_shut_far(p: AlphPlaces*, kind: Word) {
+// A far place's machine no longer does a kind.
+fn alph_place_shut_far(p: AlphPlaces*, x: AlphPlace*, kind: Word) {
+  if (kind < 0 || kind >= 16) {
+    return;
+  }
   var was: int32 = p->gate.enter();
-  p->kinds[kind].off[ALPH_FAR] = 1;
+  x->workers[kind] = 0;
+  alph_place_far_open(p, kind);
   p->gate.leave(was);
 }
 
@@ -621,10 +671,11 @@ export fn alph_place_run(a: AlphActor*, m: AlphMsg*) -> Word {
         // work stops going there until it is tried again. Either way the
         // job goes to whichever place is best now.
         var k: AlphKind* = &p->kinds[job->kind];
-        var was: int32 = p->gate.enter();
         if (m->arg == ALPH_GONE) {
-          k->off[ALPH_FAR] = 1;
-        } else {
+          alph_place_shut_far(p, x, job->kind);
+        }
+        var was: int32 = p->gate.enter();
+        if (m->arg != ALPH_GONE) {
           var slow: Word = (Word)(k->est[job->at] * 2);
           var took: Word = alph_place_ns() - job->began;
           if (slow < took) {
@@ -642,9 +693,9 @@ export fn alph_place_run(a: AlphActor*, m: AlphMsg*) -> Word {
   if (m->tag == ALPH_ENDED) {
     // A worker on another machine ended, or its machine was lost: that way
     // is over for its kinds, and what was sent to it goes somewhere else.
-    for i in 0..p->kind_count {
-      if (p->kinds[i].far == m->from) {
-        alph_place_shut_far(p, (Word)i);
+    for i in 0..16 {
+      if (x->workers[i] == m->from && m->from != 0) {
+        alph_place_shut_far(p, x, (Word)i);
       }
     }
     var job: AlphJob* = x->open;
@@ -707,11 +758,14 @@ export fn alph_place_run(a: AlphActor*, m: AlphMsg*) -> Word {
       x->far_refs = 1;
     }
     job->far_ref = x->far_refs;
-    job->far_to = k->far;
+    job->far_to = 0;
+    if (job->kind < 16) {
+      job->far_to = x->workers[job->kind];
+    }
     job->began = alph_place_ns();
     var ask: AlphMsg = { tag: ALPH_WORK, from: a->pid, arg: job->in, ref: job->far_ref };
     var out: Word = ALPH_GONE;
-    if (job->far_to != 0 && k->off[ALPH_FAR] == 0) {
+    if (job->far_to != 0) {
       if (job->count > 0 && p->link != 0) {
         out = p->link->send_bytes(a->pid, job->far_to, ALPH_WORK_BYTES, job->far_ref, job->bytes, job->count);
       } else {
@@ -733,7 +787,7 @@ export fn alph_place_run(a: AlphActor*, m: AlphMsg*) -> Word {
     } else {
       // The worker cannot be reached: the way is shut, as when a way
       // fails, and the job goes somewhere else.
-      alph_place_shut_far(p, job->kind);
+      alph_place_shut_far(p, x, job->kind);
       alph_place_elsewhere(a, p, x, job);
     }
   }

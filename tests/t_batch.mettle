@@ -116,7 +116,7 @@ fn main() -> int32 {
   expect(t.wrong == 0, "with the right result ({t.wrong} wrong)");
   expect(g_batch.by_way[ALPH_CPU] == PIECES, "all on this machine's cores ({g_batch.by_way[ALPH_CPU]})");
   expect(t.notes == 2, "mail that is not the batch's is left to the actor ({t.notes} of 2)");
-  expect(g_m.seats[1].ran > 0 && g_m.seats[2].ran > 0, "both cores that take work took some");
+  expect(g_m.seats[0].ran > 0 && g_m.seats[1].ran > 0, "both cores that take work took some");
 
   // The batch again, for a second lot.
   clear(&t);

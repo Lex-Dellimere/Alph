@@ -109,7 +109,9 @@ The layers above are small on purpose, and a program that uses several of them r
 
 Sharing is what they are for. A machine says how a kind of job is done and that it is shared. It then does that kind for other machines, through its own places, and its own jobs of the kind may go to them. Every machine runs the same program, and the one whose actor begins a batch is the one that hands the work out. A job taken for another machine is not sent on again. In the test two machines each hand out 200 pieces at the same moment and each answers all of its own rightly. `examples/share.mettle` is the program: about forty lines of its own, counting primes on however many machines run it.
 
-Limits: one other machine at a time does a kind for a machine; a job that goes to another machine has no home, so it carries a word or up to 1,024 bytes; and the sizes are fixed.
+Each other machine is a place of its own, with its own work waiting, so with several the work goes to whichever is least busy. In the test three machines share one kind: of 300 pieces the one that hands them out did 110 and the other two 92 and 98, and when one of them is lost in the middle of a second batch every piece is still answered.
+
+Limits: the places keep one time for "another machine", not one for each, so a slow helper is told from a fast one only by the work waiting at it; a job that goes to another machine has no home, so it carries a word or up to 1,024 bytes; and the sizes are fixed.
 
 ## Crossings
 

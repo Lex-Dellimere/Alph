@@ -4,8 +4,8 @@
 // machines. A program that needs other sizes puts the layers together
 // itself, as this file does.
 //
-// The first core has the door, the place that sends work to other machines,
-// and the program's own first actors. Every other core takes work. With a
+// The first core has the door, a place for each other machine that work
+// can be sent to, and the program's own first actors. Every other core takes work. With a
 // GPU, the last core is the GPU's.
 //
 // Sharing: a kind of job that is shared is done by whichever machine should
@@ -50,11 +50,14 @@ export struct AlphMachine {
   door: AlphDoor;
   time: AlphTime;
   places: AlphPlaces;
-  far_place: Word;   // the place that sends work to other machines
+  far_place: Word;   // the place that sends work to the first other machine
+  far_places: Word[8];  // and to each, in the order they were added
+  peer_count: Word;
   steward: Word;     // the actor that finds other machines' workers
   told: Word;        // the program's actor that hears of machines coming and going
+  served: Word;      // jobs done here for other machines
   shared: Word[8];   // by kind: shared or not
-  asked: Word[8];    // by kind: the ref of the question to another machine's door
+  asked: Word[64];   // by other machine and kind: the ref of the question to its door
   serving: AlphServing[8];
   taken: AlphTaken[16];
   // The memory the layers work in.
@@ -67,21 +70,26 @@ export struct AlphMachine {
   watches: AlphWatch[64];
   keeps: AlphKeep[32];
   timers: AlphTimer[16];
-  seats: AlphPlace[18];
+  seats: AlphPlace[26];
   kinds: AlphKind[8];
 }
 
 // Hears of machines coming and going, asks a new one's door for the worker
-// of every shared kind, and gives each one found to the places.
+// of every shared kind, and gives each one found to that machine's place.
 fn alph_machine_steward(a: AlphActor*, msg: AlphMsg*) -> Word {
   var m: AlphMachine* = (AlphMachine*)a->state;
   if (msg->tag == ALPH_UP) {
     var again: bool = false;
-    for k in 0..8 {
-      if (m->shared[k] != 0) {
-        m->asked[k] = m->door.find(a, msg->arg, SHARED + (Word)k);
-        if (m->asked[k] == ALPH_FULL) {
-          again = true;
+    for i in 0..m->peer_count {
+      if (m->peers[i].first != msg->arg) {
+        continue;
+      }
+      for k in 0..8 {
+        if (m->shared[k] != 0) {
+          m->asked[i * 8 + k] = m->door.find(a, msg->arg, SHARED + (Word)k);
+          if (m->asked[i * 8 + k] == ALPH_FULL) {
+            again = true;
+          }
         }
       }
     }
@@ -91,10 +99,13 @@ fn alph_machine_steward(a: AlphActor*, msg: AlphMsg*) -> Word {
       return 0;
     }
   } else if (msg->tag == ALPH_HERE && msg->arg != 0) {
-    for k in 0..8 {
-      if (m->shared[k] != 0 && m->asked[k] == msg->ref) {
-        m->places.far((Word)k, msg->arg);
-        m->door.watch(m->far_place, msg->arg);
+    for i in 0..m->peer_count {
+      for k in 0..8 {
+        if (m->shared[k] != 0 && m->asked[i * 8 + k] == msg->ref) {
+          m->asked[i * 8 + k] = 0;
+          m->places.far_at(m->far_places[i], (Word)k, msg->arg);
+          m->door.watch(m->far_places[i], msg->arg);
+        }
       }
     }
   }
@@ -155,6 +166,7 @@ fn alph_machine_serve(a: AlphActor*, msg: AlphMsg*) -> Word {
       if (why > 0) {
         t->busy = 1;
         taken = true;
+        m->served = m->served + 1;
       }
       break;
     }
@@ -181,9 +193,15 @@ export fn AlphMachine_init__ptr(m: AlphMachine*, cores: Word, first: Word, gpu: 
     n = 16;
   }
   m->told = 0;
+  m->served = 0;
+  m->peer_count = 0;
+  m->far_place = 0;
   for k in 0..8 {
     m->shared[k] = 0;
-    m->asked[k] = 0;
+    m->far_places[k] = 0;
+  }
+  for i in 0..64 {
+    m->asked[i] = 0;
   }
   for i in 0..16 {
     m->taken[i].busy = 0;
@@ -197,10 +215,9 @@ export fn AlphMachine_init__ptr(m: AlphMachine*, cores: Word, first: Word, gpu: 
   m->steward = m->cores.spawn_on(0, &alph_machine_steward, (rawptr)m);
   m->door.tell(m->steward);
   m->time.init(&m->core[0].node, &m->timers[0], 16);
-  m->places.init(&m->seats[0], 18, &m->kinds[0], 8);
+  m->places.init(&m->seats[0], 26, &m->kinds[0], 8);
   m->places.clock(&m->time);
   m->places.net(&m->link);
-  m->far_place = m->places.on_core(&m->cores, 0, ALPH_FAR);
   var workers: Word = n;
   if (gpu && n > 1) {
     workers = n - 1;
@@ -215,9 +232,18 @@ export fn AlphMachine_init__ptr(m: AlphMachine*, cores: Word, first: Word, gpu: 
 }
 
 // Another machine: where its places start, how many it has, and where it
-// listens. Returns ALPH_FULL after eight.
+// listens. It gets a place of its own here, which work for it goes through.
+// Returns ALPH_FULL after eight.
 export fn AlphMachine_peer__ptr(m: AlphMachine*, first: Word, count: Word, ip: uint32, port: int64) -> Word {
-  return m->link.peer(first, count, ip, port);
+  if (m->peer_count >= 8 || m->link.peer(first, count, ip, port) != ALPH_OK) {
+    return ALPH_FULL;
+  }
+  m->far_places[m->peer_count] = m->places.on_core(&m->cores, 0, ALPH_FAR);
+  if (m->peer_count == 0) {
+    m->far_place = m->far_places[0];
+  }
+  m->peer_count = m->peer_count + 1;
+  return ALPH_OK;
 }
 
 // Says how a kind of job (0 to 7) is done on a core and on the GPU, 0 for a
@@ -231,8 +257,7 @@ export fn AlphMachine_kind__ptr(m: AlphMachine*, kind: Word, cpu: fn(AlphJob*) -
 // Shares a kind with the other machines: this machine does it for them, and
 // its own jobs of the kind may go to them. Call it after kind, on every
 // machine that should take part. Only jobs with no home (a word in, or
-// bytes) leave a machine. One other machine at a time does a kind for this
-// one. Returns ALPH_FULL when the first core has no room for one more
+// bytes) leave a machine. Returns ALPH_FULL when the first core has no room for one more
 // actor, ALPH_GONE for a kind that is not 0 to 7.
 export fn AlphMachine_share__ptr(m: AlphMachine*, kind: Word) -> Word {
   if (kind < 0 || kind >= 8) {
