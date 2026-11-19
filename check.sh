@@ -181,6 +181,24 @@ if [ "$#" -eq 0 ] && command -v qemu-system-riscv32 > /dev/null 2>&1 && [ -f "$O
   fi
 fi
 
+# Both harts of one board: the cores layer with a node on each.
+if [ "$#" -eq 0 ] && command -v qemu-system-riscv32 > /dev/null 2>&1; then
+  bin="$OUT/harts.bin"
+  log="$OUT/harts.log"
+  if ! "$METTLE" --release examples/mcu/harts.mettle --target riscv32-none --board qemu-virt --isa rv32imac \
+      --emit-flat "$bin" -I ports/harts -I ports/mcu > "$log" 2>&1; then
+    echo "FAIL  mcu/harts build (see $log)"
+    fails=$((fails + 1))
+  else
+    got=$(timeout 20 qemu-system-riscv32 -M virt -smp 2 -bios none -nographic \
+      -device loader,file="$bin",addr=0x80000000,force-raw=on 2>> "$log" | tr -d '\r\n')
+    case "$got" in
+      *" 2262 ") echo "ok    mcu/harts [riscv32, two harts, $(stat -c %s "$bin") bytes: chunks by hart and primes: $got]" ;;
+      *) echo "FAIL  mcu/harts printed '$got'"; fails=$((fails + 1)) ;;
+    esac
+  fi
+fi
+
 # Two boards as one: each in its own QEMU, their serial lines joined.
 if [ "$#" -eq 0 ] && command -v qemu-system-riscv32 > /dev/null 2>&1 && [ -f "$OUT/tether.bin" ]; then
   bin="$OUT/asker.bin"

@@ -1,0 +1,15 @@
+// Threads, for src/cores: each core after the first runs on its own.
+
+import "std/thread";
+
+// Starts run(arg) on a thread of its own. Returns a handle for
+// alph_cpu_join.
+export fn alph_cpu_start(index: int32, run: fn(cstring) -> uint32, arg: cstring) -> int64 {
+  return CreateThread(0, 0, run, arg, 0, 0);
+}
+
+// Waits until what a thread was started on has returned.
+export fn alph_cpu_join(handle: int64) {
+  thread_join_infinite(handle);
+  thread_close(handle);
+}

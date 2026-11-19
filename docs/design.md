@@ -42,7 +42,7 @@ Not built: a watch cannot be dropped across machines.
 
 A timer is something that sends a message later, so it is a layer (`src/time`), not part of the core. `after` sends a message in so many milliseconds and returns a ref, `cancel` takes it back. The port's alarm rings when the soonest timer is due: the board's timer interrupt on `mcu`, one sleeping thread on `host`.
 
-Every operation looks at every timer slot. That is the smallest code and right for tens of timers. A server with thousands needs a timer wheel behind the same four functions, which is not built.
+`AlphTime` looks at every timer slot on every operation. That is the smallest code and right for tens of timers, so it is the one a board uses. `src/time/wheel.mettle` is `AlphWheel`, the same four functions for a program with thousands: a timer waits in the spoke of the tick it is due in, so setting and cancelling one take the same time however many wait. With 10,000 timers waiting, a set and a cancel cost about 330 ns on the wheel against about 35,000 ns on the plain timers.
 
 ## Polls
 
@@ -55,9 +55,10 @@ What differs between devices is in a port, a folder picked at build time with `-
 | Port | Device | Word | Actors in a node | Places | How it waits | How senders exclude each other |
 |---|---|---|---|---|---|---|
 | `mcu` | one hart, no OS | 32 bits | 1,024 | 256 | `wfi` | interrupts off |
+| `harts` | several harts, no OS | 32 bits | 1,024 | 256 | `wfi`, woken by the software interrupt | interrupts off and a lock |
 | `host` | an x86-64 Linux process | 64 bits | 16 million | 32,768 | looks for mail for about 10 µs, then a futex | a spin lock |
 
-A port is a few files of 30 to 130 lines each: the gate, the alarm, the guard that catches a crash, and the wire to other machines. A new device is a new port.
+A port is a few files of 30 to 130 lines each: the gate, the alarm, the guard that catches a crash, how a core is started, and the wire or line to other machines. Ports stack: `harts` has only what differs from `mcu`, and is built with `-I ports/harts -I ports/mcu`. A new device is a new port.
 
 ## Size
 
@@ -69,7 +70,7 @@ A place is anything that can run work: a core, a GPU, another node. Each has a c
 
 Placement is one decision made from measured costs, not three separate features. The places arrive in this order:
 
-1. **Cores.** Built: `src/cores` runs one node per thread. A pid's place is the core's number, so a message for another core is put straight into that core's node. `spawn` picks the core with the fewest actors. Measured on a busy 16-CPU laptop: about 20 ns per message inside a node, 150 to 300 ns between two cores, and 4.8 million messages sent at random among 64 actors on 8 cores at about 90 ns each. An actor stays on the core it was spawned on. Work moves when a program hands it out in pieces, as `examples/spread.mettle` does.
+1. **Cores.** Built: `src/cores` runs one node per core: a thread each in a Linux process, a hart each on a chip that has several. Starting a core is the port's business, so the layer is the same code on both. `examples/mcu/harts.mettle` counts primes on both harts of a RISC-V board in a 4,360-byte image, and `check.sh` runs it in QEMU with two harts. On Linux `src/cores` runs one node per thread. A pid's place is the core's number, so a message for another core is put straight into that core's node. `spawn` picks the core with the fewest actors. Measured on a busy 16-CPU laptop: about 20 ns per message inside a node, 150 to 300 ns between two cores, and 4.8 million messages sent at random among 64 actors on 8 cores at about 90 ns each. An actor stays on the core it was spawned on. Work moves when a program hands it out in pieces, as `examples/spread.mettle` does.
 2. **GPU.** Built as `src/place`, which knows nothing about GPUs. A job has a kind and a size, and a kind can be run more than one way: the program gives a function for a core and a function for the GPU, both calling the same Mettle code, so the answer is the same bits either way. A place is an actor that runs jobs one way. The GPU is one place on a core of its own, because a GPU belongs to the thread that opened it; every other core that takes work is a place too. alph times each way for each kind and size, and sends a job to the place where the work already waiting plus this job's own time is least. A way not yet tried is tried. A way that lost is tried again once the time spent since is 16 times what a run of it costs. A size not yet timed is guessed from the two nearest that were, so a core is not handed a huge job just to learn that it is slow. A way that cannot run (no GPU in the machine) is dropped and its jobs go the other way.
 
    `examples/render.mettle` renders a Mandelbrot picture in tiles of four sizes, on three cores and an RTX 4070 laptop GPU. Every pixel matches the picture computed on one core. Four runs on a busy machine, times in milliseconds for the whole step:

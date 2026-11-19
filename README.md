@@ -53,8 +53,8 @@ This is [examples/count.mettle](examples/count.mettle). The node owns no memory:
 | Layer | What it does | Where |
 |---|---|---|
 | Core | Actors, messages, the run loop. A handler that crashes ends only its actor | [src/actor](src/actor/actor.mettle) |
-| Cores | One node per thread. An actor sends to another core the way it sends next door | [src/cores](src/cores/cores.mettle) |
-| Time | A message sent later | [src/time](src/time/time.mettle) |
+| Cores | One node per core: a thread each on Linux, a hart each on a chip with several. An actor sends to another core the way it sends next door | [src/cores](src/cores/cores.mettle) |
+| Time | A message sent later. Small timers for a board, a timer wheel for thousands | [src/time](src/time/time.mettle), [wheel](src/time/wheel.mettle) |
 | Places | A job goes to a core, the GPU or another machine, whichever alph has timed as finishing it first. A job stays where its data is | [src/place](src/place/place.mettle) |
 | Polls | A socket sends a message when it is ready, so no handler waits. TCP calls that go with it, and other programs: start one and get a message when it ends | [src/poll](src/poll/poll.mettle) |
 | Lives | Watch an actor to be told when it ends and why. Keep one, and a crash restarts it in place with the same pid | [src/life](src/life/life.mettle) |
@@ -62,7 +62,7 @@ This is [examples/count.mettle](examples/count.mettle). The node owns no memory:
 | Names and the door | Find an actor on another machine by name, and watch it | [src/name](src/name/name.mettle), [src/door](src/door/door.mettle) |
 | Seals | A link only the holders of one key can read or speak on | [src/seal](src/seal/seal.mettle) |
 | Tether | A microcontroller tied to a bigger machine by its serial line: each side's actors reach the other's by pid. That machine can pass the board's mail on, so the whole network reaches it | [src/tether](src/tether/tether.mettle) |
-| Ports | What differs per device: `mcu` (one hart, no OS) and `host` (x86-64 Linux) | [ports](ports) |
+| Ports | What differs per device: `mcu` (one hart, no OS), `harts` (several harts, no OS) and `host` (x86-64 Linux) | [ports](ports) |
 
 [docs/start.md](docs/start.md) shows how to use each of these. [docs/design.md](docs/design.md) explains why they are built this way, what was measured, and what is not built yet.
 
@@ -126,13 +126,19 @@ mettle --build -s --release examples/mcu/tether_host.mettle -I ports/host -o tet
 qemu-system-riscv32 -M virt -bios none -display none -monitor none -serial tcp:127.0.0.1:7421 -device loader,file=tether.bin,addr=0x80000000,force-raw=on
 ```
 
+Both harts of one board, [examples/mcu/harts.mettle](examples/mcu/harts.mettle), the same `AlphCores` as on Linux:
+
+```bash
+mettle --release examples/mcu/harts.mettle --target riscv32-none --board qemu-virt --isa rv32imac --emit-flat harts.bin -I ports/harts -I ports/mcu
+qemu-system-riscv32 -M virt -smp 2 -bios none -nographic -device loader,file=harts.bin,addr=0x80000000,force-raw=on
+```
+
 Two boards on one serial line, with no other machine: [examples/mcu/asker.mettle](examples/mcu/asker.mettle) asks the board above for numbers. Each board's actor reaches the other's by its pid, so a device with several chips is one program. `check.sh` runs the pair in two QEMUs.
 
 ## What it does not do yet
 
 - A sealed link has one key for the whole network: any holder can speak as any machine, and someone who gets the key later can read what they recorded before.
 - A job for another machine carries at most 1,024 bytes, and one word comes back.
-- Timers look at every timer slot: right for tens of timers, not thousands.
 - Sockets are Linux only, and there is no file IO.
 - A message between two cores costs 150 to 300 ns against about 20 ns inside a node.
 - A microcontroller joins through a serial line to one machine, and nothing lost on that line is sent again.
@@ -158,6 +164,7 @@ Everything under `src/core`, `src/heal`, `src/work`, `src/net`, `src/io`, `src/s
 src/actor/actor.mettle      the core: actors, messages, the run loop
 src/cores/cores.mettle      the core on several threads, one node each
 src/time/time.mettle        timers: a message sent later
+src/time/wheel.mettle       a timer wheel, for thousands of timers
 src/place/place.mettle      places: a job goes to a core, the GPU or another machine
 src/poll/poll.mettle        polls: a socket sends a message when it is ready
 src/life/life.mettle        lives: watching and keeping actors
@@ -166,7 +173,8 @@ src/name/name.mettle        names: a number for a pid
 src/door/door.mettle        the door: find and watch actors on other machines
 src/seal/seal.mettle        seals: an encrypted and signed link (needs the cryptex package)
 src/tether/tether.mettle    tether: a board and a bigger machine on a serial line
-ports/mcu, ports/host       what differs per device, picked with -I ports/<name>
+ports/mcu, ports/harts, ports/host
+                            what differs per device, picked with -I ports/<name>
 src/alph.mettle             the first runtime in one import
 src/core, src/heal, src/work, src/net, src/io, src/sched, src/sys
                             the first runtime

@@ -182,6 +182,21 @@ fn main() -> int32 {
 
 If the mailbox of the actor a timer is for is full when it falls due, the timer tries again a tick later. Every timer operation looks at every slot, which is right for tens of timers, not for thousands.
 
+For thousands, use `AlphWheel` from `alph/time/wheel`. It has the same four functions, and setting or cancelling a timer takes the same time however many wait. It needs one more array, the spokes, whose count is a power of two. A turn of the wheel should be longer than most of your delays. This is from `tests/t_wheel.mettle`:
+
+```mettle
+import "alph/time/wheel";
+
+var g_wheel: AlphWheel;
+var g_timers: AlphWheelTimer[10000];
+var g_spokes: Word[256];
+
+g_wheel.init(&g_node, &g_timers[0], 10000, &g_spokes[0], 256);
+var ref: Word = g_wheel.after(50, log, DUE, 50);
+g_wheel.cancel(ref);
+g_wheel.stop();
+```
+
 ## Sockets
 
 `AlphPoll` has a socket, or any file descriptor, send a message when it is ready. A handler never waits: it reads and writes what can be done now, and asks to be told when there is more. The host port's `port/net` has TCP calls to go with it, and none of them waits. This is the connection actor of the echo server in [examples/talk.mettle](../examples/talk.mettle):
@@ -525,6 +540,8 @@ qemu-system-riscv32 -M virt -bios none -nographic -device loader,file=blink.bin,
 
 The whole image of this program, board startup included, is 3,256 bytes: about 1.3 KB of core, 1.1 KB of timers and alarm, and the rest the board and the program. `check.sh` fails the build above 5 KB.
 
+**Both cores of a chip.** On a board with several harts, build with `-I ports/harts -I ports/mcu` and use `AlphCores` as on Linux: core i runs on hart i. [examples/mcu/harts.mettle](../examples/mcu/harts.mettle) counts primes on two harts. The board's timer and its serial input serve hart 0, so timers and the tether belong to the first core's node. It needs the A extension (`--isa rv32imac`), and on the boards Mettle has today only `qemu-virt` can start a second hart.
+
 **A board among bigger machines.** `AlphTether` ties a node to one other machine by a line of bytes: on a board, its serial port. Each side's actors then reach the other's by pid, as with any other place. This is the board's side, [examples/mcu/tether.mettle](../examples/mcu/tether.mettle): the board is place 1 and the machine on the line is place 0.
 
 ```mettle
@@ -574,7 +591,6 @@ These are not built yet.
 
 - A sealed link has one key for the whole network: any holder can speak as any machine, and someone who gets the key later can read what they recorded before.
 - A job for another machine carries at most 1,024 bytes, and one word comes back.
-- Timers look at every timer slot: right for tens of timers, not thousands. A timer wheel behind the same four functions is not built.
 - Sockets are Linux only, and there is no file IO.
 - A message between two cores costs 150 to 300 ns against about 20 ns inside a node. Removing that needs a queue per pair of cores that the sender writes without touching anything the receiver owns, which changes what a full mailbox can tell a sender. Not built.
 - A microcontroller joins through a serial line to one machine, and nothing lost on that line is sent again.

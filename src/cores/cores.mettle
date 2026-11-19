@@ -1,11 +1,12 @@
-// Many nodes in one process, one thread each. A core is a place: an actor
+// Many nodes, one on each core: a thread each in a Linux process, a hart
+// each on a chip with several. A core is a place: an actor
 // sends to a pid on another core the same way it sends next door, and the
 // message is put straight into that core's node.
 //
 // Like the node, this owns no memory: the caller hands it the cores, the
 // actor slots and the mailboxes, which it shares out evenly.
 
-import "std/thread";
+import "port/cpu";
 import "alph/actor/actor";
 
 export struct AlphCore {
@@ -116,12 +117,11 @@ fn alph_core_main(arg: cstring) -> uint32 {
 // handler opened) does not last from one run to the next.
 export fn AlphCores_run__ptr(c: AlphCores*) {
   for i in 1..c->count {
-    c->cores[i].thread = CreateThread(0, 0, &alph_core_main, (cstring)&c->cores[i].node, 0, 0);
+    c->cores[i].thread = alph_cpu_start(i, &alph_core_main, (cstring)&c->cores[i].node);
   }
   c->cores[0].node.run();
   for i in 1..c->count {
-    thread_join_infinite(c->cores[i].thread);
-    thread_close(c->cores[i].thread);
+    alph_cpu_join(c->cores[i].thread);
   }
 }
 

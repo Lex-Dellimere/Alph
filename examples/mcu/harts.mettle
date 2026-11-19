@@ -1,0 +1,129 @@
+// Both cores of one chip. The same AlphCores that runs a node on each
+// thread of a Linux process runs one on each hart here: a worker on each
+// counts primes, and the boss hands out the range in chunks, so the hart
+// that is free takes the next one. It prints how many chunks each hart
+// counted and the primes below 20,000.
+//
+//   mettle --release examples/mcu/harts.mettle --target riscv32-none --board qemu-virt \
+//       --isa rv32imac --emit-flat harts.bin -I ports/harts -I ports/mcu
+//   qemu-system-riscv32 -M virt -smp 2 -bios none -nographic \
+//       -device loader,file=harts.bin,addr=0x80000000,force-raw=on
+
+import "alph/actor/actor";
+import "alph/cores/cores";
+
+const CORES: Word = 2;
+const CHUNK: Word = 500;
+const CHUNKS: Word = 40;
+
+const GO: Word = 1;
+const COUNT: Word = 2;  // arg: which chunk
+const DONE: Word = 3;   // arg: the primes in it
+
+var g_cores: AlphCores;
+var g_core: AlphCore[2];
+var g_actors: AlphActor[4];
+var g_mail: AlphMsg[16];
+var g_chunks: Word[2];  // by hart
+
+@interrupt fn mettle_trap() {
+  mettle_board_exit(99);
+}
+
+fn is_prime(n: Word) -> bool {
+  if (n < 2) {
+    return false;
+  }
+  var d: Word = 2;
+  while (d * d <= n) {
+    if (n % d == 0) {
+      return false;
+    }
+    d = d + 1;
+  }
+  return true;
+}
+
+fn worker(a: AlphActor*, m: AlphMsg*) -> Word {
+  var n: Word = (Word)(m->arg * CHUNK);
+  var end: Word = n + CHUNK;
+  var found: Word = 0;
+  while (n < end) {
+    if (is_prime(n)) {
+      found = found + 1;
+    }
+    n = n + 1;
+  }
+  var hart: int32 = mettle_board_hart_id();
+  g_chunks[hart] = g_chunks[hart] + 1;
+  a->reply(m, DONE, found);
+  return 0;
+}
+
+struct Boss {
+  workers: Word[2];
+  next: Word;
+  back: Word;
+  primes: Word;
+}
+
+fn boss(a: AlphActor*, m: AlphMsg*) -> Word {
+  var b: Boss* = (Boss*)a->state;
+  if (m->tag == GO) {
+    for i in 0..CORES {
+      a->send(b->workers[i], COUNT, b->next);
+      b->next = b->next + 1;
+    }
+    return 0;
+  }
+  b->primes = b->primes + m->arg;
+  b->back = b->back + 1;
+  if (b->next < CHUNKS) {
+    a->send(m->from, COUNT, b->next);
+    b->next = b->next + 1;
+  }
+  if (b->back == CHUNKS) {
+    a->cores()->stop();
+    return 1;
+  }
+  return 0;
+}
+
+fn print(n: Word) {
+  var digits: uint8[10];
+  var count: int32 = 0;
+  var left: Word = n;
+  while (left > 0 || count == 0) {
+    digits[count] = (uint8)(48 + left % 10);
+    left = (Word)(left / 10);
+    count = count + 1;
+  }
+  while (count > 0) {
+    count = count - 1;
+    mettle_board_putc(digits[count]);
+  }
+  mettle_board_putc(32);
+}
+
+fn main() -> int32 {
+  var b: Boss;
+  b.next = 0;
+  b.back = 0;
+  b.primes = 0;
+  mettle_board_trap_install();
+  g_cores.init(&g_core[0], CORES, &g_actors[0], 2, &g_mail[0], 4);
+  for i in 0..CORES {
+    b.workers[i] = g_cores.spawn_on((Word)i, &worker, 0);
+  }
+  g_cores.send(g_cores.spawn_on(0, &boss, (rawptr)&b), GO, 0);
+  mettle_irq_enable();
+  g_cores.run();
+  print(g_chunks[0]);
+  print(g_chunks[1]);
+  print(b.primes);
+  mettle_board_putc(10);
+  if (b.primes != 2262 || g_chunks[0] == 0 || g_chunks[1] == 0) {
+    return 1;
+  }
+  return 0;
+}
