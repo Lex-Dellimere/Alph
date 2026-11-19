@@ -53,9 +53,11 @@ fn now_ns() -> Word {
 // Two milliseconds a chunk here, so the board gets a share and the batch
 // lasts long enough to lose the board in.
 fn primes_job(job: AlphJob*) -> Word {
-  var until: Word = now_ns() + 2000000;
-  while (now_ns() < until) {
-  }
+  // Sleeps where real work would compute: a busy machine cannot stretch it.
+  var rest: int64[2];
+  rest[0] = (int64)2000000 / 1000000000;
+  rest[1] = (int64)2000000 % 1000000000;
+  syscall(35, (int64)&rest[0], 0);
   job->out = count_primes(job->in);
   return 0;
 }

@@ -470,7 +470,7 @@ g_places.ask(a, fetch);
 - `reaches(place)` says whether a place on another machine can be reached now.
 - `stop()` goes quiet. To its peers this machine is down half a second later. `close()` gives the port up, once nothing can send: after `stop`, with the cores stopped too.
 
-Between two machines that are both up, messages arrive once and in order. What a machine has not got in 40 ms is sent again. Every machine tells its peers it is alive 20 times a second, and one that stays quiet for half a second is down. A send to a machine that is down, or not heard yet, returns `ALPH_GONE`. A send returns `ALPH_FULL` when too many messages to that machine are still waiting for its word. A machine that was only out of reach carries on where it was. A machine that was restarted counts as a new one, so mail meant for the old one is not handed to the new. A full mailbox at the far end drops the message and the sender is not told, so for a message that must arrive, ask and wait for the reply.
+Between two machines that are both up, messages arrive once and in order. What a machine has not got in 40 ms is sent again. Every machine tells its peers it is alive 20 times a second, and one that stays quiet for half a second is down. A send to a machine that is down, or not heard yet, returns `ALPH_GONE`. A send returns `ALPH_FULL` when too many messages to that machine are still waiting for its word. A machine that was only out of reach carries on where it was. A machine that was restarted counts as a new one, so mail meant for the old one is not handed to the new. A message for an actor whose mailbox is full is not dropped: it is sent again until there is room, and the messages behind it wait with it.
 
 **Bytes with a message.** A message between machines can carry up to 1,024 bytes in a parcel. Give the link a pool of parcels with `parcels(pool, room)` before `start`, then send with `send_bytes(from, to, tag, ref, bytes, count)`. The actor it is for gets the message with the parcel in `arg`, reads it, and gives it back to its own machine's link with `release`. This is from `tests/t_parcel.mettle`:
 
@@ -557,7 +557,7 @@ g_places.far(PRIMES, b->helper);
 g_boss_machine.door.watch(b->far_place, b->helper);
 ```
 
-Fill in a job with `job->in` and `job->home = ALPH_NOWHERE`, and ask as before. A job can carry bytes instead of `in`: set `job->bytes` and `job->count`, and give the places the link with `net(link)`. The worker then gets `ALPH_WORK_BYTES` with a parcel in `arg`. A worker that cannot take a job now answers `ALPH_REFUSED`, and the asker gets the job back with status `ALPH_FULL`. [examples/run.mettle](../examples/run.mettle) sends commands to run this way. In the `ALPH_DONE` answer, `way` is `ALPH_FAR` when the other machine did it, and `out` is what the worker answered. A job with data of its own cannot leave the machine. On the other machine the worker is sent `ALPH_WORK` with the job's `in` as `arg`. It answers `ALPH_WORKED` with the job's `out`:
+Fill in a job with `job->in` and `job->home = ALPH_NOWHERE`, and ask as before. A job can give bytes back as well as `out`: set `job->back` to where they go and `job->back_room` to how many fit (from another machine at most `ALPH_BACK_BYTES`, 1,016). The function that does the work writes them to `job->back` and sets `job->back_count`, the same on a core here as on another machine, where they come back over the link. [examples/picture.mettle](../examples/picture.mettle) draws a picture this way, a row a job. A job can carry bytes instead of `in`: set `job->bytes` and `job->count`, and give the places the link with `net(link)`. The worker then gets `ALPH_WORK_BYTES` with a parcel in `arg`. A worker that cannot take a job now answers `ALPH_REFUSED`, and the asker gets the job back with status `ALPH_FULL`. [examples/run.mettle](../examples/run.mettle) sends commands to run this way. In the `ALPH_DONE` answer, `way` is `ALPH_FAR` when the other machine did it, and `out` is what the worker answered. A job with data of its own cannot leave the machine. On the other machine the worker is sent `ALPH_WORK` with the job's `in` as `arg`. It answers `ALPH_WORKED` with the job's `out`:
 
 ```mettle
 fn worker(a: AlphActor*, m: AlphMsg*) -> Word {
@@ -746,13 +746,13 @@ fn asker(a: AlphActor*, m: AlphMsg*) -> Word {
 These are not built yet.
 
 - A sealed link has one key for the whole network: any holder can speak as any machine, and someone who gets the key later can read what they recorded before.
-- A job for another machine carries at most 1,024 bytes, and one word comes back.
+- A job for another machine carries at most 1,024 bytes, and gives back a word and at most 1,016 bytes.
 - Sockets are Linux only, and there is no file IO.
 - A message between two cores costs 150 to 300 ns against about 20 ns inside a node. Removing that needs a queue per pair of cores that the sender writes without touching anything the receiver owns, which changes what a full mailbox can tell a sender. Not built.
 - A microcontroller joins through a serial line to one machine, and nothing lost on that line is sent again.
 - A board's jobs are one word in and one word out, one at a time. A board asks the machine at the other end of its line, not the best of several places.
 - A job whose answer is lost is placed again, so it can be done twice. Jobs done at most once are not built.
-- A full mailbox at the far end of a link drops its message and the sender is not told.
+- A batch has 16 pieces out at once and a machine takes 16 jobs for others at once, which is less than a helper with many cores can do.
 - Peers are listed by hand.
 - A watch cannot be dropped across machines.
 - Restart limits are counted in all, not over time, and there are no groups that restart together.

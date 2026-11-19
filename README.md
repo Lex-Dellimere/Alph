@@ -52,7 +52,7 @@ This is [examples/count.mettle](examples/count.mettle). The node owns no memory:
 
 | Layer | What it does | Where |
 |---|---|---|
-| Core | Actors, messages, the run loop. A handler that crashes ends only its actor | [src/actor](src/actor/actor.mettle) |
+| Core | Actors, messages, the run loop. On Linux a handler that crashes ends only its actor | [src/actor](src/actor/actor.mettle) |
 | Cores | One node per core: a thread each on Linux, a hart each on a chip with several. An actor sends to another core the way it sends next door | [src/cores](src/cores/cores.mettle) |
 | Time | A message sent later. Small timers for a board, a timer wheel for thousands | [src/time](src/time/time.mettle), [wheel](src/time/wheel.mettle) |
 | Places | A job goes to a core, the GPU or another machine, whichever alph has timed as finishing it first. A job stays where its data is | [src/place](src/place/place.mettle) |
@@ -104,6 +104,12 @@ The same program on every machine, [examples/share.mettle](examples/share.mettle
 
 ```bash
 mettle --build -s --release examples/share.mettle -I ports/host -o share
+```
+
+A picture drawn by several machines, [examples/picture.mettle](examples/picture.mettle): each row is a job, its number goes out and its pixels come back as bytes. It takes the same arguments as `share`:
+
+```bash
+mettle --build -s --release examples/picture.mettle -I ports/host -o picture
 ```
 
 A picture rendered on the cores and the GPU of one machine, the short way too, [examples/tiles.mettle](examples/tiles.mettle). One function is the work, a core and the GPU both call it, and the pixels are the same either way. Without a GPU it runs on the cores:
@@ -176,7 +182,7 @@ mettle --release examples/mcu/two_b.mettle --target riscv32-none --board qemu-vi
 ## What it does not do yet
 
 - A sealed link has one key for the whole network: any holder can speak as any machine, and someone who gets the key later can read what they recorded before.
-- A job for another machine carries at most 1,024 bytes, and one word comes back.
+- A job for another machine carries at most 1,024 bytes, and gives back a word and at most 1,016 bytes.
 - Sockets are Linux only, and there is no file IO.
 - A message between two cores costs 150 to 300 ns against about 20 ns inside a node.
 - A microcontroller joins through a serial line to one machine, and nothing lost on that line is sent again.

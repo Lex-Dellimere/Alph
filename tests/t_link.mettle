@@ -140,6 +140,23 @@ fn sink(a: AlphActor*, m: AlphMsg*) -> Word {
   return 0;
 }
 
+var g_slow: Word = 0;
+var g_slow_got: Word = 0;
+var g_slow_bad: Word = 0;
+
+// On machine B: takes two milliseconds over each NOTE, and checks they come
+// in the order they were numbered.
+fn slow(a: AlphActor*, m: AlphMsg*) -> Word {
+  if (m->tag == NOTE) {
+    if (m->arg != g_slow_got) {
+      g_slow_bad = g_slow_bad + 1;
+    }
+    g_slow_got = g_slow_got + 1;
+    Sleep(2);
+  }
+  return 0;
+}
+
 fn b_main(arg: cstring) -> uint32 {
   g_b.run();
   return 0;
@@ -150,6 +167,7 @@ fn start_b(port_a: int64, port_b: int64) {
   g_b_link.init(&g_b, 2, &g_b_peers[0], 2);
   g_b_link.peer(0, 2, alph_ip4(127, 0, 0, 1), port_a);
   g_ponger = g_b.spawn_on(1, &ponger, 0);
+  g_slow = g_b.spawn_on(1, &slow, 0);
   expect(g_b_link.start(port_b) == ALPH_OK, "machine B listens");
   g_b_thread = CreateThread(0, 0, &b_main, 0, 0, 0);
 }
@@ -247,6 +265,31 @@ fn main() -> int32 {
   expect(d.ups == ups + 1 && g_a_peers[0].life == b_run, "it is up again, the same run of it");
   expect(d.rounds == 100 && d.bad == 0, "and requests cross as before ({d.rounds} rounds, {d.bad} bad)");
 
+  // Forty messages at once for an actor whose mailbox holds eight and who
+  // is slow to read them. None is dropped: what finds the mailbox full is
+  // left with A, sent again, and arrives in its turn.
+  g_slow_got = 0;
+  g_slow_bad = 0;
+  var sent: Word = 0;
+  var tries: Word = 0;
+  while (sent < 40 && tries < 20000) {
+    if (g_a.send(g_slow, NOTE, sent) == ALPH_OK) {
+      sent = sent + 1;
+    } else {
+      Sleep(1);
+    }
+    tries = tries + 1;
+  }
+  var waited: Word = 0;
+  while (g_slow_got < 40 && waited < 8000) {
+    Sleep(1);
+    waited = waited + 1;
+  }
+  expect(sent == 40 && g_slow_got == 40, "forty messages for a mailbox of eight all arrive ({g_slow_got} of {sent} sent)");
+  expect(g_slow_bad == 0, "in the order they were sent ({g_slow_bad} out of order)");
+  expect(g_b_link.full > 0, "because the ones that found it full were sent again ({g_b_link.full} times)");
+  var held: Word = g_b_link.full;
+
   // What a faulty machine might send, from a third socket claiming to be B.
   var notes: Word = 0;
   var sink_pid: Word = g_a.spawn_on(1, &sink, (rawptr)&notes);
@@ -305,6 +348,6 @@ fn main() -> int32 {
   if (g_failures != 0) {
     return 1;
   }
-  println("link ok: {ROUNDS} requests between two machines at {each_us} us each, {resent} lost messages sent again, a lost machine noticed in {took} ms");
+  println("link ok: {ROUNDS} requests between two machines at {each_us} us each, {resent} lost messages sent again, {held} that found a mailbox full sent again, a lost machine noticed in {took} ms");
   return 0;
 }

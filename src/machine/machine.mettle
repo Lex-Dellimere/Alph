@@ -58,6 +58,7 @@ struct AlphTaken {
   ref: Word;
   busy: Word;
   bytes: uint8[1024];
+  back: uint8[1024];  // the job's out in the first 8, then the bytes it gives back
 }
 
 // What the actor that serves one shared kind knows.
@@ -284,11 +285,22 @@ fn alph_machine_serve(a: AlphActor*, msg: AlphMsg*) -> Word {
   if (msg->tag == ALPH_DONE) {
     var t: AlphTaken* = (AlphTaken*)msg->arg;  // the job is the first thing in it
     var answer: AlphMsg = { tag: ALPH_WORKED, from: a->pid, arg: t->job.out, ref: t->ref };
+    var sent: Word = ALPH_OK;
     if (t->job.status != ALPH_OK) {
       answer.tag = ALPH_REFUSED;
       answer.arg = t->job.status;  // full for now, or gone: no place here can run it
+      sent = a->node->put(t->from, &answer);
+    } else if (t->job.back_count > 0) {
+      for i in 0..8 {
+        t->back[i] = (uint8)(((int64)t->job.out >> ((int64)i * 8)) & 255);
+      }
+      sent = m->link.send_bytes(a->pid, t->from, ALPH_WORKED_BYTES, t->ref, &t->back[0], t->job.back_count + 8);
+    } else {
+      sent = a->node->put(t->from, &answer);
     }
-    a->node->put(t->from, &answer);
+    if (sent == ALPH_FULL && a->node->put(a->pid, msg) == ALPH_OK) {
+      return 0;  // the way back is full for now: the answer is tried again
+    }
     t->busy = 0;
     return 0;
   }
@@ -312,6 +324,9 @@ fn alph_machine_serve(a: AlphActor*, msg: AlphMsg*) -> Word {
       t->job.data = 0;
       t->job.bytes = 0;
       t->job.count = 0;
+      t->job.back = &t->back[8];
+      t->job.back_room = ALPH_BACK_BYTES;
+      t->job.back_count = 0;
       if (parcel != 0) {
         for at in 0..parcel->count {
           t->bytes[at] = parcel->bytes[at];

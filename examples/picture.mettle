@@ -1,0 +1,187 @@
+// A picture drawn by however many machines run this program. Each row is a
+// job: its number goes out, and its pixels come back as bytes. The machine
+// started as the boss hands the rows out, and alph sends each to one of
+// its own cores or to another machine, wherever it should be done first.
+// A row drawn here is written straight into the picture. A row drawn on
+// another machine comes back over the link and is put in the same place.
+//
+// With no arguments two machines run in this one process:
+//
+//   mettle --build -s --release examples/picture.mettle -I ports/host -o picture
+//   ./picture
+//
+// On two computers, each with the other's address:
+//
+//   ./picture helper 192.168.1.10
+//   ./picture boss 192.168.1.20
+
+import "std/io";
+import "std/thread";
+import "alph/actor/actor";
+import "alph/machine/machine";
+import "alph/batch/batch";
+
+const WIDE: Word = 256;
+const HIGH: Word = 160;
+const ROW: Word = 0;  // the kind of job: in is a row's number, its pixels come back
+const GO: Word = 1;
+const BOSS_PORT: int64 = 7471;
+const HELPER_PORT: int64 = 7472;
+
+var g_boss: AlphMachine;
+var g_helper: AlphMachine;
+var g_batch: AlphBatch;
+var g_picture: uint8[40960];
+var g_short: Word = 0;  // rows that came back with too few pixels
+
+// One pixel of the Mandelbrot set: how many steps until the point leaves.
+fn pixel(x: Word, y: Word) -> uint8 {
+  var cr: float64 = ((float64)x - (float64)176) / (float64)96;
+  var ci: float64 = ((float64)y - (float64)80) / (float64)72;
+  var zr: float64 = (float64)0;
+  var zi: float64 = (float64)0;
+  var steps: int32 = 0;
+  while (steps < 255 && zr * zr + zi * zi < (float64)4) {
+    var next: float64 = zr * zr - zi * zi + cr;
+    zi = (float64)2 * zr * zi + ci;
+    zr = next;
+    steps = steps + 1;
+  }
+  return (uint8)steps;
+}
+
+// The work: draws one row into the bytes the job gives back.
+fn draw_row(job: AlphJob*) -> Word {
+  if (job->back == 0 || job->back_room < WIDE) {
+    return 0;
+  }
+  for x in 0..WIDE {
+    job->back[x] = pixel((Word)x, job->in);
+  }
+  job->back_count = WIDE;
+  return 0;
+}
+
+// What every machine does: three cores, the one kind of work, shared.
+fn machine(m: AlphMachine*, first: Word, other: Word, ip: uint32, port: int64) {
+  m->init(3, first, false);
+  m->peer(other, 3, ip, port);
+  m->kind(ROW, &draw_row, 0);
+  m->share(ROW);
+}
+
+// Each row's pixels go where that row is in the picture.
+fn each_row(b: AlphBatch*, job: AlphJob*, row: Word) {
+  job->back = &g_picture[row * WIDE];
+  job->back_room = WIDE;
+}
+
+fn drawn(b: AlphBatch*, job: AlphJob*, row: Word) {
+  if (job->status != ALPH_OK || job->back_count != WIDE) {
+    g_short = g_short + 1;
+  }
+}
+
+fn boss(a: AlphActor*, m: AlphMsg*) -> Word {
+  if (m->tag == GO) {
+    g_batch.begin(a, ROW, HIGH, &each_row, &drawn, 0);
+  } else if (g_batch.took(a, m) && g_batch.over()) {
+    a->cores()->stop();
+  }
+  return 0;
+}
+
+fn run_boss(helper_ip: uint32) -> int32 {
+  machine(&g_boss, 0, 3, helper_ip, HELPER_PORT);
+  g_batch.init(&g_boss.places);
+  var pid: Word = g_boss.cores.spawn_on(0, &boss, 0);
+  if (g_boss.start(BOSS_PORT) != ALPH_OK) {
+    println("port {BOSS_PORT} is taken");
+    return 1;
+  }
+  thread_sleep_ms(150);  // a moment for the helper to be heard, if there is one
+  g_boss.cores.send(pid, GO, 0);
+  g_boss.run();
+  g_boss.shut();
+  // Every pixel is checked against the same function run here.
+  var wrong: Word = 0;
+  var inside: Word = 0;
+  for y in 0..HIGH {
+    for x in 0..WIDE {
+      var right: uint8 = pixel((Word)x, (Word)y);
+      if (g_picture[y * WIDE + x] != right) {
+        wrong = wrong + 1;
+      }
+      if (right == 255) {
+        inside = inside + 1;
+      }
+    }
+  }
+  println("{HIGH} rows of {WIDE} pixels: {g_batch.by_way[ALPH_CPU]} rows drawn here, {g_batch.by_way[ALPH_FAR]} on another machine, {wrong} pixels wrong, {inside} inside the set");
+  if (wrong != 0 || g_short != 0) {
+    return 1;
+  }
+  return 0;
+}
+
+fn helper_main(arg: cstring) -> uint32 {
+  g_helper.run();
+  return 0;
+}
+
+// The address a.b.c.d in text as one number, 0 when it is not one.
+fn address(text: cstring) -> uint32 {
+  var part: int64[4];
+  var at: int32 = 0;
+  var i: int32 = 0;
+  part[0] = 0;
+  while (text[i] != 0) {
+    if (text[i] == 46 && at < 3) {
+      at = at + 1;
+      part[at] = 0;
+    } else if (text[i] >= 48 && text[i] <= 57) {
+      part[at] = part[at] * 10 + (int64)(text[i] - 48);
+    } else {
+      return 0;
+    }
+    i = i + 1;
+  }
+  if (at != 3) {
+    return 0;
+  }
+  return alph_ip4(part[0], part[1], part[2], part[3]);
+}
+
+fn main(argc: int32, argv: cstring*) -> int32 {
+  if (argc == 3) {
+    var ip: uint32 = address(argv[2]);
+    if (ip == 0) {
+      println("the address should look like 192.168.1.10");
+      return 2;
+    }
+    if (argv[1][0] == 104) {  // h: a helper waits for work until it is stopped
+      machine(&g_helper, 3, 0, ip, BOSS_PORT);
+      if (g_helper.start(HELPER_PORT) != ALPH_OK) {
+        println("port {HELPER_PORT} is taken");
+        return 1;
+      }
+      println("helping: waiting for rows to draw");
+      g_helper.run();
+      return 0;
+    }
+    return run_boss(ip);
+  }
+  var here: uint32 = alph_ip4(127, 0, 0, 1);
+  machine(&g_helper, 3, 0, here, BOSS_PORT);
+  if (g_helper.start(HELPER_PORT) != ALPH_OK) {
+    println("port {HELPER_PORT} is taken");
+    return 1;
+  }
+  var helper: int64 = CreateThread(0, 0, &helper_main, 0, 0, 0);
+  var out: int32 = run_boss(here);
+  g_helper.stop();
+  thread_join_infinite(helper);
+  thread_close(helper);
+  g_helper.shut();
+  return out;
+}

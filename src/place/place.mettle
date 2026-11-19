@@ -46,6 +46,7 @@ const ALPH_LOOK: Word = -15;           // to a far place from its own timer: loo
 const LOOK_MS: Word = 100;
 const LONG: Word = 8;                  // a far job is out too long at this many times its usual time,
 const LONG_NS: Word = 1000000000;      // and never before a second
+export const ALPH_BACK_BYTES: Word = 1016;  // the most bytes a job on another machine gives back
 const FAR_REFS: Word = 1073741824;
 const WAYS: Word = 3;
 const SIZES: Word = 32;              // sizes are told apart by their power of two
@@ -62,6 +63,9 @@ export struct AlphJob {
   out: Word;     // and what it gives back
   bytes: uint8*; // bytes that go with it to another machine, up to ALPH_PARCEL_BYTES,
   count: Word;   // and how many: 0 for none
+  back: uint8*;  // where bytes the job gives back are put, 0 for none,
+  back_room: Word;   // how many fit there (from another machine at most ALPH_BACK_BYTES),
+  back_count: Word;  // and how many came
   stay: Word;    // not 0: it must be done on this machine
   home: Word;    // where its data is: ALPH_CPU, ALPH_GPU or ALPH_NOWHERE. alph sets it to where the job ran
   status: Word;  // ALPH_OK, ALPH_GONE when no place can run it, ALPH_FULL to ask again
@@ -138,6 +142,8 @@ export struct AlphPlace {
   gave_began: Word[4];  // when,
   gave_at: Word[4];   // and its kind times 192 plus which of the kind's times it is
   gave_next: Word;
+  pace: Word[16];     // a far place, by kind: ns from one answer to the next while it has work, 0 when not known
+  busy: Word;         // it still had work when its last answer came
   own: AlphTimes*;    // a far place's own times, one for each of its first own_kinds kinds, 0 for none
   own_kinds: Word;
 }
@@ -408,6 +414,10 @@ export fn AlphPlaces_add__ptr(p: AlphPlaces*, way: Word) -> AlphPlace* {
     x->answers = 0;
     x->answered = 0;
     x->gave_next = 0;
+    x->busy = 0;
+    for k in 0..16 {
+      x->pace[k] = 0;
+    }
     x->own = 0;
     x->own_kinds = 0;
     for g in 0..4 {
@@ -536,6 +546,16 @@ fn alph_place_pick(p: AlphPlaces*, job: AlphJob*) -> AlphPlace* {
       low = est;
     }
     var cost: Word = x->backlog + est;
+    if (x->way == ALPH_FAR && est != 0 && x->pace[job->kind] != 0) {
+      // Another machine does several jobs at once. Its pace is how often
+      // an answer comes back while it has work, so a job sent now is
+      // answered after the ones waiting there and itself have each taken
+      // one pace, and never sooner than one job takes.
+      cost = (Word)((x->waiting + 1) * x->pace[job->kind]);
+      if (cost < est) {
+        cost = est;
+      }
+    }
     if (est == 0) {
       cost = -2;
       if (x->waiting > 0) {
@@ -744,6 +764,7 @@ fn alph_place_shut_far(p: AlphPlaces*, x: AlphPlace*, kind: Word) {
   }
   var was: int32 = p->gate.enter();
   x->workers[kind] = 0;
+  x->pace[kind] = 0;
   alph_place_far_open(p, kind);
   p->gate.leave(was);
 }
@@ -806,18 +827,23 @@ export fn alph_place_run(a: AlphActor*, m: AlphMsg*) -> Word {
     job->next = x->unsent;
     x->unsent = job;
   }
-  if (m->tag == ALPH_WORKED || m->tag == ALPH_REFUSED) {
+  if (m->tag == ALPH_WORKED || m->tag == ALPH_REFUSED || m->tag == ALPH_WORKED_BYTES) {
     // The answer from another machine: the job with this ref is done, or
     // the worker could not take it now and the asker is told to ask again.
+    var parcel: AlphParcel* = 0;
+    if (m->tag == ALPH_WORKED_BYTES) {
+      parcel = (AlphParcel*)m->arg;
+    }
     x->answers = x->answers + 1;
-    x->answered = alph_place_ns();
+    var gap: Word = alph_place_ns() - x->answered;
+    x->answered = x->answered + gap;
     var job: AlphJob* = x->open;
     var before: AlphJob* = 0;
     while (job != 0 && job->far_ref != m->ref) {
       before = job;
       job = job->next;
     }
-    if (job == 0 && m->tag == ALPH_WORKED) {
+    if (job == 0 && m->tag != ALPH_REFUSED) {
       // The answer to a job given up on: the work was not lost, it took
       // this long. The next job out is given time for that.
       for g in 0..4 {
@@ -839,11 +865,48 @@ export fn alph_place_run(a: AlphActor*, m: AlphMsg*) -> Word {
         before->next = job->next;
       }
       job->way = ALPH_FAR;
-      if (m->tag == ALPH_WORKED) {
+      if (m->tag != ALPH_REFUSED) {
         job->out = m->arg;
+        if (parcel != 0) {
+          // The out is the first eight bytes, and what the job gives back
+          // comes after them.
+          var word: int64 = 0;
+          for i in 0..8 {
+            word = word | ((int64)parcel->bytes[i] << ((int64)i * 8));
+          }
+          job->out = (Word)word;
+          job->back_count = 0;
+          if (job->back != 0) {
+            job->back_count = parcel->count - 8;
+            if (job->back_count > job->back_room) {
+              job->back_count = job->back_room;
+            }
+            for i in 0..job->back_count {
+              job->back[i] = parcel->bytes[(Word)i + 8];
+            }
+          }
+        }
         job->ns = alph_place_ns() - job->began;
         job->status = ALPH_OK;
+        if (x->busy != 0 && job->kind < 16) {
+          // The place had work the whole time since its last answer: the
+          // time between the two is its pace.
+          var pace: Word = x->pace[job->kind];
+          if (pace == 0) {
+            pace = gap;
+          } else {
+            pace = pace + (Word)((gap - pace) / 8);
+          }
+          if (pace < 1) {
+            pace = 1;
+          }
+          x->pace[job->kind] = pace;
+        }
         alph_place_ran(p, x, job, job->ns, 0);
+        x->busy = 0;
+        if (x->waiting > 0) {
+          x->busy = 1;
+        }
         job->next = x->unsent;
         x->unsent = job;
       } else {
@@ -871,6 +934,9 @@ export fn alph_place_run(a: AlphActor*, m: AlphMsg*) -> Word {
         p->gate.leave(was);
         alph_place_elsewhere(a, p, x, job);
       }
+    }
+    if (parcel != 0 && p->link != 0) {
+      p->link->release(parcel);
     }
   }
   if (m->tag == ALPH_ENDED) {

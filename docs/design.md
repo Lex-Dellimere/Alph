@@ -63,7 +63,7 @@ For the smallest tiles alph beats both, because it uses both. For the rest it ma
 
 `src/link` joins machines over UDP. Each machine owns a run of place numbers, so a pid says which machine its actor is on, and an actor sends to it the way it sends next door. A message is one datagram. On the wire a pid is its three parts, because a 32-bit board and a 64-bit server pack them differently.
 
-- Messages to a machine are numbered, and the machine says how far it has them. What it has not got in 40 ms is sent again. So messages arrive once and in order while both machines are up.
+- Messages to a machine are numbered, and the machine says how far it has them. What it has not got in 40 ms is sent again. So messages arrive once and in order while both machines are up. A message for an actor whose mailbox is full is not taken either: it is sent again, and what is behind it waits, so a full mailbox slows a sender down and loses nothing.
 - Every machine tells its peers it is alive 20 times a second. One quiet for half a second is down: sends to it are refused and a watcher actor is told.
 - A machine only out of reach carries on where it was. One that was restarted counts as a new machine, so mail meant for the old one is not handed to the new.
 
@@ -73,7 +73,7 @@ For the smallest tiles alph beats both, because it uses both. For the rest it ma
 
 **Work.** `src/place` has a third way to run a job: a worker actor on another machine, which the program finds by name through the door. To alph that is one more place with a time of its own, the network included, so a job goes there when that is where it will finish first.
 
-- The job is one word in and one word out, or up to a parcel's worth of bytes.
+- The job is one word in and one word out. It can carry up to a parcel's worth of bytes instead of the word in, and give back up to 1,016 bytes with the word out.
 - If the worker ends or its machine is lost, the jobs it had not answered are done here and nothing more is sent to it.
 - Given a clock, a job not answered in eight times its usual time, and at least a second, is given up on and placed again.
 
@@ -138,7 +138,9 @@ A timer sends a message later, so it is a layer (`src/time`), not part of the co
 
 A program that uses several layers repeats the same setup and bookkeeping. Two layers on top take that away. `src/machine` is a Linux machine with every layer set up in one call, with sizes that suit most programs. `src/batch` hands out one kind of work in pieces, takes each answer, hands out again what could not be placed, and says when all is back.
 
-A machine says how a kind of job is done and that it is shared. It then does that kind for other machines, through its own places, and its own jobs of the kind may go to them. Every machine runs the same program, and the one whose actor begins a batch hands the work out. A job taken for another machine is not sent on again. Each other machine is a place of its own, with its own work waiting and its own measured time, so a slow machine and a quick one that do the same kind are told apart. With one time for both, 80 jobs asked for one at a time all went to the slow machine, because it was listed first. With a time each, 78 went to the quick one. `examples/share.mettle` is about forty lines of its own.
+A machine says how a kind of job is done and that it is shared. It then does that kind for other machines, through its own places, and its own jobs of the kind may go to them. Every machine runs the same program, and the one whose actor begins a batch hands the work out. A job taken for another machine is not sent on again. Another machine does several jobs at once, so its cost is not its queue times one job. alph measures its pace, the time from one answer to the next while it has work, and takes a job sent now to be answered after everything waiting there and itself have each taken one pace, and never sooner than one job takes. With that a helper with many cores is given as much as it can do at once. With a boss of one working core and a helper of eight, 800 jobs of 2 ms took 911 ms by the queue alone and 573 ms by the pace, on a machine too busy to say more than that (all cores busy would be about 180 ms).
+
+Each other machine is a place of its own, with its own work waiting and its own measured time, so a slow machine and a quick one that do the same kind are told apart. With one time for both, 80 jobs asked for one at a time all went to the slow machine, because it was listed first. With a time each, 78 went to the quick one. `examples/share.mettle` is about forty lines of its own.
 
 ## What was measured
 
@@ -158,12 +160,11 @@ The measurements that decide a choice are in the section for that choice: the re
 - Restart limits counted over time rather than in all, and groups that restart together.
 - Dropping a watch across machines.
 - A crossing that carries everything waiting, in the cores or the link, where every message still crosses alone. Cheaper messages between cores need a queue per pair of cores that the sender writes without touching anything the receiver owns, which changes what a full mailbox can tell a sender.
-- Telling a sender that a full mailbox at the far end of a link dropped its message.
 - A sealed link has one key for all, so any holder can speak as any machine and there is no forward secrecy. Peers are listed by hand.
 - A board on the UDP link itself. A board joins through a serial line to one machine, and a line that sends again what was lost.
 - A board that sends its work to the best of several places. It asks the machine at the other end of its line.
 - Jobs done at most once. A job whose answer is lost is placed again, so it can run twice.
-- A job for another machine with more than a word or 1,024 bytes, or with its data on a GPU.
+- A job for another machine with more than 1,024 bytes in or 1,016 back, or with its data on a GPU.
 - A job's time predicted from more than its size. A Mandelbrot tile's time depends on where in the picture it is, so such work is placed less well.
 - Sizes for `src/machine` other than the fixed ones.
 - Sockets off Linux, and file IO.

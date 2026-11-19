@@ -32,9 +32,11 @@ fn now_ns() -> Word {
 }
 
 fn work(job: AlphJob*, ns: Word) -> Word {
-  var until: Word = now_ns() + ns;
-  while (now_ns() < until) {
-  }
+  // Sleeps where real work would compute: a busy machine cannot stretch it.
+  var rest: int64[2];
+  rest[0] = (int64)ns / 1000000000;
+  rest[1] = (int64)ns % 1000000000;
+  syscall(35, (int64)&rest[0], 0);
   job->out = job->in + 1;
   return 0;
 }

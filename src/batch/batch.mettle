@@ -63,6 +63,9 @@ fn alph_batch_more(b: AlphBatch*, a: AlphActor*) {
     job->in = i;
     job->bytes = 0;
     job->count = 0;
+    job->back = 0;
+    job->back_room = 0;
+    job->back_count = 0;
     job->stay = 0;
     b->fill(b, job, i);
     var asked: Word = b->places->ask(a, job);
@@ -108,8 +111,8 @@ fn alph_batch_more(b: AlphBatch*, a: AlphActor*) {
 
 // Starts handing out `total` pieces of a kind. fill is called for each
 // piece before it goes out, with the job and the piece's number (0 to
-// total - 1): it sets what the job needs (size, in, data, bytes, home; the
-// job starts with size 1, in the piece's number and no home). took is
+// total - 1): it sets what the job needs (size, in, data, bytes, back,
+// home; the job starts with size 1, in the piece's number and no home). took is
 // called with each piece's finished job: its status is ALPH_OK, or
 // ALPH_GONE for a piece no place could run. ctx is the program's own, in
 // b->ctx. Call it from the actor that will get the answers. Returns

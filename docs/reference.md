@@ -261,8 +261,8 @@ Call it as `b->begin(a, kind, total, fill, took, ctx)`, or `b.begin(a, kind, tot
 
 Starts handing out `total` pieces of a kind. fill is called for each
 piece before it goes out, with the job and the piece's number (0 to
-total - 1): it sets what the job needs (size, in, data, bytes, home; the
-job starts with size 1, in the piece's number and no home). took is
+total - 1): it sets what the job needs (size, in, data, bytes, back,
+home; the job starts with size 1, in the piece's number and no home). took is
 called with each piece's finished job: its status is ALPH_OK, or
 ALPH_GONE for a piece no place could run. ctx is the program's own, in
 b->ctx. Call it from the actor that will get the answers. Returns
@@ -988,6 +988,10 @@ export const ALPH_RUN: Word = -1;    // to a place: run the job in arg
 export const ALPH_DONE: Word = -2;   // from a place: the job in arg is done
 ```
 
+```mettle
+export const ALPH_BACK_BYTES: Word = 1016;  // the most bytes a job on another machine gives back
+```
+
 ### `AlphJob`
 
 ```mettle
@@ -999,6 +1003,9 @@ export struct AlphJob {
   out: Word;     // and what it gives back
   bytes: uint8*; // bytes that go with it to another machine, up to ALPH_PARCEL_BYTES,
   count: Word;   // and how many: 0 for none
+  back: uint8*;  // where bytes the job gives back are put, 0 for none,
+  back_room: Word;   // how many fit there (from another machine at most ALPH_BACK_BYTES),
+  back_count: Word;  // and how many came
   stay: Word;    // not 0: it must be done on this machine
   home: Word;    // where its data is: ALPH_CPU, ALPH_GPU or ALPH_NOWHERE. alph sets it to where the job ran
   status: Word;  // ALPH_OK, ALPH_GONE when no place can run it, ALPH_FULL to ask again
@@ -1081,6 +1088,8 @@ export struct AlphPlace {
   gave_began: Word[4];  // when,
   gave_at: Word[4];   // and its kind times 192 plus which of the kind's times it is
   gave_next: Word;
+  pace: Word[16];     // a far place, by kind: ns from one answer to the next while it has work, 0 when not known
+  busy: Word;         // it still had work when its last answer came
   own: AlphTimes*;    // a far place's own times, one for each of its first own_kinds kinds, 0 for none
   own_kinds: Word;
 }
@@ -1294,6 +1303,7 @@ too small for the places, can still be a worker.
 export const ALPH_WORK: Word = -13;        // to a worker on another machine: arg is the job's in
 export const ALPH_WORKED: Word = -14;      // its answer: arg is the job's out, with the same ref
 export const ALPH_WORK_BYTES: Word = -17;  // as ALPH_WORK, for a job with bytes: arg is a parcel
+export const ALPH_WORKED_BYTES: Word = -20; // as ALPH_WORKED, for a job that gives bytes back: arg is a parcel, its first 8 bytes the job's out
 export const ALPH_REFUSED: Word = -18;     // a worker's answer when it cannot take the job: arg is ALPH_FULL for now, ALPH_GONE for never
 export const ALPH_SHARED: Word = 1073741824;  // the name of the worker for a shared kind is this plus the kind
 ```
@@ -1639,8 +1649,9 @@ A message crosses in one datagram. Messages to a machine are numbered,
 the machine says how far it has them, and what it has not got in a
 twenty-fifth of a second is sent again: so between two machines messages
 arrive once and in the order they were sent, for as long as both are up.
-A full mailbox at the far end still drops its message, and the sender is
-not told. Every machine tells its peers it is alive 20 times a second.
+A message for an actor whose mailbox is full is not taken: it is sent
+again, and what is behind it waits, so a full mailbox slows a sender down
+and loses nothing. Every machine tells its peers it is alive 20 times a second.
 One that stays quiet for half a second is down: sends to it return
 ALPH_GONE and the watcher is told. If it was only out of reach, what was
 on its way is sent again when it is back. A machine that was restarted is
@@ -1737,6 +1748,7 @@ export struct AlphLink {
   open: fn(rawptr, uint8*, uint8*, int64, uint32*, Word*, Word*) -> int64;
   sealer: rawptr;
   refused: Word;  // datagrams not sealed with the key, or already heard
+  full: Word;     // messages left to be sent again because their actor had no room
   // Mail for a place that is neither on these cores nor a peer's goes to
   // beyond, if it is set: a board on this machine's serial line, say.
   beyond: fn(AlphLink*, Word, AlphMsg*) -> Word;

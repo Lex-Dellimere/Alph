@@ -6,8 +6,9 @@
 // the machine says how far it has them, and what it has not got in a
 // twenty-fifth of a second is sent again: so between two machines messages
 // arrive once and in the order they were sent, for as long as both are up.
-// A full mailbox at the far end still drops its message, and the sender is
-// not told. Every machine tells its peers it is alive 20 times a second.
+// A message for an actor whose mailbox is full is not taken: it is sent
+// again, and what is behind it waits, so a full mailbox slows a sender down
+// and loses nothing. Every machine tells its peers it is alive 20 times a second.
 // One that stays quiet for half a second is down: sends to it return
 // ALPH_GONE and the watcher is told. If it was only out of reach, what was
 // on its way is sent again when it is back. A machine that was restarted is
@@ -35,6 +36,8 @@ const MAGIC: uint32 = 1095520328;   // "ALPH"
 const BEAT: uint32 = 1;
 const MAIL: uint32 = 2;
 const PARCEL: uint32 = 3;   // mail with bytes after it: `unused` says how many
+const WAIT: uint32 = 4;     // a beat that says the next message found no room: send it again soon
+const SOON_MS: Word = 5;
 const BEAT_MS: Word = 50;
 const DOWN_MS: Word = 500;
 const BEAT_BYTES: int64 = 24;
@@ -126,6 +129,7 @@ export struct AlphLink {
   open: fn(rawptr, uint8*, uint8*, int64, uint32*, Word*, Word*) -> int64;
   sealer: rawptr;
   refused: Word;  // datagrams not sealed with the key, or already heard
+  full: Word;     // messages left to be sent again because their actor had no room
   // Mail for a place that is neither on these cores nor a peer's goes to
   // beyond, if it is set: a board on this machine's serial line, say.
   beyond: fn(AlphLink*, Word, AlphMsg*) -> Word;
@@ -340,10 +344,10 @@ fn alph_link_far(c: AlphCores*, to: Word, m: AlphMsg*) -> Word {
 }
 
 // Tells a peer this machine is alive and how far it has the peer's messages.
-fn alph_link_say(l: AlphLink*, p: AlphPeer*) {
+fn alph_link_say_as(l: AlphLink*, p: AlphPeer*, kind: uint32) {
   var k: AlphPacket;
   k.magic = MAGIC;
-  k.kind = BEAT;
+  k.kind = kind;
   k.from_place = (uint32)l->cores->first;
   k.from_life = l->life;
   k.to_life = p->life;
@@ -354,6 +358,10 @@ fn alph_link_say(l: AlphLink*, p: AlphPeer*) {
   p->owed = 0;
   alph_link_out(l, p, (uint8*)&k, BEAT_BYTES);
   p->gate.leave(was);
+}
+
+fn alph_link_say(l: AlphLink*, p: AlphPeer*) {
+  alph_link_say_as(l, p, BEAT);
 }
 
 // Brings the watcher up to date: down for a machine it thinks is up that is
@@ -426,6 +434,12 @@ fn alph_link_heard(l: AlphLink*, k: AlphPacket*, got: int64, born: Word, count: 
     p->waiting_since = alph_now();
     p->again_ms = AGAIN_MS;
   }
+  if (k->kind == WAIT && p->again_ms == AGAIN_MS) {
+    // The next message found its actor's mailbox full. It is sent again
+    // soon, and if it is refused again the wait doubles as for any other.
+    p->waiting_since = alph_now();
+    p->again_ms = SOON_MS;
+  }
   p->gate.leave(was);
   if ((k->kind != MAIL && k->kind != PARCEL) || got < MAIL_BYTES) {
     return;
@@ -465,13 +479,13 @@ fn alph_link_heard(l: AlphLink*, k: AlphPacket*, got: int64, born: Word, count: 
       parcel->bytes[i] = payload[i];
     }
   }
-  was = p->gate.enter();
-  p->got = k->seq;
-  p->owed = p->owed + 1;
-  var owed: Word = p->owed;
-  p->gate.leave(was);
-  // It is taken, whatever becomes of it: one that cannot be delivered, or
-  // whose pids do not fit a word here, must not hold up the ones behind it.
+  // It is taken unless the actor it is for has no room: then, like bytes
+  // with no parcel, it is left to be sent again, and what is behind it
+  // waits with it. So a full mailbox slows a sender down and loses
+  // nothing. One that cannot be delivered at all (no such actor, or pids
+  // that do not fit a word here) is taken and dropped, so it does not hold
+  // up the ones behind it.
+  var full: bool = false;
   if (!bytes_dropped && alph_pid_fits(k->to_place, k->to_gen, k->to_index) && alph_pid_fits(k->src_place, k->src_gen, k->src_index)) {
     var m: AlphMsg = { tag: (Word)k->tag, from: alph_pid_of(k->src_place, k->src_gen, k->src_index), arg: (Word)k->arg,
                        ref: (Word)k->ref };
@@ -481,16 +495,29 @@ fn alph_link_heard(l: AlphLink*, k: AlphPacket*, got: int64, born: Word, count: 
       m.arg = (Word)(int64)parcel;  // the actor reads the bytes and gives the parcel back
     }
     if (core >= 0 && core < l->cores->count) {
-      if (l->cores->cores[core].node.put(to, &m) == ALPH_OK) {
+      var put: Word = l->cores->cores[core].node.put(to, &m);
+      if (put == ALPH_OK) {
         parcel = 0;
       }
+      full = put == ALPH_FULL;
     } else if (parcel == 0 && l->beyond != 0 && alph_link_peer(l, (Word)(int64)k->to_place) == 0) {
-      l->beyond(l, to, &m);  // passed on, to a board on our line
+      full = l->beyond(l, to, &m) == ALPH_FULL;  // passed on, to a board on our line
     }
   }
   if (parcel != 0) {
     l->release(parcel);  // nobody took it
   }
+  was = p->gate.enter();
+  if (full) {
+    l->full = l->full + 1;
+    p->gate.leave(was);
+    alph_link_say_as(l, p, WAIT);
+    return;
+  }
+  p->got = k->seq;
+  p->owed = p->owed + 1;
+  var owed: Word = p->owed;
+  p->gate.leave(was);
   if (owed >= ACK_EVERY) {
     alph_link_say(l, p);
   }
@@ -612,6 +639,7 @@ export fn AlphLink_init__ptr(l: AlphLink*, cores: AlphCores*, first: Word, peers
   l->open = 0;
   l->sealer = 0;
   l->refused = 0;
+  l->full = 0;
   cores->join(first, &alph_link_far, (rawptr)l);
 }
 
