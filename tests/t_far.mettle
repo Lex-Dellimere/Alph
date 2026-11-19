@@ -1,0 +1,257 @@
+// Jobs to another machine (src/place with src/link and src/door): a job of
+// one word in and one word out goes to a worker on another machine when
+// that is quicker, every answer is right wherever the job ran, a job whose
+// request was forgotten is placed again, and when the other machine is lost
+// in the middle the jobs it had are done here.
+
+import "std/io";
+import "std/thread";
+import "alph/actor/actor";
+import "alph/cores/cores";
+import "alph/link/link";
+import "alph/name/name";
+import "alph/life/life";
+import "alph/door/door";
+import "alph/place/place";
+import "alph/time/time";
+
+const GO: Word = 1;
+const DOUBLE: Word = 0;   // the one kind: out is twice in
+const WORKER: Word = 7;   // the name machine B gives its worker
+
+struct Machine {
+  cores: AlphCores;
+  core: AlphCore[3];
+  actors: AlphActor[12];
+  mail: AlphMsg[192];
+  link: AlphLink;
+  peers: AlphPeer[2];
+  names: AlphNames;
+  name_slots: AlphName[4];
+  life: AlphLife;
+  watches: AlphWatch[4];
+  keeps: AlphKeep[2];
+  door: AlphDoor;
+}
+
+var g_a: Machine;
+var g_b: Machine;
+var g_b_thread: int64 = 0;
+var g_places: AlphPlaces;
+var g_seats: AlphPlace[3];
+var g_kinds: AlphKind[1];
+var g_jobs: AlphJob[8];
+var g_time: AlphTime;
+var g_timers: AlphTimer[4];
+var g_forgetful: int32 = 0;  // the worker answers only every fourth request
+var g_asked: int32 = 0;
+var g_failures: int32 = 0;
+
+fn expect(ok: bool, what: string) {
+  if (!ok) {
+    println("FAIL {what}");
+    g_failures = g_failures + 1;
+  }
+}
+
+fn now_ns() -> Word {
+  var ts: int64[2];
+  syscall(228, 1, (int64)&ts[0]);
+  return (Word)(ts[0] * 1000000000 + ts[1]);
+}
+
+fn machine(m: Machine*, first: Word, other: Word, other_port: int64) -> Word {
+  m->cores.init(&m->core[0], 3, &m->actors[0], 4, &m->mail[0], 16);
+  m->link.init(&m->cores, first, &m->peers[0], 2);
+  m->link.peer(other, 3, alph_ip4(127, 0, 0, 1), other_port);
+  m->names.init(&m->name_slots[0], 4);
+  m->life.init(&m->cores, &m->watches[0], 4, &m->keeps[0], 2);
+  return m->door.init(&m->cores, &m->link, &m->names, &m->life);
+}
+
+// On this machine the work takes 2 ms.
+fn double_here(job: AlphJob*) -> Word {
+  var until: Word = now_ns() + 2000000;
+  while (now_ns() < until) {
+  }
+  job->out = job->in * 2;
+  return 0;
+}
+
+// On machine B it takes no time.
+fn worker(a: AlphActor*, m: AlphMsg*) -> Word {
+  if (m->tag == ALPH_WORK) {
+    g_asked = g_asked + 1;
+    if (g_forgetful != 0 && g_asked % 4 != 0) {
+      return 0;
+    }
+    a->reply(m, ALPH_WORKED, m->arg * 2);
+  }
+  return 0;
+}
+
+// Asks for jobs numbered from 1 and checks every answer.
+struct Boss {
+  total: Word;
+  sent: Word;
+  back: Word;
+  by_way: Word[3];
+  wrong: Word;
+  refused: Word;
+  free: AlphJob*;
+}
+
+fn boss(a: AlphActor*, m: AlphMsg*) -> Word {
+  var b: Boss* = (Boss*)a->state;
+  if (m->tag == ALPH_DONE) {
+    var done: AlphJob* = (AlphJob*)m->arg;
+    if (done->status == ALPH_OK) {
+      b->back = b->back + 1;
+      b->by_way[done->way] = b->by_way[done->way] + 1;
+      if (done->out != done->in * 2) {
+        b->wrong = b->wrong + 1;
+      }
+    } else {
+      b->refused = b->refused + 1;  // the way to B was gone or full: asked again below
+      b->sent = b->sent - 1;
+    }
+    done->next = b->free;
+    b->free = done;
+  }
+  while (b->sent < b->total && b->free != 0) {
+    var job: AlphJob* = b->free;
+    b->free = job->next;
+    job->kind = DOUBLE;
+    job->size = 1;
+    job->home = ALPH_NOWHERE;
+    job->in = b->sent + 1;
+    if (g_places.ask(a, job) < 0) {
+      job->next = b->free;
+      b->free = job;
+      break;
+    }
+    b->sent = b->sent + 1;
+  }
+  if (b->back == b->total) {
+    a->cores()->stop();
+  }
+  return 0;
+}
+
+var g_boss: Boss;
+var g_boss_pid: Word = 0;
+
+fn run(total: Word) {
+  g_boss.total = total;
+  g_boss.sent = 0;
+  g_boss.back = 0;
+  g_boss.wrong = 0;
+  g_boss.refused = 0;
+  for i in 0..3 {
+    g_boss.by_way[i] = 0;
+  }
+  g_a.cores.send(g_boss_pid, GO, 0);
+  g_a.cores.run();
+}
+
+fn b_main(arg: cstring) -> uint32 {
+  g_b.cores.run();
+  return 0;
+}
+
+fn main() -> int32 {
+  var port_a: int64 = 10000 + (syscall(39) % 500) * 2;
+  var port_b: int64 = port_a + 1;
+
+  // Machine A, places 0 to 2: the boss, two cores that take work, and the
+  // place that sends work to B.
+  expect(machine(&g_a, 0, 3, port_b) > 0, "A's door");
+  g_boss_pid = g_a.cores.spawn_on(0, &boss, (rawptr)&g_boss);
+  g_places.init(&g_seats[0], 3, &g_kinds[0], 1);
+  g_places.kind(DOUBLE, &double_here, 0);
+  g_places.on_core(&g_a.cores, 1, ALPH_CPU);
+  g_places.on_core(&g_a.cores, 2, ALPH_CPU);
+  var far_place: Word = g_places.on_core(&g_a.cores, 0, ALPH_FAR);
+  expect(far_place > 0, "a place for work sent to B");
+  g_boss.free = 0;
+  for i in 0..8 {
+    g_jobs[i].next = g_boss.free;
+    g_boss.free = &g_jobs[i];
+  }
+
+  // Machine B, places 3 to 5: one worker.
+  expect(machine(&g_b, 3, 0, port_a) > 0, "B's door");
+  var worker_pid: Word = g_b.cores.spawn_on(1, &worker, 0);
+  g_b.names.set(WORKER, worker_pid);
+
+  // With no worker named, everything is done here.
+  run(40);
+  expect(g_boss.by_way[ALPH_CPU] == 40 && g_boss.wrong == 0, "with no other machine the work is done here ({g_boss.by_way[ALPH_CPU]} of 40)");
+
+  // B comes up and its worker is given to the kind.
+  expect(g_a.link.start(port_a) == ALPH_OK && g_b.link.start(port_b) == ALPH_OK, "both machines listen");
+  g_b_thread = CreateThread(0, 0, &b_main, 0, 0, 0);
+  var waited: Word = now_ns();
+  while (!g_a.link.reaches(3) && (Word)(now_ns() - waited) < 3000000000) {
+    g_a.core[0].node.turn();
+  }
+  expect(g_a.link.reaches(3), "A hears B");
+  g_places.far(DOUBLE, worker_pid);
+  expect(g_a.door.watch(far_place, worker_pid) > 0, "the far place watches the worker");
+
+  // 2 ms here, a round trip to B: most of the work goes to B, and every
+  // answer is right wherever it was done.
+  run(300);
+  var went: Word = g_boss.by_way[ALPH_FAR];
+  expect(g_boss.back == 300 && g_boss.wrong == 0, "every answer is right ({g_boss.wrong} wrong)");
+  expect(went >= 150, "most of the work goes to the quicker machine ({went} of 300)");
+  expect(g_boss.by_way[ALPH_CPU] > 0, "and some is still done here ({g_boss.by_way[ALPH_CPU]})");
+
+  // A worker that forgets three requests in four. With a clock, a job not
+  // answered in a second is given up on and placed again, so every job is
+  // still answered.
+  g_time.init(&g_a.core[0].node, &g_timers[0], 4);
+  g_places.clock(&g_time);
+  g_forgetful = 1;
+  run(12);
+  g_forgetful = 0;
+  expect(g_boss.back == 12 && g_boss.wrong == 0, "jobs whose requests were forgotten are still answered ({g_boss.back} of 12)");
+  expect(g_places.late > 0, "because they were given up on and placed again ({g_places.late} times)");
+  var late: Word = g_places.late;
+
+  // B is lost with work on its way. What it had is done here, and nothing
+  // more is sent to it.
+  g_boss.total = 200;
+  g_boss.sent = 0;
+  g_boss.back = 0;
+  g_boss.wrong = 0;
+  for i in 0..3 {
+    g_boss.by_way[i] = 0;
+  }
+  g_a.cores.send(g_boss_pid, GO, 0);
+  g_b.link.deaf = 1;  // B hears no more work
+  g_b.link.stop();    // and goes quiet
+  g_a.cores.run();
+  expect(g_boss.back == 200 && g_boss.wrong == 0, "with B lost every job is still answered, and rightly ({g_boss.back} of 200, {g_boss.wrong} wrong)");
+  waited = now_ns();
+  while (g_kinds[0].off[ALPH_FAR] == 0 && (Word)(now_ns() - waited) < 3000000000) {
+    g_a.core[0].node.turn();  // the jobs may all have been done here before B was missed
+  }
+  expect(g_kinds[0].off[ALPH_FAR] == 1, "and the way to B is shut");
+  var after: Word = g_boss.by_way[ALPH_FAR];
+  run(40);
+  expect(g_boss.by_way[ALPH_CPU] == 40, "after that everything is done here ({g_boss.by_way[ALPH_CPU]} of 40)");
+
+  g_b.cores.stop();
+  thread_join_infinite(g_b_thread);
+  thread_close(g_b_thread);
+  g_b.link.close();
+  g_a.link.stop();
+  g_a.link.close();
+  g_time.stop();
+  if (g_failures != 0) {
+    return 1;
+  }
+  println("far ok: {went} of 300 jobs went to the other machine, {late} forgotten jobs were placed again, and when it was lost all 200 jobs were still answered ({after} by it)");
+  return 0;
+}

@@ -83,6 +83,8 @@ Placement is one decision made from measured costs, not three separate features.
 
    What it does not do yet: a full mailbox at the far end drops its message and the sender is not told; nothing is encrypted or signed, so it is for a network you trust; peers are listed by hand; and there is no link for the `mcu` port. The first runtime's `src/net/dist` has encryption, which moves over later.
 
+4. **Work on other machines.** Built into `src/place` as a third way. A job that is one word in and one word out can be done by a worker actor on another machine, which the program finds by name through the door. To alph that is one more place with a time of its own, the network included, so a job goes to another machine when that is where it will finish first, and stays here when it is not. If the worker ends or its machine is lost, the jobs it had not answered are done here and nothing more is sent to it. Given a clock, a job not answered in eight times its usual time, and at least a second, is given up on and placed again. `examples/far.mettle` counts the primes below two million on two machines: run with no arguments it is both machines in one process; run as `far helper <address>` and `far boss <address>` it is two computers. With two cores here and one worker there, about a third of the chunks went across. A job with data of its own cannot leave the machine yet.
+
 ## Crossings
 
 A message to another core moves cache lines over the memory bus. A job for the GPU moves data over PCIe. A message to another machine is a datagram. These are one thing, a crossing, and data is what makes a crossing expensive: a message is four words, data is megabytes. Two rules follow.

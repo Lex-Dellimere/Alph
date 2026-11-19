@@ -105,6 +105,12 @@ On Linux, [examples/spread.mettle](examples/spread.mettle) counts primes on four
 mettle --build --release examples/spread.mettle -I ports/host -o spread
 ```
 
+[examples/far.mettle](examples/far.mettle) counts primes on two machines, sending each piece of the work to a core here or to the other machine, whichever should finish it first. With no arguments both machines run in one process; with `helper <address>` on one computer and `boss <address>` on another it is two computers. If the other machine is not there, or is lost on the way, the work is done here.
+
+```bash
+mettle --build --release examples/far.mettle -I ports/host -o far
+```
+
 [examples/render.mettle](examples/render.mettle) renders a picture in tiles that can each run on a core or on the GPU. Both ways call the same Mettle function, alph times them and sends each tile where it should finish first, and the pixels come out the same either way. Without a GPU it runs on the cores.
 
 ```bash
@@ -117,7 +123,7 @@ mettle --build --release examples/render.mettle -I ports/host -o render
 src/actor/actor.mettle      the small core: actors, messages, the run loop
 src/cores/cores.mettle      the small core on several threads, one node each
 src/time/time.mettle        timers for the small core: a message sent later
-src/place/place.mettle      places: a job goes to the core or the GPU, whichever should finish it first
+src/place/place.mettle      places: a job goes to a core, the GPU or another machine, whichever should finish it first
 src/link/link.mettle        links: other machines as places, over UDP, a lost machine noticed in half a second
 src/life/life.mettle        lives: watch an actor to be told when it ends, keep one so a crash restarts it in place
 src/name/name.mettle        names: a number for a pid

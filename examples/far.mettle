@@ -1,0 +1,266 @@
+// Counts the primes below two million on two machines. The boss hands the
+// range out in chunks, and alph sends each chunk to one of this machine's
+// cores or to the other machine, wherever it should be done first. If the
+// other machine is not there, or is lost on the way, the work is done here.
+//
+// With no arguments both machines run in this one process, so it can be
+// tried on one computer:
+//
+//   mettle --build --release examples/far.mettle -I ports/host -o far
+//   ./far
+//
+// On two computers, start one as the helper and the other as the boss, each
+// with the other's address:
+//
+//   ./far helper 192.168.1.10
+//   ./far boss 192.168.1.20
+
+import "std/io";
+import "std/thread";
+import "alph/actor/actor";
+import "alph/cores/cores";
+import "alph/link/link";
+import "alph/name/name";
+import "alph/life/life";
+import "alph/door/door";
+import "alph/place/place";
+
+const CHUNK: Word = 10000;
+const CHUNKS: Word = 200;
+const PRIMES: Word = 0;     // the one kind of job: in is a chunk, out the primes in it
+const HELPER: Word = 1;     // the name the helper machine gives its worker
+const GO: Word = 1;
+const QUIT: Word = 2;
+const BOSS_PORT: int64 = 7401;
+const HELPER_PORT: int64 = 7402;
+
+struct Machine {
+  cores: AlphCores;
+  core: AlphCore[3];
+  actors: AlphActor[12];
+  mail: AlphMsg[192];
+  link: AlphLink;
+  peers: AlphPeer[1];
+  names: AlphNames;
+  name_slots: AlphName[2];
+  life: AlphLife;
+  watches: AlphWatch[2];
+  keeps: AlphKeep[1];
+  door: AlphDoor;
+}
+
+var g_boss_machine: Machine;
+var g_helper_machine: Machine;
+var g_places: AlphPlaces;
+var g_seats: AlphPlace[3];
+var g_kinds: AlphKind[1];
+var g_jobs: AlphJob[8];
+
+fn count_primes(chunk: Word) -> Word {
+  var n: Word = (Word)(chunk * CHUNK);
+  var end: Word = n + CHUNK;
+  var found: Word = 0;
+  while (n < end) {
+    var prime: bool = n >= 2;
+    var d: Word = 2;
+    while (prime && d * d <= n) {
+      if (n % d == 0) {
+        prime = false;
+      }
+      d = d + 1;
+    }
+    if (prime) {
+      found = found + 1;
+    }
+    n = n + 1;
+  }
+  return found;
+}
+
+// The same work two ways: on a core here,
+fn primes_here(job: AlphJob*) -> Word {
+  job->out = count_primes(job->in);
+  return 0;
+}
+
+// or by the helper machine's worker, which answers a chunk with its count.
+fn worker(a: AlphActor*, m: AlphMsg*) -> Word {
+  if (m->tag == ALPH_WORK) {
+    a->reply(m, ALPH_WORKED, count_primes(m->arg));
+  } else if (m->tag == QUIT) {
+    a->cores()->stop();
+  }
+  return 0;
+}
+
+// A machine as far as its door: its places start at first, and the other
+// machine's three places start at other.
+fn machine(m: Machine*, first: Word, other: Word, ip: uint32, port: int64) {
+  m->cores.init(&m->core[0], 3, &m->actors[0], 4, &m->mail[0], 16);
+  m->link.init(&m->cores, first, &m->peers[0], 1);
+  m->link.peer(other, 3, ip, port);
+  m->names.init(&m->name_slots[0], 2);
+  m->life.init(&m->cores, &m->watches[0], 2, &m->keeps[0], 1);
+  m->door.init(&m->cores, &m->link, &m->names, &m->life);
+}
+
+struct Boss {
+  sent: Word;
+  back: Word;
+  primes: Word;
+  here: Word;
+  there: Word;
+  far_place: Word;
+  helper: Word;
+  free: AlphJob*;
+}
+
+fn boss(a: AlphActor*, m: AlphMsg*) -> Word {
+  var b: Boss* = (Boss*)a->state;
+  if (m->tag == ALPH_UP) {
+    // The helper machine is there: ask its door for the worker.
+    g_boss_machine.door.find(a, m->arg, HELPER);
+  } else if (m->tag == ALPH_HERE && m->arg != 0) {
+    // Found: from now on a chunk can go to it, and if it ends or its
+    // machine is lost the far place hears and the work stays here.
+    b->helper = m->arg;
+    g_places.far(PRIMES, b->helper);
+    g_boss_machine.door.watch(b->far_place, b->helper);
+  } else if (m->tag == ALPH_DONE) {
+    var done: AlphJob* = (AlphJob*)m->arg;
+    if (done->status == ALPH_OK) {
+      b->back = b->back + 1;
+      b->primes = b->primes + done->out;
+      if (done->way == ALPH_FAR) {
+        b->there = b->there + 1;
+      } else {
+        b->here = b->here + 1;
+      }
+    } else {
+      b->sent = b->sent - 1;  // it could not be sent across: asked again below
+    }
+    done->next = b->free;
+    b->free = done;
+  }
+  while (b->sent < CHUNKS && b->free != 0) {
+    var job: AlphJob* = b->free;
+    b->free = job->next;
+    job->kind = PRIMES;
+    job->size = CHUNK;
+    job->home = ALPH_NOWHERE;
+    job->in = CHUNKS - 1 - b->sent;  // the big numbers first: they take longest
+    if (g_places.ask(a, job) < 0) {
+      job->next = b->free;
+      b->free = job;
+      break;
+    }
+    b->sent = b->sent + 1;
+  }
+  if (b->back == CHUNKS) {
+    if (b->helper != 0) {
+      a->send(b->helper, QUIT, 0);
+    }
+    a->cores()->stop();
+  }
+  return 0;
+}
+
+var g_boss: Boss;
+
+fn run_boss(helper_ip: uint32) -> int32 {
+  machine(&g_boss_machine, 0, 3, helper_ip, HELPER_PORT);
+  var boss_pid: Word = g_boss_machine.cores.spawn_on(0, &boss, (rawptr)&g_boss);
+  g_boss_machine.door.tell(boss_pid);
+  g_places.init(&g_seats[0], 3, &g_kinds[0], 1);
+  g_places.kind(PRIMES, &primes_here, 0);
+  g_places.on_core(&g_boss_machine.cores, 1, ALPH_CPU);
+  g_places.on_core(&g_boss_machine.cores, 2, ALPH_CPU);
+  g_boss.far_place = g_places.on_core(&g_boss_machine.cores, 0, ALPH_FAR);
+  g_boss.free = 0;
+  for i in 0..8 {
+    g_jobs[i].next = g_boss.free;
+    g_boss.free = &g_jobs[i];
+  }
+  if (g_boss_machine.link.start(BOSS_PORT) != ALPH_OK) {
+    println("port {BOSS_PORT} is taken");
+    return 1;
+  }
+  g_boss_machine.cores.send(boss_pid, GO, 0);
+  g_boss_machine.cores.run();
+  // The last word to the helper is still to cross: give it a moment.
+  thread_sleep_ms(100);
+  g_boss_machine.link.stop();
+  println("{g_boss.primes} primes below {CHUNK * CHUNKS}: {g_boss.here} chunks counted here, {g_boss.there} on the other machine");
+  if (g_boss.primes != 148933) {
+    return 1;
+  }
+  return 0;
+}
+
+fn start_helper(boss_ip: uint32) -> bool {
+  machine(&g_helper_machine, 3, 0, boss_ip, BOSS_PORT);
+  var pid: Word = g_helper_machine.cores.spawn_on(1, &worker, 0);
+  g_helper_machine.names.set(HELPER, pid);
+  return g_helper_machine.link.start(HELPER_PORT) == ALPH_OK;
+}
+
+fn helper_main(arg: cstring) -> uint32 {
+  g_helper_machine.cores.run();
+  return 0;
+}
+
+// The address a.b.c.d in text as one number, 0 when it is not one.
+fn address(text: cstring) -> uint32 {
+  var part: int64[4];
+  var at: int32 = 0;
+  var i: int32 = 0;
+  part[0] = 0;
+  while (text[i] != 0) {
+    if (text[i] == 46 && at < 3) {
+      at = at + 1;
+      part[at] = 0;
+    } else if (text[i] >= 48 && text[i] <= 57) {
+      part[at] = part[at] * 10 + (int64)(text[i] - 48);
+    } else {
+      return 0;
+    }
+    i = i + 1;
+  }
+  if (at != 3) {
+    return 0;
+  }
+  return alph_ip4(part[0], part[1], part[2], part[3]);
+}
+
+fn main(argc: int32, argv: cstring*) -> int32 {
+  if (argc == 3) {
+    var ip: uint32 = address(argv[2]);
+    if (ip == 0) {
+      println("the address should look like 192.168.1.10");
+      return 2;
+    }
+    if (argv[1][0] == 104) {  // h: the helper
+      if (!start_helper(ip)) {
+        println("port {HELPER_PORT} is taken");
+        return 1;
+      }
+      println("helping: waiting for work");
+      g_helper_machine.cores.run();
+      g_helper_machine.link.stop();
+      return 0;
+    }
+    return run_boss(ip);
+  }
+  // Both machines in this process.
+  var here: uint32 = alph_ip4(127, 0, 0, 1);
+  if (!start_helper(here)) {
+    println("port {HELPER_PORT} is taken");
+    return 1;
+  }
+  var helper: int64 = CreateThread(0, 0, &helper_main, 0, 0, 0);
+  var out: int32 = run_boss(here);
+  thread_join_infinite(helper);
+  thread_close(helper);
+  g_helper_machine.link.stop();
+  return out;
+}
