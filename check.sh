@@ -121,6 +121,38 @@ if [ "$#" -eq 0 ] && command -v qemu-system-riscv32 > /dev/null 2>&1; then
   fi
 fi
 
+# A board tied to this machine by its serial line: the board in QEMU, the
+# other end a Linux process, 200 requests and replies between them.
+if [ "$#" -eq 0 ] && command -v qemu-system-riscv32 > /dev/null 2>&1; then
+  bin="$OUT/tether.bin"
+  host="$OUT/tether_host"
+  log="$OUT/tether.log"
+  if ! "$METTLE" --release examples/mcu/tether.mettle --target riscv32-none --board qemu-virt \
+      --emit-flat "$bin" -I ports/mcu > "$log" 2>&1 ||
+     ! "$METTLE" --build -s --release examples/mcu/tether_host.mettle -I ports/host -o "$host" >> "$log" 2>&1; then
+    echo "FAIL  mcu/tether build (see $log)"
+    fails=$((fails + 1))
+  else
+    size=$(stat -c %s "$bin")
+    port=$((7421 + $$ % 500))
+    "$host" "$port" >> "$log" 2>&1 &
+    host_pid=$!
+    sleep 0.3
+    timeout 30 qemu-system-riscv32 -M virt -bios none -display none -monitor none \
+      -serial "tcp:127.0.0.1:$port" -device loader,file="$bin",addr=0x80000000,force-raw=on >> "$log" 2>&1
+    board=$?
+    wait "$host_pid"
+    code=$?
+    if [ "$code" -eq 0 ] && [ "$board" -eq 0 ] && [ "$size" -lt "$MCU_LIMIT" ]; then
+      echo "ok    mcu/tether [riscv32, $size bytes, with a Linux process on its line]"
+    else
+      echo "FAIL  mcu/tether: host exit $code, board exit $board, $size bytes (see $log)"
+      tail -n 4 "$log" | sed 's/^/      /'
+      fails=$((fails + 1))
+    fi
+  fi
+fi
+
 if [ "$fails" -eq 0 ]; then
   echo "PASS"
 else

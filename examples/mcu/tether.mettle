@@ -1,0 +1,43 @@
+// A board as a place among bigger machines. This is the board's side: one
+// actor that answers a number with the next one, over the serial line, to
+// whoever asks from the machine at the other end. tests/t_tether.mettle is
+// that machine.
+//
+//   mettle --release examples/mcu/tether.mettle --target riscv32-none \
+//       --board qemu-virt --emit-flat tether.bin -I ports/mcu
+
+import "alph/actor/actor";
+import "alph/tether/tether";
+
+const PING: Word = 1;
+const PONG: Word = 2;
+const QUIT: Word = 3;
+
+var g_node: AlphNode;
+var g_actors: AlphActor[2];
+var g_mail: AlphMsg[8];
+var g_tether: AlphTether;
+
+@interrupt fn mettle_trap() {
+  mettle_board_exit(99);
+}
+
+fn answerer(a: AlphActor*, m: AlphMsg*) -> Word {
+  if (m->tag == QUIT) {
+    a->node->stop();
+    return 0;
+  }
+  a->reply(m, PONG, m->arg + 1);
+  return 0;
+}
+
+// The board is place 1. The machine on the line is place 0.
+fn main() -> int32 {
+  g_node.init(&g_actors[0], 2, &g_mail[0], 4);
+  mettle_board_trap_install();
+  g_tether.init(&g_node, 1, 0, 1);
+  g_node.spawn(&answerer, 0);
+  mettle_irq_enable();
+  g_node.run();
+  return 0;
+}

@@ -1,0 +1,89 @@
+// A line of bytes to one other machine: any descriptor that carries bytes
+// both ways, such as a serial port or a TCP connection. A thread reads it
+// and hands each byte that arrives to take. A process has one line.
+
+import "std/thread";
+
+const SYS_READ: int64 = 0;
+const SYS_WRITE: int64 = 1;
+const SYS_SENDTO: int64 = 44;
+const MSG_NOSIGNAL: int64 = 16384;
+const EINTR: int64 = -4;
+const ENOTSOCK: int64 = -88;
+
+extern fn mettle_atomic_exchange_i32(target: int32*, value: int32) -> int32 with none = "mettle_atomic_exchange_i32";
+extern fn mettle_atomic_compare_exchange_i32(target: int32*, exchange: int32, comparand: int32) -> int32 with none = "mettle_atomic_compare_exchange_i32";
+
+var g_lock: int32 = 0;
+
+var g_fd: int64 = -1;
+var g_take: fn(rawptr, int32) -> void;
+var g_ctx: rawptr;
+var g_out: uint8[128];
+var g_have: int64 = 0;
+
+// The descriptor the line is: set it before the line is started. It must
+// wait when read (not be set non-blocking).
+export fn alph_line_open(fd: int64) {
+  g_fd = fd;
+}
+
+fn alph_line_main(arg: cstring) -> uint32 {
+  var bytes: uint8[256];
+  while (true) {
+    var got: int64 = syscall(SYS_READ, g_fd, (int64)&bytes[0], 256);
+    if (got <= 0) {
+      return 0;  // the other end is gone
+    }
+    for i in 0..got {
+      g_take(g_ctx, (int32)bytes[i]);
+    }
+  }
+  return 0;
+}
+
+export fn alph_line_start(take: fn(rawptr, int32) -> void, ctx: rawptr) {
+  g_take = take;
+  g_ctx = ctx;
+  CreateThread(0, 0, &alph_line_main, 0, 0, 0);
+}
+
+export fn alph_line_put(byte: uint8) {
+  if (g_have == 128) {
+    alph_line_flush();
+  }
+  g_out[g_have] = byte;
+  g_have = g_have + 1;
+}
+
+// Sends what was put. If the other end is gone the rest is dropped.
+export fn alph_line_flush() {
+  var sent: int64 = 0;
+  while (sent < g_have) {
+    // As a send that raises no signal: a plain write to a connection whose
+    // other end is gone would end the process with SIGPIPE.
+    var put: int64 = syscall(SYS_SENDTO, g_fd, (int64)&g_out[sent], g_have - sent, MSG_NOSIGNAL, 0, 0);
+    if (put == ENOTSOCK) {
+      put = syscall(SYS_WRITE, g_fd, (int64)&g_out[sent], g_have - sent);
+    }
+    if (put == EINTR) {
+      continue;
+    }
+    if (put <= 0) {
+      break;
+    }
+    sent = sent + put;
+  }
+  g_have = 0;
+}
+
+// Held while one whole message is put and flushed, so two senders' bytes
+// do not mix.
+export fn alph_line_lock() {
+  while (mettle_atomic_exchange_i32(&g_lock, 1) != 0) {
+  }
+}
+
+export fn alph_line_unlock() {
+  mettle_atomic_compare_exchange_i32(&g_lock, 0, 1);
+}

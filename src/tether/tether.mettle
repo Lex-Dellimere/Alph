@@ -1,0 +1,190 @@
+// A tether: a node tied to one other machine by a line of bytes, such as a
+// board's serial port. It is the small way for a microcontroller to be a
+// place among bigger machines: no numbering, no beats, nothing sent again.
+// A message goes over once, and a byte lost on the line loses it.
+//
+// A message is 34 bytes on the line, then a byte that marks its end. The
+// pids in it are their three parts, because a 32-bit board and a 64-bit
+// server pack them differently. A pid too big for this machine's word
+// cannot be held here, so its message is dropped: an actor on a bigger
+// machine talks to a board if its place is below 256, its slot below 1,024
+// and its generation below 8,192, which holds for actors spawned at the
+// start. A message's tag, arg and ref cross as 32 bits each, so a bigger
+// machine's larger numbers are cut short.
+//
+// A process has one line, and so one tether.
+
+import "port/port";
+import "port/line";
+import "alph/actor/actor";
+
+const END: int32 = 192;      // ends a message on the line
+const ESC: int32 = 219;      // the next byte stands for an END or an ESC in the message
+const ESC_END: int32 = 220;
+const ESC_ESC: int32 = 221;
+const BYTES: Word = 34;
+const TOP: Word = -2147483648;  // bit 31 and every bit above it
+
+export struct AlphTether {
+  node: AlphNode*;
+  first: Word;    // the other machine's places are first, first + 1, ...
+  count: Word;
+  have: Word;
+  escaped: Word;
+  dropped: Word;  // messages that came in damaged, or with a pid too big for here
+  frame: uint8[34];
+}
+
+fn alph_tether_put(out: uint8*, value: Word, bytes: Word) {
+  for i in 0..bytes {
+    out[i] = (uint8)((value >> ((Word)i * 8)) & 255);
+  }
+}
+
+fn alph_tether_get(from: uint8*, bytes: Word) -> Word {
+  var value: Word = 0;
+  for i in 0..bytes {
+    value = (Word)(value | ((Word)from[i] << ((Word)i * 8)));
+  }
+  return value;
+}
+
+fn alph_tether_sum(frame: uint8*) -> Word {
+  var sum: Word = 0;
+  for i in 0..32 {
+    sum = (Word)((sum + (Word)frame[i] * ((Word)i + 1)) & 65535);
+  }
+  return sum;
+}
+
+// Writes a pid's three parts: place in 2 bytes, generation and slot in 4 each.
+fn alph_tether_pack(out: uint8*, place_at: Word, parts_at: Word, pid: Word) {
+  var gens: Word = (Word)(((Word)1 << (ALPH_PLACE_SHIFT - ALPH_INDEX_BITS)) - 1);
+  var slots: Word = (Word)(((Word)1 << ALPH_INDEX_BITS) - 1);
+  alph_tether_put(&out[place_at], (Word)(pid >> ALPH_PLACE_SHIFT), 2);
+  alph_tether_put(&out[parts_at], (Word)((pid >> ALPH_INDEX_BITS) & gens), 4);
+  alph_tether_put(&out[parts_at + 4], (Word)(pid & slots), 4);
+}
+
+// Reads a pid's three parts. Returns -1 when they do not fit a pid here.
+fn alph_tether_unpack(from: uint8*, place_at: Word, parts_at: Word) -> Word {
+  var place: Word = alph_tether_get(&from[place_at], 2);
+  var gen: Word = alph_tether_get(&from[parts_at], 4);
+  var slot: Word = alph_tether_get(&from[parts_at + 4], 4);
+  if (gen < 0 || slot < 0 || (Word)(gen >> (ALPH_PLACE_SHIFT - ALPH_INDEX_BITS)) != 0 || (Word)(slot >> ALPH_INDEX_BITS) != 0) {
+    return -1;
+  }
+  var pid: Word = (Word)((place << ALPH_PLACE_SHIFT) | (gen << ALPH_INDEX_BITS) | slot);
+  if (pid < 0 || (Word)(pid >> ALPH_PLACE_SHIFT) != place) {
+    return -1;
+  }
+  return pid;
+}
+
+fn alph_tether_byte(byte: int32) {
+  if (byte == END) {
+    alph_line_put((uint8)ESC);
+    alph_line_put((uint8)ESC_END);
+  } else if (byte == ESC) {
+    alph_line_put((uint8)ESC);
+    alph_line_put((uint8)ESC_ESC);
+  } else {
+    alph_line_put((uint8)byte);
+  }
+}
+
+// Mail for a place on the other machine.
+fn alph_tether_far(n: AlphNode*, to: Word, m: AlphMsg*) -> Word {
+  var t: AlphTether* = (AlphTether*)n->world;
+  var place: Word = (Word)(to >> ALPH_PLACE_SHIFT);
+  var out: uint8[34];
+  if (place < t->first || place >= t->first + t->count) {
+    return ALPH_GONE;
+  }
+  alph_tether_pack(&out[0], 0, 4, to);
+  alph_tether_pack(&out[0], 2, 12, m->from);
+  alph_tether_put(&out[20], m->tag, 4);
+  alph_tether_put(&out[24], m->arg, 4);
+  alph_tether_put(&out[28], m->ref, 4);
+  alph_tether_put(&out[32], alph_tether_sum(&out[0]), 2);
+  // One message at a time on the line. The line has a lock of its own and
+  // not the node's gate: a slow line must not stop the node, and the two
+  // machines must each go on reading while they write.
+  alph_line_lock();
+  for i in 0..34 {
+    alph_tether_byte((int32)out[i]);
+  }
+  alph_line_put((uint8)END);
+  alph_line_flush();
+  alph_line_unlock();
+  return ALPH_OK;
+}
+
+// A word of 4 bytes off the line, with its sign.
+fn alph_tether_word(from: uint8*) -> Word {
+  var value: Word = alph_tether_get(from, 4);
+  if ((Word)((value >> 31) & 1) != 0) {
+    value = (Word)(value | TOP);
+  }
+  return value;
+}
+
+// The line's bytes come here one at a time.
+fn alph_tether_take(ctx: rawptr, byte: int32) {
+  var t: AlphTether* = (AlphTether*)ctx;
+  if (byte != END) {
+    var b: int32 = byte;
+    if (t->escaped != 0) {
+      t->escaped = 0;
+      if (b == ESC_END) {
+        b = END;
+      } else {
+        b = ESC;
+      }
+    } else if (b == ESC) {
+      t->escaped = 1;
+      return;
+    }
+    // A message too long is counted as far as one past its length, so a
+    // line that never ends one cannot run the count round.
+    if (t->have < BYTES) {
+      t->frame[t->have] = (uint8)b;
+    }
+    if (t->have <= BYTES) {
+      t->have = t->have + 1;
+    }
+    return;
+  }
+  var whole: bool = t->have == BYTES && alph_tether_get(&t->frame[32], 2) == alph_tether_sum(&t->frame[0]);
+  var had: Word = t->have;
+  t->have = 0;
+  t->escaped = 0;
+  if (had == 0) {
+    return;  // an END with nothing before it only clears the line
+  }
+  var to: Word = alph_tether_unpack(&t->frame[0], 0, 4);
+  var from: Word = alph_tether_unpack(&t->frame[0], 2, 12);
+  if (!whole || to < 0 || from < 0 || (Word)(to >> ALPH_PLACE_SHIFT) != t->node->place) {
+    t->dropped = t->dropped + 1;
+    return;
+  }
+  var m: AlphMsg = { tag: alph_tether_word(&t->frame[20]), from: from, arg: alph_tether_word(&t->frame[24]),
+                     ref: alph_tether_word(&t->frame[28]) };
+  t->node->put(to, &m);
+}
+
+// Ties a node to the machine at the other end of the port's line. The node
+// is place `place`. The other machine's places are first, first + 1, ...
+// Call it before the first spawn.
+export fn AlphTether_init__ptr(t: AlphTether*, node: AlphNode*, place: Word, first: Word, count: Word) {
+  t->node = node;
+  t->first = first;
+  t->count = count;
+  t->have = 0;
+  t->escaped = 0;
+  t->dropped = 0;
+  node->join(place, &alph_tether_far, (rawptr)t);
+  alph_line_put((uint8)END);
+  alph_line_flush();
+  alph_line_start(&alph_tether_take, (rawptr)t);
+}

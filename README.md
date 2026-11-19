@@ -61,6 +61,7 @@ This is [examples/count.mettle](examples/count.mettle). The node owns no memory:
 | Links | Other machines over UDP. Messages arrive once and in order, and a lost machine is noticed in half a second | [src/link](src/link/link.mettle) |
 | Names and the door | Find an actor on another machine by name, and watch it | [src/name](src/name/name.mettle), [src/door](src/door/door.mettle) |
 | Seals | A link only the holders of one key can read or speak on | [src/seal](src/seal/seal.mettle) |
+| Tether | A microcontroller tied to a bigger machine by its serial line: each side's actors reach the other's by pid | [src/tether](src/tether/tether.mettle) |
 | Ports | What differs per device: `mcu` (one hart, no OS) and `host` (x86-64 Linux) | [ports](ports) |
 
 [docs/start.md](docs/start.md) shows how to use each of these. [docs/design.md](docs/design.md) explains why they are built this way, what was measured, and what is not built yet.
@@ -110,6 +111,15 @@ mettle --release examples/mcu/blink.mettle --target riscv32-none --board qemu-vi
 qemu-system-riscv32 -M virt -bios none -nographic -device loader,file=blink.bin,addr=0x80000000,force-raw=on
 ```
 
+A board and a Linux process on its serial line, [examples/mcu/tether.mettle](examples/mcu/tether.mettle) and [examples/mcu/tether_host.mettle](examples/mcu/tether_host.mettle). The board's image is 3.8 KB:
+
+```bash
+mettle --release examples/mcu/tether.mettle --target riscv32-none --board qemu-virt --emit-flat tether.bin -I ports/mcu
+mettle --build -s --release examples/mcu/tether_host.mettle -I ports/host -o tether_host
+./tether_host 7421 &
+qemu-system-riscv32 -M virt -bios none -display none -monitor none -serial tcp:127.0.0.1:7421 -device loader,file=tether.bin,addr=0x80000000,force-raw=on
+```
+
 ## What it does not do yet
 
 - A sealed link has one key for the whole network: any holder can speak as any machine, and someone who gets the key later can read what they recorded before.
@@ -117,7 +127,7 @@ qemu-system-riscv32 -M virt -bios none -nographic -device loader,file=blink.bin,
 - Timers look at every timer slot: right for tens of timers, not thousands.
 - Sockets are Linux only, and there is no file IO.
 - A message between two cores costs 150 to 300 ns against about 20 ns inside a node.
-- The microcontroller port has no link to other machines.
+- A microcontroller reaches other machines only over a serial line to one of them, and nothing lost on that line is sent again.
 
 ## Test
 
@@ -147,6 +157,7 @@ src/link/link.mettle        links: other machines, over UDP
 src/name/name.mettle        names: a number for a pid
 src/door/door.mettle        the door: find and watch actors on other machines
 src/seal/seal.mettle        seals: an encrypted and signed link (needs the cryptex package)
+src/tether/tether.mettle    tether: a board and a bigger machine on a serial line
 ports/mcu, ports/host       what differs per device, picked with -I ports/<name>
 src/alph.mettle             the first runtime in one import
 src/core, src/heal, src/work, src/net, src/io, src/sched, src/sys

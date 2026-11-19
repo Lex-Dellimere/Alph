@@ -491,7 +491,36 @@ mettle --release examples/mcu/blink.mettle --target riscv32-none --board qemu-vi
 qemu-system-riscv32 -M virt -bios none -nographic -device loader,file=blink.bin,addr=0x80000000,force-raw=on
 ```
 
-The whole image of this program, board startup included, is 3,256 bytes: about 1.3 KB of core, 1.1 KB of timers and alarm, and the rest the board and the program. `check.sh` fails the build above 5 KB. The microcontroller port has no link to other machines.
+The whole image of this program, board startup included, is 3,256 bytes: about 1.3 KB of core, 1.1 KB of timers and alarm, and the rest the board and the program. `check.sh` fails the build above 5 KB.
+
+**A board among bigger machines.** `AlphTether` ties a node to one other machine by a line of bytes: on a board, its serial port. Each side's actors then reach the other's by pid, as with any other place. This is the board's side, [examples/mcu/tether.mettle](../examples/mcu/tether.mettle): the board is place 1 and the machine on the line is place 0.
+
+```mettle
+import "alph/tether/tether";
+
+var g_tether: AlphTether;
+
+fn answerer(a: AlphActor*, m: AlphMsg*) -> Word {
+  if (m->tag == QUIT) {
+    a->node->stop();
+    return 0;
+  }
+  a->reply(m, PONG, m->arg + 1);
+  return 0;
+}
+
+fn main() -> int32 {
+  g_node.init(&g_actors[0], 2, &g_mail[0], 4);
+  mettle_board_trap_install();
+  g_tether.init(&g_node, 1, 0, 1);
+  g_node.spawn(&answerer, 0);
+  mettle_irq_enable();
+  g_node.run();
+  return 0;
+}
+```
+
+`init(node, place, first, count)` makes the node place `place` and sends mail for places `first` to `first + count - 1` down the line. Call it before the first spawn. The other end is the same layer on the host port, given the line's descriptor with `alph_line_open(fd)` first, as [examples/mcu/tether_host.mettle](../examples/mcu/tether_host.mettle) does with a TCP connection from QEMU. A message goes over once: a byte lost on the line loses it. A pid from the bigger machine has to fit the board's word (place below 256, slot below 1,024, generation below 8,192), which holds for actors spawned at the start; a message whose pids do not fit is dropped.
 
 ## Limits
 
@@ -502,7 +531,7 @@ These are not built yet.
 - Timers look at every timer slot: right for tens of timers, not thousands. A timer wheel behind the same four functions is not built.
 - Sockets are Linux only, and there is no file IO.
 - A message between two cores costs 150 to 300 ns against about 20 ns inside a node. Removing that needs a queue per pair of cores that the sender writes without touching anything the receiver owns, which changes what a full mailbox can tell a sender. Not built.
-- The microcontroller port has no link to other machines.
+- A microcontroller reaches other machines only over a serial line to one of them, and nothing lost on that line is sent again.
 - A full mailbox at the far end of a link drops its message and the sender is not told.
 - Peers are listed by hand.
 - A watch cannot be dropped across machines.

@@ -1,0 +1,174 @@
+// The tether (src/tether) on its own: the test is the machine at the other
+// end of the line and speaks its bytes by hand. A sound message arrives,
+// also when its bytes include the two that have to be escaped; a damaged
+// one, a short one, one with a pid too big for here and one for another
+// place are dropped; and what an actor sends comes out on the line as the
+// format says.
+
+import "std/io";
+import "std/thread";
+import "port/line";
+import "alph/actor/actor";
+import "alph/tether/tether";
+
+const NOTE: Word = 1;
+const END: uint8 = 192;
+const ESC: uint8 = 219;
+
+var g_node: AlphNode;
+var g_actors: AlphActor[2];
+var g_mail: AlphMsg[16];
+var g_tether: AlphTether;
+var g_failures: int32 = 0;
+
+fn expect(ok: bool, what: string) {
+  if (!ok) {
+    println("FAIL {what}");
+    g_failures = g_failures + 1;
+  }
+}
+
+struct Seen {
+  notes: Word;
+  from: Word;
+  arg: Word;
+  ref: Word;
+}
+
+fn sink(a: AlphActor*, m: AlphMsg*) -> Word {
+  var s: Seen* = (Seen*)a->state;
+  s->notes = s->notes + 1;
+  s->from = m->from;
+  s->arg = m->arg;
+  s->ref = m->ref;
+  return 0;
+}
+
+fn put(out: uint8*, value: int64, bytes: int64) {
+  for i in 0..bytes {
+    out[i] = (uint8)((value >> ((int64)i * 8)) & 255);
+  }
+}
+
+// A message as the line carries it, before the escapes: to and from as
+// place, generation and slot, then tag, arg, ref and the sum.
+fn frame(out: uint8*, to_place: int64, to_gen: int64, to_slot: int64, from_place: int64, from_gen: int64,
+         from_slot: int64, tag: int64, arg: int64, ref: int64) {
+  put(&out[0], to_place, 2);
+  put(&out[2], from_place, 2);
+  put(&out[4], to_gen, 4);
+  put(&out[8], to_slot, 4);
+  put(&out[12], from_gen, 4);
+  put(&out[16], from_slot, 4);
+  put(&out[20], tag, 4);
+  put(&out[24], arg, 4);
+  put(&out[28], ref, 4);
+  var sum: int64 = 0;
+  for i in 0..32 {
+    sum = (sum + (int64)out[i] * ((int64)i + 1)) & 65535;
+  }
+  put(&out[32], sum, 2);
+}
+
+// Sends a frame down the line with its escapes and its END.
+fn speak(fd: int64, plain: uint8*, count: int64) {
+  var out: uint8[80];
+  var n: int64 = 0;
+  for i in 0..count {
+    if (plain[i] == END) {
+      out[n] = ESC;
+      out[n + 1] = 220;
+      n = n + 2;
+    } else if (plain[i] == ESC) {
+      out[n] = ESC;
+      out[n + 1] = 221;
+      n = n + 2;
+    } else {
+      out[n] = plain[i];
+      n = n + 1;
+    }
+  }
+  out[n] = END;
+  syscall(1, fd, (int64)&out[0], n + 1);
+}
+
+// Runs what has arrived, giving the line's thread time to hand it over.
+fn settle(want: Word, s: Seen*) {
+  var tries: int32 = 0;
+  while (s->notes < want && tries < 200) {
+    g_node.turn();
+    Sleep(1);
+    tries = tries + 1;
+  }
+  Sleep(20);
+  g_node.turn();
+}
+
+fn main() -> int32 {
+  var ends: int64[2];
+  var s: Seen;
+  var f: uint8[34];
+  var back: uint8[80];
+  s.notes = 0;
+  expect(syscall(53, 1, 1, 0, (int64)&ends[0]) == 0, "a pair of sockets for the line");
+  var mine: int64 = (int64)(*(int32*)&ends[0]);
+  var theirs: int64 = (int64)(*((int32*)&ends[0] + 1));
+  alph_line_open(mine);
+
+  // This machine is place 5. The one on the line is places 0 and 1.
+  g_node.init(&g_actors[0], 2, &g_mail[0], 8);
+  g_tether.init(&g_node, 5, 0, 2);
+  var pid: Word = g_node.spawn(&sink, (rawptr)&s);
+  var gen: int64 = (int64)((pid >> ALPH_INDEX_BITS) & 16777215);
+
+  // The tether clears the line when it starts.
+  expect(syscall(0, theirs, (int64)&back[0], 80) == 1 && back[0] == END, "the line is cleared with one END");
+
+  // A sound message arrives, with its sender and its words.
+  frame(&f[0], 5, gen, 0, 1, 3, 7, (int64)NOTE, 41, 9);
+  speak(theirs, &f[0], 34);
+  settle(1, &s);
+  expect(s.notes == 1 && s.arg == 41 && s.ref == 9, "a sound message arrives");
+  expect(s.from == (Word)(((Word)1 << ALPH_PLACE_SHIFT) | ((Word)3 << ALPH_INDEX_BITS) | 7), "from the pid its three parts make");
+
+  // One whose bytes include the END and the ESC, and a negative number.
+  frame(&f[0], 5, gen, 0, 1, 3, 7, (int64)NOTE, 192 + 219 * 256, -2);
+  speak(theirs, &f[0], 34);
+  settle(2, &s);
+  expect(s.notes == 2 && s.arg == 192 + 219 * 256 && s.ref == -2, "bytes that have to be escaped come through, and a negative word");
+
+  // Damaged, short, too big for a pid here, and for another place.
+  frame(&f[0], 5, gen, 0, 1, 3, 7, (int64)NOTE, 1, 1);
+  f[25] = f[25] + 1;
+  speak(theirs, &f[0], 34);
+  frame(&f[0], 5, gen, 0, 1, 3, 7, (int64)NOTE, 1, 1);
+  speak(theirs, &f[0], 20);
+  frame(&f[0], 5, gen, 0, 1, 3, 16777216 * 16, (int64)NOTE, 1, 1);
+  speak(theirs, &f[0], 34);
+  frame(&f[0], 6, gen, 0, 1, 3, 7, (int64)NOTE, 1, 1);
+  speak(theirs, &f[0], 34);
+  settle(3, &s);
+  expect(s.notes == 2, "none of four false messages arrives ({s.notes - 2} did)");
+  expect(g_tether.dropped == 4, "all four are counted as dropped ({g_tether.dropped})");
+
+  // What an actor here sends comes out on the line as the format says.
+  var there: Word = (Word)(((Word)1 << ALPH_PLACE_SHIFT) | ((Word)2 << ALPH_INDEX_BITS) | 4);
+  expect(g_node.send(there, NOTE, 77) == ALPH_OK, "a message for the other machine is taken");
+  expect(g_node.send((Word)(((Word)3 << ALPH_PLACE_SHIFT) | ((Word)1 << ALPH_INDEX_BITS)), NOTE, 0) == ALPH_GONE, "a place the line does not lead to is gone");
+  var got: int64 = syscall(0, theirs, (int64)&back[0], 80);
+  frame(&f[0], 1, 2, 4, 0, 0, 0, (int64)NOTE, 77, 0);
+  var same: bool = got == 35 && back[34] == END;
+  for i in 0..34 {
+    if (back[i] != f[i]) {
+      same = false;
+    }
+  }
+  expect(same, "it is 34 bytes and an END, as the format says ({got} bytes)");
+
+  syscall(3, theirs);
+  if (g_failures != 0) {
+    return 1;
+  }
+  println("tether ok: 2 messages in, 4 false ones dropped, 1 out as the format says");
+  return 0;
+}
