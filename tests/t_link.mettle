@@ -1,8 +1,9 @@
 // Links (src/link): two machines in one process, each with its own cores,
 // talking over UDP on this computer. Requests and replies cross, a machine
 // not yet heard or not known is gone, one that goes quiet is noticed in
-// under a second, one that comes back is reachable again as a new one, and
-// mail that is malformed, misaddressed or from an earlier run is dropped.
+// under a second, one that comes back is reachable again as a new one,
+// messages lost on the way are sent again, and mail that is malformed,
+// misaddressed, repeated, out of turn or from an earlier run is dropped.
 
 import "std/io";
 import "std/thread";
@@ -47,6 +48,12 @@ fn now_ms() -> Word {
   return (Word)(ts[0] * 1000 + ts[1] / 1000000);
 }
 
+fn now_us() -> Word {
+  var ts: int64[2];
+  syscall(228, 1, (int64)&ts[0]);
+  return (Word)(ts[0] * 1000000 + ts[1] / 1000);
+}
+
 fn ponger(a: AlphActor*, m: AlphMsg*) -> Word {
   a->reply(m, PONG, m->arg + 1);
   return 0;
@@ -61,6 +68,7 @@ struct Driver {
   ups: Word;
   downs: Word;
   down_at: Word;
+  half_at: Word;  // us on the clock when half the rounds were done
 }
 
 fn driver(a: AlphActor*, m: AlphMsg*) -> Word {
@@ -85,6 +93,9 @@ fn driver(a: AlphActor*, m: AlphMsg*) -> Word {
     d->bad = d->bad + 1;
   }
   d->rounds = m->arg;
+  if (d->rounds == d->want / 2) {
+    d->half_at = now_us();
+  }
   if (d->rounds >= d->want) {
     a->cores()->stop();
     return 0;
@@ -101,6 +112,8 @@ struct Forged {
   from_place: uint32;
   from_life: uint32;
   to_life: uint32;
+  ack: uint32;
+  seq: uint32;
   to_place: uint32;
   to_gen: uint32;
   to_index: uint32;
@@ -150,7 +163,7 @@ fn stop_b() {
 }
 
 fn main() -> int32 {
-  var port_a: int64 = 21000 + (syscall(39) % 20000) * 2;
+  var port_a: int64 = 12000 + (syscall(39) % 5000) * 4;  // below the ports the system hands out itself
   var port_b: int64 = port_a + 1;
   var d: Driver;
   d.rounds = 0;
@@ -175,9 +188,8 @@ fn main() -> int32 {
   start_b(port_a, port_b);
   expect(g_ponger == there, "the ponger is where A expects it");
   d.want = ROUNDS;
-  var began: Word = now_ms();
   g_a.run();
-  var each_us: Word = (Word)((now_ms() - began) * 1000 / ROUNDS);
+  var each_us: Word = (Word)((now_us() - d.half_at) / (ROUNDS / 2));  // the second half: B is known by then
   expect(d.ups == 1, "A is told once that B is up ({d.ups})");
   expect(d.rounds == ROUNDS, "every round crossed and came back ({d.rounds})");
   expect(d.bad == 0, "each reply came from the ponger with its request's ref ({d.bad} did not)");
@@ -204,6 +216,37 @@ fn main() -> int32 {
   expect(d.rounds == 100 && d.bad == 0, "requests cross again ({d.rounds} rounds, {d.bad} bad)");
   expect(g_a_peers[0].life != first_life, "the B that came back is a new one");
 
+  // One message in four from A and one in three from B is lost on the way.
+  // Every round still crosses, in order, because what is lost is sent again.
+  g_a_link.lose = 4;
+  g_b_link.lose = 3;
+  d.rounds = 0;
+  d.want = 60;
+  d.ref = g_a_actors[0].ask(g_ponger, PING, 0);
+  g_a.run();
+  expect(d.rounds == 60 && d.bad == 0, "with messages lost on the way every round still crosses ({d.rounds} rounds, {d.bad} bad)");
+  expect(g_a_link.resent > 0 && g_b_link.resent > 0, "because they were sent again ({g_a_link.resent} and {g_b_link.resent} times)");
+  var resent: Word = g_a_link.resent + g_b_link.resent;
+  g_a_link.lose = 0;
+  g_b_link.lose = 0;
+
+  // B is out of A's hearing for a while, though it never stopped. A calls
+  // it down, then up again, and messages cross as before: the same run of
+  // B, so the numbering carries on where it was.
+  var b_run: uint32 = g_a_peers[0].life;
+  var ups: Word = d.ups;
+  var downs: Word = d.downs;
+  d.want = 0;
+  g_a_link.deaf = 1;
+  g_a.run();
+  expect(d.downs == downs + 1, "a machine out of hearing is called down");
+  g_a_link.deaf = 0;
+  d.rounds = 0;
+  d.want = 100;
+  g_a.run();
+  expect(d.ups == ups + 1 && g_a_peers[0].life == b_run, "it is up again, the same run of it");
+  expect(d.rounds == 100 && d.bad == 0, "and requests cross as before ({d.rounds} rounds, {d.bad} bad)");
+
   // What a faulty machine might send, from a third socket claiming to be B.
   var notes: Word = 0;
   var sink_pid: Word = g_a.spawn_on(1, &sink, (rawptr)&notes);
@@ -217,6 +260,8 @@ fn main() -> int32 {
   f.from_place = 2;
   f.from_life = b_life;
   f.to_life = g_a_link.life;
+  f.ack = 0;
+  f.seq = g_a_peers[0].got + 1;
   f.to_place = 1;
   f.to_gen = (uint32)((sink_pid >> ALPH_INDEX_BITS) & 16777215);
   f.to_index = (uint32)(sink_pid & 16777215);
@@ -227,26 +272,31 @@ fn main() -> int32 {
   f.tag = (int64)NOTE;
   f.arg = 0;
   f.ref = 0;
-  third.send(here, port_a, (uint8*)&f, 72);   // sound: arrives
+  third.send(here, port_a, (uint8*)&f, 80);   // sound: arrives
+  third.send(here, port_a, (uint8*)&f, 80);   // the same one again
+  f.seq = f.seq + 1;
   f.to_life = g_a_link.life + 1;
-  third.send(here, port_a, (uint8*)&f, 72);   // meant for another run of A
+  third.send(here, port_a, (uint8*)&f, 80);   // meant for another run of A
   f.to_life = g_a_link.life;
   f.to_place = 0;
   f.to_gen = f.to_gen + 16777216;             // spills into the place: names core 1 from core 0
-  third.send(here, port_a, (uint8*)&f, 72);
+  third.send(here, port_a, (uint8*)&f, 80);
   f.to_place = 1;
   f.to_gen = f.to_gen - 16777216;
   third.send(here, port_a, (uint8*)&f, 40);   // cut short
   f.from_life = b_life - 5000;                // from a run of B before this one
-  third.send(here, port_a, (uint8*)&f, 72);
+  third.send(here, port_a, (uint8*)&f, 80);
   f.from_life = b_life;
+  f.seq = f.seq + 3;
+  third.send(here, port_a, (uint8*)&f, 80);   // too early: the ones before it never came
+  f.seq = f.seq - 3;
   f.tag = (int64)END;
-  third.send(here, port_a, (uint8*)&f, 72);
+  third.send(here, port_a, (uint8*)&f, 80);
   g_a.run();
   third.close();
-  expect(notes == 1, "of five notes only the sound one arrives ({notes})");
+  expect(notes == 1, "of seven notes only the sound one arrives, once ({notes})");
   expect(g_a_peers[0].life == b_life, "mail from an earlier run of B does not bring that run back");
-  expect(d.ups == 2 && d.downs == 1, "and the watcher is told nothing new ({d.ups} ups, {d.downs} downs)");
+  expect(d.ups == ups + 1 && d.downs == downs + 1, "and the watcher is told nothing new ({d.ups} ups, {d.downs} downs)");
 
   stop_b();
   g_a_link.stop();
@@ -254,6 +304,6 @@ fn main() -> int32 {
   if (g_failures != 0) {
     return 1;
   }
-  println("link ok: {ROUNDS} requests between two machines at {each_us} us each, a lost machine noticed in {took} ms");
+  println("link ok: {ROUNDS} requests between two machines at {each_us} us each, {resent} lost messages sent again, a lost machine noticed in {took} ms");
   return 0;
 }

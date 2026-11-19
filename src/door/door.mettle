@@ -36,13 +36,19 @@ export fn alph_door_of(first: Word) -> Word {
 
 fn alph_door_run(a: AlphActor*, m: AlphMsg*) -> Word {
   var d: AlphDoor* = (AlphDoor*)a->state;
+  // An answer that cannot be sent yet (the way to that machine is full) is
+  // not dropped: the door sends itself the request and answers it later.
   if (m->tag == ALPH_WHERE) {
-    a->reply(m, ALPH_HERE, d->names->get(m->arg));
+    if (a->reply(m, ALPH_HERE, d->names->get(m->arg)) == ALPH_FULL) {
+      a->node->put(a->pid, m);
+    }
   } else if (m->tag == ALPH_WATCH) {
     var out: Word = d->life->watch_as(m->from, m->arg, m->ref);
     if (out != ALPH_OK) {
       var gone: AlphMsg = { tag: ALPH_ENDED, from: m->arg, arg: out, ref: m->ref };
-      a->node->put(m->from, &gone);
+      if (a->node->put(m->from, &gone) == ALPH_FULL) {
+        a->node->put(a->pid, m);
+      }
     }
   } else if (m->tag == ALPH_ENDED) {
     // Only another machine's door speaks for an actor that ended there.
@@ -101,8 +107,9 @@ export fn AlphDoor_find__ptr(d: AlphDoor*, a: AlphActor*, place: Word, name: Wor
 }
 
 // Has watcher sent ALPH_ENDED when target ends, wherever target is.
-// Returns the watch's ref, ALPH_FULL when every watch is in use, ALPH_GONE
-// when the target is gone or its machine cannot be reached. A target on
+// Returns the watch's ref, ALPH_FULL when every watch is in use or the way
+// to the target's machine is full for now, ALPH_GONE when the target is
+// gone or its machine cannot be reached. A target on
 // another machine that was already gone there is told as an end, with the
 // reason ALPH_GONE, and one that machine has no watch left for with the
 // reason ALPH_FULL.

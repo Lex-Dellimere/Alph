@@ -36,7 +36,7 @@ Not built: restart limits counted over time rather than in all, and groups that 
 
 `src/door` is how machines find and watch each other's actors, with nothing but messages. The door is the first actor a machine spawns, so its pid can be worked out from the machine's first place alone. An actor asks another machine's door for the pid behind a name and gets it back as a message. Watching works for an actor anywhere: for one on another machine, the door there keeps the watch and tells the watcher's door when the actor ends, and if that machine is lost first, the actor has ended with `ALPH_LOST`. Between two machines in one process: an actor found by name, a request answered, an end told across, and a lost machine's actors ended in about 540 ms.
 
-Not built: a watch cannot be dropped across machines, and since a message between machines can be lost, so can the word that an actor ended; the watcher then hears only if the machine is lost.
+Not built: a watch cannot be dropped across machines.
 
 ## Time
 
@@ -79,9 +79,9 @@ Placement is one decision made from measured costs, not three separate features.
 
    For the smallest tiles alph beats both, because it uses both. For the rest it matches the GPU. One limit is real: alph predicts a job's time from its size, and a Mandelbrot tile's time depends on where in the picture it is.
 
-3. **Machines.** Started, as `src/link`. Each machine owns a run of place numbers, so a pid says which machine its actor is on and an actor sends to it the way it sends next door. A message crosses in one UDP datagram. On the wire a pid is its three parts, because a 32-bit board and a 64-bit server pack them differently. Every machine tells its peers it is alive 20 times a second. One that stays quiet for half a second is down: sends to it are refused and a watcher actor is told. A machine that comes back counts as a new one, so mail meant for the old one is not handed to the new. Measured between two machines in one process over this computer's loopback: a request and its reply in under 40 µs, a lost machine noticed in 500 to 570 ms over 50 runs.
+3. **Machines.** Built as `src/link`. Each machine owns a run of place numbers, so a pid says which machine its actor is on and an actor sends to it the way it sends next door. A message crosses in one UDP datagram. On the wire a pid is its three parts, because a 32-bit board and a 64-bit server pack them differently. Messages to a machine are numbered, the machine says how far it has them, and what it has not got in 40 ms is sent again, so between two machines messages arrive once and in order while both are up. Every machine tells its peers it is alive 20 times a second. One that stays quiet for half a second is down: sends to it are refused and a watcher actor is told. One that was only out of reach carries on where it was. One that was restarted counts as a new machine, so mail meant for the old one is not handed to the new. Measured between two machines in one process over this computer's loopback, on a busy machine: a request and its reply in 45 to 65 µs, every request still crossing with a quarter to a third of the messages deliberately lost, a lost machine noticed in 500 to 570 ms.
 
-   What it does not do yet: a message arrives once or not at all, and nothing is sent again; nothing is encrypted or signed, so it is for a network you trust; peers are listed by hand; a job from `src/place` cannot go to another machine; and there is no link for the `mcu` port. The first runtime's `src/net/dist` has encryption and remote links and monitors, which move over later.
+   What it does not do yet: a full mailbox at the far end drops its message and the sender is not told; nothing is encrypted or signed, so it is for a network you trust; peers are listed by hand; and there is no link for the `mcu` port. The first runtime's `src/net/dist` has encryption, which moves over later.
 
 ## Crossings
 

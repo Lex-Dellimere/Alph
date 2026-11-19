@@ -2,12 +2,17 @@
 // numbers, so a pid says which machine its actor is on, and an actor sends
 // to it the way it sends next door.
 //
-// A message crosses in one datagram. It arrives once or not at all: nothing
-// is sent again, and a full mailbox at the far end drops it. Every machine
-// tells its peers it is alive 20 times a second. One that stays quiet for
-// half a second is down: sends to it return ALPH_GONE and the watcher is
-// told. A machine that comes back is a new one, with a new life, so mail
-// meant for the old one is not handed to the new.
+// A message crosses in one datagram. Messages to a machine are numbered,
+// the machine says how far it has them, and what it has not got in a
+// twenty-fifth of a second is sent again: so between two machines messages
+// arrive once and in the order they were sent, for as long as both are up.
+// A full mailbox at the far end still drops its message, and the sender is
+// not told. Every machine tells its peers it is alive 20 times a second.
+// One that stays quiet for half a second is down: sends to it return
+// ALPH_GONE and the watcher is told. If it was only out of reach, what was
+// on its way is sent again when it is back. A machine that was restarted is
+// a new one, with a new life: what was on its way to the old one is lost,
+// and mail meant for the old one is not handed to the new.
 //
 // Nothing is encrypted or signed yet: use it on a network you trust.
 
@@ -25,17 +30,22 @@ const BEAT: uint32 = 1;
 const MAIL: uint32 = 2;
 const BEAT_MS: Word = 50;
 const DOWN_MS: Word = 500;
-const BEAT_BYTES: int64 = 20;
-const MAIL_BYTES: int64 = 72;
+const BEAT_BYTES: int64 = 24;
+const MAIL_BYTES: int64 = 80;
+const WINDOW: uint32 = 64;   // messages to one machine that may be waiting for its word
+const AGAIN_MS: Word = 40;   // how long that word is waited for before sending again
+const ACK_EVERY: Word = 16;  // messages taken before saying so at once
 
 // A pid on the wire is its three parts, because machines of different word
-// sizes pack them differently.
+// sizes pack them differently. The first six fields are a beat.
 struct AlphPacket {
   magic: uint32;
   kind: uint32;
   from_place: uint32;  // the sender's first place
   from_life: uint32;
   to_life: uint32;
+  ack: uint32;         // the sender has every message up to this one
+  seq: uint32;         // this message's number
   to_place: uint32;
   to_gen: uint32;
   to_index: uint32;
@@ -58,6 +68,13 @@ export struct AlphPeer {
   told: Word;    // the watcher was told it is up,
   told_life: uint32;  // and this was its life then
   seen: Word;
+  gate: AlphGate;     // what follows is shared by senders and the link's thread
+  sent: uint32;       // the number of the last message sent to it
+  acked: uint32;      // it has every message up to this one
+  got: uint32;        // every message from it up to this one was taken
+  owed: Word;         // messages taken since it was last told so
+  waiting_since: Word;
+  window: AlphPacket[64];  // the messages it has not yet said it has
 }
 
 export struct AlphLink {
@@ -70,7 +87,25 @@ export struct AlphLink {
   watcher: Word;
   thread: int64;
   stopping: int32;
-  port: int64;  // the port the wire is open on, 0 when it is not
+  port: int64;    // the port the wire is open on, 0 when it is not
+  resent: Word;   // messages sent again
+  lose: Word;     // for tests: one in so many messages is not sent the first time
+  lost: Word;
+  deaf: Word;     // for tests: hears nothing while this is set
+}
+
+// Starts the numbering with a peer afresh, because it is a new run of its
+// machine or this is a new run of ours: both sides see that and start
+// again together. A peer that only went quiet for a while keeps its
+// numbers, and what was waiting for it is sent again when it is back.
+fn alph_link_fresh(p: AlphPeer*, life: uint32) {
+  var was: int32 = p->gate.enter();
+  p->life = life;
+  p->sent = 0;
+  p->acked = 0;
+  p->got = 0;
+  p->owed = 0;
+  p->gate.leave(was);
 }
 
 fn alph_link_peer(l: AlphLink*, place: Word) -> AlphPeer* {
@@ -107,33 +142,68 @@ fn alph_pid_fits(place: uint32, gen: uint32, index: uint32) -> bool {
       && (int64)index < ((int64)1 << (int64)ALPH_INDEX_BITS);
 }
 
-// Mail for a place that is not on this machine.
+// Mail for a place that is not on this machine. ALPH_FULL when too many
+// messages to that machine are still waiting for its word.
 fn alph_link_far(c: AlphCores*, to: Word, m: AlphMsg*) -> Word {
   var l: AlphLink* = (AlphLink*)c->world;
   var p: AlphPeer* = alph_link_peer(l, (Word)(to >> ALPH_PLACE_SHIFT));
   if (p == 0 || p->alive == 0) {
     return ALPH_GONE;
   }
-  var k: AlphPacket;
-  k.magic = MAGIC;
-  k.kind = MAIL;
-  k.from_place = (uint32)c->first;
-  k.from_life = l->life;
-  k.to_life = p->life;
-  k.to_place = alph_pid_place(to);
-  k.to_gen = alph_pid_gen(to);
-  k.to_index = alph_pid_index(to);
-  k.src_place = alph_pid_place(m->from);
-  k.src_gen = alph_pid_gen(m->from);
-  k.src_index = alph_pid_index(m->from);
-  k.unused = 0;
-  k.tag = (int64)m->tag;
-  k.arg = (int64)m->arg;
-  k.ref = (int64)m->ref;
-  if (!l->wire.send(p->ip, p->port, (uint8*)&k, MAIL_BYTES)) {
+  var was: int32 = p->gate.enter();
+  if (p->alive == 0) {
+    p->gate.leave(was);
     return ALPH_GONE;
   }
+  if (p->sent - p->acked >= WINDOW) {
+    p->gate.leave(was);
+    return ALPH_FULL;
+  }
+  p->sent = p->sent + 1;
+  var k: AlphPacket* = &p->window[p->sent % WINDOW];
+  k->magic = MAGIC;
+  k->kind = MAIL;
+  k->from_place = (uint32)c->first;
+  k->from_life = l->life;
+  k->to_life = p->life;
+  k->ack = p->got;
+  k->seq = p->sent;
+  k->to_place = alph_pid_place(to);
+  k->to_gen = alph_pid_gen(to);
+  k->to_index = alph_pid_index(to);
+  k->src_place = alph_pid_place(m->from);
+  k->src_gen = alph_pid_gen(m->from);
+  k->src_index = alph_pid_index(m->from);
+  k->unused = 0;
+  k->tag = (int64)m->tag;
+  k->arg = (int64)m->arg;
+  k->ref = (int64)m->ref;
+  p->owed = 0;
+  if (p->sent - p->acked == 1) {
+    p->waiting_since = alph_now();
+  }
+  // Sent inside the gate, so messages reach the wire in their order.
+  l->lost = l->lost + 1;
+  if (l->lose == 0 || l->lost % l->lose != 0) {
+    l->wire.send(p->ip, p->port, (uint8*)k, MAIL_BYTES);
+  }
+  p->gate.leave(was);
   return ALPH_OK;
+}
+
+// Tells a peer this machine is alive and how far it has the peer's messages.
+fn alph_link_say(l: AlphLink*, p: AlphPeer*) {
+  var k: AlphPacket;
+  k.magic = MAGIC;
+  k.kind = BEAT;
+  k.from_place = (uint32)l->cores->first;
+  k.from_life = l->life;
+  k.to_life = p->life;
+  var was: int32 = p->gate.enter();
+  k.ack = p->got;
+  p->owed = 0;
+  p->gate.leave(was);
+  l->wire.send(p->ip, p->port, (uint8*)&k, BEAT_BYTES);
 }
 
 // Brings the watcher up to date: down for a machine it thinks is up that is
@@ -168,11 +238,22 @@ fn alph_link_heard(l: AlphLink*, k: AlphPacket*, got: int64) {
   if (p->alive != 0 && k->from_life != p->life && (int32)(k->from_life - p->life) < 0) {
     return;
   }
-  p->life = k->from_life;
+  if (p->life != k->from_life) {
+    alph_link_fresh(p, k->from_life);
+  }
   p->seen = alph_now();
   p->alive = 1;
   alph_link_tell(l, p);
-  if (k->kind != MAIL || got < MAIL_BYTES || k->to_life != l->life) {
+  if (k->to_life != l->life) {
+    return;  // it has not heard this run of ours yet, or means an earlier one
+  }
+  var was: int32 = p->gate.enter();
+  if ((int32)(k->ack - p->acked) > 0 && (int32)(p->sent - k->ack) >= 0) {
+    p->acked = k->ack;
+    p->waiting_since = alph_now();
+  }
+  p->gate.leave(was);
+  if (k->kind != MAIL || got < MAIL_BYTES) {
     return;
   }
   if (!alph_pid_fits(k->to_place, k->to_gen, k->to_index) || !alph_pid_fits(k->src_place, k->src_gen, k->src_index)) {
@@ -182,22 +263,60 @@ fn alph_link_heard(l: AlphLink*, k: AlphPacket*, got: int64) {
   if (core < 0 || core >= l->cores->count) {
     return;
   }
+  if (k->seq != p->got + 1) {
+    // One again, or one too early. The next chase says where we are: once,
+    // however many of these come.
+    was = p->gate.enter();
+    if (p->owed == 0) {
+      p->owed = 1;
+    }
+    p->gate.leave(was);
+    return;
+  }
+  was = p->gate.enter();
+  p->got = k->seq;
+  p->owed = p->owed + 1;
+  var owed: Word = p->owed;
+  p->gate.leave(was);
   var m: AlphMsg = { tag: (Word)k->tag, from: alph_pid_of(k->src_place, k->src_gen, k->src_index), arg: (Word)k->arg,
                      ref: (Word)k->ref };
   l->cores->cores[core].node.put(alph_pid_of(k->to_place, k->to_gen, k->to_index), &m);
+  if (owed >= ACK_EVERY) {
+    alph_link_say(l, p);
+  }
+}
+
+// Sends again what a peer has not said it has, when that has waited long
+// enough, and says what is owed.
+fn alph_link_chase(l: AlphLink*, p: AlphPeer*) {
+  var now: Word = alph_now();
+  var owed: Word = 0;
+  var was: int32 = p->gate.enter();
+  if (p->alive != 0 && p->sent != p->acked && (Word)(now - p->waiting_since) >= alph_ms(AGAIN_MS)) {
+    var seq: uint32 = p->acked + 1;
+    while ((int32)(p->sent - seq) >= 0) {
+      var k: AlphPacket* = &p->window[seq % WINDOW];
+      k->ack = p->got;
+      k->to_life = p->life;
+      l->wire.send(p->ip, p->port, (uint8*)k, MAIL_BYTES);
+      l->resent = l->resent + 1;
+      seq = seq + 1;
+    }
+    p->waiting_since = now;
+    p->owed = 0;
+  }
+  owed = p->owed;
+  p->gate.leave(was);
+  if (owed > 0) {
+    alph_link_say(l, p);
+  }
 }
 
 fn alph_link_beat(l: AlphLink*) {
-  var k: AlphPacket;
   var now: Word = alph_now();
-  k.magic = MAGIC;
-  k.kind = BEAT;
-  k.from_place = (uint32)l->cores->first;
-  k.from_life = l->life;
-  k.to_life = 0;
   for i in 0..l->count {
     var p: AlphPeer* = &l->peers[i];
-    l->wire.send(p->ip, p->port, (uint8*)&k, BEAT_BYTES);
+    alph_link_say(l, p);
     if (p->alive != 0 && (Word)(now - p->seen) > alph_ms(DOWN_MS)) {
       p->alive = 0;
     }
@@ -211,10 +330,17 @@ fn alph_link_main(arg: cstring) -> uint32 {
   var ip: uint32 = 0;
   var port: int64 = 0;
   var beat: Word = alph_now() - alph_ms(BEAT_MS);
+  var chase: Word = alph_now();
   while (l->stopping == 0) {
     var got: int64 = l->wire.recv((uint8*)&k, MAIL_BYTES, &ip, &port);
-    if (got > 0) {
+    if (got > 0 && l->deaf == 0) {
       alph_link_heard(l, &k, got);
+    }
+    if (got == 0 || (Word)(alph_now() - chase) >= alph_ms(5)) {
+      chase = alph_now();
+      for i in 0..l->count {
+        alph_link_chase(l, &l->peers[i]);
+      }
     }
     if ((Word)(alph_now() - beat) >= alph_ms(BEAT_MS)) {
       beat = alph_now();
@@ -236,6 +362,10 @@ export fn AlphLink_init__ptr(l: AlphLink*, cores: AlphCores*, first: Word, peers
   l->thread = 0;
   l->stopping = 0;
   l->port = 0;
+  l->resent = 0;
+  l->lose = 0;
+  l->lost = 0;
+  l->deaf = 0;
   cores->join(first, &alph_link_far, (rawptr)l);
 }
 
@@ -255,6 +385,8 @@ export fn AlphLink_peer__ptr(l: AlphLink*, first: Word, count: Word, ip: uint32,
   p->told = 0;
   p->told_life = 0;
   p->seen = 0;
+  p->gate.init();
+  alph_link_fresh(p, 0);
   l->count = l->count + 1;
   return ALPH_OK;
 }
@@ -329,7 +461,7 @@ export fn AlphLink_stop__ptr(l: AlphLink*) {
   for i in 0..l->count {
     l->peers[i].alive = 0;
     l->peers[i].told = 0;
-    l->peers[i].life = 0;
+    alph_link_fresh(&l->peers[i], 0);
   }
 }
 

@@ -105,7 +105,7 @@ fn b_main(arg: cstring) -> uint32 {
 }
 
 fn main() -> int32 {
-  var port_a: int64 = 23000 + (syscall(39) % 20000) * 2;
+  var port_a: int64 = 8000 + (syscall(39) % 1000) * 2;  // below the ports the system hands out itself
   var port_b: int64 = port_a + 1;
   var d: Driver;
   d.ups = 0;
