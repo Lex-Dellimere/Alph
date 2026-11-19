@@ -39,6 +39,7 @@ const SLOTS: Word = 32;   // actors a core
 const TAKEN: Word = 32;   // jobs taken for other machines at once: two for each of 16 cores
 const ROOM: Word = 16;    // messages a mailbox
 const ALPH_ROUND: Word = -19;  // the steward's timer: ask the boards again
+const WORK_BEGIN: Word = 1;    // to the actor behind work: begin the batch
 const ROUND_MS: Word = 500;
 const QUIET: Word = 4;         // rounds with no answer before a board is taken for lost
 const BOARD_JOBS: Word = 4;    // jobs at a board at once: half its worker's mailbox
@@ -115,6 +116,13 @@ export struct AlphMachine {
   seats: AlphPlace[26];
   gives: Word[8];         // by kind: the most bytes a job gives back (gives)
   longs: AlphLong[16];    // the link's long buffers, in the program's memory (longs)
+  worked: AlphBatch;      // the batch of the last work (work): its counts are the program's to read
+  work_actor: Word;       // the actor that hands it out
+  work_kind: Word;
+  work_total: Word;
+  work_fill: fn(AlphBatch*, AlphJob*, Word) -> void;
+  work_took: fn(AlphBatch*, AlphJob*, Word) -> void;
+  work_ctx: rawptr;
   slots: AlphBatchSlot[128];  // room for the batches tied to this machine (batch)
   slots_used: Word;
   far_times: AlphTimes[96];  // each other machine's and board's own times, eight kinds each
@@ -487,6 +495,7 @@ export fn AlphMachine_init__ptr(m: AlphMachine*, cores: Word, first: Word, gpu: 
   m->told = 0;
   m->served = 0;
   m->slots_used = 0;
+  m->work_actor = 0;
   for k in 0..8 {
     m->gives[k] = 0;
   }
@@ -728,6 +737,51 @@ export fn AlphMachine_tell__ptr(m: AlphMachine*, pid: Word) {
 // the port cannot be had. A machine with no peers need not call it.
 export fn AlphMachine_start__ptr(m: AlphMachine*, port: int64) -> Word {
   return m->link.start(port);
+}
+
+// The actor behind work: begins the batch, takes its answers, and stops
+// the cores when all are back.
+fn alph_machine_work(a: AlphActor*, msg: AlphMsg*) -> Word {
+  var m: AlphMachine* = (AlphMachine*)a->state;
+  if (msg->tag == WORK_BEGIN) {
+    m->worked.begin(a, m->work_kind, m->work_total, m->work_fill, m->work_took, m->work_ctx);
+  } else if (!m->worked.took(a, msg)) {
+    return 0;
+  }
+  if (m->worked.over()) {
+    a->cores()->stop();
+  }
+  return 0;
+}
+
+// Does `total` pieces of a kind of work and returns when every one is
+// answered: the short way to use a batch. fill and took are a batch's (see
+// AlphBatch_begin), and so is ctx. fill may be 0 when a piece needs only
+// its number, which is the job's in. It runs the cores on this thread, so
+// call it from the program's main thread, after kind, the peers and start,
+// and not from an actor. It can be called again for more work. Returns
+// how many pieces were not done: those no place could run and those lost
+// with their worker. m->worked is the batch, for its counts by way.
+export fn AlphMachine_work__ptr(m: AlphMachine*, kind: Word, total: Word,
+                                fill: fn(AlphBatch*, AlphJob*, Word) -> void,
+                                took: fn(AlphBatch*, AlphJob*, Word) -> void, ctx: rawptr) -> Word {
+  if (m->work_actor == 0) {
+    m->batch(&m->worked);
+    m->work_actor = m->cores.spawn_on(0, &alph_machine_work, (rawptr)m);
+    if (m->work_actor == 0) {
+      return total;
+    }
+  }
+  m->work_kind = kind;
+  m->work_total = total;
+  m->work_fill = fill;
+  m->work_took = took;
+  m->work_ctx = ctx;
+  if (m->cores.send(m->work_actor, WORK_BEGIN, 0) != ALPH_OK) {
+    return total;
+  }
+  m->cores.run();
+  return m->worked.gone + m->worked.lost;
 }
 
 // Runs the cores until stop, the first on this thread.

@@ -170,6 +170,25 @@ fn main() -> int32 {
   expect(answered == PIECES && t.twice == 0 && t.wrong == 0, "with more room every piece is still answered once ({answered} of {PIECES}, {t.twice} twice, {t.wrong} wrong)");
   expect(g_most >= 1 && g_most <= 2, "and no more than two wait at a core ({g_most})");
 
+  // The same with no actor of the program's: work does a kind and returns.
+  clear(&t);
+  var undone: Word = g_m.work(DOUBLE, 300, &fill, &took, (rawptr)&t);
+  answered = 0;
+  for i in 0..1000 {
+    answered = answered + (Word)t.seen[i];
+  }
+  expect(undone == 0 && answered == 300 && t.twice == 0 && t.wrong == 0, "work does every piece and returns ({answered} of 300, {undone} not done)");
+  expect(g_m.worked.by_way[ALPH_CPU] == 300, "and its batch is the program's to read ({g_m.worked.by_way[ALPH_CPU]})");
+  clear(&t);
+  undone = g_m.work(NOWHERE, 5, 0, &took, (rawptr)&t);
+  expect(undone == 5 && t.gone == 5, "work says how many pieces were not done ({undone} of 5)");
+  clear(&t);
+  undone = g_m.work(DOUBLE, 0, 0, &took, (rawptr)&t);
+  expect(undone == 0, "work of no pieces returns at once");
+  clear(&t);
+  undone = g_m.work(DOUBLE, 40, &fill, &took, (rawptr)&t);
+  expect(undone == 0 && t.wrong == 0 && t.twice == 0, "and work can be called again ({t.wrong} wrong)");
+
   g_m.shut();
   if (g_failures != 0) {
     return 1;

@@ -1,0 +1,58 @@
+// The short way, as short as it gets: one kind of work, done in pieces on
+// every core of this machine. The program says how a piece is done and
+// what to do with its answer. alph hands the pieces out and comes back
+// when all are answered.
+//
+//   mettle --build -s --release examples/primes.mettle -I ports/host -o primes
+
+import "std/io";
+import "alph/actor/actor";
+import "alph/machine/machine";
+import "alph/batch/batch";
+
+const PRIMES: Word = 0;    // the kind of job: in is a chunk's number, out the primes in it
+const CHUNKS: Word = 200;
+const CHUNK: Word = 5000;  // numbers in a chunk
+
+var g_m: AlphMachine;
+var g_primes: Word = 0;
+
+// The work: counts the primes in one chunk.
+fn count_primes(job: AlphJob*) -> Word {
+  var found: Word = 0;
+  var n: Word = (Word)(job->in * CHUNK);
+  var end: Word = n + CHUNK;
+  while (n < end) {
+    var prime: bool = n >= 2;
+    var d: Word = 2;
+    while (prime && d * d <= n) {
+      if (n % d == 0) {
+        prime = false;
+      }
+      d = d + 1;
+    }
+    if (prime) {
+      found = found + 1;
+    }
+    n = n + 1;
+  }
+  job->out = found;
+  return 0;
+}
+
+// Called with each answer.
+fn counted(b: AlphBatch*, job: AlphJob*, chunk: Word) {
+  g_primes = g_primes + job->out;
+}
+
+fn main() -> int32 {
+  g_m.init(4, 0, false);               // four cores: one hands out, three work
+  g_m.kind(PRIMES, &count_primes, 0);  // how the work is done on a core; it has no GPU way
+  var undone: Word = g_m.work(PRIMES, CHUNKS, 0, &counted, 0);
+  g_m.shut();
+  println("{g_primes} primes below {CHUNKS * CHUNK}, counted in {CHUNKS} chunks, {g_m.worked.by_way[ALPH_CPU]} of them on this machine's cores");
+  if (undone != 0 || g_primes != 78498) {
+    return 1;
+  }
+  return 0;
+}

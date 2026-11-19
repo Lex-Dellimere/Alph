@@ -93,7 +93,9 @@ fn alph_batch_more(b: AlphBatch*, a: AlphActor*) {
     job->back_room = 0;
     job->back_count = 0;
     job->stay = 0;
-    b->fill(b, job, i);
+    if (b->fill != 0) {
+      b->fill(b, job, i);
+    }
     var asked: Word = b->places->offer(a, job);
     if (asked == ALPH_GONE) {
       // No place can run this kind at all: the piece is answered as it is,
@@ -138,7 +140,8 @@ fn alph_batch_more(b: AlphBatch*, a: AlphActor*) {
 // Starts handing out `total` pieces of a kind. fill is called for each
 // piece before it goes out, with the job and the piece's number (0 to
 // total - 1): it sets what the job needs (size, in, data, bytes, back,
-// home; the job starts with size 1, in the piece's number and no home). took is
+// home; the job starts with size 1, in the piece's number and no home). It
+// may be 0 when that start is all a piece needs. took is
 // called with each piece's finished job: its status is ALPH_OK, ALPH_GONE
 // for a piece no place could run, or ALPH_LOST for a piece of a kind done
 // at most once whose worker was lost. ctx is the program's own, in

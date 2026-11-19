@@ -69,6 +69,13 @@ export struct AlphMachine {
   seats: AlphPlace[26];
   gives: Word[8];         // by kind: the most bytes a job gives back (gives)
   longs: AlphLong[16];    // the link's long buffers, in the program's memory (longs)
+  worked: AlphBatch;      // the batch of the last work (work): its counts are the program's to read
+  work_actor: Word;       // the actor that hands it out
+  work_kind: Word;
+  work_total: Word;
+  work_fill: fn(AlphBatch*, AlphJob*, Word) -> void;
+  work_took: fn(AlphBatch*, AlphJob*, Word) -> void;
+  work_ctx: rawptr;
   slots: AlphBatchSlot[128];  // room for the batches tied to this machine (batch)
   slots_used: Word;
   far_times: AlphTimes[96];  // each other machine's and board's own times, eight kinds each
@@ -247,6 +254,25 @@ Call it as `m->start(port)`, or `m.start(port)` on a value.
 Listens on a port and joins the other machines. Returns ALPH_GONE when
 the port cannot be had. A machine with no peers need not call it.
 
+### `AlphMachine_work__ptr`
+
+```mettle
+export fn AlphMachine_work__ptr(m: AlphMachine*, kind: Word, total: Word,
+                                fill: fn(AlphBatch*, AlphJob*, Word) -> void,
+                                took: fn(AlphBatch*, AlphJob*, Word) -> void, ctx: rawptr) -> Word
+```
+
+Call it as `m->work(kind, total, fill, took, ctx)`, or `m.work(kind, total, fill, took, ctx)` on a value.
+
+Does `total` pieces of a kind of work and returns when every one is
+answered: the short way to use a batch. fill and took are a batch's (see
+AlphBatch_begin), and so is ctx. fill may be 0 when a piece needs only
+its number, which is the job's in. It runs the cores on this thread, so
+call it from the program's main thread, after kind, the peers and start,
+and not from an actor. It can be called again for more work. Returns
+how many pieces were not done: those no place could run and those lost
+with their worker. m->worked is the batch, for its counts by way.
+
 ### `AlphMachine_run__ptr`
 
 ```mettle
@@ -370,7 +396,8 @@ Call it as `b->begin(a, kind, total, fill, took, ctx)`, or `b.begin(a, kind, tot
 Starts handing out `total` pieces of a kind. fill is called for each
 piece before it goes out, with the job and the piece's number (0 to
 total - 1): it sets what the job needs (size, in, data, bytes, back,
-home; the job starts with size 1, in the piece's number and no home). took is
+home; the job starts with size 1, in the piece's number and no home). It
+may be 0 when that start is all a piece needs. took is
 called with each piece's finished job: its status is ALPH_OK, ALPH_GONE
 for a piece no place could run, or ALPH_LOST for a piece of a kind done
 at most once whose worker was lost. ctx is the program's own, in
