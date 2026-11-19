@@ -11,4 +11,6 @@ export const ALPH_WORKED_BYTES: Word = -20; // as ALPH_WORKED, for a job that gi
 export const ALPH_REFUSED: Word = -18;     // a worker's answer when it cannot take the job: arg is ALPH_FULL for now, ALPH_GONE for never
 export const ALPH_WORK_ONCE: Word = -21;   // as ALPH_WORK, for a job that must not be done twice (see alph/place/once)
 export const ALPH_HELLO: Word = -22;       // to a worker before the first ALPH_WORK_ONCE: a new run of refs starts at ref. It answers the same back
+export const ALPH_WORK_LONG: Word = -23;   // as ALPH_WORK_BYTES, for more bytes than a parcel holds: arg is a long buffer, or 0 when they did not fit there
+export const ALPH_WORKED_LONG: Word = -24; // as ALPH_WORKED_BYTES, the same way
 export const ALPH_SHARED: Word = 1073741824;  // the name of the worker for a shared kind is this plus the kind

@@ -164,6 +164,8 @@ export struct AlphPlace {
   paced: Word;        // and when that was
   own: AlphTimes*;    // a far place's own times, one for each of its first own_kinds kinds, 0 for none
   own_kinds: Word;
+  too_big: Word;      // a far place: a job with this many bytes or more does not fit its machine, 0 when none was refused
+  back_big: Word;     // and its machine cannot give back more bytes than a parcel holds
 }
 
 // The places of one machine and the kinds of job they run.
@@ -479,6 +481,8 @@ export fn AlphPlaces_add__ptr(p: AlphPlaces*, way: Word) -> AlphPlace* {
     }
     x->own = 0;
     x->own_kinds = 0;
+    x->too_big = 0;
+    x->back_big = 0;
     for g in 0..4 {
       x->gave_ref[g] = 0;
     }
@@ -597,6 +601,12 @@ fn alph_place_pick(p: AlphPlaces*, job: AlphJob*, soon: bool) -> AlphPlace* {
     }
     if (x->way == ALPH_FAR && (x->limit != 0 || k->once != 0) && job->count > 0) {
       continue;  // a small machine takes no bytes, and a job done at most once carries none
+    }
+    if (x->way == ALPH_FAR && job->count > ALPH_PARCEL_BYTES && (p->link == 0 || (x->too_big != 0 && job->count >= x->too_big))) {
+      continue;  // more bytes than that machine was found to take
+    }
+    if (x->way == ALPH_FAR && x->back_big != 0 && job->back_room > ALPH_BACK_BYTES) {
+      continue;
     }
     var row: Word = alph_place_row(job, x->way);
     var at: Word = row + size;
@@ -994,12 +1004,29 @@ export fn alph_place_run(a: AlphActor*, m: AlphMsg*) -> Word {
     job->next = x->unsent;
     x->unsent = job;
   }
-  if (m->tag == ALPH_WORKED || m->tag == ALPH_REFUSED || m->tag == ALPH_WORKED_BYTES) {
+  if (m->tag == ALPH_WORKED_LONG && m->arg == 0) {
+    // The answer had more bytes than a long buffer of this machine holds:
+    // they are gone. It counts as a refusal of that, and the job is done
+    // again where its answer fits.
+    m->tag = ALPH_REFUSED;
+    m->arg = ALPH_BIG;
+  }
+  if (m->tag == ALPH_WORKED || m->tag == ALPH_REFUSED || m->tag == ALPH_WORKED_BYTES || m->tag == ALPH_WORKED_LONG) {
     // The answer from another machine: the job with this ref is done, or
     // the worker could not take it now and the asker is told to ask again.
     var parcel: AlphParcel* = 0;
+    var whole: AlphLong* = 0;
+    var got: uint8* = 0;   // the bytes that came with the answer,
+    var got_count: Word = 0;  // and how many
     if (m->tag == ALPH_WORKED_BYTES) {
       parcel = (AlphParcel*)m->arg;
+      got = &parcel->bytes[0];
+      got_count = parcel->count;
+    }
+    if (m->tag == ALPH_WORKED_LONG) {
+      whole = (AlphLong*)m->arg;
+      got = whole->bytes;
+      got_count = whole->count;
     }
     x->answers = x->answers + 1;
     x->answered = alph_place_ns();
@@ -1047,22 +1074,22 @@ export fn alph_place_run(a: AlphActor*, m: AlphMsg*) -> Word {
       job->way = ALPH_FAR;
       if (m->tag != ALPH_REFUSED) {
         job->out = m->arg;
-        if (parcel != 0) {
+        if (got != 0) {
           // The out is the first eight bytes, and what the job gives back
           // comes after them.
           var word: int64 = 0;
           for i in 0..8 {
-            word = word | ((int64)parcel->bytes[i] << ((int64)i * 8));
+            word = word | ((int64)got[i] << ((int64)i * 8));
           }
           job->out = (Word)word;
           job->back_count = 0;
           if (job->back != 0) {
-            job->back_count = parcel->count - 8;
+            job->back_count = got_count - 8;
             if (job->back_count > job->back_room) {
               job->back_count = job->back_room;
             }
             for i in 0..job->back_count {
-              job->back[i] = parcel->bytes[(Word)i + 8];
+              job->back[i] = got[(Word)i + 8];
             }
           }
         }
@@ -1115,8 +1142,17 @@ export fn alph_place_run(a: AlphActor*, m: AlphMsg*) -> Word {
           alph_place_shut_far(p, x, job->kind);
         }
         var t: AlphAt;
+        if (m->arg == ALPH_BIG && job->count > ALPH_PARCEL_BYTES) {
+          // Its bytes are more than that machine takes: no job as big goes
+          // there again.
+          if (x->too_big == 0 || job->count < x->too_big) {
+            x->too_big = job->count;
+          }
+        } else if (m->arg == ALPH_BIG) {
+          x->back_big = 1;  // or what it gives back is more than fits one way or the other
+        }
         var was: int32 = p->gate.enter();
-        if (m->arg != ALPH_GONE) {
+        if (m->arg != ALPH_GONE && m->arg != ALPH_BIG) {
           alph_place_at(k, x, job->kind, job->at, &t);
           var slow: Word = (Word)(t.est[0] * 2);
           var took: Word = alph_place_ns() - job->began;
@@ -1130,6 +1166,9 @@ export fn alph_place_run(a: AlphActor*, m: AlphMsg*) -> Word {
         p->gate.leave(was);
         alph_place_elsewhere(a, p, x, job);
       }
+    }
+    if (whole != 0 && p->link != 0) {
+      p->link->free(whole);
     }
     if (parcel != 0 && p->link != 0) {
       p->link->release(parcel);
@@ -1275,7 +1314,11 @@ export fn alph_place_run(a: AlphActor*, m: AlphMsg*) -> Word {
       }
     } else if (job->far_to != 0) {
       if (job->count > 0 && p->link != 0) {
-        out = p->link->send_bytes(a->pid, job->far_to, ALPH_WORK_BYTES, job->far_ref, job->bytes, job->count);
+        var with: Word = ALPH_WORK_BYTES;
+        if (job->count > ALPH_PARCEL_BYTES) {
+          with = ALPH_WORK_LONG;
+        }
+        out = p->link->send_much(a->pid, job->far_to, with, job->far_ref, job->bytes, job->count);
       } else {
         out = a->node->put(job->far_to, &ask);
       }
@@ -1292,6 +1335,13 @@ export fn alph_place_run(a: AlphActor*, m: AlphMsg*) -> Word {
       job->way = ALPH_FAR;
       job->next = x->unsent;
       x->unsent = job;
+    } else if (out == ALPH_BIG) {
+      // More bytes than a long buffer of this machine holds: no job as
+      // big goes that way again, and this one goes somewhere else.
+      if (x->too_big == 0 || job->count < x->too_big) {
+        x->too_big = job->count;
+      }
+      alph_place_elsewhere(a, p, x, job);
     } else {
       // The worker cannot be reached: the way is shut, as when a way
       // fails, and the job goes somewhere else.

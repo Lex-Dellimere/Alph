@@ -58,7 +58,7 @@ This is [examples/count.mettle](examples/count.mettle). The node owns no memory:
 | Places | A job goes to a core, the GPU or another machine, whichever alph has timed as finishing it first. A job stays where its data is. A kind can be done at most once, for work that must never happen twice | [src/place](src/place/place.mettle) |
 | Polls | A socket sends a message when it is ready, so no handler waits. TCP calls that go with it, and other programs: start one and get a message when it ends | [src/poll](src/poll/poll.mettle) |
 | Lives | Watch an actor to be told when it ends and why. Keep one, and a crash restarts it in place with the same pid | [src/life](src/life/life.mettle) |
-| Links | Other machines over UDP. Messages arrive once and in order, can carry up to 1,024 bytes, and a lost machine is noticed in half a second | [src/link](src/link/link.mettle) |
+| Links | Other machines over UDP. Messages arrive once and in order, can carry bytes (1,024 in a parcel, more as a long message put together at the other end), and a lost machine is noticed in half a second | [src/link](src/link/link.mettle) |
 | Names and the door | Find an actor on another machine by name, and watch it | [src/name](src/name/name.mettle), [src/door](src/door/door.mettle) |
 | Seals | A link only the holders of one key can read or speak on | [src/seal](src/seal/seal.mettle) |
 | Tether | A microcontroller tied to a bigger machine by its serial line: each side's actors reach the other's by pid. That machine can pass the board's mail on, so the whole network reaches it. The line can be made sure, so what is lost or damaged on it is sent again | [src/tether](src/tether/tether.mettle) |
@@ -190,7 +190,7 @@ mettle --release examples/mcu/two_b.mettle --target riscv32-none --board qemu-vi
 - Nothing here has run on real hardware other than an x86-64 computer. The boards run in QEMU and, for the Pico 2, on the compiler's model of its chip. The ARM Linux programs run under an emulator. [docs/hardware.md](docs/hardware.md) is the order to try a real Pico 2 in.
 - On ARM Linux a handler that crashes ends the process.
 - A sealed link has one key for the whole network: any holder can speak as any machine, and someone who gets the key later can read what they recorded before.
-- A job for another machine carries at most 1,024 bytes, and gives back a word and at most 1,016 bytes.
+- A job for another machine carries at most 1,024 bytes and gives back at most 1,016, unless the machines are given long buffers. Then the most is what one buffer holds.
 - Sockets are Linux only, and there is no file IO.
 - A message between two cores costs 150 to 300 ns against about 20 ns inside a node. Lanes bring a stream of them down to about 70 ns, but a single request and its reply are no quicker.
 - A microcontroller joins through a serial line to one machine, and a machine has at most four such lines. What is lost on that line is sent again only when both ends make the line sure, which costs a board about 1.1 KB.

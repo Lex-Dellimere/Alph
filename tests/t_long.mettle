@@ -1,0 +1,314 @@
+// Long messages (src/link long buffers), between two machines in one
+// process: forty messages of 1,025 to 68,000 bytes cross with messages
+// being lost on the way, and each arrives once, whole and in order, with
+// short messages getting through in between; one longer than the other machine's buffers
+// arrives with no bytes; one longer than this machine's is refused; and a
+// machine with no long buffer free takes no more until one is given back.
+
+import "std/io";
+import "std/thread";
+import "alph/actor/actor";
+import "alph/cores/cores";
+import "alph/link/link";
+import "port/sys";
+
+const GO: Word = 1;
+const DATA: Word = 2;   // with a long buffer: ref is its number
+const SUM: Word = 3;    // the answer: arg is the sum of its bytes, ref its number
+const MORE: Word = 4;
+const GIVE_BACK: Word = 5;
+const NOTE: Word = 6;   // a short message between two long ones
+const TOTAL: Word = 40;
+const A_EACH: Word = 100000;
+const B_EACH: Word = 70000;
+
+var g_a: AlphCores;
+var g_a_core: AlphCore[2];
+var g_a_actors: AlphActor[4];
+var g_a_mail: AlphMsg[32];
+var g_a_link: AlphLink;
+var g_a_peers: AlphPeer[1];
+var g_a_longs: AlphLong[4];
+var g_a_memory: uint8[400000];
+
+var g_b: AlphCores;
+var g_b_core: AlphCore[2];
+var g_b_actors: AlphActor[4];
+var g_b_mail: AlphMsg[32];
+var g_b_link: AlphLink;
+var g_b_peers: AlphPeer[1];
+var g_b_longs: AlphLong[2];
+var g_b_memory: uint8[140000];
+
+var g_bytes: uint8[200000];
+var g_checker: Word = 0;
+var g_failures: int32 = 0;
+
+fn expect(ok: bool, what: string) {
+  if (!ok) {
+    println("FAIL {what}");
+    g_failures = g_failures + 1;
+  }
+}
+
+// Message n has this many bytes, and byte i of it is this. The first few
+// sizes are the edges: one byte more than a parcel, whole pieces, and all
+// that fits.
+fn size_of(n: Word) -> Word {
+  if (n == 0) {
+    return 1025;
+  }
+  if (n == 1) {
+    return 2048;
+  }
+  if (n == 2) {
+    return B_EACH;
+  }
+  if (n == 3) {
+    return 65536;
+  }
+  return (Word)(1025 + (n * 4999) % 67000);
+}
+
+fn byte_of(n: Word, i: Word) -> uint8 {
+  return (uint8)((n * 7 + i * 3 + i / 1024) & 255);
+}
+
+// On machine B: checks each long message, gives its buffer back and
+// answers with the sum of its bytes. While it hoards, it keeps the buffers.
+struct Checker {
+  next: Word;
+  bad: Word;
+  notes: Word;
+  none: Word;     // messages that arrived with no bytes
+  hoard: Word;
+  kept: AlphLong*[2];
+  keeping: Word;
+}
+
+fn checker(a: AlphActor*, m: AlphMsg*) -> Word {
+  var c: Checker* = (Checker*)a->state;
+  if (m->tag == GIVE_BACK) {
+    for i in 0..c->keeping {
+      g_b_link.free(c->kept[i]);
+    }
+    c->keeping = 0;
+    c->hoard = 0;
+    return 0;
+  }
+  if (m->tag == NOTE) {
+    c->notes = c->notes + 1;  // before or after its long message: it may overtake
+    return 0;
+  }
+  var g: AlphLong* = (AlphLong*)m->arg;
+  var n: Word = m->ref;
+  var sum: Word = 0;
+  if (g == 0) {
+    c->none = c->none + 1;
+    a->reply(m, SUM, -1);
+    return 0;
+  }
+  if (n != c->next || g->count != size_of(n)) {
+    c->bad = c->bad + 1;
+  }
+  c->next = n + 1;
+  for i in 0..g->count {
+    if (g->bytes[i] != byte_of(n, (Word)i)) {
+      c->bad = c->bad + 1;
+    }
+    sum = sum + (Word)g->bytes[i];
+  }
+  if (c->hoard != 0 && c->keeping < 2) {
+    c->kept[c->keeping] = g;
+    c->keeping = c->keeping + 1;
+  } else {
+    g_b_link.free(g);
+  }
+  if (a->reply(m, SUM, sum) != ALPH_OK) {
+    c->bad = c->bad + 1;
+  }
+  return 0;
+}
+
+// On machine A: sends the long messages, at most two not yet answered, a
+// short one after each, and checks the answers.
+struct Sender {
+  to: Word;
+  total: Word;
+  sent: Word;
+  back: Word;
+  bad: Word;
+  refused: Word;
+}
+
+fn sender(a: AlphActor*, m: AlphMsg*) -> Word {
+  var s: Sender* = (Sender*)a->state;
+  if (m->tag == SUM) {
+    var want: Word = 0;
+    for i in 0..size_of(m->ref) {
+      want = want + (Word)byte_of(m->ref, (Word)i);
+    }
+    if (m->ref != s->back || m->arg != want) {
+      s->bad = s->bad + 1;
+    }
+    s->back = s->back + 1;
+  }
+  while (s->sent < s->total && s->sent - s->back < 2) {
+    var count: Word = size_of(s->sent);
+    for i in 0..count {
+      g_bytes[i] = byte_of(s->sent, (Word)i);
+    }
+    var out: Word = g_a_link.send_much(a->pid, s->to, DATA, s->sent, &g_bytes[0], count);
+    if (out == ALPH_FULL) {
+      s->refused = s->refused + 1;
+      a->send(a->pid, MORE, 0);
+      return 0;
+    }
+    if (out != ALPH_OK) {
+      s->bad = s->bad + 1000;
+      a->cores()->stop();
+      return 0;
+    }
+    s->sent = s->sent + 1;
+    if (a->send(s->to, NOTE, s->sent) != ALPH_OK) {
+      s->bad = s->bad + 1;  // the pieces of a long message leave room for other mail
+    }
+  }
+  if (s->back == s->total) {
+    a->cores()->stop();
+  }
+  return 0;
+}
+
+fn b_main(arg: cstring) -> uint32 {
+  g_b.run();
+  return 0;
+}
+
+fn in_use() -> Word {
+  var used: Word = 0;
+  for i in 0..4 {
+    used = used + g_a_longs[i].used;
+  }
+  for i in 0..2 {
+    used = used + g_b_longs[i].used;
+  }
+  return used;
+}
+
+fn main() -> int32 {
+  var port_a: int64 = 13000 + (syscall(ALPH_NR_GETPID) % 2000) * 2;
+  var port_b: int64 = port_a + 1;
+  var here: uint32 = alph_ip4(127, 0, 0, 1);
+  var s: Sender;
+  var c: Checker;
+  s.sent = 0;
+  s.back = 0;
+  s.bad = 0;
+  s.refused = 0;
+  c.next = 0;
+  c.bad = 0;
+  c.notes = 0;
+  c.none = 0;
+  c.hoard = 0;
+  c.keeping = 0;
+
+  g_a.init(&g_a_core[0], 2, &g_a_actors[0], 2, &g_a_mail[0], 8);
+  g_a_link.init(&g_a, 0, &g_a_peers[0], 1);
+  g_a_link.peer(2, 2, here, port_b);
+  var sender_pid: Word = g_a.spawn_on(0, &sender, (rawptr)&s);
+
+  g_b.init(&g_b_core[0], 2, &g_b_actors[0], 2, &g_b_mail[0], 8);
+  g_b_link.init(&g_b, 2, &g_b_peers[0], 1);
+  g_b_link.peer(0, 2, here, port_a);
+  g_b_link.longs(&g_b_longs[0], 2, &g_b_memory[0], B_EACH);
+  g_checker = g_b.spawn_on(1, &checker, (rawptr)&c);
+
+  // No long buffers given to A's link yet, then more bytes than one holds.
+  expect(g_a_link.send_much(0, g_checker, DATA, 0, &g_bytes[0], 2000) == ALPH_BIG, "with no long buffers more than a parcel's bytes are refused as too many");
+  g_a_link.longs(&g_a_longs[0], 4, &g_a_memory[0], A_EACH);
+  expect(g_a_link.send_much(0, g_checker, DATA, 0, &g_bytes[0], A_EACH + 1) == ALPH_BIG, "and so are more than a long buffer holds");
+  var early: AlphLong* = g_a_link.long();
+  expect(early != 0 && g_a_link.send_long(0, g_checker, DATA, 0, early) == ALPH_GONE, "a long message for a machine not yet heard is refused");
+  g_a_link.free(early);
+  expect(in_use() == 0, "and its buffer is still the caller's to give back");
+
+  expect(g_a_link.start(port_a) == ALPH_OK && g_b_link.start(port_b) == ALPH_OK, "both machines listen");
+  var b_thread: int64 = CreateThread(0, 0, &b_main, 0, 0, 0);
+  var waited: int32 = 0;
+  while (!g_a_link.reaches(2) && waited < 3000) {
+    Sleep(1);
+    waited = waited + 1;
+  }
+  expect(g_a_link.reaches(2), "A hears B");
+
+  // Forty long messages, with messages lost on the way.
+  g_a_link.lose = 7;
+  g_b_link.lose = 9;
+  s.to = g_checker;
+  s.total = TOTAL;
+  g_a.send(sender_pid, GO, 0);
+  g_a.run();
+  g_a_link.lose = 0;
+  g_b_link.lose = 0;
+  expect(s.back == TOTAL && s.bad == 0, "every long message is answered with the right sum, in order ({s.back} of {TOTAL}, {s.bad} bad)");
+  expect(c.bad == 0, "each arrived once, whole and in its turn ({c.bad} did not)");
+  expect(c.notes == TOTAL, "and so did the short message after each ({c.notes} of {TOTAL})");
+  expect(g_a_link.resent > 0, "though some pieces were sent again ({g_a_link.resent})");
+  waited = 0;
+  while (in_use() != 0 && waited < 2000) {
+    Sleep(1);
+    waited = waited + 1;
+  }
+  expect(in_use() == 0, "every long buffer is back in its pool ({in_use()} are not)");
+
+  // One that fits A's buffers and not B's: it arrives with no bytes.
+  var long_one: AlphLong* = g_a_link.long();
+  expect(long_one != 0, "A has a long buffer free");
+  long_one->count = B_EACH + 1;
+  expect(g_a_link.send_long(sender_pid, g_checker, DATA, 999, long_one) == ALPH_OK, "a message longer than B's buffers is sent");
+  waited = 0;
+  while (s.back == TOTAL && waited < 3000) {
+    g_a_core[0].node.turn();  // until the sender has the checker's word about it
+    Sleep(1);
+    waited = waited + 1;
+  }
+  expect(c.none == 1 && g_b_link.skipped == 1, "and arrives with no bytes ({c.none}, {g_b_link.skipped} skipped)");
+  expect(c.bad == 0 && c.next == TOTAL, "with nothing else disturbed");
+
+  // B keeps the next two buffers: it has no more, so the third long
+  // message waits on A until B gives one back. Nothing is lost.
+  c.hoard = 1;
+  s.sent = TOTAL;
+  s.back = TOTAL;
+  s.bad = 0;
+  s.total = TOTAL + 4;
+  g_a.send(sender_pid, GO, 0);
+  waited = 0;
+  while (s.back < TOTAL + 2 && waited < 3000) {
+    g_a_core[0].node.turn();
+    Sleep(1);
+    waited = waited + 1;
+  }
+  for i in 0..300 {
+    g_a_core[0].node.turn();
+    Sleep(1);
+  }
+  expect(s.back == TOTAL + 2, "with B's two long buffers kept, two are answered and the third waits ({s.back - TOTAL})");
+  g_b.send(g_checker, GIVE_BACK, 0);
+  g_a.run();
+  expect(s.back == TOTAL + 4 && s.bad == 0 && c.bad == 0, "once B gives them back the rest arrive, none lost ({s.back - TOTAL} of 4, {s.bad} and {c.bad} bad)");
+
+  g_b_link.stop();
+  g_b.stop();
+  thread_join_infinite(b_thread);
+  thread_close(b_thread);
+  g_b_link.close();
+  g_a_link.stop();
+  g_a_link.close();
+  if (g_failures != 0) {
+    return 1;
+  }
+  println("long ok: {TOTAL} messages of 1,025 to 70,000 bytes crossed whole and in order, {g_a_link.resent} pieces sent again");
+  return 0;
+}

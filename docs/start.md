@@ -80,6 +80,7 @@ Every machine runs the same program. Each says how a kind of job is done (`kind`
 - `share(kind)` shares a kind with the other machines, both ways. With several, a job goes to whichever should finish it first: the machine keeps a time for each of the others. Only a job with no home leaves a machine: one word in, or bytes.
 - `board(first, count)` adds a microcontroller on this machine's serial line that takes work too. See "A board that shares work" under A microcontroller.
 - `batch(&batch)` ties a batch to the machine. See The batch below.
+- `longs(memory, each, count)` gives the machine long buffers, so a job for another machine can carry more than 1,024 bytes. `gives(kind, bytes)` says a job of a kind gives back up to that many, when that is more than 1,016. Call both on every machine. See Jobs on other machines.
 - `tell(pid)` names your actor that hears `ALPH_UP` and `ALPH_DOWN`.
 - `run()` runs the cores until `stop()`, and `shut()` ends the timers and the link afterwards.
 - The layers are fields of the machine, for when you want them: `m.cores`, `m.link`, `m.names`, `m.life`, `m.door`, `m.time`, `m.places`.
@@ -513,6 +514,31 @@ c->link->release(p);
 
 Parcels arrive once and in order, like every message. `send_bytes` returns `ALPH_FULL` when too few parcels are free or too much is waiting for that machine: half the pool is kept for what arrives. An actor that keeps its parcels stops its machine taking more, so give them back as soon as they are read.
 
+**More bytes than a parcel holds** go as a long message. Give the link long buffers, in memory of your own, before `start`:
+
+```mettle
+var g_longs: AlphLong[4];
+var g_memory: uint8[400000];
+
+g_link.longs(&g_longs[0], 4, &g_memory[0], 100000);  // four buffers of 100,000 bytes
+```
+
+`send_much(from, to, tag, ref, bytes, count)` then sends any number of bytes: in a parcel when they fit one, and if not, cut into pieces of 1,024 bytes that cross like other messages and are put together again in a long buffer of the other machine. The actor gets the message with that buffer in `arg`: it reads `count` bytes at `bytes` and gives the buffer back with `free`.
+
+```mettle
+var g: AlphLong* = (AlphLong*)m->arg;
+if (g != 0) {
+  // g->count bytes at g->bytes
+  g_link.free(g);
+}
+```
+
+- `arg` is 0 when the bytes were more than a long buffer of that machine holds: the message arrives, its bytes do not.
+- `send_much` returns `ALPH_BIG` when they are more than a long buffer of this machine holds, and `ALPH_FULL` when too few buffers are free: half are kept for what arrives.
+- To fill a buffer in place and send it without a copy, take one with `long()`, set its `count`, and send it with `send_long(from, to, tag, ref, buffer)`.
+- A long message takes its place among the others when its last piece goes, so a short message sent after it can arrive before it. Its pieces leave room in between for other messages.
+- A machine with no long buffer free takes no more long messages until one is given back. Nothing is lost.
+
 **Sealing the link.** A link is in the clear unless you seal it. `AlphSeal` encrypts and signs every datagram with one 32-byte key that every machine of the network is given. A datagram made without the key, changed on the way or played a second time is dropped, and so is everything from a run of a machine earlier than the latest one heard. Call `init(link, key)` once, after the link's `init` and before its `start`. It returns `ALPH_GONE` when the link is sealed already or the system gave no random bytes. This is from `tests/t_seal.mettle`:
 
 ```mettle
@@ -582,7 +608,22 @@ g_places.far(PRIMES, b->helper);
 g_boss_machine.door.watch(b->far_place, b->helper);
 ```
 
-Fill in a job with `job->in` and `job->home = ALPH_NOWHERE`, and ask as before. A job can give bytes back as well as `out`: set `job->back` to where they go and `job->back_room` to how many fit (from another machine at most `ALPH_BACK_BYTES`, 1,016). The function that does the work writes them to `job->back` and sets `job->back_count`, the same on a core here as on another machine, where they come back over the link. [examples/picture.mettle](../examples/picture.mettle) draws a picture this way, a row a job. Its helper gives the kind a GPU way, so the boss, which has no GPU, has most rows drawn on the helper's: a job that reaches another machine is placed again there, on a core or the GPU. Open the GPU before work arrives (the example's helper draws one row for itself at the start), because the first job on a GPU pays for opening it. A job can carry bytes instead of `in`: set `job->bytes` and `job->count`, and give the places the link with `net(link)`. The worker then gets `ALPH_WORK_BYTES` with a parcel in `arg`. A worker that cannot take a job now answers `ALPH_REFUSED`, and the asker gets the job back with status `ALPH_FULL`. [examples/run.mettle](../examples/run.mettle) sends commands to run this way. In the `ALPH_DONE` answer, `way` is `ALPH_FAR` when the other machine did it, and `out` is what the worker answered. A job with data of its own cannot leave the machine. On the other machine the worker is sent `ALPH_WORK` with the job's `in` as `arg`. It answers `ALPH_WORKED` with the job's `out`:
+Fill in a job with `job->in` and `job->home = ALPH_NOWHERE`, and ask as before. A job can give bytes back as well as `out`: set `job->back` to where they go and `job->back_room` to how many fit (from another machine at most `ALPH_BACK_BYTES`, 1,016, unless the machines have long buffers: see below). The function that does the work writes them to `job->back` and sets `job->back_count`, the same on a core here as on another machine, where they come back over the link. [examples/picture.mettle](../examples/picture.mettle) draws a picture this way, a row a job. Its helper gives the kind a GPU way, so the boss, which has no GPU, has most rows drawn on the helper's: a job that reaches another machine is placed again there, on a core or the GPU. Open the GPU before work arrives (the example's helper draws one row for itself at the start), because the first job on a GPU pays for opening it. A job can carry bytes instead of `in`: set `job->bytes` and `job->count`, and give the places the link with `net(link)`. The worker then gets `ALPH_WORK_BYTES` with a parcel in `arg`. A worker that cannot take a job now answers `ALPH_REFUSED`, and the asker gets the job back with status `ALPH_FULL`. [examples/run.mettle](../examples/run.mettle) sends commands to run this way. In the `ALPH_DONE` answer, `way` is `ALPH_FAR` when the other machine did it, and `out` is what the worker answered. A job with data of its own cannot leave the machine. On the other machine the worker is sent `ALPH_WORK` with the job's `in` as `arg`. It answers `ALPH_WORKED` with the job's `out`:
+
+**Big jobs.** With long buffers on both machines, a job carries and gives back as many bytes as one buffer holds: an image, a block of samples.
+
+```mettle
+var g_memory: uint8[640000];
+
+g_m.longs(&g_memory[0], 80000, 8);  // eight long buffers of 80,000 bytes
+g_m.gives(BLUR, 64000);             // a BLUR job gives back up to 64,000 bytes
+```
+
+- Every machine calls both, before `start`. A job's bytes must fit a buffer, and so must what it gives back and eight bytes more.
+- The job is written the same: `job->bytes` and `job->count` in, `job->back` and `job->back_count` out. On the machine that does it they point into long buffers, so nothing is copied there.
+- A machine whose buffers are too small for a job refuses it, and alph sends no job as big there again. The job is done where it fits, here if here has a way.
+- Each such job in flight holds a buffer on the machine that asks and one or two on the machine that works, so the number of buffers bounds how many are out at once. Without a free one a job waits.
+- Without `AlphMachine`: give the link its long buffers. The far place then sends `ALPH_WORK_LONG` with the bytes in a long buffer, and a worker of your own answers with `ALPH_WORKED_LONG`: the job's out in the first eight bytes of a long buffer, what it gives back after them.
 
 ```mettle
 fn worker(a: AlphActor*, m: AlphMsg*) -> Word {
@@ -864,7 +905,8 @@ fn asker(a: AlphActor*, m: AlphMsg*) -> Word {
 These are not built yet.
 
 - A sealed link has one key for the whole network: any holder can speak as any machine, and someone who gets the key later can read what they recorded before.
-- A job for another machine carries at most 1,024 bytes, and gives back a word and at most 1,016 bytes.
+- A job for another machine carries at most 1,024 bytes and gives back at most 1,016, unless the machines are given long buffers. Then the most is what one buffer holds, and each job in flight holds a buffer at each end.
+- A job of a kind done at most once carries no bytes.
 - Sockets are Linux only, and there is no file IO.
 - A message between two cores costs 150 to 300 ns against about 20 ns inside a node. Lanes bring a stream of them down to about 70 ns, but one request and its reply are no quicker, and lanes are for Linux only.
 - A microcontroller joins through a serial line to one machine. What is lost on that line is sent again only when both ends make the line sure.

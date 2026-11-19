@@ -1,0 +1,211 @@
+// Jobs with more bytes than a parcel holds (src/machine longs, gives): a
+// machine with no way to do a kind sends sixty jobs of 1 to 39,000 bytes
+// to another, with messages lost on the way, and each comes back with as
+// many bytes, all right. Then jobs too big for the other machine's long
+// buffers are refused there once and done here from then on.
+
+import "std/io";
+import "std/thread";
+import "alph/actor/actor";
+import "alph/machine/machine";
+import "alph/batch/batch";
+import "port/sys";
+
+const GO: Word = 1;
+const FLIP: Word = 0;   // gives the job's bytes back in the other order, each turned; out is their sum
+const BOTH: Word = 1;   // the same, and both machines can do it
+const PIECES: Word = 60;
+const MOST: Word = 39000;
+const TOO_BIG: Word = 50000;  // fits this machine's long buffers and not the other's
+
+var g_m: AlphMachine[2];
+var g_batch: AlphBatch;
+var g_slots: AlphBatchSlot[4];
+var g_in: uint8[320000];    // 80,000 for each slot
+var g_back: uint8[320000];
+var g_long_a: uint8[640000];  // 8 of 80,000
+var g_long_b: uint8[320000];  // 8 of 40,000
+var g_kind: Word = 0;
+var g_wrong: Word = 0;
+var g_failures: int32 = 0;
+
+fn expect(ok: bool, what: string) {
+  if (!ok) {
+    println("FAIL {what}");
+    g_failures = g_failures + 1;
+  }
+}
+
+// Piece n has this many bytes, and byte i of it is this. The first sizes
+// are the edges between a parcel and a long buffer, there and back.
+fn size_of(n: Word) -> Word {
+  if (g_kind == BOTH) {
+    return TOO_BIG;
+  }
+  if (n == 0) {
+    return 1016;
+  }
+  if (n == 1) {
+    return 1017;
+  }
+  if (n == 2) {
+    return 1024;
+  }
+  if (n == 3) {
+    return 1025;
+  }
+  if (n == 4) {
+    return MOST;
+  }
+  return (Word)(1 + (n * 2731) % MOST);
+}
+
+fn byte_of(n: Word, i: Word) -> uint8 {
+  return (uint8)((n * 11 + i * 5 + i / 1000) & 255);
+}
+
+fn flip(job: AlphJob*) -> Word {
+  var sum: Word = 0;
+  for i in 0..job->count {
+    sum = sum + (Word)job->bytes[i];
+    job->back[i] = job->bytes[job->count - 1 - (Word)i] ^ 90;
+  }
+  job->back_count = job->count;
+  job->out = sum;
+  return 0;
+}
+
+fn slot_of(job: AlphJob*) -> Word {
+  return (Word)(((int64)job - (int64)&g_slots[0]) / (int64)sizeof(AlphBatchSlot));
+}
+
+fn fill(b: AlphBatch*, job: AlphJob*, piece: Word) {
+  var at: Word = (Word)(slot_of(job) * 80000);
+  var count: Word = size_of(piece);
+  for i in 0..count {
+    g_in[at + (Word)i] = byte_of(piece, (Word)i);
+  }
+  job->bytes = &g_in[at];
+  job->count = count;
+  job->back = &g_back[at];
+  job->back_room = 80000;
+}
+
+fn took(b: AlphBatch*, job: AlphJob*, piece: Word) {
+  var count: Word = size_of(piece);
+  var sum: Word = 0;
+  var bad: Word = 0;
+  if (job->status != ALPH_OK || job->back_count != count) {
+    g_wrong = g_wrong + 1;
+    return;
+  }
+  for i in 0..count {
+    sum = sum + (Word)byte_of(piece, (Word)i);
+    if (job->back[i] != (byte_of(piece, count - 1 - (Word)i) ^ 90)) {
+      bad = 1;
+    }
+  }
+  if (bad != 0 || job->out != sum) {
+    g_wrong = g_wrong + 1;
+  }
+}
+
+fn boss(a: AlphActor*, m: AlphMsg*) -> Word {
+  if (m->tag == GO) {
+    g_kind = m->arg;
+    g_batch.begin(a, m->arg, PIECES, &fill, &took, 0);
+  } else if (g_batch.took(a, m) && g_batch.over()) {
+    a->cores()->stop();
+  }
+  return 0;
+}
+
+fn helper_main(arg: cstring) -> uint32 {
+  g_m[1].run();
+  return 0;
+}
+
+fn in_use() -> Word {
+  var used: Word = 0;
+  for i in 0..8 {
+    used = used + g_m[0].longs[i].used + g_m[1].longs[i].used;
+  }
+  return used;
+}
+
+fn main() -> int32 {
+  var port: int64 = 22000 + (syscall(ALPH_NR_GETPID) % 2000) * 2;
+  var here: uint32 = alph_ip4(127, 0, 0, 1);
+  g_m[0].init(2, 0, false);
+  g_m[0].peer(16, 3, here, port + 1);
+  g_m[1].init(3, 16, false);
+  g_m[1].peer(0, 2, here, port);
+  g_m[0].kind(FLIP, 0, 0);  // no way to do it here: every job goes to the other machine
+  g_m[1].kind(FLIP, &flip, 0);
+  g_m[0].longs(&g_long_a[0], 80000, 8);
+  g_m[1].longs(&g_long_b[0], 40000, 8);
+  for i in 0..2 {
+    g_m[i].kind(BOTH, &flip, 0);
+    g_m[i].gives(FLIP, MOST);
+    g_m[i].gives(BOTH, TOO_BIG);
+    expect(g_m[i].share(FLIP) == ALPH_OK && g_m[i].share(BOTH) == ALPH_OK, "the machine shares both kinds");
+    expect(g_m[i].start(port + (int64)i) == ALPH_OK, "the machine listens");
+  }
+  g_batch.init(&g_m[0].places);
+  g_batch.wide(&g_slots[0], 4);
+  var pid: Word = g_m[0].cores.spawn_on(0, &boss, 0);
+  var helper: int64 = CreateThread(0, 0, &helper_main, 0, 0, 0);
+  var waited: int32 = 0;
+  while ((g_m[0].seats[1].workers[FLIP] == 0 || g_m[0].seats[1].workers[BOTH] == 0) && waited < 3000) {
+    g_m[0].core[0].node.turn();
+    Sleep(1);
+    waited = waited + 1;
+  }
+  expect(g_m[0].seats[1].workers[FLIP] != 0, "the first machine finds the other's worker");
+
+  // Sixty jobs of every size, with messages lost on the way.
+  g_m[0].link.lose = 9;
+  g_m[1].link.lose = 11;
+  g_m[0].cores.send(pid, GO, FLIP);
+  g_m[0].run();
+  g_m[0].link.lose = 0;
+  g_m[1].link.lose = 0;
+  expect(g_batch.over() && g_wrong == 0, "every job comes back with its bytes, all right ({g_wrong} wrong)");
+  expect(g_batch.by_way[ALPH_FAR] == PIECES && g_m[1].served >= PIECES, "all done on the other machine ({g_batch.by_way[ALPH_FAR]} of {PIECES})");
+  expect(g_m[0].link.resent > 0, "though some pieces were sent again ({g_m[0].link.resent})");
+  waited = 0;
+  while (in_use() != 0 && waited < 2000) {
+    Sleep(1);
+    waited = waited + 1;
+  }
+  expect(in_use() == 0, "every long buffer is back in its pool ({in_use()} are not)");
+
+  // Jobs of 50,000 bytes fit this machine's long buffers and not the
+  // other's: the first is refused there, and from then on they are done
+  // here.
+  var served: Word = g_m[1].served;
+  g_wrong = 0;
+  g_m[0].cores.send(pid, GO, BOTH);
+  g_m[0].run();
+  expect(g_batch.over() && g_wrong == 0, "jobs too big for the other machine are all done rightly ({g_wrong} wrong)");
+  expect(g_batch.by_way[ALPH_CPU] == PIECES && g_m[1].served == served, "on this machine ({g_batch.by_way[ALPH_CPU]} of {PIECES})");
+  expect(g_m[0].seats[1].too_big == TOO_BIG && g_m[1].link.skipped >= 1, "after one was sent and came back refused as too big ({g_m[0].seats[1].too_big}, {g_m[1].link.skipped} arrived with no bytes)");
+  waited = 0;
+  while (in_use() != 0 && waited < 2000) {
+    Sleep(1);
+    waited = waited + 1;
+  }
+  expect(in_use() == 0, "with every long buffer back again ({in_use()} are not)");
+
+  g_m[1].stop();
+  thread_join_infinite(helper);
+  thread_close(helper);
+  for i in 0..2 {
+    g_m[i].shut();
+  }
+  if (g_failures != 0) {
+    return 1;
+  }
+  println("big ok: {PIECES} jobs of 1 to {MOST} bytes done on another machine and given back whole, {g_m[0].link.resent} pieces sent again; jobs of {TOO_BIG} bytes, too big for it, done here");
+  return 0;
+}

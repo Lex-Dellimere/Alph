@@ -67,6 +67,8 @@ export struct AlphMachine {
   keeps: AlphKeep[32];
   timers: AlphTimer[32];
   seats: AlphPlace[26];
+  gives: Word[8];         // by kind: the most bytes a job gives back (gives)
+  longs: AlphLong[16];    // the link's long buffers, in the program's memory (longs)
   slots: AlphBatchSlot[128];  // room for the batches tied to this machine (batch)
   slots_used: Word;
   far_times: AlphTimes[96];  // each other machine's and board's own times, eight kinds each
@@ -165,6 +167,34 @@ board can do, such as moving an arm, is asked for here. Only jobs with no
 home (a word in, or bytes) leave a machine. Returns ALPH_FULL when the
 first core has no room for one more actor, ALPH_GONE for a kind that is
 not 0 to 7.
+
+### `AlphMachine_longs__ptr`
+
+```mettle
+export fn AlphMachine_longs__ptr(m: AlphMachine*, memory: uint8*, each: Word, count: Word)
+```
+
+Call it as `m->longs(memory, each, count)`, or `m.longs(memory, each, count)` on a value.
+
+Gives the machine long buffers, so that a job for another machine can
+carry more bytes than a parcel holds, and give more back: `count` of
+them (up to 16), each of `each` bytes, in `memory`, which must hold
+count times each. A job's bytes, or what it gives back and eight bytes
+more, must fit one. Half are kept for what arrives. Call it on every
+machine, before start.
+
+### `AlphMachine_gives__ptr`
+
+```mettle
+export fn AlphMachine_gives__ptr(m: AlphMachine*, kind: Word, bytes: Word)
+```
+
+Call it as `m->gives(kind, bytes)`, or `m.gives(kind, bytes)` on a value.
+
+Says that a job of this kind (0 to 7) gives back up to `bytes` bytes.
+Needed only for more than ALPH_BACK_BYTES: a job taken for another
+machine then gets a long buffer to put them in (see longs). Call it on
+every machine.
 
 ### `AlphMachine_batch__ptr`
 
@@ -1360,6 +1390,8 @@ export struct AlphPlace {
   paced: Word;        // and when that was
   own: AlphTimes*;    // a far place's own times, one for each of its first own_kinds kinds, 0 for none
   own_kinds: Word;
+  too_big: Word;      // a far place: a job with this many bytes or more does not fit its machine, 0 when none was refused
+  back_big: Word;     // and its machine cannot give back more bytes than a parcel holds
 }
 ```
 
@@ -1623,6 +1655,8 @@ export const ALPH_WORKED_BYTES: Word = -20; // as ALPH_WORKED, for a job that gi
 export const ALPH_REFUSED: Word = -18;     // a worker's answer when it cannot take the job: arg is ALPH_FULL for now, ALPH_GONE for never
 export const ALPH_WORK_ONCE: Word = -21;   // as ALPH_WORK, for a job that must not be done twice (see alph/place/once)
 export const ALPH_HELLO: Word = -22;       // to a worker before the first ALPH_WORK_ONCE: a new run of refs starts at ref. It answers the same back
+export const ALPH_WORK_LONG: Word = -23;   // as ALPH_WORK_BYTES, for more bytes than a parcel holds: arg is a long buffer, or 0 when they did not fit there
+export const ALPH_WORKED_LONG: Word = -24; // as ALPH_WORKED_BYTES, the same way
 export const ALPH_SHARED: Word = 1073741824;  // the name of the worker for a shared kind is this plus the kind
 ```
 
@@ -2094,6 +2128,14 @@ and in order. The parcels are the caller's memory: a pool the link is
 given. A parcel that arrives belongs to the actor it was sent to, which
 gives it back with release when it has read it.
 
+More bytes than that go as a long message, if the link is given long
+buffers (longs): it is cut into pieces of 1,024 bytes that cross like
+any other message, and put together again at the other end in a long
+buffer of that machine. The actor gets the whole at once, and gives the
+buffer back with free. A long message takes its place among the others
+when its last piece goes, so a short message sent after it can arrive
+before it.
+
 A link is in the clear unless it is sealed: see src/seal.
 
 ```mettle
@@ -2106,6 +2148,7 @@ The most bytes one message can carry.
 ```mettle
 export const ALPH_PARCEL_BYTES: Word = 1024;
 export const ALPH_DATAGRAM: int64 = 1104;  // the most a datagram holds before it is sealed
+export const ALPH_BIG: Word = -25;  // more bytes than a long buffer holds
 ```
 
 ### `AlphParcel`
@@ -2119,6 +2162,25 @@ export struct AlphParcel {
 ```
 
 Bytes that travel with a message.
+
+### `AlphLong`
+
+```mettle
+export struct AlphLong {
+  count: Word;   // how many of the bytes are in use
+  room: Word;    // how many fit
+  used: Word;    // taken from the pool
+  bytes: uint8*;
+  to: Word;
+  from: Word;
+  tag: Word;
+  ref: Word;
+  at: Word;      // how many bytes have gone
+  next: AlphLong*;
+}
+```
+
+The bytes of a long message, and while it is on its way out, the message.
 
 ### `AlphPeer`
 
@@ -2148,6 +2210,12 @@ export struct AlphPeer {
   again_ms: Word;     // how long its word is waited for before sending again
   window: AlphPacket[64];  // the messages it has not yet said it has
   held: AlphParcel*[64];   // and the bytes of those that carry any
+  part: uint8*[64];        // or, for a piece of a long message, where its bytes are,
+  ends: AlphLong*[64];     // and for the mail that ends one, the long to give back
+  longs: AlphLong*;        // long messages waiting to go, the next first
+  longs_last: AlphLong*;
+  filling: AlphLong*;      // a long message arriving
+  skipping: Word;          // one is arriving that cannot be taken: its bytes are dropped
 }
 ```
 
@@ -2189,6 +2257,9 @@ export struct AlphLink {
   parcels: AlphParcel*;
   parcel_room: Word;
   parcel_gate: AlphGate;
+  longs: AlphLong*;
+  long_room: Word;
+  skipped: Word;  // long messages that arrived with no long buffer big enough here
 }
 ```
 
@@ -2207,6 +2278,18 @@ this when it has read it, on the link of its own machine. A machine whose
 actors keep every parcel can take no more bytes, and since messages
 arrive in order, nothing else from that sender either until one is given
 back.
+
+### `AlphLink_free__ptr`
+
+```mettle
+export fn AlphLink_free__ptr(l: AlphLink*, buffer: AlphLong*)
+```
+
+Call it as `l->free(buffer)`, or `l.free(buffer)` on a value.
+
+Gives a long buffer back to the pool. The actor a long message was sent
+to calls it when it has read the bytes, and so does a program that took
+a buffer (long) and did not send it.
 
 ### `AlphLink_init__ptr`
 
@@ -2256,6 +2339,61 @@ with release. from and ref are what the message carries. Returns ALPH_OK,
 ALPH_FULL when too few parcels are free (half the pool is kept for what
 arrives) or too much is waiting for that machine, ALPH_GONE when the
 actor or its machine cannot be reached or the bytes are too many.
+
+### `AlphLink_longs__ptr`
+
+```mettle
+export fn AlphLink_longs__ptr(l: AlphLink*, longs: AlphLong*, room: Word, memory: uint8*, each: Word)
+```
+
+Call it as `l->longs(longs, room, memory, each)`, or `l.longs(longs, room, memory, each)` on a value.
+
+Gives the link its long buffers: room of them, each of `each` bytes, in
+`memory`, which must hold room times each. Without any, no message
+carries more than ALPH_PARCEL_BYTES, and a longer one from another
+machine arrives with no bytes. Call it before start.
+
+### `AlphLink_long__ptr`
+
+```mettle
+export fn AlphLink_long__ptr(l: AlphLink*) -> AlphLong*
+```
+
+Call it as `l->long()`, or `l.long()` on a value.
+
+A long buffer to fill and send (send_long), or 0 when too few are free:
+half the pool is kept for what arrives. Put the bytes in ->bytes, up to
+->room of them, and how many in ->count. Give it back with free if it is
+not sent after all.
+
+### `AlphLink_send_long__ptr`
+
+```mettle
+export fn AlphLink_send_long__ptr(l: AlphLink*, from: Word, to: Word, tag: Word, ref: Word, buffer: AlphLong*) -> Word
+```
+
+Call it as `l->send_long(from, to, tag, ref, buffer)`, or `l.send_long(from, to, tag, ref, buffer)` on a value.
+
+Sends a message with the bytes of a long buffer to an actor on another
+machine. The actor gets the message with a long buffer of its own
+machine in arg ((AlphLong*)m->arg), reads ->count bytes at ->bytes and
+gives it back with free. arg is 0 when that machine has no long buffer
+big enough. From ALPH_OK on the buffer is the link's, which gives it
+back when the whole has arrived. Returns ALPH_GONE, with the buffer
+still the caller's, when the actor's machine cannot be reached.
+
+### `AlphLink_send_much__ptr`
+
+```mettle
+export fn AlphLink_send_much__ptr(l: AlphLink*, from: Word, to: Word, tag: Word, ref: Word, bytes: uint8*, count: Word) -> Word
+```
+
+Call it as `l->send_much(from, to, tag, ref, bytes, count)`, or `l.send_much(from, to, tag, ref, bytes, count)` on a value.
+
+Sends a message with any number of bytes: in a parcel when they fit one
+(send_bytes), in a long buffer when not, into which they are copied
+here. Returns as send_bytes does, and ALPH_BIG when this machine has no
+long buffer that holds them.
 
 ### `AlphLink_through__ptr`
 

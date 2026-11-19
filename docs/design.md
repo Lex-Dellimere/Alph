@@ -71,11 +71,13 @@ For the smallest tiles alph beats both, because it uses both. For the rest it ma
 
 **Bytes.** A message can carry up to 1,024 bytes in a parcel, with the same numbering. The parcels are a pool the program gives the link. Half of it is kept for what arrives, so two machines sending to each other cannot each fill their pool and never take the other's. A machine with no parcel free takes no more, and the sender waits longer each time before sending again.
 
+More bytes go as a long message. The link cuts it into pieces of 1,024 bytes, each numbered like any message, and the other end puts them together in a long buffer from a pool of its own. So the bytes are whole and in order for the same reason messages are, and nothing new had to be made sure. The pieces are sent straight from the sender's buffer as the window opens, and leave a quarter of the window to other messages, which would otherwise wait for as long as a long message takes. A long message that is too long for the other machine arrives without its bytes, so the actor it was for can say so. Between two machines in one process, 400 messages of 65,536 bytes crossed in about 200 ms, 125 MB a second, with a sum checked at the far end. With one datagram in seven lost each way, forty of up to 70,000 bytes all arrived whole.
+
 **Sealing.** A link is in the clear unless sealed. `src/seal` encrypts and signs every datagram (XChaCha20-Poly1305) with one key the whole network shares. A datagram made without the key, changed or played again is dropped, and so is everything from a run earlier than the latest heard, so a recording of an old run cannot make a dead machine look alive. It is its own layer, so a program that does not seal needs no crypto package.
 
 **Work.** `src/place` has a third way to run a job: a worker actor on another machine, which the program finds by name through the door. To alph that is one more place with a time of its own, the network included, so a job goes there when that is where it will finish first.
 
-- The job is one word in and one word out. It can carry up to a parcel's worth of bytes instead of the word in, and give back up to 1,016 bytes with the word out.
+- The job is one word in and one word out. It can carry up to a parcel's worth of bytes instead of the word in, and give back up to 1,016 bytes with the word out. With long buffers on both machines it carries and gives back as much as one buffer holds: a camera's frame, say. A machine whose buffers are too small for a job refuses it once, and no job as big is sent there again.
 - If the worker ends or its machine is lost, the jobs it had not answered are done here and nothing more is sent to it.
 - Given a clock, a job not answered in eight times its usual time, and at least a second, is given up on and placed again.
 
@@ -198,7 +200,7 @@ The measurements that decide a choice are in the section for that choice: the re
 - A sealed link has one key for all, so any holder can speak as any machine and there is no forward secrecy. Peers are listed by hand.
 - A board on the UDP link itself. A board joins through a serial line to one machine.
 - A board that sends its work to the best of several places. It asks the machine at the other end of its line.
-- A job for another machine with more than 1,024 bytes in or 1,016 back, or with its data on a GPU.
+- A job for another machine with more bytes than a long buffer holds, or with its data on a GPU.
 - A job's time predicted from more than its size. A Mandelbrot tile's time depends on where in the picture it is, so such work is placed less well.
 - Sizes for `src/machine` other than the fixed ones.
 - Sockets off Linux, and file IO.

@@ -62,6 +62,8 @@ struct AlphTaken {
   ref: Word;
   busy: Word;
   once: Word;   // it must not be done twice: its end is remembered
+  whole: AlphLong*;       // the long buffer its bytes came in, kept while it runs, 0 for none
+  whole_back: AlphLong*;  // and one for what it gives back, for a kind that gives much
   bytes: uint8[1024];
   back: uint8[1024];  // the job's out in the first 8, then the bytes it gives back
 }
@@ -111,6 +113,8 @@ export struct AlphMachine {
   keeps: AlphKeep[32];
   timers: AlphTimer[32];
   seats: AlphPlace[26];
+  gives: Word[8];         // by kind: the most bytes a job gives back (gives)
+  longs: AlphLong[16];    // the link's long buffers, in the program's memory (longs)
   slots: AlphBatchSlot[128];  // room for the batches tied to this machine (batch)
   slots_used: Word;
   far_times: AlphTimes[96];  // each other machine's and board's own times, eight kinds each
@@ -311,15 +315,35 @@ fn alph_machine_serve(a: AlphActor*, msg: AlphMsg*) -> Word {
       answer.arg = t->job.status;  // full for now, or gone: no place here can run it
       sent = a->node->put(t->from, &answer);
     } else if (t->job.back_count > 0 && t->once == 0) {  // a job done at most once gives no bytes back
-      for i in 0..8 {
-        t->back[i] = (uint8)(((int64)t->job.out >> ((int64)i * 8)) & 255);
+      var back: uint8* = &t->back[0];
+      if (t->whole_back != 0) {
+        back = t->whole_back->bytes;
       }
-      sent = m->link.send_bytes(a->pid, t->from, ALPH_WORKED_BYTES, t->ref, &t->back[0], t->job.back_count + 8);
+      for i in 0..8 {
+        back[i] = (uint8)(((int64)t->job.out >> ((int64)i * 8)) & 255);
+      }
+      if (t->job.back_count > ALPH_BACK_BYTES) {
+        t->whole_back->count = t->job.back_count + 8;
+        sent = m->link.send_long(a->pid, t->from, ALPH_WORKED_LONG, t->ref, t->whole_back);
+        if (sent == ALPH_OK) {
+          t->whole_back = 0;  // the link's now
+        }
+      } else {
+        sent = m->link.send_bytes(a->pid, t->from, ALPH_WORKED_BYTES, t->ref, back, t->job.back_count + 8);
+      }
     } else {
       sent = a->node->put(t->from, &answer);
     }
     if (sent == ALPH_FULL && a->node->put(a->pid, msg) == ALPH_OK) {
       return 0;  // the way back is full for now: the answer is tried again
+    }
+    if (t->whole != 0) {
+      m->link.free(t->whole);
+      t->whole = 0;
+    }
+    if (t->whole_back != 0) {
+      m->link.free(t->whole_back);
+      t->whole_back = 0;
     }
     t->busy = 0;
     return 0;
@@ -349,16 +373,39 @@ fn alph_machine_serve(a: AlphActor*, msg: AlphMsg*) -> Word {
       return 0;
     }
     once = 1;
-  } else if (msg->tag != ALPH_WORK && msg->tag != ALPH_WORK_BYTES) {
+  } else if (msg->tag != ALPH_WORK && msg->tag != ALPH_WORK_BYTES && msg->tag != ALPH_WORK_LONG) {
     return 0;
   }
   var parcel: AlphParcel* = 0;
   if (msg->tag == ALPH_WORK_BYTES) {
     parcel = (AlphParcel*)msg->arg;
   }
+  var whole: AlphLong* = 0;
+  var whole_back: AlphLong* = 0;
   var taken: bool = false;
   var why: Word = ALPH_FULL;
+  var room: bool = true;
+  if (msg->tag == ALPH_WORK_LONG) {
+    whole = (AlphLong*)msg->arg;
+    if (whole == 0) {
+      why = ALPH_BIG;  // its bytes did not fit a long buffer here
+      room = false;
+    }
+  }
+  if (room && m->gives[s->kind] > ALPH_BACK_BYTES) {
+    // A kind that gives much back: the job gets a long buffer to put it in.
+    if (m->link.long_room == 0 || m->gives[s->kind] + 8 > m->longs[0].room) {
+      why = ALPH_BIG;  // no long buffer here holds that much
+      room = false;
+    } else {
+      whole_back = m->link.long();
+      room = whole_back != 0;
+    }
+  }
   for i in 0..TAKEN {
+    if (!room) {
+      break;
+    }
     var t: AlphTaken* = &m->taken[i];
     if (t->busy == 0) {
       t->job.kind = s->kind;
@@ -381,6 +428,18 @@ fn alph_machine_serve(a: AlphActor*, msg: AlphMsg*) -> Word {
         t->job.bytes = &t->bytes[0];
         t->job.count = parcel->count;
       }
+      if (whole != 0) {
+        t->job.in = 0;
+        t->job.data = (rawptr)whole->bytes;
+        t->job.bytes = whole->bytes;
+        t->job.count = whole->count;
+      }
+      if (whole_back != 0) {
+        t->job.back = whole_back->bytes + 8;
+        t->job.back_room = m->gives[s->kind];
+      }
+      t->whole = 0;
+      t->whole_back = 0;
       t->from = msg->from;
       t->ref = msg->ref;
       t->once = once;
@@ -390,6 +449,8 @@ fn alph_machine_serve(a: AlphActor*, msg: AlphMsg*) -> Word {
           m->done[s->kind].begin(msg->from, msg->ref);
         }
         t->busy = 1;
+        t->whole = whole;
+        t->whole_back = whole_back;
         taken = true;
         m->served = m->served + 1;
       }
@@ -398,6 +459,12 @@ fn alph_machine_serve(a: AlphActor*, msg: AlphMsg*) -> Word {
   }
   if (parcel != 0) {
     m->link.release(parcel);
+  }
+  if (!taken && whole != 0) {
+    m->link.free(whole);
+  }
+  if (!taken && whole_back != 0) {
+    m->link.free(whole_back);
   }
   if (!taken) {
     var refusal: AlphMsg = { tag: ALPH_REFUSED, from: a->pid, arg: why, ref: msg->ref };
@@ -420,6 +487,9 @@ export fn AlphMachine_init__ptr(m: AlphMachine*, cores: Word, first: Word, gpu: 
   m->told = 0;
   m->served = 0;
   m->slots_used = 0;
+  for k in 0..8 {
+    m->gives[k] = 0;
+  }
   m->peer_count = 0;
   m->board_count = 0;
   m->round_at = 0;
@@ -435,6 +505,8 @@ export fn AlphMachine_init__ptr(m: AlphMachine*, cores: Word, first: Word, gpu: 
     m->asked[i] = 0;
   }
   for i in 0..TAKEN {
+    m->taken[i].whole = 0;
+    m->taken[i].whole_back = 0;
     m->taken[i].busy = 0;
   }
   m->cores.init(&m->core[0], n, &m->actors[0], SLOTS, &m->mail[0], ROOM);
@@ -585,6 +657,30 @@ export fn AlphMachine_share__ptr(m: AlphMachine*, kind: Word) -> Word {
   }
   m->shared[kind] = 1;
   return m->names.set(ALPH_SHARED + kind, pid);
+}
+
+// Gives the machine long buffers, so that a job for another machine can
+// carry more bytes than a parcel holds, and give more back: `count` of
+// them (up to 16), each of `each` bytes, in `memory`, which must hold
+// count times each. A job's bytes, or what it gives back and eight bytes
+// more, must fit one. Half are kept for what arrives. Call it on every
+// machine, before start.
+export fn AlphMachine_longs__ptr(m: AlphMachine*, memory: uint8*, each: Word, count: Word) {
+  var n: Word = count;
+  if (n > 16) {
+    n = 16;
+  }
+  m->link.longs(&m->longs[0], n, memory, each);
+}
+
+// Says that a job of this kind (0 to 7) gives back up to `bytes` bytes.
+// Needed only for more than ALPH_BACK_BYTES: a job taken for another
+// machine then gets a long buffer to put them in (see longs). Call it on
+// every machine.
+export fn AlphMachine_gives__ptr(m: AlphMachine*, kind: Word, bytes: Word) {
+  if (kind >= 0 && kind < 8) {
+    m->gives[kind] = bytes;
+  }
 }
 
 // Ties a batch to this machine, in place of the batch's own init, with
