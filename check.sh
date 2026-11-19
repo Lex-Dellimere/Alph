@@ -309,6 +309,11 @@ build_board() {
       "$METTLE" --build -s --release tests/mcu/sure_host.mettle -I ports/host -o "$OUT/sure_host" >> "$log" 2>&1 &&
       "$METTLE" --build -s --release tests/mcu/sure_arm.mettle -I ports/host -o "$OUT/sure_arm" >> "$log" 2>&1 || status=1
       ;;
+    irq)
+      log="$OUT/irq.log"
+      "$METTLE" --release tests/mcu/irq_board.mettle --target riscv32-none --board qemu-virt \
+        --emit-flat "$OUT/irq_board.bin" -I ports/mcu > "$log" 2>&1 || status=1
+      ;;
     two)
       log="$OUT/two.log"
       "$METTLE" --release examples/mcu/two_a.mettle --target riscv32-none --board qemu-virt \
@@ -341,7 +346,7 @@ built() { [ "$(cat "$OUT/$1.built" 2> /dev/null)" = "${2:-0}" ]; }
 board_steps=()
 if [ "$boards" -eq 1 ]; then
   board_steps=(pico2 arm64)
-  [ "$qemu" -eq 1 ] && board_steps+=(blink tether relay arm harts pair two sure)
+  [ "$qemu" -eq 1 ] && board_steps+=(blink tether relay arm harts pair two sure irq)
   rm -f "$OUT"/*.built "$OUT/pico2.unbuilt" "$OUT/arm64.unbuilt"
 fi
 
@@ -629,6 +634,26 @@ step_two() {
   fi
 }
 
+# An interrupt as a message: the QEMU board's clock raises five alarms, and
+# each reaches an actor as a message.
+step_irq() {
+  local log="$OUT/irq.log" code
+  if ! built irq; then
+    echo "FAIL  mcu/irq build (see $log)"
+    fails=$((fails + 1))
+    return
+  fi
+  timeout 20 qemu-system-riscv32 -M virt -bios none -display none -monitor none -serial null \
+    -device loader,file="$OUT/irq_board.bin",addr=0x80000000,force-raw=on >> "$log" 2>&1
+  code=$?
+  if [ "$code" -eq 0 ]; then
+    echo "ok    mcu/irq [$(stat -c %s "$OUT/irq_board.bin") bytes: five interrupts from the board's clock arrive as five messages]"
+  else
+    echo "FAIL  mcu/irq: board exit $code (see $log)"
+    fails=$((fails + 1))
+  fi
+}
+
 # A sure line that loses about a quarter of the frames each way and damages
 # some: 300 requests and replies arrive once each and in order. Then the
 # machine on the line leaves in the middle of its questions and comes back
@@ -712,6 +737,7 @@ if [ "$boards" -eq 1 ]; then
   [ "$qemu" -eq 1 ] && step_pair
   [ "$qemu" -eq 1 ] && step_two
   [ "$qemu" -eq 1 ] && step_sure
+  [ "$qemu" -eq 1 ] && step_irq
   step_arm64
 fi
 

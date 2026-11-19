@@ -62,6 +62,7 @@ NEW_MODULES=(
   src/batch/batch.mettle
   src/board/board.mettle
   src/board/once.mettle
+  src/board/irq.mettle
   src/actor/actor.mettle
   src/cores/cores.mettle
   src/cores/lanes.mettle

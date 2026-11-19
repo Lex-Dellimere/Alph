@@ -1,0 +1,87 @@
+// An interrupt as a message (alph/board/irq), on the QEMU board. The
+// board's real-time clock can raise an alarm: each alarm is an external
+// interrupt, which becomes a message to an actor, which sets the next. Five
+// alarms 20 ms apart, then the board stops. It returns 0 when the five
+// messages came, in order, from the clock's source.
+
+import "port/board";
+import "alph/actor/actor";
+import "alph/time/time";
+import "alph/board/irq";
+
+const ALARM: Word = 1;
+const LATE: Word = 2;
+const RTC: int64 = 1052672;  // 0x101000: the clock on QEMU's virt board
+const RTC_IRQ: Word = 11;
+
+var g_node: AlphNode;
+var g_actors: AlphActor[2];
+var g_mail: AlphMsg[8];
+var g_irqs: AlphIrq[2];
+var g_time: AlphTime;
+var g_timers: AlphTimer[2];
+var g_alarms: Word = 0;
+var g_wrong: Word = 0;
+
+@interrupt fn mettle_trap() {
+  mettle_board_exit(99);
+}
+
+fn reg(at: int64) -> volatile uint32* {
+  return (volatile uint32*)(RTC + at);
+}
+
+// Sets the clock's alarm 20 ms from now.
+fn alarm_in_20ms() {
+  var low: int64 = (int64)*reg(0);
+  var high: int64 = (int64)*reg(4);
+  var then: int64 = ((high << 32) | low) + 20000000;
+  *reg(12) = (uint32)(then >> 32);
+  *reg(8) = (uint32)(then & 4294967295);
+  *reg(16) = 1;
+}
+
+// In the interrupt: the clock stops asking.
+fn quiet(source: Word) {
+  *reg(28) = 1;
+}
+
+fn waiter(a: AlphActor*, m: AlphMsg*) -> Word {
+  if (m->tag == LATE) {
+    a->node->stop();
+    return 0;
+  }
+  if (m->tag != ALARM) {
+    return 0;
+  }
+  g_alarms = g_alarms + 1;
+  if (m->arg != RTC_IRQ || m->ref != g_alarms) {
+    g_wrong = g_wrong + 1;
+  }
+  if (g_alarms == 5) {
+    a->node->stop();
+    return 0;
+  }
+  alarm_in_20ms();
+  return 0;
+}
+
+fn main() -> int32 {
+  alph_board_start();
+  g_node.init(&g_actors[0], 2, &g_mail[0], 4);
+  g_time.init(&g_node, &g_timers[0], 2);
+  var me: Word = g_node.spawn(&waiter, 0);
+  alph_irqs(&g_node, &g_irqs[0], 2);
+  if (alph_irq(RTC_IRQ, me, ALARM, &quiet) != ALPH_OK) {
+    return 3;
+  }
+  mettle_irq_enable();
+  g_time.after(3000, me, LATE, 0);
+  alarm_in_20ms();
+  g_node.run();
+  g_time.stop();
+  if (g_alarms != 5 || g_wrong != 0) {
+    return 1;
+  }
+  return 0;
+}

@@ -1,12 +1,13 @@
 // A line of bytes to one other machine: the board's console, both ways.
 // The console's interrupt hands each byte that arrives to take. This file
-// has the board's external interrupt handler, so a program with other
-// external sources adds them here.
+// has the board's external interrupt handler. Other external sources are
+// handed to whatever alph_board_others was given.
 
 import "port/port";
 
 var g_take: fn(rawptr, int32) -> void;
 var g_ctx: rawptr;
+var g_other: fn(int32) -> void;
 
 export fn alph_line_start(take: fn(rawptr, int32) -> void, ctx: rawptr) {
   g_take = take;
@@ -39,6 +40,12 @@ export fn alph_line_which() -> Word {
 export fn alph_line_use(line: Word) {
 }
 
+// What is called, in the interrupt, for an external interrupt that is not
+// the console's: see alph/board/irq, which makes a message of it.
+export fn alph_board_others(call: fn(int32) -> void) {
+  g_other = call;
+}
+
 @interrupt fn mettle_trap_external() {
   var source: int32 = mettle_board_irq_claim();
   if (source == mettle_board_console_irq()) {
@@ -47,6 +54,9 @@ export fn alph_line_use(line: Word) {
       g_take(g_ctx, c);
       c = mettle_board_getc();
     }
+  } else if (g_other != 0) {
+    var other: fn(int32) -> void = g_other;
+    other(source);
   }
   mettle_board_irq_complete(source);
 }

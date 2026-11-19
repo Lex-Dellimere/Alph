@@ -470,6 +470,54 @@ memory for it. The machines must ask for the kind the same way
 left for it, ALPH_GONE for a kind that is not 0 to 7 or is shared
 already.
 
+## alph/board/irq
+
+Interrupts as messages, on a board. A source of external interrupts (a
+pin, a sensor that has a reading, a counter that wrapped) is given an
+actor and a tag: each interrupt sends that actor one message, with the
+source in arg and how many there have been in ref. The handler then runs
+like any other, outside the interrupt, so it may take its time.
+
+A device that keeps asking until it is answered has to be quieted in the
+interrupt itself, or the interrupt comes again at once: give a function
+for that. It runs in the interrupt and should do nothing else.
+
+If the actor's mailbox is full the message is lost and the count still
+goes up, so the actor sees from ref that it missed some.
+
+### `AlphIrq`
+
+```mettle
+export struct AlphIrq {
+  source: Word;
+  to: Word;
+  tag: Word;
+  count: Word;
+  quiet: fn(Word) -> void;
+}
+```
+
+One source: who is told, and how.
+
+### `alph_irqs`
+
+```mettle
+export fn alph_irqs(node: AlphNode*, irqs: AlphIrq*, room: Word)
+```
+
+Gives the interrupts their node and the memory for `room` sources. Call
+it once, before the first on.
+
+### `alph_irq`
+
+```mettle
+export fn alph_irq(source: Word, to: Word, tag: Word, quiet: fn(Word) -> void) -> Word
+```
+
+From now on each interrupt from `source` sends `to` a message with this
+tag. quiet, if not 0, is called in the interrupt first, to stop the
+device asking. Returns ALPH_OK, or ALPH_FULL when every source is taken.
+
 ## alph/actor/actor
 
 alph's core: actors, messages and the loop that runs them.

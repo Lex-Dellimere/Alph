@@ -100,6 +100,8 @@ A board asks for work too. It asks the door at the other end of its line who doe
 
 A computer has up to four serial lines, a board on each, so the two chips of an arm and the computer that plans are one machine. Each board is a place of its own with its own measured time. With two boards that both read angles, 60 jobs went 30 and 30.
 
+On a board the outside world arrives as interrupts. `src/board/irq.mettle` makes a message of each: the port's interrupt handler passes a source that is not its own to a hook, and the hook sends the actor that asked for that source a message with a count. So a handler for a sensor is written like any other and may take its time, and the interrupt itself only quiets the device and puts four words in a mailbox. A board that uses no such source pays for one test in its interrupt handler.
+
 A board must also know when its machine is gone, because a board that moves something has to stop then. The machine's question twice a second is the sign of life: the board counts them (`heard`), and a program that sees the count stand still for a second or two stops what it drives. It costs the board one add.
 
 The board runs one job at a time, so a machine sends it at most four and a place has a limit for that. Nothing on the line is sent again: a job or an answer lost there is given up on after a second and placed again.

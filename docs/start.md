@@ -780,6 +780,21 @@ g_board.share_once(MOVE, &move, &g_moves);
 - Without the short way: `g_places.once(kind)` on the asking side, and the worker uses `AlphOnce` from `alph/place/once`, as `src/board/once.mettle` does.
 - A board that shares no such kind pays nothing for this. With one, the arm example's image goes from 4,544 to 5,520 bytes.
 
+**Interrupts as messages.** A sensor that has a reading, a pin that changed, a counter that wrapped: on a board these arrive as interrupts. `alph/board/irq` turns each into a message, so the code that deals with it is an ordinary handler:
+
+```mettle
+import "alph/board/irq";
+
+var g_irqs: AlphIrq[2];
+
+alph_irqs(&g_board.node, &g_irqs[0], 2);
+alph_irq(11, me, ALARM, &quiet);  // source 11 sends actor `me` an ALARM each time
+```
+
+- The message has the source in `arg` and how many interrupts there have been from it in `ref`. If the actor's mailbox is full the message is lost and the count still goes up, so the actor can see it missed some.
+- `quiet` is called in the interrupt, before the message is sent, for a device that keeps asking until it is answered: it tells the device to stop. Pass 0 for a source that needs nothing.
+- Which number a source has is the board's business: see Mettle's page for the board. [tests/mcu/irq_board.mettle](../tests/mcu/irq_board.mettle) uses the clock of QEMU's board.
+
 **A board that asks.** A board asks for work as well: `g_board.ask(a, kind, in)` sends a job to whoever does that kind at the other end of the line, a computer or another board. The answer comes to actor `a` as `ALPH_WORKED`, with the job's out in `arg` and the ref `ask` returned:
 
 ```mettle
