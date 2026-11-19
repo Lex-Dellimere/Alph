@@ -153,6 +153,34 @@ if [ "$#" -eq 0 ] && command -v qemu-system-riscv32 > /dev/null 2>&1; then
   fi
 fi
 
+# The same board reached from a third machine, through the one on its line.
+if [ "$#" -eq 0 ] && command -v qemu-system-riscv32 > /dev/null 2>&1 && [ -f "$OUT/tether.bin" ]; then
+  bin="$OUT/tether.bin"
+  host="$OUT/relay_host"
+  log="$OUT/relay.log"
+  if ! "$METTLE" --build -s --release examples/mcu/relay_host.mettle -I ports/host -o "$host" > "$log" 2>&1; then
+    echo "FAIL  mcu/relay build (see $log)"
+    fails=$((fails + 1))
+  else
+    port=$((8431 + $$ % 300 * 3))
+    "$host" "$port" >> "$log" 2>&1 &
+    host_pid=$!
+    sleep 0.3
+    timeout 30 qemu-system-riscv32 -M virt -bios none -display none -monitor none \
+      -serial "tcp:127.0.0.1:$port" -device loader,file="$bin",addr=0x80000000,force-raw=on >> "$log" 2>&1
+    board=$?
+    wait "$host_pid"
+    code=$?
+    if [ "$code" -eq 0 ] && [ "$board" -eq 0 ]; then
+      echo "ok    mcu/relay [a third machine reaches the board through the one on its line]"
+    else
+      echo "FAIL  mcu/relay: hosts exit $code, board exit $board (see $log)"
+      tail -n 4 "$log" | sed 's/^/      /'
+      fails=$((fails + 1))
+    fi
+  fi
+fi
+
 if [ "$fails" -eq 0 ]; then
   echo "PASS"
 else

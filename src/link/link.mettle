@@ -61,6 +61,8 @@ struct AlphPacket {
 export struct AlphPeer {
   first: Word;   // its places are first, first + 1, ...
   count: Word;
+  more_first: Word;  // places reached through it, such as a board on its serial line
+  more_count: Word;
   ip: uint32;
   port: int64;
   life: uint32;  // which run of that machine this is, 0 before it is heard
@@ -102,6 +104,10 @@ export struct AlphLink {
   open: fn(rawptr, uint8*, uint8*, int64, uint32*, Word*, Word*) -> int64;
   sealer: rawptr;
   refused: Word;  // datagrams not sealed with the key, or already heard
+  // Mail for a place that is neither on these cores nor a peer's goes to
+  // beyond, if it is set: a board on this machine's serial line, say.
+  beyond: fn(AlphLink*, Word, AlphMsg*) -> Word;
+  beyond_ctx: rawptr;
 }
 
 // Sends a datagram to a peer, sealed if the link is.
@@ -137,6 +143,9 @@ fn alph_link_peer(l: AlphLink*, place: Word) -> AlphPeer* {
     if (place >= p->first && place < p->first + p->count) {
       return p;
     }
+    if (place >= p->more_first && place < p->more_first + p->more_count) {
+      return p;
+    }
   }
   return 0;
 }
@@ -170,6 +179,9 @@ fn alph_pid_fits(place: uint32, gen: uint32, index: uint32) -> bool {
 fn alph_link_far(c: AlphCores*, to: Word, m: AlphMsg*) -> Word {
   var l: AlphLink* = (AlphLink*)c->world;
   var p: AlphPeer* = alph_link_peer(l, (Word)(to >> ALPH_PLACE_SHIFT));
+  if (p == 0 && l->beyond != 0) {
+    return l->beyond(l, to, m);
+  }
   if (p == 0 || p->alive == 0) {
     return ALPH_GONE;
   }
@@ -297,13 +309,6 @@ fn alph_link_heard(l: AlphLink*, k: AlphPacket*, got: int64, born: Word, count: 
   if (k->kind != MAIL || got < MAIL_BYTES) {
     return;
   }
-  if (!alph_pid_fits(k->to_place, k->to_gen, k->to_index) || !alph_pid_fits(k->src_place, k->src_gen, k->src_index)) {
-    return;
-  }
-  var core: Word = (Word)(int64)k->to_place - l->cores->first;
-  if (core < 0 || core >= l->cores->count) {
-    return;
-  }
   if (k->seq != p->got + 1) {
     // One again, or one too early. The next chase says where we are: once,
     // however many of these come.
@@ -319,9 +324,19 @@ fn alph_link_heard(l: AlphLink*, k: AlphPacket*, got: int64, born: Word, count: 
   p->owed = p->owed + 1;
   var owed: Word = p->owed;
   p->gate.leave(was);
-  var m: AlphMsg = { tag: (Word)k->tag, from: alph_pid_of(k->src_place, k->src_gen, k->src_index), arg: (Word)k->arg,
-                     ref: (Word)k->ref };
-  l->cores->cores[core].node.put(alph_pid_of(k->to_place, k->to_gen, k->to_index), &m);
+  // It is taken, whatever becomes of it: one that cannot be delivered, or
+  // whose pids do not fit a word here, must not hold up the ones behind it.
+  if (alph_pid_fits(k->to_place, k->to_gen, k->to_index) && alph_pid_fits(k->src_place, k->src_gen, k->src_index)) {
+    var m: AlphMsg = { tag: (Word)k->tag, from: alph_pid_of(k->src_place, k->src_gen, k->src_index), arg: (Word)k->arg,
+                       ref: (Word)k->ref };
+    var to: Word = alph_pid_of(k->to_place, k->to_gen, k->to_index);
+    var core: Word = (Word)(int64)k->to_place - l->cores->first;
+    if (core >= 0 && core < l->cores->count) {
+      l->cores->cores[core].node.put(to, &m);
+    } else if (l->beyond != 0 && alph_link_peer(l, (Word)(int64)k->to_place) == 0) {
+      l->beyond(l, to, &m);  // passed on, to a board on our line
+    }
+  }
   if (owed >= ACK_EVERY) {
     alph_link_say(l, p);
   }
@@ -426,6 +441,8 @@ export fn AlphLink_init__ptr(l: AlphLink*, cores: AlphCores*, first: Word, peers
   l->lose = 0;
   l->lost = 0;
   l->deaf = 0;
+  l->beyond = 0;
+  l->beyond_ctx = 0;
   l->seal = 0;
   l->open = 0;
   l->sealer = 0;
@@ -442,6 +459,8 @@ export fn AlphLink_peer__ptr(l: AlphLink*, first: Word, count: Word, ip: uint32,
   var p: AlphPeer* = &l->peers[l->count];
   p->first = first;
   p->count = count;
+  p->more_first = 0;
+  p->more_count = 0;
   p->ip = ip;
   p->port = port;
   p->life = 0;
@@ -455,6 +474,20 @@ export fn AlphLink_peer__ptr(l: AlphLink*, first: Word, count: Word, ip: uint32,
   alph_link_fresh(p, 0);
   l->count = l->count + 1;
   return ALPH_OK;
+}
+
+// Says that places first, first + 1, ... are reached through the peer whose
+// own places start at peer: a board on that machine's serial line, which it
+// passes mail on to. Returns ALPH_GONE when there is no such peer.
+export fn AlphLink_through__ptr(l: AlphLink*, peer: Word, first: Word, count: Word) -> Word {
+  for i in 0..l->count {
+    if (l->peers[i].first == peer) {
+      l->peers[i].more_first = first;
+      l->peers[i].more_count = count;
+      return ALPH_OK;
+    }
+  }
+  return ALPH_GONE;
 }
 
 // The actor told when a machine becomes reachable (ALPH_UP) or is lost
@@ -493,11 +526,15 @@ export fn AlphLink_first_of__ptr(l: AlphLink*, place: Word) -> Word {
   if (place >= l->cores->first && place < l->cores->first + l->cores->count) {
     return l->cores->first;
   }
-  var p: AlphPeer* = alph_link_peer(l, place);
-  if (p == 0) {
-    return -1;
+  // Only a machine's own places: a board reached through one is not that
+  // machine, and has no door.
+  for i in 0..l->count {
+    var p: AlphPeer* = &l->peers[i];
+    if (place >= p->first && place < p->first + p->count) {
+      return p->first;
+    }
   }
-  return p->first;
+  return -1;
 }
 
 // How many places the machine starting at first has, 0 when there is none.

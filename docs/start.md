@@ -520,7 +520,19 @@ fn main() -> int32 {
 }
 ```
 
-`init(node, place, first, count)` makes the node place `place` and sends mail for places `first` to `first + count - 1` down the line. Call it before the first spawn. The other end is the same layer on the host port, given the line's descriptor with `alph_line_open(fd)` first, as [examples/mcu/tether_host.mettle](../examples/mcu/tether_host.mettle) does with a TCP connection from QEMU. A message goes over once: a byte lost on the line loses it. A pid from the bigger machine has to fit the board's word (place below 256, slot below 1,024, generation below 8,192), which holds for actors spawned at the start; a message whose pids do not fit is dropped.
+`init(node, place, first, count)` makes the node place `place` and sends mail for places `first` to `first + count - 1` down the line. Call it before the first spawn. The other end is the same layer on the host port, given the line's descriptor with `alph_line_open(fd)` first, as [examples/mcu/tether_host.mettle](../examples/mcu/tether_host.mettle) does with a TCP connection from QEMU. The machine on the line can pass the board's mail on to the rest of the network. On that machine call `relay(link, first, count)` in place of `init`, after the link's `init` and before its `start` (it is in `alph/tether/relay`). On the other machines call `link.through(peer, first, count)` to say the board's places are reached through that peer. [examples/mcu/relay_host.mettle](../examples/mcu/relay_host.mettle) does both:
+
+```mettle
+g_mid_link.init(&g_mid, 0, &g_mid_peers[0], 1);
+g_mid_link.peer(2, 1, here, port + 2);
+g_tether.relay(&g_mid_link, 1, 1);
+
+g_far_link.init(&g_far, 2, &g_far_peers[0], 1);
+g_far_link.peer(0, 1, here, port + 1);
+g_far_link.through(0, 1, 1);
+```
+
+A message goes over once: a byte lost on the line loses it. A pid from the bigger machine has to fit the board's word (place below 256, slot below 1,024, generation below 8,192), which holds for actors spawned at the start; a message whose pids do not fit is dropped.
 
 ## Limits
 
@@ -531,7 +543,7 @@ These are not built yet.
 - Timers look at every timer slot: right for tens of timers, not thousands. A timer wheel behind the same four functions is not built.
 - Sockets are Linux only, and there is no file IO.
 - A message between two cores costs 150 to 300 ns against about 20 ns inside a node. Removing that needs a queue per pair of cores that the sender writes without touching anything the receiver owns, which changes what a full mailbox can tell a sender. Not built.
-- A microcontroller reaches other machines only over a serial line to one of them, and nothing lost on that line is sent again.
+- A microcontroller joins through a serial line to one machine, and nothing lost on that line is sent again.
 - A full mailbox at the far end of a link drops its message and the sender is not told.
 - Peers are listed by hand.
 - A watch cannot be dropped across machines.

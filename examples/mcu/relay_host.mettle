@@ -1,0 +1,159 @@
+// Three machines: a board, the machine on its serial line, and a third
+// machine on the network that asks the board for numbers. The middle one
+// passes the mail on both ways, so the asker reaches the board's actor by
+// its pid as it would reach any other. Here the two Linux machines run in
+// one process. The board is examples/mcu/tether.mettle, unchanged.
+// check.sh runs them together.
+//
+//   mettle --build -s --release examples/mcu/relay_host.mettle -I ports/host -o relay_host
+//   ./relay_host 7431 &
+//   qemu-system-riscv32 -M virt -bios none -display none -monitor none \
+//       -serial tcp:127.0.0.1:7431 -device loader,file=tether.bin,addr=0x80000000,force-raw=on
+
+import "std/io";
+import "std/thread";
+import "port/net";
+import "port/wire";
+import "port/line";
+import "alph/actor/actor";
+import "alph/cores/cores";
+import "alph/time/time";
+import "alph/link/link";
+import "alph/tether/tether";
+import "alph/tether/relay";
+
+const PING: Word = 1;
+const PONG: Word = 2;
+const QUIT: Word = 3;
+const LATE: Word = 4;
+const ROUNDS: Word = 100;
+
+// The middle machine is place 0, the board is place 1, the asker is place 2.
+var g_mid: AlphCores;
+var g_mid_core: AlphCore[1];
+var g_mid_actors: AlphActor[2];
+var g_mid_mail: AlphMsg[16];
+var g_mid_link: AlphLink;
+var g_mid_peers: AlphPeer[1];
+var g_tether: AlphTether;
+
+var g_far: AlphCores;
+var g_far_core: AlphCore[1];
+var g_far_actors: AlphActor[2];
+var g_far_mail: AlphMsg[16];
+var g_far_link: AlphLink;
+var g_far_peers: AlphPeer[1];
+var g_time: AlphTime;
+var g_timers: AlphTimer[2];
+
+struct Asker {
+  board: Word;
+  ref: Word;
+  rounds: Word;
+  bad: Word;
+  late: Word;
+}
+
+fn asker(a: AlphActor*, m: AlphMsg*) -> Word {
+  var p: Asker* = (Asker*)a->state;
+  if (m->tag == LATE) {
+    p->late = 1;
+    a->cores()->stop();
+    return 0;
+  }
+  if (m->tag == ALPH_DOWN) {
+    return 0;
+  }
+  if (m->tag == PONG) {
+    if (m->ref != p->ref || m->arg != p->rounds + 1 || m->from != p->board) {
+      p->bad = p->bad + 1;
+    }
+    p->rounds = m->arg;
+    if (p->rounds >= ROUNDS) {
+      a->send(p->board, QUIT, 0);
+      a->cores()->stop();
+      return 0;
+    }
+  }
+  // The middle machine is up, or an answer came: ask for the next number.
+  p->ref = a->ask(p->board, PING, p->rounds);
+  return 0;
+}
+
+fn mid_main(arg: cstring) -> uint32 {
+  g_mid.run();
+  return 0;
+}
+
+fn main(argc: int32, argv: cstring*) -> int32 {
+  var port: int64 = 7431;
+  if (argc > 1) {
+    port = 0;
+    var i: int32 = 0;
+    while (argv[1][i] >= 48 && argv[1][i] <= 57) {
+      port = port * 10 + (int64)(argv[1][i] - 48);
+      i = i + 1;
+    }
+  }
+  var here: uint32 = alph_ip4(127, 0, 0, 1);
+  var listening: int64 = alph_tcp_listen(port);
+  if (listening < 0) {
+    println("port {port} is taken");
+    return 1;
+  }
+  var line: int64 = ALPH_LATER;
+  var waited: int32 = 0;
+  while (line < 0 && waited < 2000) {
+    line = alph_tcp_accept(listening);
+    waited = waited + 1;
+    Sleep(10);
+  }
+  if (line < 0) {
+    println("no board called");
+    return 1;
+  }
+  syscall(72, line, 4, 0);  // the line's thread reads it and waits
+  alph_line_open(line);
+
+  // The middle machine: on the link, with the board behind it.
+  g_mid.init(&g_mid_core[0], 1, &g_mid_actors[0], 2, &g_mid_mail[0], 8);
+  g_mid_link.init(&g_mid, 0, &g_mid_peers[0], 1);
+  g_mid_link.peer(2, 1, here, port + 2);
+  g_tether.relay(&g_mid_link, 1, 1);
+
+  // The asking machine: it knows the board is reached through the middle one.
+  var p: Asker;
+  p.board = (Word)(((Word)1 << ALPH_PLACE_SHIFT) | ((Word)1 << ALPH_INDEX_BITS));
+  p.rounds = 0;
+  p.bad = 0;
+  p.late = 0;
+  g_far.init(&g_far_core[0], 1, &g_far_actors[0], 2, &g_far_mail[0], 8);
+  g_far_link.init(&g_far, 2, &g_far_peers[0], 1);
+  g_far_link.peer(0, 1, here, port + 1);
+  g_far_link.through(0, 1, 1);
+  var me: Word = g_far.spawn(&asker, (rawptr)&p);
+  g_far_link.watch(me);
+  g_time.init(&g_far_core[0].node, &g_timers[0], 2);
+  g_time.after(15000, me, LATE, 0);
+
+  if (g_mid_link.start(port + 1) != ALPH_OK || g_far_link.start(port + 2) != ALPH_OK) {
+    println("the ports after {port} are taken");
+    return 1;
+  }
+  var mid: int64 = CreateThread(0, 0, &mid_main, 0, 0, 0);
+  g_far.run();  // the asker starts when it hears the middle machine is up
+  g_time.stop();
+  Sleep(100);   // let the word to stop reach the board
+  g_mid.stop();
+  thread_join_infinite(mid);
+  thread_close(mid);
+  g_far_link.stop();
+  g_mid_link.stop();
+  alph_close(line);
+  alph_close(listening);
+  println("{p.rounds} numbers answered by the board through another machine, {p.bad} wrong");
+  if (p.rounds != ROUNDS || p.bad != 0 || p.late != 0) {
+    return 1;
+  }
+  return 0;
+}

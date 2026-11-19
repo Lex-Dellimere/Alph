@@ -32,6 +32,7 @@ export struct AlphTether {
   have: Word;
   escaped: Word;
   dropped: Word;  // messages that came in damaged, or with a pid too big for here
+  relay: Word;    // mail off the line for places other than this node's is passed on
   frame: uint8[34];
 }
 
@@ -93,14 +94,9 @@ fn alph_tether_byte(byte: int32) {
   }
 }
 
-// Mail for a place on the other machine.
-fn alph_tether_far(n: AlphNode*, to: Word, m: AlphMsg*) -> Word {
-  var t: AlphTether* = (AlphTether*)n->world;
-  var place: Word = (Word)(to >> ALPH_PLACE_SHIFT);
+// Puts a message on the line, whoever it is for.
+export fn AlphTether_send__ptr(t: AlphTether*, to: Word, m: AlphMsg*) -> Word {
   var out: uint8[34];
-  if (place < t->first || place >= t->first + t->count) {
-    return ALPH_GONE;
-  }
   alph_tether_pack(&out[0], 0, 4, to);
   alph_tether_pack(&out[0], 2, 12, m->from);
   alph_tether_put(&out[20], m->tag, 4);
@@ -118,6 +114,16 @@ fn alph_tether_far(n: AlphNode*, to: Word, m: AlphMsg*) -> Word {
   alph_line_flush();
   alph_line_unlock();
   return ALPH_OK;
+}
+
+// Mail for a place on the other machine.
+fn alph_tether_far(n: AlphNode*, to: Word, m: AlphMsg*) -> Word {
+  var t: AlphTether* = (AlphTether*)n->world;
+  var place: Word = (Word)(to >> ALPH_PLACE_SHIFT);
+  if (place < t->first || place >= t->first + t->count) {
+    return ALPH_GONE;
+  }
+  return t->send(to, m);
 }
 
 // A word of 4 bytes off the line, with its sign.
@@ -164,7 +170,14 @@ fn alph_tether_take(ctx: rawptr, byte: int32) {
   }
   var to: Word = alph_tether_unpack(&t->frame[0], 0, 4);
   var from: Word = alph_tether_unpack(&t->frame[0], 2, 12);
-  if (!whole || to < 0 || from < 0 || (Word)(to >> ALPH_PLACE_SHIFT) != t->node->place) {
+  // For this node, or, on a machine that passes mail on, for anywhere but
+  // back down the line.
+  var place: Word = (Word)(to >> ALPH_PLACE_SHIFT);
+  var mine: bool = place == t->node->place;
+  if (t->relay != 0 && to >= 0) {
+    mine = place < t->first || place >= t->first + t->count;
+  }
+  if (!whole || to < 0 || from < 0 || !mine) {
     t->dropped = t->dropped + 1;
     return;
   }
@@ -173,18 +186,25 @@ fn alph_tether_take(ctx: rawptr, byte: int32) {
   t->node->put(to, &m);
 }
 
-// Ties a node to the machine at the other end of the port's line. The node
-// is place `place`. The other machine's places are first, first + 1, ...
-// Call it before the first spawn.
-export fn AlphTether_init__ptr(t: AlphTether*, node: AlphNode*, place: Word, first: Word, count: Word) {
+// Starts the line for a node that is already placed: mail off the line is
+// put through it. The other machine's places are first, first + 1, ...
+export fn AlphTether_open__ptr(t: AlphTether*, node: AlphNode*, first: Word, count: Word) {
   t->node = node;
   t->first = first;
   t->count = count;
   t->have = 0;
   t->escaped = 0;
   t->dropped = 0;
-  node->join(place, &alph_tether_far, (rawptr)t);
+  t->relay = 0;
   alph_line_put((uint8)END);
   alph_line_flush();
   alph_line_start(&alph_tether_take, (rawptr)t);
+}
+
+// Ties a node to the machine at the other end of the port's line. The node
+// is place `place`. The other machine's places are first, first + 1, ...
+// Call it before the first spawn.
+export fn AlphTether_init__ptr(t: AlphTether*, node: AlphNode*, place: Word, first: Word, count: Word) {
+  node->join(place, &alph_tether_far, (rawptr)t);
+  t->open(node, first, count);
 }

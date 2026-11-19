@@ -280,7 +280,8 @@ fn main() -> int32 {
   f.to_life = g_a_link.life;
   f.to_place = 0;
   f.to_gen = f.to_gen + 16777216;             // spills into the place: names core 1 from core 0
-  third.send(here, port_a, (uint8*)&f, 80);
+  third.send(here, port_a, (uint8*)&f, 80);   // taken in its turn, so nothing waits behind it, then dropped
+  f.seq = f.seq + 1;
   f.to_place = 1;
   f.to_gen = f.to_gen - 16777216;
   third.send(here, port_a, (uint8*)&f, 40);   // cut short

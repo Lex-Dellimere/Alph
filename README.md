@@ -61,7 +61,7 @@ This is [examples/count.mettle](examples/count.mettle). The node owns no memory:
 | Links | Other machines over UDP. Messages arrive once and in order, and a lost machine is noticed in half a second | [src/link](src/link/link.mettle) |
 | Names and the door | Find an actor on another machine by name, and watch it | [src/name](src/name/name.mettle), [src/door](src/door/door.mettle) |
 | Seals | A link only the holders of one key can read or speak on | [src/seal](src/seal/seal.mettle) |
-| Tether | A microcontroller tied to a bigger machine by its serial line: each side's actors reach the other's by pid | [src/tether](src/tether/tether.mettle) |
+| Tether | A microcontroller tied to a bigger machine by its serial line: each side's actors reach the other's by pid. That machine can pass the board's mail on, so the whole network reaches it | [src/tether](src/tether/tether.mettle) |
 | Ports | What differs per device: `mcu` (one hart, no OS) and `host` (x86-64 Linux) | [ports](ports) |
 
 [docs/start.md](docs/start.md) shows how to use each of these. [docs/design.md](docs/design.md) explains why they are built this way, what was measured, and what is not built yet.
@@ -127,7 +127,7 @@ qemu-system-riscv32 -M virt -bios none -display none -monitor none -serial tcp:1
 - Timers look at every timer slot: right for tens of timers, not thousands.
 - Sockets are Linux only, and there is no file IO.
 - A message between two cores costs 150 to 300 ns against about 20 ns inside a node.
-- A microcontroller reaches other machines only over a serial line to one of them, and nothing lost on that line is sent again.
+- A microcontroller joins through a serial line to one machine, and nothing lost on that line is sent again.
 
 ## Test
 
