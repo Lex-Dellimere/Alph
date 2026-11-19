@@ -395,7 +395,7 @@ fn alph_machine_serve(a: AlphActor*, msg: AlphMsg*) -> Word {
   if (room && m->gives[s->kind] > ALPH_BACK_BYTES) {
     // A kind that gives much back: the job gets a long buffer to put it in.
     if (m->link.long_room == 0 || m->gives[s->kind] + 8 > m->longs[0].room) {
-      why = ALPH_BIG;  // no long buffer here holds that much
+      why = ALPH_GONE;  // no long buffer here holds that much: this machine cannot do the kind for others
       room = false;
     } else {
       whole_back = m->link.long();

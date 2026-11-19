@@ -38,8 +38,10 @@ TIMED="t_bound t_fair t_shed t_shed_edge t_timer_handoff t_storm"
 # that measure where work goes by timing it (t_places t_far t_own t_machine
 # t_three t_batch t_time t_wheel t_link t_parcel t_door t_seal t_poll t_proc
 # t_cores) each passed 20 of 20 runs in both modes beside a full parallel
-# build, so none is listed. Add a test here if it fails only in a full run.
-LOADED=""
+# build, so none was listed. Add a test here if it fails only in a full run.
+# t_places is here since examples/frames joined the parallel part: with it
+# running, the GPU was once tried only once in 300 small jobs, not twice.
+LOADED="t_places"
 ALONE="$TIMED $LOADED"
 # Programs that listen on ports, as <name>:<lock>. They run in the parallel
 # part, but two with the same lock never run at once: their ports could be
@@ -53,10 +55,10 @@ ALONE="$TIMED $LOADED"
 PORTS="t_door:8000 t_poll:8000 t_link:12000 t_parcel:12000 t_machine:12000
   t_three:12000 t_own:12000 t_back:12000 t_wide:12000 t_long:12000
   t_big:12000 t_far:10000 t_seal:11000
-  far:7401 talk:7411 run:7441 share:7451 picture:7471"
+  far:7401 talk:7411 run:7441 share:7451 picture:7471 frames:7481"
 # --quick: the new layers only, for use between small edits.
 QUICK_TESTS="t_actor t_cores t_time t_wheel t_places t_life t_link t_seal t_door t_far t_parcel t_poll t_proc t_tether t_batch t_machine t_three t_own t_cross t_back t_once t_serial t_tether_sure t_wide t_long t_big"
-QUICK_EXAMPLES="count spread render far run share picture tiles talk"
+QUICK_EXAMPLES="count spread render far run share picture frames tiles talk"
 mkdir -p "$OUT"
 
 # Any exit, Ctrl-C included, stops every process this script started and
@@ -341,7 +343,7 @@ build_board() {
           tests/t_life tests/t_link tests/t_seal tests/t_door tests/t_far tests/t_parcel tests/t_poll \
           tests/t_proc tests/t_tether tests/t_batch tests/t_machine tests/t_three tests/t_own \
           tests/t_serial tests/t_back tests/t_once tests/t_wide tests/t_long tests/t_big examples/tiles examples/render examples/share \
-          examples/picture examples/run examples/count examples/spread examples/far examples/talk \
+          examples/picture examples/frames examples/run examples/count examples/spread examples/far examples/talk \
           examples/mcu/arm_host examples/mcu/tether_host examples/mcu/relay_host tests/mcu/arm_test; do
         name=$(basename "$src")
         if ! "$METTLE" -s --release --target aarch64-linux "$src.mettle" -I ports/arm64 -I ports/host \

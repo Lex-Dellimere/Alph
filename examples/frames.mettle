@@ -1,0 +1,348 @@
+// A camera's frames worked on by another machine's GPU. The machine started
+// as the boss has the camera and no GPU. Each frame is a job that carries
+// the frame's 61,440 bytes and gives back as many: the frame made smooth,
+// each pixel the mean of the 225 around it. alph sends each to a core here
+// or to the other machine, wherever it should be done first. There the
+// helper's own places send it to its GPU or a core. One function,
+// smooth_at, is the work on both, so the bytes are the same either way.
+//
+// A frame is more than a message's parcel holds, so the machines are given
+// long buffers: the link cuts a frame into pieces and puts it together at
+// the other end. The camera here is made up: frame n is a pattern that
+// moves with n.
+//
+// With no arguments two machines run in this one process:
+//
+//   mettle --build -s --release examples/frames.mettle -I ports/host -o frames
+//   ./frames
+//
+// On two computers, each with the other's address:
+//
+//   ./frames helper 192.168.1.10
+//   ./frames boss 192.168.1.20
+
+import "std/io";
+import "std/gpu";
+import "std/thread";
+import "alph/actor/actor";
+import "alph/machine/machine";
+import "alph/batch/batch";
+
+const WIDE: int32 = 256;
+const HIGH: int32 = 240;
+const FRAME: Word = 61440;   // bytes in a frame
+const FRAMES: Word = 200;
+const REACH: int32 = 7;      // how far around a pixel its mean is taken
+const SMOOTH: Word = 0;  // the kind of job: a frame in, the frame made smooth back
+const GO: Word = 1;
+const BOSS_PORT: int64 = 7481;
+const HELPER_PORT: int64 = 7482;
+
+var g_boss: AlphMachine;
+var g_helper: AlphMachine;
+var g_boss_longs: uint8[560000];    // eight long buffers of 70,000 bytes
+var g_helper_longs: uint8[560000];
+var g_batch: AlphBatch;
+var g_slots: AlphBatchSlot[8];      // eight frames out at once,
+var g_frames: uint8[491520];        // each with room for the frame
+var g_smooth: uint8[491520];        // and for what comes back
+var g_sums: Word[200];          // by frame: what its bytes added up to when it came back
+var g_check: uint8[61440];
+var g_right: uint8[61440];
+var g_short: Word = 0;          // frames that came back with too few bytes
+var g_src: int64 = 0;         // a frame on the GPU,
+var g_dst: int64 = 0;         // and the same made smooth
+var g_gpu_state: int32 = 0;   // 0 not tried, 1 ready, 2 none
+var g_gpu_frames: Word = 0;
+var g_warm_job: AlphJob;      // a helper works on one frame for itself first,
+var g_warm_in: uint8[61440];  // so its GPU is open before work arrives
+var g_warm_back: uint8[61440];
+var g_warmed: int32 = 0;
+
+// The mean of the pixels up to REACH away from pixel i, with the frame's
+// border counted again past its end. A core and the GPU both call this, on
+// the frame where each has it, so the bytes are the same wherever a frame
+// is worked on.
+fn smooth_at(px: uint8*, i: int32) -> int32 {
+  var x: int32 = i % WIDE;
+  var y: int32 = i / WIDE;
+  var sum: int32 = 0;
+  var dy: int32 = -REACH;
+  while (dy <= REACH) {
+    var yy: int32 = y + dy;
+    if (yy < 0) {
+      yy = 0;
+    }
+    if (yy > HIGH - 1) {
+      yy = HIGH - 1;
+    }
+    var dx: int32 = -REACH;
+    while (dx <= REACH) {
+      var xx: int32 = x + dx;
+      if (xx < 0) {
+        xx = 0;
+      }
+      if (xx > WIDE - 1) {
+        xx = WIDE - 1;
+      }
+      sum = sum + (int32)px[yy * WIDE + xx];
+      dx = dx + 1;
+    }
+    dy = dy + 1;
+  }
+  return sum / 225;
+}
+
+kernel(block = 256) smooth_kernel(src: uint8*, dst: uint8*, count: int32) {
+  var i: int32 = block.x * block_dim.x + thread.x;
+  if (i < count) {
+    dst[i] = (uint8)smooth_at(src, i);
+  }
+}
+
+// The work on a core: the frame in the job's bytes, made smooth, into the
+// bytes it gives back.
+fn smooth(job: AlphJob*) -> Word {
+  if (job->count != FRAME || job->back == 0 || job->back_room < FRAME) {
+    return 0;
+  }
+  for i in 0..FRAME {
+    job->back[i] = (uint8)smooth_at(job->bytes, (int32)i);
+  }
+  job->back_count = FRAME;
+  return 0;
+}
+
+// The same work on the GPU. It runs on the GPU's own core, which is the
+// thread that opens the GPU. The frame goes to the GPU from where it
+// arrived and comes back to where it leaves from.
+fn smooth_gpu(job: AlphJob*) -> Word {
+  if (g_gpu_state == 0) {
+    g_gpu_state = 2;
+    if (gpu_init() != 0) {
+      g_src = gpu_malloc((int64)FRAME);
+      g_dst = gpu_malloc((int64)FRAME);
+      if (g_src != 0 && g_dst != 0) {
+        g_gpu_state = 1;
+      }
+    }
+  }
+  if (g_gpu_state != 1 || job->count != FRAME || job->back == 0 || job->back_room < FRAME) {
+    return 1;  // no GPU: alph sends the frame to a core and does not try this again
+  }
+  if (gpu_to_device(g_src, job->bytes, (int64)FRAME) != 0) {
+    return 1;
+  }
+  dispatch smooth_kernel[work: 61440](g_src, g_dst, 61440);
+  if (gpu_sync() != 0 || gpu_to_host(job->back, g_dst, (int64)FRAME) != 0) {
+    return 1;
+  }
+  job->back_count = FRAME;
+  g_gpu_frames = g_gpu_frames + 1;
+  return 0;
+}
+
+// What the camera sees: frame n, written to `to`.
+fn camera(n: Word, to: uint8*) {
+  for y in 0..HIGH {
+    for x in 0..WIDE {
+      var v: int32 = ((x + (int32)n * 3) * (y + 7)) / 64 + ((x ^ y) & 31);
+      to[y * WIDE + x] = (uint8)(v & 255);
+    }
+  }
+}
+
+// What every machine does: three cores, the one kind of work, shared, and
+// long buffers for frames on their way. With gpu, the last core is the
+// GPU's and the kind has a GPU way.
+fn machine(m: AlphMachine*, first: Word, other: Word, ip: uint32, port: int64, gpu: bool, longs: uint8*) {
+  m->init(3, first, gpu);
+  m->peer(other, 3, ip, port);
+  if (gpu) {
+    m->kind(SMOOTH, &smooth, &smooth_gpu);
+  } else {
+    m->kind(SMOOTH, &smooth, 0);
+  }
+  m->longs(longs, 70000, 8);
+  m->gives(SMOOTH, FRAME);
+  m->share(SMOOTH);
+}
+
+fn slot_of(job: AlphJob*) -> Word {
+  return (Word)(((int64)job - (int64)&g_slots[0]) / (int64)sizeof(AlphBatchSlot));
+}
+
+// Each frame goes out from its slot's own memory and comes back to it.
+fn each_frame(b: AlphBatch*, job: AlphJob*, n: Word) {
+  var at: Word = (Word)(slot_of(job) * FRAME);
+  camera(n, &g_frames[at]);
+  job->bytes = &g_frames[at];
+  job->count = FRAME;
+  job->back = &g_smooth[at];
+  job->back_room = FRAME;
+  job->size = FRAME;
+}
+
+// What a frame's bytes add up to, two ways, so that two frames that differ
+// anywhere almost surely differ here.
+fn sum_of(px: uint8*) -> Word {
+  var plain: Word = 0;
+  var placed: Word = 0;
+  for i in 0..FRAME {
+    plain = plain + (Word)px[i];
+    placed = (Word)((placed * 31 + (Word)px[i]) & 1073741823);
+  }
+  return (Word)(plain * 1073741824 + placed);
+}
+
+// The sum of every frame that comes back is kept, to be checked against
+// the same work done here once the batch is over.
+fn worked(b: AlphBatch*, job: AlphJob*, n: Word) {
+  if (job->status != ALPH_OK || job->back_count != FRAME) {
+    g_short = g_short + 1;
+    return;
+  }
+  g_sums[n] = sum_of(job->back);
+}
+
+fn boss(a: AlphActor*, m: AlphMsg*) -> Word {
+  if (m->tag == GO) {
+    g_batch.begin(a, SMOOTH, FRAMES, &each_frame, &worked, 0);
+  } else if (g_batch.took(a, m) && g_batch.over()) {
+    a->cores()->stop();
+  }
+  return 0;
+}
+
+fn run_boss(helper_ip: uint32) -> int32 {
+  machine(&g_boss, 0, 3, helper_ip, HELPER_PORT, false, &g_boss_longs[0]);  // the boss has no GPU
+  g_batch.init(&g_boss.places);
+  g_batch.wide(&g_slots[0], 8);
+  var pid: Word = g_boss.cores.spawn_on(0, &boss, 0);
+  if (g_boss.start(BOSS_PORT) != ALPH_OK) {
+    println("port {BOSS_PORT} is taken");
+    return 1;
+  }
+  thread_sleep_ms(150);  // a moment for the helper to be heard, if there is one
+  g_boss.cores.send(pid, GO, 0);
+  var began: Word = alph_now();
+  g_boss.run();
+  var ms: Word = (Word)((alph_now() - began) / alph_ms(1));
+  g_boss.shut();
+  // Every frame is checked against the same work done here.
+  var wrong: Word = g_short;
+  var here: AlphJob;
+  here.bytes = &g_check[0];
+  here.count = FRAME;
+  here.back = &g_right[0];
+  here.back_room = FRAME;
+  for n in 0..FRAMES {
+    camera((Word)n, &g_check[0]);
+    smooth(&here);
+    if (sum_of(&g_right[0]) != g_sums[n]) {
+      wrong = wrong + 1;
+    }
+  }
+  println("{FRAMES} frames of {WIDE} by {HIGH} in {ms} ms: {g_batch.by_way[ALPH_CPU]} worked on here, {g_batch.by_way[ALPH_FAR]} on another machine ({g_gpu_frames} of them on its GPU), {wrong} frames wrong");
+  if (wrong != 0) {
+    return 1;
+  }
+  return 0;
+}
+
+// On a helper: works on one frame through the helper's own places, which
+// try the GPU first. Opening a GPU takes a good part of a second, and the
+// first job would otherwise pay for it.
+fn warm(a: AlphActor*, m: AlphMsg*) -> Word {
+  if (m->tag == GO) {
+    g_warm_job.kind = SMOOTH;
+    g_warm_job.size = FRAME;
+    g_warm_job.home = ALPH_NOWHERE;
+    g_warm_job.stay = 1;
+    g_warm_job.in = 0;
+    g_warm_job.bytes = &g_warm_in[0];
+    g_warm_job.count = FRAME;
+    g_warm_job.back = &g_warm_back[0];
+    g_warm_job.back_room = FRAME;
+    if (g_helper.places.ask(a, &g_warm_job) < 0) {
+      g_warmed = 1;
+    }
+  } else if (m->tag == ALPH_DONE) {
+    g_warmed = 1;
+  }
+  return 0;
+}
+
+fn start_helper(ip: uint32) -> bool {
+  machine(&g_helper, 3, 0, ip, BOSS_PORT, true, &g_helper_longs[0]);
+  var pid: Word = g_helper.cores.spawn_on(0, &warm, 0);
+  if (g_helper.start(HELPER_PORT) != ALPH_OK) {
+    println("port {HELPER_PORT} is taken");
+    return false;
+  }
+  g_helper.cores.send(pid, GO, 0);
+  return true;
+}
+
+fn helper_main(arg: cstring) -> uint32 {
+  g_helper.run();
+  return 0;
+}
+
+// The address a.b.c.d in text as one number, 0 when it is not one.
+fn address(text: cstring) -> uint32 {
+  var part: int64[4];
+  var at: int32 = 0;
+  var i: int32 = 0;
+  part[0] = 0;
+  while (text[i] != 0) {
+    if (text[i] == 46 && at < 3) {
+      at = at + 1;
+      part[at] = 0;
+    } else if (text[i] >= 48 && text[i] <= 57) {
+      part[at] = part[at] * 10 + (int64)(text[i] - 48);
+    } else {
+      return 0;
+    }
+    i = i + 1;
+  }
+  if (at != 3) {
+    return 0;
+  }
+  return alph_ip4(part[0], part[1], part[2], part[3]);
+}
+
+fn main(argc: int32, argv: cstring*) -> int32 {
+  if (argc == 3) {
+    var ip: uint32 = address(argv[2]);
+    if (ip == 0) {
+      println("the address should look like 192.168.1.10");
+      return 2;
+    }
+    if (argv[1][0] == 104) {  // h: a helper waits for work until it is stopped
+      if (!start_helper(ip)) {
+        return 1;
+      }
+      println("helping: waiting for frames to work on");
+      g_helper.run();
+      return 0;
+    }
+    return run_boss(ip);
+  }
+  var here: uint32 = alph_ip4(127, 0, 0, 1);
+  if (!start_helper(here)) {
+    return 1;
+  }
+  var helper: int64 = CreateThread(0, 0, &helper_main, 0, 0, 0);
+  var waited: int32 = 0;
+  while (g_warmed == 0 && waited < 300) {
+    thread_sleep_ms(10);  // until the helper's GPU is open, or it has none
+    waited = waited + 1;
+  }
+  var out: int32 = run_boss(here);
+  g_helper.stop();
+  thread_join_infinite(helper);
+  thread_close(helper);
+  g_helper.shut();
+  return out;
+}

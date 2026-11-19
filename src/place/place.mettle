@@ -165,7 +165,6 @@ export struct AlphPlace {
   own: AlphTimes*;    // a far place's own times, one for each of its first own_kinds kinds, 0 for none
   own_kinds: Word;
   too_big: Word;      // a far place: a job with this many bytes or more does not fit its machine, 0 when none was refused
-  back_big: Word;     // and its machine cannot give back more bytes than a parcel holds
 }
 
 // The places of one machine and the kinds of job they run.
@@ -482,7 +481,6 @@ export fn AlphPlaces_add__ptr(p: AlphPlaces*, way: Word) -> AlphPlace* {
     x->own = 0;
     x->own_kinds = 0;
     x->too_big = 0;
-    x->back_big = 0;
     for g in 0..4 {
       x->gave_ref[g] = 0;
     }
@@ -604,9 +602,6 @@ fn alph_place_pick(p: AlphPlaces*, job: AlphJob*, soon: bool) -> AlphPlace* {
     }
     if (x->way == ALPH_FAR && job->count > ALPH_PARCEL_BYTES && (p->link == 0 || (x->too_big != 0 && job->count >= x->too_big))) {
       continue;  // more bytes than that machine was found to take
-    }
-    if (x->way == ALPH_FAR && x->back_big != 0 && job->back_room > ALPH_BACK_BYTES) {
-      continue;
     }
     var row: Word = alph_place_row(job, x->way);
     var at: Word = row + size;
@@ -1006,10 +1001,11 @@ export fn alph_place_run(a: AlphActor*, m: AlphMsg*) -> Word {
   }
   if (m->tag == ALPH_WORKED_LONG && m->arg == 0) {
     // The answer had more bytes than a long buffer of this machine holds:
-    // they are gone. It counts as a refusal of that, and the job is done
-    // again where its answer fits.
+    // they are gone, and so would the next be. That machine cannot do
+    // this kind for this one: the way is shut, and the job is done again
+    // where its answer fits.
     m->tag = ALPH_REFUSED;
-    m->arg = ALPH_BIG;
+    m->arg = ALPH_GONE;
   }
   if (m->tag == ALPH_WORKED || m->tag == ALPH_REFUSED || m->tag == ALPH_WORKED_BYTES || m->tag == ALPH_WORKED_LONG) {
     // The answer from another machine: the job with this ref is done, or
@@ -1142,14 +1138,12 @@ export fn alph_place_run(a: AlphActor*, m: AlphMsg*) -> Word {
           alph_place_shut_far(p, x, job->kind);
         }
         var t: AlphAt;
-        if (m->arg == ALPH_BIG && job->count > ALPH_PARCEL_BYTES) {
+        if (m->arg == ALPH_BIG) {
           // Its bytes are more than that machine takes: no job as big goes
           // there again.
           if (x->too_big == 0 || job->count < x->too_big) {
             x->too_big = job->count;
           }
-        } else if (m->arg == ALPH_BIG) {
-          x->back_big = 1;  // or what it gives back is more than fits one way or the other
         }
         var was: int32 = p->gate.enter();
         if (m->arg != ALPH_GONE && m->arg != ALPH_BIG) {

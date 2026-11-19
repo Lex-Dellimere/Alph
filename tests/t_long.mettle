@@ -2,8 +2,10 @@
 // process: forty messages of 1,025 to 68,000 bytes cross with messages
 // being lost on the way, and each arrives once, whole and in order, with
 // short messages getting through in between; one longer than the other machine's buffers
-// arrives with no bytes; one longer than this machine's is refused; and a
-// machine with no long buffer free takes no more until one is given back.
+// arrives with no bytes; one longer than this machine's is refused; a
+// machine with no long buffer free takes no more until one is given back;
+// and long messages on their way to a machine that is no longer heard are
+// given up, so their buffers are free again.
 
 import "std/io";
 import "std/thread";
@@ -196,6 +198,14 @@ fn in_use() -> Word {
   return used;
 }
 
+fn in_use_a() -> Word {
+  var used: Word = 0;
+  for i in 0..4 {
+    used = used + g_a_longs[i].used;
+  }
+  return used;
+}
+
 fn main() -> int32 {
   var port_a: int64 = 13000 + (syscall(ALPH_NR_GETPID) % 2000) * 2;
   var port_b: int64 = port_a + 1;
@@ -298,6 +308,54 @@ fn main() -> int32 {
   g_b.send(g_checker, GIVE_BACK, 0);
   g_a.run();
   expect(s.back == TOTAL + 4 && s.bad == 0 && c.bad == 0, "once B gives them back the rest arrive, none lost ({s.back - TOTAL} of 4, {s.bad} and {c.bad} bad)");
+
+  // A stops hearing B with long messages on their way to it. A takes B
+  // for lost and gives them up: its buffers are free again, not kept for
+  // a machine that may never be back. When B is heard again it is told to
+  // drop what had arrived of them, and what follows crosses as before.
+  waited = 0;
+  while (in_use() != 0 && waited < 2000) {
+    Sleep(1);
+    waited = waited + 1;
+  }
+  g_a_link.deaf = 1;
+  for i in 0..3 {
+    var given_up: AlphLong* = g_a_link.long();
+    if (given_up == 0) {
+      break;  // half the pool is kept for what arrives
+    }
+    given_up->count = 60000;
+    g_a_link.send_long(sender_pid, g_checker, DATA, 500 + (Word)i, given_up);
+  }
+  expect(in_use_a() == 2, "long messages for a machine that is not heard hold their buffers at first ({in_use_a()})");
+  waited = 0;
+  while ((g_a_link.reaches(2) || in_use_a() != 0) && waited < 3000) {
+    Sleep(1);
+    waited = waited + 1;
+  }
+  expect(!g_a_link.reaches(2) && in_use_a() == 0, "once it is taken for lost they are given up and A's buffers are free ({in_use_a()} are not)");
+  g_a_link.deaf = 0;
+  waited = 0;
+  while ((!g_a_link.reaches(2) || in_use() != 0) && waited < 3000) {
+    Sleep(1);
+    waited = waited + 1;
+  }
+  expect(g_a_link.reaches(2) && in_use() == 0, "B is heard again, and drops what had arrived of them ({in_use()} buffers still held)");
+  expect(c.bad == 0 && c.next == TOTAL + 4, "none of them reached B's actor");
+  var next_before: Word = c.next;
+  s.sent = c.next;
+  s.back = c.next;
+  s.bad = 0;
+  s.total = c.next + 3;
+  g_a.send(sender_pid, GO, 0);
+  g_a.run();
+  expect(s.back == next_before + 3 && s.bad == 0 && c.bad == 0, "and three more long messages cross whole ({s.back - next_before} of 3, {s.bad} and {c.bad} bad)");
+  waited = 0;
+  while (in_use() != 0 && waited < 2000) {
+    Sleep(1);
+    waited = waited + 1;
+  }
+  expect(in_use() == 0, "with every buffer back at the end ({in_use()} are not)");
 
   g_b_link.stop();
   g_b.stop();

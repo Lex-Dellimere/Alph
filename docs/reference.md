@@ -1391,7 +1391,6 @@ export struct AlphPlace {
   own: AlphTimes*;    // a far place's own times, one for each of its first own_kinds kinds, 0 for none
   own_kinds: Word;
   too_big: Word;      // a far place: a job with this many bytes or more does not fit its machine, 0 when none was refused
-  back_big: Word;     // and its machine cannot give back more bytes than a parcel holds
 }
 ```
 
@@ -2134,7 +2133,12 @@ any other message, and put together again at the other end in a long
 buffer of that machine. The actor gets the whole at once, and gives the
 buffer back with free. A long message takes its place among the others
 when its last piece goes, so a short message sent after it can arrive
-before it.
+before it. One on its way to or from a machine that goes down is given
+up, and its buffers are free again at once.
+
+A message that arrives too early shows that the one before it was lost.
+The sender is told at once and sends again from there, so a loss costs
+one round trip and not the wait of a clock.
 
 A link is in the clear unless it is sealed: see src/seal.
 
@@ -2205,6 +2209,7 @@ export struct AlphPeer {
   got: uint32;        // every message from it up to this one was taken
   owed: Word;         // messages taken since it was last told so
   waiting_since: Word;
+  missed: uint32;     // the message last said to be missing: said once, then left to the sender's clock
   stuck: uint32;      // the message being refused because its actor has no room,
   stuck_at: Word;     // and since when
   again_ms: Word;     // how long its word is waited for before sending again
@@ -3138,5 +3143,6 @@ export fn alph_board_fresh() -> Word
 
 A number this board has not given before, for work that must be done at
 most once (alph/board/asks). QEMU's virt board has a clock that goes on
-while the board is restarted: this is its time in steps of 134 ms, so a
-board that is back within one step has no fresh number yet.
+while the board is restarted: this is its time in steps of 134 ms. The
+first call after a start waits for the next step, at most that long, so
+the number is one the board cannot have given before it was restarted.

@@ -538,6 +538,7 @@ if (g != 0) {
 - To fill a buffer in place and send it without a copy, take one with `long()`, set its `count`, and send it with `send_long(from, to, tag, ref, buffer)`.
 - A long message takes its place among the others when its last piece goes, so a short message sent after it can arrive before it. Its pieces leave room in between for other messages.
 - A machine with no long buffer free takes no more long messages until one is given back. Nothing is lost.
+- A long message on its way to a machine that goes down is given up, and its buffer is free again. A short message waits for the machine to be back.
 
 **Sealing the link.** A link is in the clear unless you seal it. `AlphSeal` encrypts and signs every datagram with one 32-byte key that every machine of the network is given. A datagram made without the key, changed on the way or played a second time is dropped, and so is everything from a run of a machine earlier than the latest one heard. Call `init(link, key)` once, after the link's `init` and before its `start`. It returns `ALPH_GONE` when the link is sealed already or the system gave no random bytes. This is from `tests/t_seal.mettle`:
 
@@ -621,7 +622,8 @@ g_m.gives(BLUR, 64000);             // a BLUR job gives back up to 64,000 bytes
 
 - Every machine calls both, before `start`. A job's bytes must fit a buffer, and so must what it gives back and eight bytes more.
 - The job is written the same: `job->bytes` and `job->count` in, `job->back` and `job->back_count` out. On the machine that does it they point into long buffers, so nothing is copied there.
-- A machine whose buffers are too small for a job refuses it, and alph sends no job as big there again. The job is done where it fits, here if here has a way.
+- A machine whose buffers are too small for a job refuses it, and alph sends no job as big there again. The job is done where it fits, here if here has a way. A machine with no buffer for what a kind gives back does not do that kind for others at all.
+- [examples/frames.mettle](../examples/frames.mettle) sends a camera's frames to another machine's GPU this way.
 - Each such job in flight holds a buffer on the machine that asks and one or two on the machine that works, so the number of buffers bounds how many are out at once. Without a free one a job waits.
 - Without `AlphMachine`: give the link its long buffers. The far place then sends `ALPH_WORK_LONG` with the bytes in a long buffer, and a worker of your own answers with `ALPH_WORKED_LONG`: the job's out in the first eight bytes of a long buffer, what it gives back after them.
 

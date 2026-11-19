@@ -112,6 +112,12 @@ A picture drawn by several machines, [examples/picture.mettle](examples/picture.
 mettle --build -s --release examples/picture.mettle -I ports/host -o picture
 ```
 
+A camera's frames worked on by another machine's GPU, [examples/frames.mettle](examples/frames.mettle): each frame is a job that carries its 61,440 bytes and gives back as many, the frame made smooth. One function is the work on a core and on the GPU. The boss has two working cores and no GPU: of 200 frames it sends about 180 to the helper, which does nearly all of them on its GPU, in about 190 ms. On its own two cores they take about 950 ms. Every frame is the same as when a core here does it. It takes the same arguments as `share`:
+
+```bash
+mettle --build -s --release examples/frames.mettle -I ports/host -o frames
+```
+
 A picture rendered on the cores and the GPU of one machine, the short way too, [examples/tiles.mettle](examples/tiles.mettle). One function is the work, a core and the GPU both call it, and the pixels are the same either way. Without a GPU it runs on the cores:
 
 ```bash

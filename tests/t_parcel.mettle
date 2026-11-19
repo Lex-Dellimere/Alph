@@ -245,6 +245,19 @@ fn main() -> int32 {
   g_a.run();
   expect(s.back == TOTAL + 6 && s.bad == 0 && c.bad == 0, "once B gives them back the rest arrive, none lost ({s.back - TOTAL} of 6)");
 
+  // B's word that it has the last parcel can come a moment after its
+  // answer to it: until then A keeps that parcel.
+  waited = 0;
+  used = 1;
+  while (used != 0 && waited < 2000) {
+    used = 0;
+    for i in 0..8 {
+      used = used + g_a_parcels[i].used;
+    }
+    Sleep(1);
+    waited = waited + 1;
+  }
+
   // Bytes for an actor on the same machine.
   var near: Word = g_a.spawn_on(1, &checker, (rawptr)&local);
   var bytes: uint8[1024];

@@ -14,6 +14,7 @@ import "port/sys";
 const GO: Word = 1;
 const FLIP: Word = 0;   // gives the job's bytes back in the other order, each turned; out is their sum
 const BOTH: Word = 1;   // the same, and both machines can do it
+const MUCH: Word = 2;   // the same again, said to give back more than the other machine's long buffers hold
 const PIECES: Word = 60;
 const MOST: Word = 39000;
 const TOO_BIG: Word = 50000;  // fits this machine's long buffers and not the other's
@@ -41,6 +42,9 @@ fn expect(ok: bool, what: string) {
 fn size_of(n: Word) -> Word {
   if (g_kind == BOTH) {
     return TOO_BIG;
+  }
+  if (g_kind == MUCH) {
+    return (Word)(1 + n * 13);
   }
   if (n == 0) {
     return 1016;
@@ -146,9 +150,11 @@ fn main() -> int32 {
   g_m[1].longs(&g_long_b[0], 40000, 8);
   for i in 0..2 {
     g_m[i].kind(BOTH, &flip, 0);
+    g_m[i].kind(MUCH, &flip, 0);
     g_m[i].gives(FLIP, MOST);
     g_m[i].gives(BOTH, TOO_BIG);
-    expect(g_m[i].share(FLIP) == ALPH_OK && g_m[i].share(BOTH) == ALPH_OK, "the machine shares both kinds");
+    g_m[i].gives(MUCH, 60000);
+    expect(g_m[i].share(FLIP) == ALPH_OK && g_m[i].share(BOTH) == ALPH_OK && g_m[i].share(MUCH) == ALPH_OK, "the machine shares the kinds");
     expect(g_m[i].start(port + (int64)i) == ALPH_OK, "the machine listens");
   }
   g_batch.init(&g_m[0].places);
@@ -156,7 +162,7 @@ fn main() -> int32 {
   var pid: Word = g_m[0].cores.spawn_on(0, &boss, 0);
   var helper: int64 = CreateThread(0, 0, &helper_main, 0, 0, 0);
   var waited: int32 = 0;
-  while ((g_m[0].seats[1].workers[FLIP] == 0 || g_m[0].seats[1].workers[BOTH] == 0) && waited < 3000) {
+  while ((g_m[0].seats[1].workers[FLIP] == 0 || g_m[0].seats[1].workers[BOTH] == 0 || g_m[0].seats[1].workers[MUCH] == 0) && waited < 3000) {
     g_m[0].core[0].node.turn();
     Sleep(1);
     waited = waited + 1;
@@ -196,6 +202,18 @@ fn main() -> int32 {
     waited = waited + 1;
   }
   expect(in_use() == 0, "with every long buffer back again ({in_use()} are not)");
+
+  // A kind said to give back 60,000 bytes: the other machine has no long
+  // buffer that holds as much, so it can never do the kind for this one.
+  // It says so once, the way is shut, and every job is done here. None
+  // goes round and round.
+  served = g_m[1].served;
+  g_wrong = 0;
+  g_m[0].cores.send(pid, GO, MUCH);
+  g_m[0].run();
+  expect(g_batch.over() && g_wrong == 0, "jobs of a kind the other machine cannot give back are all done rightly ({g_wrong} wrong)");
+  expect(g_batch.by_way[ALPH_CPU] == PIECES && g_m[1].served == served, "on this machine ({g_batch.by_way[ALPH_CPU]} of {PIECES})");
+  expect(g_m[0].seats[1].workers[MUCH] == 0, "and the way there is shut for that kind");
 
   g_m[1].stop();
   thread_join_infinite(helper);
