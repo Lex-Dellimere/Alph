@@ -30,6 +30,7 @@ import "alph/life/life";
 import "alph/door/door";
 import "alph/place/place";
 import "alph/place/once";
+import "alph/batch/batch";
 import "alph/tether/tether";
 import "alph/tether/relay";
 import "port/alarm";
@@ -110,6 +111,8 @@ export struct AlphMachine {
   keeps: AlphKeep[32];
   timers: AlphTimer[32];
   seats: AlphPlace[26];
+  slots: AlphBatchSlot[128];  // room for the batches tied to this machine (batch)
+  slots_used: Word;
   far_times: AlphTimes[96];  // each other machine's and board's own times, eight kinds each
   kinds: AlphKind[8];
 }
@@ -416,6 +419,7 @@ export fn AlphMachine_init__ptr(m: AlphMachine*, cores: Word, first: Word, gpu: 
   }
   m->told = 0;
   m->served = 0;
+  m->slots_used = 0;
   m->peer_count = 0;
   m->board_count = 0;
   m->round_at = 0;
@@ -581,6 +585,31 @@ export fn AlphMachine_share__ptr(m: AlphMachine*, kind: Word) -> Word {
   }
   m->shared[kind] = 1;
   return m->names.set(ALPH_SHARED + kind, pid);
+}
+
+// Ties a batch to this machine, in place of the batch's own init, with
+// room for two pieces out for each core at work here and on the machines
+// it was given, for what each board holds, and for sixteen answers on
+// their way. Call it after the last peer
+// and board. The machine has room for 128
+// pieces out over all its batches: a batch that finds less left than it
+// could use takes what there is, or keeps its own sixteen.
+export fn AlphMachine_batch__ptr(m: AlphMachine*, b: AlphBatch*) {
+  b->init(&m->places);
+  var room: Word = ROOM;  // answers on their way hold a slot each: a mailbox of them
+  for i in 0..m->places.count {
+    room = room + (Word)(m->seats[i].wide * 2);
+    if (m->seats[i].wide == 0) {
+      room = room + m->seats[i].limit;  // a board: what it holds at once
+    }
+  }
+  if (room > 128 - m->slots_used) {
+    room = 128 - m->slots_used;
+  }
+  if (room > 16) {
+    b->wide(&m->slots[m->slots_used], room);
+    m->slots_used = m->slots_used + room;
+  }
 }
 
 // Says that a job of this kind (0 to 7) is never done twice, whatever is

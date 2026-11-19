@@ -79,6 +79,7 @@ Every machine runs the same program. Each says how a kind of job is done (`kind`
 - `kind(kind, cpu, gpu)` says how a kind of job (0 to 7) is done: a function for a core and one for the GPU, 0 for a way it does not have.
 - `share(kind)` shares a kind with the other machines, both ways. With several, a job goes to whichever should finish it first: the machine keeps a time for each of the others. Only a job with no home leaves a machine: one word in, or bytes.
 - `board(first, count)` adds a microcontroller on this machine's serial line that takes work too. See "A board that shares work" under A microcontroller.
+- `batch(&batch)` ties a batch to the machine. See The batch below.
 - `tell(pid)` names your actor that hears `ALPH_UP` and `ALPH_DOWN`.
 - `run()` runs the cores until `stop()`, and `shut()` ends the timers and the link afterwards.
 - The layers are fields of the machine, for when you want them: `m.cores`, `m.link`, `m.names`, `m.life`, `m.door`, `m.time`, `m.places`.
@@ -87,19 +88,19 @@ The sizes are fixed: 32 actors a core, 16 messages a mailbox, 8 kinds. A program
 
 **The batch.**
 
-- `init(places)` ties a batch to a machine's places (`&m.places`).
+- `m.batch(&batch)` ties a batch to a machine, with room for the cores at work on it and on the machines and boards it was given. Call it after the last `peer` and `board`. Without a machine, `init(places)` ties a batch to places.
 - `begin(a, kind, total, fill, took, ctx)` starts handing out `total` pieces, from the actor that will get the answers. `fill(b, job, piece)` is called before each piece goes out, to set what the job needs: it starts with `in` as the piece's number, size 1 and no home. `took(b, job, piece)` is called with each finished job. `ctx` is yours, in `b->ctx`.
 - Pass the batch every message the actor gets: `took(a, m)` returns true when the message was the batch's. `over()` says when every piece is answered.
 - `b->by_way[ALPH_CPU]`, `[ALPH_GPU]` and `[ALPH_FAR]` count how the pieces were done. A piece no place can run comes back with `job->status == ALPH_GONE`, counted in `b->gone`.
 
 A piece goes out only when some place can start it soon, so no piece sits in a slow place's queue while another place is free: no more than two wait for each core, here or on another machine. A piece that could not be placed, or whose machine was lost, is handed out again.
 
-A batch has room for 16 pieces out at once. That is enough for about eight cores in all. With more, give it room of your own, about two slots for each core at work on all the machines:
+How many pieces a batch can have out is its room: two for each core at work and sixteen for answers on their way, which `m.batch` works out and takes from the machine's 128 slots. A batch set up with `init` has room for 16, enough for about eight cores in all. Give it more of your own with `wide`:
 
 ```mettle
 var g_slots: AlphBatchSlot[64];
 
-g_batch.init(&g_m.places);
+g_batch.init(&g_places);
 g_batch.wide(&g_slots[0], 64);
 ```
 
@@ -664,7 +665,7 @@ The whole image of this program, board startup included, is 3,256 bytes: about 1
 mettle --release examples/mcu/blink.mettle --target riscv32-none --board pico2 --emit-flat blink.uf2 -I ports/pico2 -I ports/mcu
 ```
 
-Hold BOOTSEL while plugging the board in and copy `blink.uf2` onto the `RP2350` drive. UART0 is TX on GP0 and RX on GP1 at 115200 baud, through a 3.3 V adapter. The tether uses UART0 as its line. These have run on the compiler's model of the chip, not yet on a real board.
+Hold BOOTSEL while plugging the board in and copy `blink.uf2` onto the `RP2350` drive. UART0 is TX on GP0 and RX on GP1 at 115200 baud, through a 3.3 V adapter. The tether uses UART0 as its line. These have run on the compiler's model of the chip, not yet on a real board. [hardware.md](hardware.md) is the order to try a real one in.
 
 **Both cores of a chip.** On a board with several harts, build with `-I ports/harts -I ports/mcu` and use `AlphCores` as on Linux: core i runs on hart i. [examples/mcu/harts.mettle](../examples/mcu/harts.mettle) counts primes on two harts. The board's timer and its serial input serve hart 0, so timers and the tether belong to the first core's node. It needs the A extension (`--isa rv32imac`), and on the boards Mettle has today only `qemu-virt` can start a second hart.
 
@@ -869,7 +870,7 @@ These are not built yet.
 - A microcontroller joins through a serial line to one machine. What is lost on that line is sent again only when both ends make the line sure.
 - A board's jobs are one word in and one word out, one at a time. A board asks the machine at the other end of its line, not the best of several places.
 - A job of a kind done at most once carries a word and gives a word back. When its worker is lost the program is told `ALPH_LOST`: it cannot know whether the job was done.
-- A batch does not find out by itself how much room it needs: with more than about eight cores in all it must be given more (`wide`). A machine takes 32 jobs for others at once, two for each of the 16 cores it can have.
+- A machine has room for 128 pieces out over all its batches, which is 56 cores at work, and takes 32 jobs for others at once, two for each of the 16 cores it can have.
 - Peers are listed by hand.
 - A watch cannot be dropped across machines.
 - Restart limits are counted in all, not over time, and there are no groups that restart together.

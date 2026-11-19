@@ -67,6 +67,8 @@ export struct AlphMachine {
   keeps: AlphKeep[32];
   timers: AlphTimer[32];
   seats: AlphPlace[26];
+  slots: AlphBatchSlot[128];  // room for the batches tied to this machine (batch)
+  slots_used: Word;
   far_times: AlphTimes[96];  // each other machine's and board's own times, eight kinds each
   kinds: AlphKind[8];
 }
@@ -163,6 +165,22 @@ board can do, such as moving an arm, is asked for here. Only jobs with no
 home (a word in, or bytes) leave a machine. Returns ALPH_FULL when the
 first core has no room for one more actor, ALPH_GONE for a kind that is
 not 0 to 7.
+
+### `AlphMachine_batch__ptr`
+
+```mettle
+export fn AlphMachine_batch__ptr(m: AlphMachine*, b: AlphBatch*)
+```
+
+Call it as `m->batch(b)`, or `m.batch(b)` on a value.
+
+Ties a batch to this machine, in place of the batch's own init, with
+room for two pieces out for each core at work here and on the machines
+it was given, for what each board holds, and for sixteen answers on
+their way. Call it after the last peer
+and board. The machine has room for 128
+pieces out over all its batches: a batch that finds less left than it
+could use takes what there is, or keeps its own sixteen.
 
 ### `AlphMachine_once__ptr`
 

@@ -1,0 +1,53 @@
+// The line to a board, as the computer's side of these examples is told on
+// its command line. A path such as /dev/ttyUSB0 is a real board's serial
+// device, opened at 115200 baud. A number, or nothing, is a TCP port to
+// wait on for 20 seconds: QEMU's serial line calls in over TCP.
+
+import "std/io";
+import "std/thread";
+import "port/net";
+import "port/line";
+import "port/serial";
+import "port/sys";
+
+// Opens the line and gives it to the port. Returns its descriptor, or a
+// negative number after printing why not.
+export fn host_line(argc: int32, argv: cstring*, port: int64) -> int64 {
+  var line: int64 = ALPH_LATER;
+  if (argc > 1 && argv[1][0] == 47) {
+    line = alph_serial_open(argv[1], 115200);
+    if (line < 0) {
+      println("the serial device cannot be opened");
+      return -1;
+    }
+  } else {
+    var at: int64 = port;
+    if (argc > 1) {
+      at = 0;
+      var i: int32 = 0;
+      while (argv[1][i] >= 48 && argv[1][i] <= 57) {
+        at = at * 10 + (int64)(argv[1][i] - 48);
+        i = i + 1;
+      }
+    }
+    var listening: int64 = alph_tcp_listen(at);
+    if (listening < 0) {
+      println("port {at} is taken");
+      return -1;
+    }
+    var waited: int32 = 0;
+    while (line < 0 && waited < 2000) {
+      line = alph_tcp_accept(listening);
+      waited = waited + 1;
+      Sleep(10);
+    }
+    alph_close(listening);
+    if (line < 0) {
+      println("no board called");
+      return -1;
+    }
+  }
+  syscall(ALPH_NR_FCNTL, line, 4, 0);  // the line's thread reads it and waits
+  alph_line_open(line);
+  return line;
+}

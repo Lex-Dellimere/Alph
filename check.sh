@@ -544,6 +544,35 @@ step_arm() {
   fi
 }
 
+# The arm example over a serial device in place of a TCP port: QEMU gives
+# its serial line a pseudo-terminal, and the computer's side opens that as
+# it would open a real board's /dev/ttyUSB0.
+step_device() {
+  local log="$OUT/device.log" board_pid dev n code board
+  built arm || return
+  : > "$log"
+  timeout 50 qemu-system-riscv32 -M virt -bios none -display none -monitor none \
+    -serial pty -device loader,file="$OUT/arm.bin",addr=0x80000000,force-raw=on > "$log" 2>&1 &
+  board_pid=$!
+  n=0
+  until grep -q '/dev/pts/' "$log" || [ "$n" -ge 50 ]; do
+    sleep 0.1
+    n=$((n + 1))
+  done
+  dev=$(grep -o '/dev/pts/[0-9]*' "$log" | head -n 1)
+  timeout 40 "$OUT/arm_host" "$dev" > "$log.host" 2>&1
+  code=$?
+  wait "$board_pid"
+  board=$?
+  cat "$log.host" >> "$log"
+  if [ -n "$dev" ] && [ "$code" -eq 0 ] && [ "$board" -eq 0 ]; then
+    echo "ok    mcu/device [the arm example with the board on a serial device, not a TCP port]"
+  else
+    echo "FAIL  mcu/device: host exit $code, board exit $board, device '$dev' (see $log)"
+    fails=$((fails + 1))
+  fi
+}
+
 # One computer with two boards, each on a serial line of its own: work only
 # a board can do goes to both.
 step_lines() {
@@ -772,6 +801,7 @@ if [ "$boards" -eq 1 ]; then
   [ "$qemu" -eq 1 ] && step_relay
   step_pico2
   [ "$qemu" -eq 1 ] && step_arm
+  [ "$qemu" -eq 1 ] && step_device
   [ "$qemu" -eq 1 ] && step_lines
   [ "$qemu" -eq 1 ] && step_harts
   [ "$qemu" -eq 1 ] && step_pair

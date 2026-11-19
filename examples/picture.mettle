@@ -148,7 +148,7 @@ fn boss(a: AlphActor*, m: AlphMsg*) -> Word {
 
 fn run_boss(helper_ip: uint32) -> int32 {
   machine(&g_boss, 0, 3, helper_ip, HELPER_PORT, false);  // the boss has no GPU
-  g_batch.init(&g_boss.places);
+  g_boss.batch(&g_batch);
   var pid: Word = g_boss.cores.spawn_on(0, &boss, 0);
   if (g_boss.start(BOSS_PORT) != ALPH_OK) {
     println("port {BOSS_PORT} is taken");

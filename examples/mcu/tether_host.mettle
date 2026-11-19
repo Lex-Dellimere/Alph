@@ -7,6 +7,10 @@
 //   ./tether_host 7421 &
 //   qemu-system-riscv32 -M virt -bios none -display none -monitor none \
 //       -serial tcp:127.0.0.1:7421 -device loader,file=tether.bin,addr=0x80000000,force-raw=on
+//
+// With a real board, name its serial device in place of the port:
+//
+//   ./tether_host /dev/ttyUSB0
 
 import "std/io";
 import "std/thread";
@@ -15,6 +19,7 @@ import "port/line";
 import "alph/actor/actor";
 import "alph/time/time";
 import "alph/tether/tether";
+import "host_line";
 import "port/sys";
 
 const GO: Word = 1;
@@ -62,34 +67,10 @@ fn pinger(a: AlphActor*, m: AlphMsg*) -> Word {
 }
 
 fn main(argc: int32, argv: cstring*) -> int32 {
-  var port: int64 = 7421;
-  if (argc > 1) {
-    port = 0;
-    var i: int32 = 0;
-    while (argv[1][i] >= 48 && argv[1][i] <= 57) {
-      port = port * 10 + (int64)(argv[1][i] - 48);
-      i = i + 1;
-    }
-  }
-  var listening: int64 = alph_tcp_listen(port);
-  if (listening < 0) {
-    println("port {port} is taken");
-    return 1;
-  }
-  // Wait for the board's line, 20 seconds at most.
-  var line: int64 = ALPH_LATER;
-  var waited: int32 = 0;
-  while (line < 0 && waited < 2000) {
-    line = alph_tcp_accept(listening);
-    waited = waited + 1;
-    Sleep(10);
-  }
+  var line: int64 = host_line(argc, argv, 7421);
   if (line < 0) {
-    println("no board called");
     return 1;
   }
-  syscall(ALPH_NR_FCNTL, line, 4, 0);  // the line's thread reads it and waits
-  alph_line_open(line);
 
   // This machine is place 0. The board is place 1, and its one actor is the
   // first it spawned.
@@ -109,7 +90,6 @@ fn main(argc: int32, argv: cstring*) -> int32 {
   g_time.stop();
   Sleep(100);  // let the word to stop reach the board
   alph_close(line);
-  alph_close(listening);
   println("{p.rounds} numbers answered by the board, {p.bad} wrong, {g_tether.dropped} messages dropped");
   if (p.rounds != ROUNDS || p.bad != 0 || p.late != 0) {
     return 1;

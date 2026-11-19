@@ -80,7 +80,7 @@ fn main() -> int32 {
     g_m[i].kind(SQUARE, &square, 0);
     expect(g_m[i].share(SQUARE) == ALPH_OK, "the machine shares the kind");
   }
-  g_batch.init(&g_m[0].places);
+  g_m[0].batch(&g_batch);
   var pid: Word = g_m[0].cores.spawn_on(0, &boss, 0);
   for i in 0..3 {
     expect(g_m[i].start(port + (int64)i) == ALPH_OK, "the machine listens");

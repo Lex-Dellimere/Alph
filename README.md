@@ -169,7 +169,7 @@ Two boards on one serial line, with no other machine: [examples/mcu/asker.mettle
 
 A computer and a board working as one machine, [examples/mcu/arm.mettle](examples/mcu/arm.mettle) and [examples/mcu/arm_host.mettle](examples/mcu/arm_host.mettle): the chip in a robot's arm, say, on the serial line of the computer that plans. The computer asks for joint angles, which only the board can read, and for primes, which both can count. It never says where either is done. Every angle comes from the board, and the board counts some of the primes. It also asks for five moves of the arm, a kind that is done at most once: the board remembers what it did, so a move sent again because its answer was lost is answered and not made again. The function that counts is one file built into both programs. The board's image is 5.5 KB:
 
-With a real board in place of QEMU, the computer opens the board's serial device with `alph_serial_open("/dev/ttyACM0", 115200)` and gives it to `alph_line_open`.
+With a real board in place of QEMU, name its serial device in place of the port: `./arm_host /dev/ttyUSB0`. A program of your own opens it with `alph_serial_open("/dev/ttyUSB0", 115200)` and gives it to `alph_line_open`. [docs/hardware.md](docs/hardware.md) has the wiring and the order to try things in.
 
 ```bash
 mettle --release examples/mcu/arm.mettle --target riscv32-none --board qemu-virt --emit-flat arm.bin -I ports/mcu
@@ -187,7 +187,7 @@ mettle --release examples/mcu/two_b.mettle --target riscv32-none --board qemu-vi
 
 ## What it does not do yet
 
-- Nothing here has run on real hardware other than an x86-64 computer. The boards run in QEMU and, for the Pico 2, on the compiler's model of its chip. The ARM Linux programs run under an emulator.
+- Nothing here has run on real hardware other than an x86-64 computer. The boards run in QEMU and, for the Pico 2, on the compiler's model of its chip. The ARM Linux programs run under an emulator. [docs/hardware.md](docs/hardware.md) is the order to try a real Pico 2 in.
 - On ARM Linux a handler that crashes ends the process.
 - A sealed link has one key for the whole network: any holder can speak as any machine, and someone who gets the key later can read what they recorded before.
 - A job for another machine carries at most 1,024 bytes, and gives back a word and at most 1,016 bytes.
@@ -240,6 +240,7 @@ src/core, src/heal, src/work, src/net, src/io, src/sched, src/sys
 docs/start.md               how to use the new alph, layer by layer
 docs/design.md              the design of the new alph, with what was measured
 docs/reference.md           every struct, constant and function of the new alph, built from the source
+docs/hardware.md            the first run on a real Pico 2, step by step
 docs/guide.md, docs/api.md  the first runtime's guide and reference
 examples/                   small programs, run by check.sh
 tests/                      self-checking test programs

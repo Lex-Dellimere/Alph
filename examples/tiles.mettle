@@ -147,7 +147,7 @@ fn main() -> int32 {
   g_m.kind(RENDER, &tile_on_core, &tile_on_gpu);
   g_m.kind(FETCH, &picture_here, 0);
   g_m.places.bring(FETCH, &bring_picture);
-  g_batch.init(&g_m.places);
+  g_m.batch(&g_batch);
   g_m.cores.send(g_m.cores.spawn_on(0, &boss, 0), GO, 0);
   g_m.run();
   g_m.shut();

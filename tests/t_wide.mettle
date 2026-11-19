@@ -1,5 +1,5 @@
-// A batch with more room (AlphBatch_wide) and two helpers of eight working
-// cores each: more than sixteen pieces are out at once, never more than two
+// A batch tied to its machine (AlphMachine_batch), which gives it room for
+// all the cores at work, and two helpers of eight working cores each: more than sixteen pieces are out at once, never more than two
 // wait for each core at work, and every piece is answered once and rightly.
 
 import "std/io";
@@ -16,7 +16,6 @@ const WIDE: Word = 9;    // a helper's cores: the first hands out, eight work
 
 var g_m: AlphMachine[3];
 var g_batch: AlphBatch;
-var g_slots: AlphBatchSlot[64];
 var g_seen: uint8[600];
 var g_wrong: Word = 0;
 var g_most: Word = 0;
@@ -89,8 +88,7 @@ fn main() -> int32 {
     expect(g_m[i].share(SQUARE) == ALPH_OK, "the machine shares the kind");
     expect(g_m[i].start(port + (int64)i) == ALPH_OK, "the machine listens");
   }
-  g_batch.init(&g_m[0].places);
-  g_batch.wide(&g_slots[0], 64);
+  g_m[0].batch(&g_batch);  // room for two pieces for each of the seventeen cores at work, and sixteen answers
   var pid: Word = g_m[0].cores.spawn_on(0, &boss, 0);
   var helper1: int64 = CreateThread(0, 0, &helper_main, (cstring)&g_m[1], 0, 0);
   var helper2: int64 = CreateThread(0, 0, &helper_main, (cstring)&g_m[2], 0, 0);
@@ -111,6 +109,7 @@ fn main() -> int32 {
   var by1: Word = g_m[1].served;
   var by2: Word = g_m[2].served;
   expect(g_batch.over() && answered == PIECES && g_wrong == 0, "every piece is answered once and rightly ({answered} of {PIECES}, {g_wrong} wrong)");
+  expect(g_batch.room == 50, "the machine gives the batch two slots for each core at work and sixteen more ({g_batch.room})");
   expect(g_most > 16, "more than sixteen pieces are out at once ({g_most})");
   expect(g_deep[0] <= 2 && g_deep[1] <= 16 && g_deep[2] <= 16, "and no more than two wait for each core at work ({g_deep[0]} here, {g_deep[1]} and {g_deep[2]} at the helpers)");
   expect(g_deep[1] > 8 && g_deep[2] > 8, "a helper's eight cores all have work ({g_deep[1]} and {g_deep[2]})");
