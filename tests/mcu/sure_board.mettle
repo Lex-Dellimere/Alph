@@ -1,0 +1,72 @@
+// A board on a sure line that loses and damages frames: the board's side
+// of tests/mcu/sure_host.mettle. One actor answers each number with the
+// next. About a frame in four that the board sends is not sent, and one
+// in nine has a byte changed. The board does not tick: the machine on the
+// line does, and the board sends again when it is asked.
+//
+// The numbers it is asked must come once each and in order, from 0 again
+// when the other side has started again. It exits 0 when told to stop and
+// they did, 1 when they did not.
+//
+//   mettle --release tests/mcu/sure_board.mettle --target riscv32-none \
+//       --board qemu-virt --emit-flat sure_board.bin -I ports/mcu
+
+import "port/board";
+import "alph/actor/actor";
+import "alph/tether/tether";
+
+const PING: Word = 1;
+const PONG: Word = 2;
+const QUIT: Word = 3;
+const STOP: Word = 4;
+
+var g_node: AlphNode;
+var g_actors: AlphActor[2];
+var g_mail: AlphMsg[16];
+var g_tether: AlphTether;
+var g_kept: AlphKept[8];
+var g_sure: AlphSure;
+var g_next: Word = 0;
+var g_wrong: Word = 0;
+
+@interrupt fn mettle_trap() {
+  mettle_board_exit(99);
+}
+
+fn answerer(a: AlphActor*, m: AlphMsg*) -> Word {
+  if (m->tag == QUIT) {
+    // The answer's header says the word to stop was had. The line's helper
+    // writes it, and runs before the STOP sent after it.
+    a->reply(m, QUIT, 0);
+    a->send(a->pid, STOP, 0);
+    return 0;
+  }
+  if (m->tag == STOP) {
+    a->node->stop();
+    return 0;
+  }
+  if (m->arg != g_next && m->arg != 0) {
+    g_wrong = g_wrong + 1;
+  }
+  g_next = m->arg + 1;
+  if (a->reply(m, PONG, m->arg + 1) != ALPH_OK) {
+    g_wrong = g_wrong + 1;
+  }
+  return 0;
+}
+
+fn main() -> int32 {
+  alph_board_start();
+  g_node.init(&g_actors[0], 2, &g_mail[0], 8);
+  g_tether.init(&g_node, 1, 0, 256);
+  g_node.spawn(&answerer, 0);
+  g_sure.lose = 4;
+  g_sure.damage = 9;
+  g_tether.sure(&g_sure, &g_kept[0], 8);
+  mettle_irq_enable();
+  g_node.run();
+  if (g_wrong != 0) {
+    return 1;
+  }
+  return 0;
+}

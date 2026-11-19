@@ -61,7 +61,7 @@ This is [examples/count.mettle](examples/count.mettle). The node owns no memory:
 | Links | Other machines over UDP. Messages arrive once and in order, can carry up to 1,024 bytes, and a lost machine is noticed in half a second | [src/link](src/link/link.mettle) |
 | Names and the door | Find an actor on another machine by name, and watch it | [src/name](src/name/name.mettle), [src/door](src/door/door.mettle) |
 | Seals | A link only the holders of one key can read or speak on | [src/seal](src/seal/seal.mettle) |
-| Tether | A microcontroller tied to a bigger machine by its serial line: each side's actors reach the other's by pid. That machine can pass the board's mail on, so the whole network reaches it | [src/tether](src/tether/tether.mettle) |
+| Tether | A microcontroller tied to a bigger machine by its serial line: each side's actors reach the other's by pid. That machine can pass the board's mail on, so the whole network reaches it. The line can be made sure, so what is lost or damaged on it is sent again | [src/tether](src/tether/tether.mettle) |
 | Board | The short way for a microcontroller: it says which kinds of work it does, and the bigger machines send it jobs as they would to any other place. It asks for work too, so two boards share work with no computer between them | [src/board](src/board/board.mettle) |
 | Machine and batch | The short way: a machine set up in one call, and one kind of work handed out in pieces to cores, the GPU, other machines and boards | [src/machine](src/machine/machine.mettle), [src/batch](src/batch/batch.mettle) |
 | Ports | What differs per device: `mcu` (one hart, no OS), `harts` (several harts, no OS), `pico2` (a Raspberry Pi Pico 2), `host` (x86-64 Linux) and `arm64` (64-bit ARM Linux: a Raspberry Pi, a Jetson) | [ports](ports) |
@@ -193,7 +193,7 @@ mettle --release examples/mcu/two_b.mettle --target riscv32-none --board qemu-vi
 - A job for another machine carries at most 1,024 bytes, and gives back a word and at most 1,016 bytes.
 - Sockets are Linux only, and there is no file IO.
 - A message between two cores costs 150 to 300 ns against about 20 ns inside a node. Lanes bring a stream of them down to about 70 ns, but a single request and its reply are no quicker.
-- A microcontroller joins through a serial line to one machine, and nothing lost on that line is sent again.
+- A microcontroller joins through a serial line to one machine. What is lost on that line is sent again only when both ends make the line sure, which costs a board about 1.1 KB.
 - A board's jobs are one word in and one word out, one at a time. A board asks the machine at the other end of its line, not the best of several places.
 - A job of a kind done at most once carries a word and gives a word back, and when its worker is lost the program is told it cannot know, not what happened.
 

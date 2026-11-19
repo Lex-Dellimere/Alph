@@ -87,6 +87,8 @@ For the smallest tiles alph beats both, because it uses both. For the rest it ma
 
 Two boards can be tied the same way with no bigger machine: one device with several chips, each chip a place. `examples/mcu/asker.mettle` asks the first board for fifty numbers. The machine on the line can also pass the board's mail on (`src/tether/relay.mettle`), so the other machines of the link reach the board's actors by pid, and the board theirs. `examples/mcu/relay_host.mettle` has a third machine ask the board this way.
 
+A line can be made sure (`AlphTether_sure`). Each message then goes out behind a seven-byte header with its number, how far the sender has the other side's messages, and each side's life, and what is not acknowledged is sent again. A board has no clock and nothing that differs from one start to the next, so a side that starts takes as its life one more than the life it first hears itself called: a restart shows as a change of life, and the numbering begins again by itself. Only one side needs a clock to drive resends, and on a machine the relay's thread is that clock. With a quarter of the frames lost each way and some damaged, 300 requests and replies arrived once each and in order in 20 runs of 20, in 19 to 27 seconds a run. It costs a board 1,128 bytes, and a board that does not turn it on is the same image to the byte.
+
 `src/board` makes a board a place that takes work. The board says which kinds it does, each a function from one word to one word. The machines find out by asking, and from then on the board is one more place, chosen by the same rule as a core or a GPU. A kind is not only done faster in one place than another: some kinds can be done in one place only. A machine with no way of its own to do a kind sends every job of it away, so work that only a board can do (read a sensor, move an arm) is asked for like any other. `examples/mcu/arm.mettle` and `examples/mcu/arm_host.mettle` are a board and a computer that share two kinds, one that both can do and one that only the board can.
 
 A board is too small for a door and sends no beats, so two things differ from a Linux helper:
@@ -183,7 +185,7 @@ The measurements that decide a choice are in the section for that choice: the re
 - Dropping a watch across machines.
 - A crossing that carries everything waiting in the link, where every message is still a datagram of its own.
 - A sealed link has one key for all, so any holder can speak as any machine and there is no forward secrecy. Peers are listed by hand.
-- A board on the UDP link itself. A board joins through a serial line to one machine, and a line that sends again what was lost.
+- A board on the UDP link itself. A board joins through a serial line to one machine.
 - A board that sends its work to the best of several places. It asks the machine at the other end of its line.
 - A job for another machine with more than 1,024 bytes in or 1,016 back, or with its data on a GPU.
 - A job's time predicted from more than its size. A Mandelbrot tile's time depends on where in the picture it is, so such work is placed less well.

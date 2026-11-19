@@ -1,0 +1,51 @@
+// examples/mcu/arm.mettle on a sure line that loses and damages frames:
+// about a frame in four that the board sends is not sent, and one in nine
+// has a byte changed. tests/mcu/sure_arm.mettle is the machine on its line.
+//
+//   mettle --release tests/mcu/sure_arm_board.mettle --target riscv32-none \
+//       --board qemu-virt --emit-flat sure_arm_board.bin -I ports/mcu
+
+import "port/board";
+import "alph/actor/actor";
+import "alph/board/board";
+import "alph/tether/tether";
+import "../../examples/mcu/arm_work";
+
+const STOP: Word = 4;
+
+var g_board: AlphBoard;
+var g_sure: AlphSure;
+var g_kept: AlphKept[8];
+
+@interrupt fn mettle_trap() {
+  mettle_board_exit(99);
+}
+
+fn angle(joint: Word) -> Word {
+  return (Word)(joint * 3) + 1;
+}
+
+// Stops once the line's helper has said the word to stop was had: the
+// helper was woken before the STOP sent here.
+fn quitter(a: AlphActor*, m: AlphMsg*) -> Word {
+  if (m->tag == QUIT) {
+    a->send(a->pid, STOP, 0);
+  } else if (m->tag == STOP) {
+    a->node->stop();
+  }
+  return 0;
+}
+
+fn main() -> int32 {
+  alph_board_start();
+  g_board.init(8, 0, 8);
+  g_board.node.spawn(&quitter, 0);
+  g_board.share(PRIMES, &count_primes);
+  g_board.share(ANGLE, &angle);
+  g_sure.lose = 4;
+  g_sure.damage = 9;
+  g_board.tether.sure(&g_sure, &g_kept[0], 8);
+  mettle_irq_enable();
+  g_board.run();
+  return 0;
+}

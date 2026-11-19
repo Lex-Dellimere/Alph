@@ -1,0 +1,340 @@
+// A sure tether (src/tether, sure) on its own: the test is the other end of
+// the line and speaks its frames by hand. It checks the numbering, the
+// acks, what is not heeded from a side that does not know this run, a full
+// kept array, sending again on tick and when asked, and a restart of the
+// other side.
+
+import "std/io";
+import "port/sys";
+import "std/thread";
+import "port/line";
+import "alph/actor/actor";
+import "alph/tether/tether";
+
+const NOTE: Word = 1;
+const END: uint8 = 192;
+const ESC: uint8 = 219;
+const ACK: int64 = 0;
+const CHASE: int64 = 1;
+const MSG: int64 = 2;
+
+var g_node: AlphNode;
+var g_actors: AlphActor[4];
+var g_mail: AlphMsg[32];
+var g_tether: AlphTether;
+var g_kept: AlphKept[4];
+var g_sure: AlphSure;
+var g_failures: int32 = 0;
+var g_fd: int64 = 0;
+var g_gen: int64 = 0;
+
+fn expect(ok: bool, what: string) {
+  if (!ok) {
+    println("FAIL {what}");
+    g_failures = g_failures + 1;
+  }
+}
+
+struct Seen {
+  notes: Word;
+  args: Word[16];
+}
+
+fn sink(a: AlphActor*, m: AlphMsg*) -> Word {
+  var s: Seen* = (Seen*)a->state;
+  if (s->notes < 16) {
+    s->args[s->notes] = m->arg;
+  }
+  s->notes = s->notes + 1;
+  return 0;
+}
+
+fn put(out: uint8*, value: int64, bytes: int64) {
+  for i in 0..bytes {
+    out[i] = (uint8)((value >> ((int64)i * 8)) & 255);
+  }
+}
+
+fn sum(f: uint8*, count: int64) -> int64 {
+  var s: int64 = 0;
+  for i in 0..count {
+    s = (s + (int64)f[i] * ((int64)i + 1)) & 65535;
+  }
+  return s;
+}
+
+// A message for the sink, from place 1, before the escapes.
+fn message(out: uint8*, arg: int64) {
+  put(&out[0], 5, 2);
+  put(&out[2], 1, 2);
+  put(&out[4], g_gen, 4);
+  put(&out[8], 0, 4);
+  put(&out[12], 3, 4);
+  put(&out[16], 7, 4);
+  put(&out[20], (int64)NOTE, 4);
+  put(&out[24], arg, 4);
+  put(&out[28], 0, 4);
+  put(&out[32], sum(&out[0], 32), 2);
+}
+
+fn speak(plain: uint8*, count: int64) {
+  var out: uint8[80];
+  var n: int64 = 0;
+  for i in 0..count {
+    if (plain[i] == END) {
+      out[n] = ESC;
+      out[n + 1] = 220;
+      n = n + 2;
+    } else if (plain[i] == ESC) {
+      out[n] = ESC;
+      out[n + 1] = 221;
+      n = n + 2;
+    } else {
+      out[n] = plain[i];
+      n = n + 1;
+    }
+  }
+  out[n] = END;
+  syscall(ALPH_NR_WRITE, g_fd, (int64)&out[0], n + 1);
+}
+
+fn header(kind: int64, seq: int64, ack: int64, from: int64, to: int64) {
+  var h: uint8[7];
+  h[0] = (uint8)kind;
+  h[1] = (uint8)seq;
+  h[2] = (uint8)ack;
+  h[3] = (uint8)from;
+  h[4] = (uint8)to;
+  h[5] = (uint8)(sum(&h[0], 5) & 127);
+  h[6] = (uint8)(sum(&h[0], 5) >> 7);
+  speak(&h[0], 7);
+}
+
+// A message with its header: seq, and life 9 speaking to life 1.
+fn speak_message(seq: int64, ack: int64, arg: int64) {
+  var f: uint8[34];
+  header(MSG, seq, ack, 9, 1);
+  message(&f[0], arg);
+  speak(&f[0], 34);
+}
+
+// The next frame off the line with something in it, without its escapes.
+// Returns its length, or -1 when nothing comes in a second.
+fn hear(out: uint8*) -> int64 {
+  var n: int64 = 0;
+  var b: uint8[1];
+  var escaped: bool = false;
+  while (true) {
+    if (syscall(ALPH_NR_READ, g_fd, (int64)&b[0], 1) != 1) {
+      return -1;
+    }
+    if (b[0] == END) {
+      if (n > 0) {
+        return n;
+      }
+      continue;
+    }
+    var c: uint8 = b[0];
+    if (escaped) {
+      escaped = false;
+      if (c == 220) {
+        c = END;
+      } else {
+        c = ESC;
+      }
+    } else if (c == ESC) {
+      escaped = true;
+      continue;
+    }
+    if (n < 64) {
+      out[n] = c;
+    }
+    n = n + 1;
+  }
+  return n;
+}
+
+// The next header: kind, seq, ack, from and to in h. Checks its sum.
+fn hear_header(h: uint8*, what: string) -> bool {
+  var n: int64 = hear(h);
+  var ok: bool = n == 7 && (int64)h[5] + (int64)h[6] * 128 == sum(h, 5);
+  expect(ok, what);
+  return ok;
+}
+
+// The next message frame: its arg.
+fn hear_message(what: string) -> int64 {
+  var f: uint8[64];
+  var n: int64 = hear(&f[0]);
+  expect(n == 34 && (int64)f[32] + (int64)f[33] * 256 == sum(&f[0], 32), what);
+  return (int64)f[24] + (int64)f[25] * 256;
+}
+
+// Runs what has arrived, the tether's helper too.
+fn settle() {
+  for i in 0..30 {
+    g_node.turn();
+    Sleep(1);
+  }
+}
+
+fn main() -> int32 {
+  var ends: int64[2];
+  var s: Seen;
+  var h: uint8[64];
+  var tv: int64[2];
+  s.notes = 0;
+  expect(syscall(ALPH_NR_SOCKETPAIR, 1, 1, 0, (int64)&ends[0]) == 0, "a pair of sockets for the line");
+  var mine: int64 = (int64)(*(int32*)&ends[0]);
+  g_fd = (int64)(*((int32*)&ends[0] + 1));
+  tv[0] = 1;
+  tv[1] = 0;
+  syscall(ALPH_NR_SETSOCKOPT, g_fd, 1, 20, (int64)&tv[0], 16);  // a read waits a second at most
+  alph_line_open(mine);
+
+  // This machine is place 5. The one on the line is places 0 and 1.
+  g_node.init(&g_actors[0], 4, &g_mail[0], 8);
+  g_tether.init(&g_node, 5, 0, 2);
+  var pid: Word = g_node.spawn(&sink, (rawptr)&s);
+  g_gen = (int64)((pid >> ALPH_INDEX_BITS) & 16777215);
+  expect(g_tether.sure(&g_sure, &g_kept[0], 4) == ALPH_OK, "the line is made sure");
+  settle();
+
+  // A new run says it is there: a header alone, knowing no life.
+  if (hear_header(&h[0], "a header when the line is made sure")) {
+    expect(h[0] == (uint8)CHASE && h[3] == 0 && h[4] == 0, "it has no life yet and knows none");
+  }
+
+  // Four messages are kept and sent, numbered 1 to 4; a fifth is refused.
+  var there: Word = (Word)(((Word)1 << ALPH_PLACE_SHIFT) | ((Word)2 << ALPH_INDEX_BITS) | 4);
+  for i in 1..5 {
+    expect(g_node.send(there, NOTE, (Word)(i * 10)) == ALPH_OK, "a message is kept");
+    settle();
+    if (hear_header(&h[0], "a message's header")) {
+      expect(h[0] == (uint8)MSG && (int64)h[1] == (int64)i, "numbered {i} ({h[1]})");
+    }
+    expect(hear_message("the message after its header") == (int64)(i * 10), "with its arg");
+  }
+  expect(g_node.send(there, NOTE, 50) == ALPH_FULL, "a fifth is refused while four are kept");
+
+  // The other side, life 9, says it has two, but does not know this run:
+  // that is not heeded, and it is told this run's life.
+  header(ACK, 0, 2, 9, 0);
+  settle();
+  if (hear_header(&h[0], "an answer to a side that does not know this run")) {
+    expect(h[0] == (uint8)ACK && h[3] == 1 && h[4] == 9, "this run is life 1, and the other is 9 ({h[3]}, {h[4]})");
+  }
+  expect(g_sure.held == 4, "nothing is heeded from a side that does not know this run");
+
+  // Now it knows: two are had, two kept, and a new one is number 5.
+  header(ACK, 0, 2, 9, 1);
+  settle();
+  expect(g_sure.held == 2, "two are dropped once had ({g_sure.held} kept)");
+  expect(g_node.send(there, NOTE, 50) == ALPH_OK, "a message is kept again");
+  settle();
+  if (hear_header(&h[0], "the next message's header")) {
+    expect((int64)h[1] == 5, "numbered 5 ({h[1]})");
+  }
+  hear_message("the next message");
+
+  // Messages to this side: in order once each, whatever comes twice or early.
+  speak_message(1, 2, 101);
+  settle();
+  if (hear_header(&h[0], "an ack")) {
+    expect(h[0] == (uint8)ACK && h[2] == 1, "it says it has number 1");
+  }
+  speak_message(1, 2, 101);
+  speak_message(3, 2, 103);
+  settle();
+  speak_message(2, 2, 102);
+  speak_message(3, 2, 103);
+  settle();
+  expect(s.notes == 3 && s.args[0] == 101 && s.args[1] == 102 && s.args[2] == 103,
+         "three arrive, once each and in order ({s.notes})");
+
+  // A message with no header, one whose header is damaged, and one that is
+  // damaged itself: none arrives.
+  var f: uint8[34];
+  var dropped: Word = g_tether.dropped;
+  message(&f[0], 104);
+  speak(&f[0], 34);
+  var bad: uint8[7];
+  bad[0] = (uint8)MSG;
+  bad[1] = 4;
+  bad[2] = 2;
+  bad[3] = 9;
+  bad[4] = 1;
+  bad[5] = (uint8)((sum(&bad[0], 5) + 1) & 127);
+  bad[6] = (uint8)(sum(&bad[0], 5) >> 7);
+  speak(&bad[0], 7);
+  speak(&f[0], 34);
+  header(MSG, 4, 2, 9, 1);
+  f[25] = f[25] + 1;
+  speak(&f[0], 34);
+  settle();
+  expect(s.notes == 3, "no false message arrives ({s.notes})");
+  expect(g_tether.dropped - dropped == 4, "four frames are dropped ({g_tether.dropped - dropped})");
+
+  // Drain what was said meanwhile: acks only.
+  while (hear(&h[0]) > 0) {
+  }
+  tv[0] = 1;
+
+  // Ticks: three kept messages wait a whole tick, so the next sends them
+  // again; nothing came in its turn since, so it also asks for again.
+  g_tether.tick();
+  settle();
+  g_tether.tick();
+  settle();
+  var again: int64 = 0;
+  var asked: bool = false;
+  for i in 0..8 {
+    if (hear(&h[0]) == 7) {
+      if (h[0] == (uint8)MSG) {
+        again = again + 1;
+        hear(&f[0]);
+      } else if (h[0] == (uint8)CHASE) {
+        asked = true;
+      }
+    }
+  }
+  expect(again == 3 && g_sure.resent == 3, "three kept are sent again on the second tick ({again}, {g_sure.resent})");
+  expect(asked, "and the other side is asked to send again");
+
+  // The other side asks: it has up to 4, so number 5 is sent again.
+  header(CHASE, 0, 4, 9, 1);
+  settle();
+  if (hear_header(&h[0], "a message sent again when asked")) {
+    expect(h[0] == (uint8)MSG && h[1] == 5, "it is number 5 ({h[1]})");
+  }
+  hear_message("its message");
+
+  // The other side starts again: a run with no life. What was kept for the
+  // old one is dropped, and both number from the start.
+  header(CHASE, 0, 0, 0, 0);
+  settle();
+  expect(g_sure.held == 0, "what was kept for the old run is dropped");
+  while (hear(&h[0]) > 0) {
+  }
+  header(ACK, 0, 0, 2, 1);
+  settle();
+  expect(g_node.send(there, NOTE, 60) == ALPH_OK, "a message for the new run is kept");
+  settle();
+  if (hear_header(&h[0], "its header")) {
+    expect(h[1] == 1 && h[4] == 2, "numbered 1 again, for life 2 ({h[1]}, {h[4]})");
+  }
+  hear_message("the message for the new run");
+  var f2: uint8[34];
+  header(MSG, 1, 1, 2, 1);
+  message(&f2[0], 105);
+  speak(&f2[0], 34);
+  settle();
+  expect(s.notes == 4 && s.args[3] == 105, "the new run's first message arrives");
+
+  syscall(ALPH_NR_CLOSE, g_fd);
+  if (g_failures != 0) {
+    return 1;
+  }
+  println("tether sure ok: numbered, acked, full at 4, sent again on tick and when asked, a new run started afresh");
+  return 0;
+}

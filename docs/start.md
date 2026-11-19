@@ -692,7 +692,23 @@ g_far_link.peer(0, 1, here, port + 1);
 g_far_link.through(0, 1, 1);
 ```
 
-A message goes over once: a byte lost on the line loses it. A pid from the bigger machine has to fit the board's word (place below 256, slot below 1,024, generation below 8,192), which holds for actors spawned at the start; a message whose pids do not fit is dropped.
+**A sure line.** By itself the line sends a message once, and a byte lost on it loses the message. A line can be made sure: each message then arrives once and in order while both ends are up, and what was lost or damaged is sent again. Both ends turn it on, each with memory for the messages kept until the other end says it has them:
+
+```mettle
+var g_sure: AlphSure;
+var g_kept: AlphKept[8];
+
+g_board.tether.sure(&g_sure, &g_kept[0], 8);  // on the board, after init
+g_m.tether.sure(&g_sure, &g_kept[0], 8);      // on the computer, after board()
+```
+
+- With it on, a send returns `ALPH_FULL` when all the kept messages are still waiting for the other end's word. Ask again.
+- Sending again needs something to drive it. The computer's side does that by itself. A board need not: the computer asks it to send again. With two boards and no computer, one of them calls `tether.tick()` on a timer, about as often as a message goes there and back.
+- A side that restarts is noticed, and the two start numbering again by themselves. What was kept for the run before is lost.
+- It costs a board about 1.1 KB. A board that does not turn it on pays nothing and speaks the same bytes as before.
+- A full mailbox at the far end still drops a message, and a lost message is sent again with all the ones after it, so a line that loses a lot is slow.
+
+A message goes over once when the line is not sure: a byte lost on the line loses it. A pid from the bigger machine has to fit the board's word (place below 256, slot below 1,024, generation below 8,192), which holds for actors spawned at the start; a message whose pids do not fit is dropped.
 
 **A board that shares work.** `AlphBoard` is the short way for a board, as `AlphMachine` is for a Linux machine. It is a node, the tether, and an actor for each kind of work the board does for the others. A kind on a board is a function from one word to one word. This is [examples/mcu/arm.mettle](../examples/mcu/arm.mettle), the chip in a robot's arm:
 
@@ -788,7 +804,7 @@ These are not built yet.
 - A job for another machine carries at most 1,024 bytes, and gives back a word and at most 1,016 bytes.
 - Sockets are Linux only, and there is no file IO.
 - A message between two cores costs 150 to 300 ns against about 20 ns inside a node. Lanes bring a stream of them down to about 70 ns, but one request and its reply are no quicker, and lanes are for Linux only.
-- A microcontroller joins through a serial line to one machine, and nothing lost on that line is sent again.
+- A microcontroller joins through a serial line to one machine. What is lost on that line is sent again only when both ends make the line sure.
 - A board's jobs are one word in and one word out, one at a time. A board asks the machine at the other end of its line, not the best of several places.
 - A job of a kind done at most once carries a word and gives a word back. When its worker is lost the program is told `ALPH_LOST`: it cannot know whether the job was done.
 - A batch has 16 pieces out at once and a machine takes 16 jobs for others at once, which is less than a helper with many cores can do.

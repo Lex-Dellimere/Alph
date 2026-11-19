@@ -53,7 +53,7 @@ PORTS="t_door:8000 t_poll:8000 t_link:12000 t_parcel:12000 t_machine:12000
   t_three:12000 t_own:12000 t_back:12000 t_far:10000 t_seal:11000
   far:7401 talk:7411 run:7441 share:7451 picture:7471"
 # --quick: the new layers only, for use between small edits.
-QUICK_TESTS="t_actor t_cores t_time t_wheel t_places t_life t_link t_seal t_door t_far t_parcel t_poll t_proc t_tether t_batch t_machine t_three t_own t_cross t_back t_once t_serial"
+QUICK_TESTS="t_actor t_cores t_time t_wheel t_places t_life t_link t_seal t_door t_far t_parcel t_poll t_proc t_tether t_batch t_machine t_three t_own t_cross t_back t_once t_serial t_tether_sure"
 QUICK_EXAMPLES="count spread render far run share picture tiles talk"
 mkdir -p "$OUT"
 
@@ -298,6 +298,15 @@ build_board() {
       "$METTLE" --release examples/mcu/asker.mettle --target riscv32-none --board qemu-virt \
         --emit-flat "$bin" -I ports/mcu > "$log" 2>&1 || status=1
       ;;
+    sure)
+      log="$OUT/sure.log"
+      "$METTLE" --release tests/mcu/sure_board.mettle --target riscv32-none --board qemu-virt \
+        --emit-flat "$OUT/sure_board.bin" -I ports/mcu > "$log" 2>&1 &&
+      "$METTLE" --release tests/mcu/sure_arm_board.mettle --target riscv32-none --board qemu-virt \
+        --emit-flat "$OUT/sure_arm_board.bin" -I ports/mcu >> "$log" 2>&1 &&
+      "$METTLE" --build -s --release tests/mcu/sure_host.mettle -I ports/host -o "$OUT/sure_host" >> "$log" 2>&1 &&
+      "$METTLE" --build -s --release tests/mcu/sure_arm.mettle -I ports/host -o "$OUT/sure_arm" >> "$log" 2>&1 || status=1
+      ;;
     two)
       log="$OUT/two.log"
       "$METTLE" --release examples/mcu/two_a.mettle --target riscv32-none --board qemu-virt \
@@ -330,7 +339,7 @@ built() { [ "$(cat "$OUT/$1.built" 2> /dev/null)" = "${2:-0}" ]; }
 board_steps=()
 if [ "$boards" -eq 1 ]; then
   board_steps=(pico2 arm64)
-  [ "$qemu" -eq 1 ] && board_steps+=(blink tether relay arm harts pair two)
+  [ "$qemu" -eq 1 ] && board_steps+=(blink tether relay arm harts pair two sure)
   rm -f "$OUT"/*.built "$OUT/pico2.unbuilt" "$OUT/arm64.unbuilt"
 fi
 
@@ -588,6 +597,62 @@ step_two() {
   fi
 }
 
+# A sure line that loses about a quarter of the frames each way and damages
+# some: 300 requests and replies arrive once each and in order. Then the
+# machine on the line leaves in the middle of its questions and comes back
+# as a new run, and the two go on by themselves. Then a machine shares work
+# with a board over such a line.
+step_sure() {
+  local log="$OUT/sure.log" port run prog bin board_pid host_pid first code board
+  if ! built sure; then
+    echo "FAIL  mcu/sure build (see $log)"
+    fails=$((fails + 1))
+    return
+  fi
+  port=$((13101 + $$ % 300 * 3))
+  for run in lossy restart arm; do
+    : > "$log.host"
+    if [ "$run" = restart ]; then
+      timeout 60 qemu-system-riscv32 -M virt -bios none -display none -monitor none \
+        -serial "tcp:127.0.0.1:$port,server=on,wait=off" \
+        -device loader,file="$OUT/sure_board.bin",addr=0x80000000,force-raw=on >> "$log" 2>&1 &
+      board_pid=$!
+      sleep 0.3
+      timeout 60 "$OUT/sure_host" "$port" first >> "$log.host" 2>&1
+      first=$?
+      timeout 60 "$OUT/sure_host" "$port" second >> "$log.host" 2>&1
+      code=$((first + $?))
+      wait "$board_pid"
+      board=$?
+    else
+      prog="$OUT/sure_host"
+      bin="$OUT/sure_board.bin"
+      if [ "$run" = arm ]; then
+        prog="$OUT/sure_arm"
+        bin="$OUT/sure_arm_board.bin"
+      fi
+      # shellcheck disable=SC2046
+      timeout 60 "$prog" "$port" $([ "$run" = lossy ] && echo lossy) >> "$log.host" 2>&1 &
+      host_pid=$!
+      sleep 0.3
+      timeout 60 qemu-system-riscv32 -M virt -bios none -display none -monitor none \
+        -serial "tcp:127.0.0.1:$port" -device loader,file="$bin",addr=0x80000000,force-raw=on >> "$log" 2>&1
+      board=$?
+      wait "$host_pid"
+      code=$?
+    fi
+    port=$((port + 1))
+    cat "$log.host" >> "$log"
+    if [ "$code" -eq 0 ] && [ "$board" -eq 0 ]; then
+      echo "ok    mcu/sure $run [$(tail -n 1 "$log.host")]"
+    else
+      echo "FAIL  mcu/sure $run: host exit $code, board exit $board (see $log)"
+      tail -n 4 "$log.host" | sed 's/^/      /'
+      fails=$((fails + 1))
+    fi
+  done
+}
+
 # The same layers for 64-bit ARM Linux (a Raspberry Pi, a Jetson): built,
 # not run here.
 step_arm64() {
@@ -613,6 +678,7 @@ if [ "$boards" -eq 1 ]; then
   [ "$qemu" -eq 1 ] && step_harts
   [ "$qemu" -eq 1 ] && step_pair
   [ "$qemu" -eq 1 ] && step_two
+  [ "$qemu" -eq 1 ] && step_sure
   step_arm64
 fi
 

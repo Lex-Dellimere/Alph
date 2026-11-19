@@ -2553,11 +2553,15 @@ wait when read (not be set non-blocking).
 export fn alph_line_start(take: fn(rawptr, int32) -> void, ctx: rawptr)
 ```
 
+Called again, it only changes where the bytes go: one thread reads.
+
 ### `alph_line_put`
 
 ```mettle
 export fn alph_line_put(byte: uint8)
 ```
+
+Puts one byte on the line. It goes out at the next flush, or when 128 are waiting.
 
 ### `alph_line_flush`
 
@@ -2582,6 +2586,8 @@ do not mix.
 export fn alph_line_unlock()
 ```
 
+Lets the next sender have the line.
+
 ## port/serial (host port)
 
 A serial device as a line of bytes: a board's UART on /dev/ttyACM0 or
@@ -2603,7 +2609,8 @@ a negative number when it cannot be opened or set.
 A tether: a node tied to one other machine by a line of bytes, such as a
 board's serial port. It is the small way for a microcontroller to be a
 place among bigger machines: no numbering, no beats, nothing sent again.
-A message goes over once, and a byte lost on the line loses it.
+A message goes over once, and a byte lost on the line loses it, unless
+both ends make the line sure (see sure below).
 
 A message is 34 bytes on the line, then a byte that marks its end. The
 pids in it are their three parts, because a 32-bit board and a 64-bit
@@ -2615,6 +2622,17 @@ start. A message's tag, arg and ref cross as 32 bits each, so a bigger
 machine's larger numbers are cut short.
 
 A process has one line, and so one tether.
+
+### `AlphKept`
+
+```mettle
+export struct AlphKept {
+  to: Word;
+  m: AlphMsg;
+}
+```
+
+A message on a sure line until the other side has it.
 
 ### `AlphTether`
 
@@ -2630,6 +2648,40 @@ export struct AlphTether {
   frame: uint8[34];
 }
 ```
+
+One end of a line: the node it serves and the message being taken off the line.
+
+### `AlphSure`
+
+```mettle
+export struct AlphSure {
+  t: AlphTether*;
+  kept: AlphKept*;
+  room: Word;
+  held: Word;     // messages kept
+  posted: Word;   // of those, how many are on the line since they were last asked for again
+  acked: Word;    // the other side has every message up to this number
+  got: Word;      // every message from it up to this number was taken
+  life: Word;     // this run, 0 until a sound header is heard
+  their: Word;    // the other side's run, 0 while it has none
+  owe: Word;      // a header to send alone
+  stale: Word;    // ticks since the other side last said it has more
+  again: Word;    // ticks to wait for that before sending again
+  quiet: Word;    // ticks since a message came in its turn
+  ask: Word;      // ticks to wait for one before asking
+  gap: Word;      // one came early, and the other side was asked to send again
+  helper: Word;   // the actor that writes on the line
+  next: Word;     // 128 and its number while a message's header has come
+  gate: AlphGate;
+  frames: Word;   // the test knobs' random number
+  resent: Word;   // messages sent again
+  lose: Word;     // for tests: about one frame in so many is not sent
+  damage: Word;   // for tests: about one frame in so many has a byte changed
+}
+```
+
+What a sure line keeps. A tether that is not sure has none of it, and
+is not one byte bigger.
 
 ### `AlphTether_send__ptr`
 
@@ -2665,6 +2717,55 @@ Ties a node to the machine at the other end of the port's line. The node
 is place `place`. The other machine's places are first, first + 1, ...
 Call it before the first spawn.
 
+### `AlphTether_keep__ptr`
+
+```mettle
+export fn AlphTether_keep__ptr(t: AlphTether*, to: Word, m: AlphMsg*) -> Word
+```
+
+Call it as `t->keep(to, m)`, or `t.keep(to, m)` on a value.
+
+Sends a message on a sure line: it is kept until the other side says it
+has it, and sent again until then. Returns ALPH_FULL when room messages
+are kept already, so the sender can try again later. On a line that is
+not sure it is send.
+
+### `AlphTether_tick__ptr`
+
+```mettle
+export fn AlphTether_tick__ptr(t: AlphTether*)
+```
+
+Call it as `t->tick()`, or `t.tick()` on a value.
+
+The line's clock: at least one side of a sure line calls it now and then,
+from a timer, about as often as a message goes there and back (20 to 100
+ms on a serial line). Kept messages the other side has not said it has
+for more than a tick are sent again. When nothing came in its turn from
+the other side for more than a tick, it is asked to send again what this
+side has not said it has. Each time that brings nothing, the next waits
+twice as long, up to 8 ticks, unless messages came early: then one is
+surely missing. On a line that is not sure it does nothing.
+
+### `AlphTether_sure__ptr`
+
+```mettle
+export fn AlphTether_sure__ptr(t: AlphTether*, s: AlphSure*, kept: AlphKept*, room: Word) -> Word
+```
+
+Call it as `t->sure(s, kept, room)`, or `t.sure(s, kept, room)` on a value.
+
+Makes the line sure: each message arrives once and in the order it was
+sent while both ends are up, and what is lost or damaged on the line is
+sent again. Both ends call it, after init or relay, and at least one
+calls tick. s is new (all 0) and holds what the line keeps. kept holds
+the messages the other side does not yet have: room of them, 1, 2, 4 and
+so on up to 64 (another room is taken as the one below it). A send while
+all are kept is refused with ALPH_FULL. A side that starts again is a
+new run: what was kept for its last run is dropped, and the two start
+numbering again by themselves. It takes one actor of the node. Returns
+ALPH_FULL when no actor is left.
+
 ## alph/tether/relay
 
 A relay: a machine on the link that has a board on its serial line and
@@ -2677,6 +2778,9 @@ to the line. So a slow line holds up neither the link, which must go on
 saying this machine is alive, nor the actors that send. When 64 messages
 are waiting, a sender gets ALPH_FULL and mail passed on from another
 machine is dropped.
+
+Made sure after relay (AlphTether_sure), the line is ticked by that
+thread, so the program has nothing more to do.
 
 The board has no door: its actors are reached by pid, not found by name
 or watched from other machines.

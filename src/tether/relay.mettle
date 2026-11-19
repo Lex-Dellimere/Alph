@@ -9,6 +9,9 @@
 // are waiting, a sender gets ALPH_FULL and mail passed on from another
 // machine is dropped.
 //
+// Made sure after relay (AlphTether_sure), the line is ticked by that
+// thread, so the program has nothing more to do.
+//
 // The board has no door: its actors are reached by pid, not found by name
 // or watched from other machines.
 //
@@ -17,6 +20,7 @@
 import "std/thread";
 import "port/port";
 import "port/sys";
+import "port/alarm";
 import "alph/actor/actor";
 import "alph/cores/cores";
 import "alph/link/link";
@@ -25,6 +29,7 @@ import "alph/tether/tether";
 const FUTEX_WAIT: int64 = 128;  // private
 const FUTEX_WAKE: int64 = 129;
 const ROOM: int32 = 64;
+const TICK_MS: Word = 50;  // how often the line is ticked
 
 extern fn mettle_atomic_exchange_i32(target: int32*, value: int32) -> int32 with none = "mettle_atomic_exchange_i32";
 extern fn mettle_atomic_compare_exchange_i32(target: int32*, exchange: int32, comparand: int32) -> int32 with none = "mettle_atomic_compare_exchange_i32";
@@ -42,25 +47,40 @@ var g_count: int32 = 0;
 var g_lock: int32 = 0;
 var g_news: int32 = 0;  // goes up with every message queued, so the writer looks again
 
-// Writes the queue to the line, and sleeps when it is empty.
+// Writes the queue to the line, and sleeps when it is empty. It also ticks
+// the tether, which does nothing unless the line is sure. A message a sure
+// line cannot keep yet waits here until it can.
 fn alph_relay_main(arg: cstring) -> uint32 {
   var next: Waiting;
+  var have: bool = false;
+  var ticked: Word = alph_now();
+  var nap: int64[2];
   while (true) {
     var seen: int32 = mettle_atomic_compare_exchange_i32(&g_news, 0, 0);
-    var have: bool = false;
-    while (mettle_atomic_exchange_i32(&g_lock, 1) != 0) {
+    if ((Word)(alph_now() - ticked) >= alph_ms(TICK_MS)) {
+      ticked = alph_now();
+      g_tether->tick();
     }
-    if (g_count > 0) {
-      next = g_waiting[g_first];
-      g_first = (g_first + 1) % ROOM;
-      g_count = g_count - 1;
-      have = true;
+    if (!have) {
+      while (mettle_atomic_exchange_i32(&g_lock, 1) != 0) {
+      }
+      if (g_count > 0) {
+        next = g_waiting[g_first];
+        g_first = (g_first + 1) % ROOM;
+        g_count = g_count - 1;
+        have = true;
+      }
+      mettle_atomic_compare_exchange_i32(&g_lock, 0, 1);
     }
-    mettle_atomic_compare_exchange_i32(&g_lock, 0, 1);
-    if (have) {
-      g_tether->send(next.to, &next.m);
+    if (have && g_tether->keep(next.to, &next.m) == ALPH_OK) {
+      have = false;
     } else {
-      syscall(ALPH_NR_FUTEX, (int64)&g_news, FUTEX_WAIT, (int64)seen, 0);
+      nap[0] = 0;
+      nap[1] = (int64)TICK_MS * 1000000;
+      if (have) {
+        nap[1] = 2000000;
+      }
+      syscall(ALPH_NR_FUTEX, (int64)&g_news, FUTEX_WAIT, (int64)seen, (int64)&nap[0]);
     }
   }
   return 0;

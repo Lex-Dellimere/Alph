@@ -19,6 +19,7 @@ var g_take: fn(rawptr, int32) -> void;
 var g_ctx: rawptr;
 var g_out: uint8[128];
 var g_have: int64 = 0;
+var g_started: int32 = 0;
 
 // The descriptor the line is: set it before the line is started. It must
 // wait when read (not be set non-blocking).
@@ -40,12 +41,17 @@ fn alph_line_main(arg: cstring) -> uint32 {
   return 0;
 }
 
+// Called again, it only changes where the bytes go: one thread reads.
 export fn alph_line_start(take: fn(rawptr, int32) -> void, ctx: rawptr) {
-  g_take = take;
   g_ctx = ctx;
-  CreateThread(0, 0, &alph_line_main, 0, 0, 0);
+  g_take = take;
+  if (g_started == 0) {
+    g_started = 1;
+    CreateThread(0, 0, &alph_line_main, 0, 0, 0);
+  }
 }
 
+// Puts one byte on the line. It goes out at the next flush, or when 128 are waiting.
 export fn alph_line_put(byte: uint8) {
   if (g_have == 128) {
     alph_line_flush();
@@ -82,6 +88,7 @@ export fn alph_line_lock() {
   }
 }
 
+// Lets the next sender have the line.
 export fn alph_line_unlock() {
   mettle_atomic_compare_exchange_i32(&g_lock, 0, 1);
 }
