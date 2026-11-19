@@ -203,7 +203,7 @@ mettle --release examples/mcu/two_b.mettle --target riscv32-none --board qemu-vi
 ./check.sh
 ```
 
-It builds every test and example in debug and release and runs it, builds the RISC-V example, runs it in QEMU and fails if the image is over 5 KB. It also checks that `docs/api.md` matches the first runtime's source.
+It builds every test and example in debug and release and runs them, several at a time. Then it runs the board programs in QEMU, fails if the smallest image is over 5 KB, builds everything for ARM Linux, and checks that the two reference pages match the source. It takes about two minutes on a 16-core machine. `./check.sh --quick` runs only the new layers in release, in under a minute, and `./check.sh tests/t_name` runs one program.
 
 ## The first runtime
 

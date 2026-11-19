@@ -4,25 +4,105 @@
 # it. A program passes when it exits 0. Release builds have had miscompiles, so every
 # test runs in debug and in release.
 #
-#   ./check.sh                  all tests and examples
-#   ./check.sh tests/t_atomic   one program
+#   ./check.sh                  all tests and examples, then the board steps
+#   ./check.sh --quick          the new layers' tests and examples in release, then the board steps
+#   ./check.sh tests/t_atomic   one program (or several)
+#   JOBS=4 ./check.sh           at most 4 builds or runs at once (default: one per CPU)
 #   METTLE=/path/to/mettle ./check.sh
 #
 # Every mode carries -s: without it the compiler emits inserted traps as an
 # inline exit that alph's crash recovery cannot catch.
+#
+# The order of work: everything is built first, JOBS at a time. Then the
+# programs run, JOBS at a time, except the ones listed in ALONE below, which
+# run one after another once the rest are done. Then the board steps, one
+# after another. Results are printed in the same order as a serial run (tests
+# then examples, debug then release), once all programs have run. JOBS=1 is
+# a serial run.
 
 set -u
+started=$SECONDS
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$ROOT" || exit 2
 METTLE="${METTLE:-$ROOT/../Mettle/bin/mettle}"
 OUT="build/check"
 MODES=("-s" "-s --release")
 MCU_LIMIT=5120  # bytes: the whole RISC-V image, board startup included
+JOBS="${JOBS:-$(nproc)}"
 # Tests of the first runtime that assert millisecond deadlines. On a busy
 # machine they miss them, so they get three tries and the output says when
-# one needed more than the first. Every other test gets one.
+# one needed more than the first. Every other test gets one. They run alone,
+# one at a time, after the parallel part, with nothing else running.
 TIMED="t_bound t_fair t_shed t_shed_edge t_timer_handoff t_storm"
+# Other tests that fail when the machine is loaded run alone too. The tests
+# that measure where work goes by timing it (t_places t_far t_own t_machine
+# t_three t_batch t_time t_wheel t_link t_parcel t_door t_seal t_poll t_proc
+# t_cores) each passed 20 of 20 runs in both modes beside a full parallel
+# build, so none is listed. Add a test here if it fails only in a full run.
+LOADED=""
+ALONE="$TIMED $LOADED"
+# Programs that listen on ports, as <name>:<lock>. They run in the parallel
+# part, but two with the same lock never run at once: their ports could be
+# the same. Each lock is named after the lowest port of its range.
+# - Tests on ports worked out from their pid: t_door 8000-9999 and t_poll
+#   9000-9899 overlap; t_link 12000-31999 overlaps t_parcel 13000-16999,
+#   t_machine 14000-17999, t_three 15000-20999 and t_own 21000-26999; t_far
+#   10000-10999 and t_seal 11000-11899 overlap only their own other mode.
+# - Examples on fixed ports: their debug and release runs take the same one.
+PORTS="t_door:8000 t_poll:8000 t_link:12000 t_parcel:12000 t_machine:12000
+  t_three:12000 t_own:12000 t_back:12000 t_far:10000 t_seal:11000
+  far:7401 talk:7411 run:7441 share:7451 picture:7471"
+# --quick: the new layers only, for use between small edits.
+QUICK_TESTS="t_actor t_cores t_time t_wheel t_places t_life t_link t_seal t_door t_far t_parcel t_poll t_proc t_tether t_batch t_machine t_three t_own t_cross t_back t_once t_serial"
+QUICK_EXAMPLES="count spread render far run share picture tiles talk"
 mkdir -p "$OUT"
+
+# Any exit, Ctrl-C included, stops every process this script started and
+# anything those started: a test left running holds a CPU and its ports.
+# Programs run under timeout, which puts itself in a process group of its own,
+# so they are found by parent pid, not by process group.
+descendants() {
+  local child
+  for child in $(ps -o pid= --ppid "$1"); do
+    echo "$child"
+    descendants "$child"
+  done
+}
+# A second Ctrl-C, or the copy of the signal that reaches the script through
+# its process group, must not cut this short, so signals are ignored while it
+# runs. It goes over the tree twice: a job can start its next program between
+# the listing and the kill.
+stop_children() {
+  local pids _
+  trap '' INT TERM
+  for _ in 1 2; do
+    pids=$(descendants $$)
+    # shellcheck disable=SC2086
+    [ -n "$pids" ] && kill -TERM $pids 2> /dev/null
+  done
+  wait 2> /dev/null
+}
+trap stop_children EXIT
+trap 'trap "" INT TERM; echo "interrupted"; exit 130' INT TERM
+
+# Runs the function $1 once for each further argument, at most JOBS at once,
+# and returns when all are done. Each job writes its results to files, never
+# to the terminal, so nothing interleaves.
+# set -m puts each job in a process group of its own. Then Ctrl-C, which goes
+# to the whole foreground group, reaches only this script, which stops the
+# jobs whole. Without it a job and flock die at once and leave the program
+# they started running, no longer below this script.
+pool() {
+  local fn="$1" item
+  shift
+  set -m
+  for item in "$@"; do
+    while [ "$(jobs -rp | wc -l)" -ge "$JOBS" ]; do wait -n; done
+    "$fn" "$item" < /dev/null &
+  done
+  wait
+  set +m
+}
 
 # mettle.deps is generated (mbuild writes it on every build). Without mbuild,
 # write the two mappings the compiler needs, in mbuild's own block so a later
@@ -39,20 +119,37 @@ if [ ! -f mettle.deps ]; then
   printf '# >>> mbuild: generated, edits inside this block are overwritten\nalph=./src\ncryptex=../cryptex/src\n# <<< mbuild\n' > mettle.deps
 fi
 
+case "$JOBS" in
+  '' | *[!0-9]* | 0) echo "JOBS must be a number above 0, not '$JOBS'"; exit 2 ;;
+esac
+
 if [ ! -x "$METTLE" ]; then
   echo "no compiler at $METTLE (set METTLE)"
   exit 2
 fi
 
-if [ $# -gt 0 ]; then
+full=0   # the docs check, every program in both modes
+boards=0 # the board steps
+if [ "${1:-}" = "--quick" ]; then
+  shift
+  boards=1
+  MODES=("-s --release")
+  tests=()
+  for name in $QUICK_TESTS; do tests+=("tests/$name.mettle"); done
+  for name in $QUICK_EXAMPLES; do tests+=("examples/$name.mettle"); done
+elif [ $# -gt 0 ]; then
   tests=()
   for name in "$@"; do tests+=("${name%.mettle}.mettle"); done
 else
+  full=1
+  boards=1
   tests=(tests/t_*.mettle examples/*.mettle)
 fi
+qemu=0
+command -v qemu-system-riscv32 > /dev/null 2>&1 && qemu=1
 
 fails=0
-if [ $# -eq 0 ]; then
+if [ "$full" -eq 1 ]; then
   if tools/apidoc.sh --check > "$OUT/apidoc.log" 2>&1; then
     echo "ok    docs/api.md matches src/"
   else
@@ -69,50 +166,212 @@ if [ $# -eq 0 ]; then
   fi
 fi
 
-for src in "${tests[@]}"; do
+# Building. A program's two modes are built one after the other in one job:
+# the compiler names its object file after the output without its extension,
+# so t_x.s and t_x.srelease both write t_x.o.
+# Each build or run writes what it would print to $OUT/<name>.<tag>.result.
+build_program() {
+  local src="$1" name mode tag exe log result
   name="$(basename "$src" .mettle)"
   for mode in "${MODES[@]}"; do
     tag="${mode//[- ]/}"
     exe="$OUT/$name.$tag"
     log="$OUT/$name.$tag.log"
+    result="$OUT/$name.$tag.result"
+    : > "$result"
+    rm -f "$exe"
     # shellcheck disable=SC2086
     if ! "$METTLE" --build $mode "$src" -I ports/host -o "$exe" > "$log" 2>&1; then
-      echo "FAIL  $name [$mode] build (see $log)"
-      tail -n 8 "$log" | sed 's/^/      /'
-      fails=$((fails + 1))
-      continue
+      {
+        echo "FAIL  $name [$mode] build (see $log)"
+        tail -n 8 "$log" | sed 's/^/      /'
+      } > "$result"
     fi
-    tries=1
-    case " $TIMED " in *" $name "*) tries=3 ;; esac
-    try=1
-    while true; do
-      timeout 60 "$exe" >> "$log" 2>&1
-      code=$?
-      if [ "$code" -eq 0 ]; then
-        if [ "$try" -eq 1 ]; then
-          echo "ok    $name [$mode]"
-        else
-          echo "ok    $name [$mode] (try $try: it asserts deadlines and the machine was busy)"
-        fi
-        break
+  done
+}
+
+# A program in one mode, given as "<src>|<mode>". It runs only if it built.
+run_program() {
+  local src="${1%%|*}" mode="${1#*|}" name tag exe log result tries try code lock entry
+  name="$(basename "$src" .mettle)"
+  tag="${mode//[- ]/}"
+  exe="$OUT/$name.$tag"
+  log="$OUT/$name.$tag.log"
+  result="$OUT/$name.$tag.result"
+  [ -s "$result" ] && return
+  tries=1
+  case " $TIMED " in *" $name "*) tries=3 ;; esac
+  lock=()
+  for entry in $PORTS; do
+    [ "${entry%%:*}" = "$name" ] && lock=(flock "$OUT/ports.${entry#*:}.lock")
+  done
+  try=1
+  while true; do
+    "${lock[@]}" timeout 60 "$exe" >> "$log" 2>&1
+    code=$?
+    if [ "$code" -eq 0 ]; then
+      if [ "$try" -eq 1 ]; then
+        echo "ok    $name [$mode]" > "$result"
+      else
+        echo "ok    $name [$mode] (try $try: it asserts deadlines and the machine was busy)" > "$result"
       fi
-      if [ "$try" -ge "$tries" ]; then
+      break
+    fi
+    if [ "$try" -ge "$tries" ]; then
+      {
         echo "FAIL  $name [$mode] exit $code (see $log)"
         tail -n 8 "$log" | sed 's/^/      /'
-        fails=$((fails + 1))
-        break
+      } > "$result"
+      break
+    fi
+    try=$((try + 1))
+  done
+}
+
+# The board images and the Linux programs on their lines are built here, with
+# the rest, and each board step further down runs what was built. A step's
+# builds stay together in one job, in the order the step had them, so its log
+# reads as before. The exit status goes to $OUT/<step>.built.
+build_board() {
+  local step="$1" bin host log status=0
+  case "$step" in
+    blink)
+      bin="$OUT/blink.bin"
+      log="$OUT/blink.log"
+      "$METTLE" --release examples/mcu/blink.mettle --target riscv32-none --board qemu-virt \
+        --emit-flat "$bin" -I ports/mcu > "$log" 2>&1 || status=1
+      ;;
+    tether)
+      bin="$OUT/tether.bin"
+      host="$OUT/tether_host"
+      log="$OUT/tether.log"
+      "$METTLE" --release examples/mcu/tether.mettle --target riscv32-none --board qemu-virt \
+        --emit-flat "$bin" -I ports/mcu > "$log" 2>&1 &&
+      "$METTLE" --build -s --release examples/mcu/tether_host.mettle -I ports/host -o "$host" >> "$log" 2>&1 || status=1
+      ;;
+    relay)
+      host="$OUT/relay_host"
+      log="$OUT/relay.log"
+      "$METTLE" --build -s --release examples/mcu/relay_host.mettle -I ports/host -o "$host" > "$log" 2>&1 || status=1
+      ;;
+    pico2)
+      # The four images, then the chip's model when a C compiler is here.
+      # status 2: the images built but there is no model to run them on.
+      log="$OUT/pico2.log"
+      : > "$log"
+      for name in blink tether asker arm two_a; do
+        if ! "$METTLE" --release "examples/mcu/$name.mettle" --target riscv32-none --board pico2 \
+            --emit-flat "$OUT/pico2_$name.bin" -I ports/pico2 -I ports/mcu >> "$log" 2>&1; then
+          echo "$name" >> "$OUT/pico2.unbuilt"
+          status=1
+        fi
+      done
+      sim="$(dirname "$METTLE")/../tools/riscv-sim/rvsim.c"
+      if [ "$status" -eq 0 ] && ! { [ -f "$sim" ] && command -v gcc > /dev/null 2>&1 &&
+         gcc -std=c99 -O2 -o "$OUT/rvsim" "$sim" -lm >> "$log" 2>&1; }; then
+        status=2
       fi
-      try=$((try + 1))
-    done
+      ;;
+    arm)
+      bin="$OUT/arm.bin"
+      log="$OUT/arm.log"
+      "$METTLE" --release examples/mcu/arm.mettle --target riscv32-none --board qemu-virt \
+        --emit-flat "$bin" -I ports/mcu > "$log" 2>&1 &&
+      "$METTLE" --release tests/mcu/slow_board.mettle --target riscv32-none --board qemu-virt \
+        --emit-flat "$OUT/slow_board.bin" -I ports/mcu >> "$log" 2>&1 &&
+      "$METTLE" --release tests/mcu/asking_board.mettle --target riscv32-none --board qemu-virt \
+        --emit-flat "$OUT/asking_board.bin" -I ports/mcu >> "$log" 2>&1 &&
+      "$METTLE" --build -s --release examples/mcu/arm_host.mettle -I ports/host -o "$OUT/arm_host" >> "$log" 2>&1 &&
+      "$METTLE" --build -s --release tests/mcu/arm_test.mettle -I ports/host -o "$OUT/arm_test" >> "$log" 2>&1 || status=1
+      ;;
+    harts)
+      bin="$OUT/harts.bin"
+      log="$OUT/harts.log"
+      "$METTLE" --release examples/mcu/harts.mettle --target riscv32-none --board qemu-virt --isa rv32imac \
+        --emit-flat "$bin" -I ports/harts -I ports/mcu > "$log" 2>&1 || status=1
+      ;;
+    pair)
+      bin="$OUT/asker.bin"
+      log="$OUT/pair.log"
+      "$METTLE" --release examples/mcu/asker.mettle --target riscv32-none --board qemu-virt \
+        --emit-flat "$bin" -I ports/mcu > "$log" 2>&1 || status=1
+      ;;
+    two)
+      log="$OUT/two.log"
+      "$METTLE" --release examples/mcu/two_a.mettle --target riscv32-none --board qemu-virt \
+        --emit-flat "$OUT/two_a.bin" -I ports/mcu > "$log" 2>&1 &&
+      "$METTLE" --release examples/mcu/two_b.mettle --target riscv32-none --board qemu-virt \
+        --emit-flat "$OUT/two_b.bin" -I ports/mcu >> "$log" 2>&1 || status=1
+      ;;
+    arm64)
+      # Every test and example of the new layers as an object for 64-bit ARM
+      # Linux. Linking needs an ARM machine.
+      for src in tests/t_actor tests/t_cores tests/t_cross tests/t_time tests/t_wheel tests/t_places \
+          tests/t_life tests/t_link tests/t_seal tests/t_door tests/t_far tests/t_parcel tests/t_poll \
+          tests/t_proc tests/t_tether tests/t_batch tests/t_machine tests/t_three tests/t_own \
+          tests/t_serial tests/t_back tests/t_once examples/tiles examples/render examples/share \
+          examples/picture examples/run examples/count examples/spread examples/far examples/talk \
+          examples/mcu/arm_host examples/mcu/tether_host examples/mcu/relay_host tests/mcu/arm_test; do
+        name=$(basename "$src")
+        if ! "$METTLE" -s --release --target aarch64-linux "$src.mettle" -I ports/arm64 -I ports/host \
+            -o "$OUT/arm64_$name.o" > "$OUT/arm64_$name.log" 2>&1; then
+          echo "$name" >> "$OUT/arm64.unbuilt"
+          status=1
+        fi
+      done
+      ;;
+  esac
+  echo "$status" > "$OUT/$step.built"
+}
+built() { [ "$(cat "$OUT/$1.built" 2> /dev/null)" = "${2:-0}" ]; }
+
+board_steps=()
+if [ "$boards" -eq 1 ]; then
+  board_steps=(pico2 arm64)
+  [ "$qemu" -eq 1 ] && board_steps+=(blink tether relay arm harts pair two)
+  rm -f "$OUT"/*.built "$OUT/pico2.unbuilt" "$OUT/arm64.unbuilt"
+fi
+
+echo "..    building ${#tests[@]} programs in ${#MODES[@]} mode(s) and ${#board_steps[@]} board steps, $JOBS at a time"
+pool build_program "${tests[@]}"
+pool build_board "${board_steps[@]}"
+
+# Running. The programs not in ALONE run JOBS at a time; then the ones in it
+# run one at a time, with nothing else running.
+together=()
+alone=()
+for src in "${tests[@]}"; do
+  name="$(basename "$src" .mettle)"
+  for mode in "${MODES[@]}"; do
+    case " $ALONE " in
+      *" $name "*) alone+=("$src|$mode") ;;
+      *) together+=("$src|$mode") ;;
+    esac
+  done
+done
+echo "..    running ${#together[@]} programs $JOBS at a time ($((SECONDS - started))s so far)"
+pool run_program "${together[@]}"
+if [ "${#alone[@]}" -gt 0 ]; then
+  echo "..    running ${#alone[@]} programs alone ($((SECONDS - started))s so far)"
+  JOBS=1 pool run_program "${alone[@]}"
+fi
+
+for src in "${tests[@]}"; do
+  name="$(basename "$src" .mettle)"
+  for mode in "${MODES[@]}"; do
+    result="$OUT/$name.${mode//[- ]/}.result"
+    cat "$result"
+    grep -q '^FAIL' "$result" && fails=$((fails + 1))
   done
 done
 
+# The board steps run one after another: each takes ports worked out from
+# this script's pid, and some of those ranges overlap.
+
 # The core on a bare 32-bit RISC-V board: it must run and stay small.
-if [ "$#" -eq 0 ] && command -v qemu-system-riscv32 > /dev/null 2>&1; then
-  bin="$OUT/blink.bin"
-  log="$OUT/blink.log"
-  if ! "$METTLE" --release examples/mcu/blink.mettle --target riscv32-none --board qemu-virt \
-      --emit-flat "$bin" -I ports/mcu > "$log" 2>&1; then
+step_blink() {
+  local bin="$OUT/blink.bin" log="$OUT/blink.log" size got
+  if ! built blink; then
     echo "FAIL  mcu/blink build (see $log)"
     fails=$((fails + 1))
   else
@@ -126,17 +385,13 @@ if [ "$#" -eq 0 ] && command -v qemu-system-riscv32 > /dev/null 2>&1; then
       fails=$((fails + 1))
     fi
   fi
-fi
+}
 
 # A board tied to this machine by its serial line: the board in QEMU, the
 # other end a Linux process, 200 requests and replies between them.
-if [ "$#" -eq 0 ] && command -v qemu-system-riscv32 > /dev/null 2>&1; then
-  bin="$OUT/tether.bin"
-  host="$OUT/tether_host"
-  log="$OUT/tether.log"
-  if ! "$METTLE" --release examples/mcu/tether.mettle --target riscv32-none --board qemu-virt \
-      --emit-flat "$bin" -I ports/mcu > "$log" 2>&1 ||
-     ! "$METTLE" --build -s --release examples/mcu/tether_host.mettle -I ports/host -o "$host" >> "$log" 2>&1; then
+step_tether() {
+  local bin="$OUT/tether.bin" host="$OUT/tether_host" log="$OUT/tether.log" size port host_pid board code
+  if ! built tether; then
     echo "FAIL  mcu/tether build (see $log)"
     fails=$((fails + 1))
   else
@@ -158,14 +413,13 @@ if [ "$#" -eq 0 ] && command -v qemu-system-riscv32 > /dev/null 2>&1; then
       fails=$((fails + 1))
     fi
   fi
-fi
+}
 
 # The same board reached from a third machine, through the one on its line.
-if [ "$#" -eq 0 ] && command -v qemu-system-riscv32 > /dev/null 2>&1 && [ -f "$OUT/tether.bin" ]; then
-  bin="$OUT/tether.bin"
-  host="$OUT/relay_host"
-  log="$OUT/relay.log"
-  if ! "$METTLE" --build -s --release examples/mcu/relay_host.mettle -I ports/host -o "$host" > "$log" 2>&1; then
+step_relay() {
+  local bin="$OUT/tether.bin" host="$OUT/relay_host" log="$OUT/relay.log" port host_pid board code
+  [ -f "$OUT/tether.bin" ] || return
+  if ! built relay; then
     echo "FAIL  mcu/relay build (see $log)"
     fails=$((fails + 1))
   else
@@ -186,26 +440,19 @@ if [ "$#" -eq 0 ] && command -v qemu-system-riscv32 > /dev/null 2>&1 && [ -f "$O
       fails=$((fails + 1))
     fi
   fi
-fi
+}
 
 # The same board programs for a Raspberry Pi Pico 2. They are built, and the
 # blink runs on the compiler's model of the chip when a C compiler is here
 # to build that model.
-if [ "$#" -eq 0 ]; then
-  log="$OUT/pico2.log"
-  : > "$log"
-  built=1
-  for name in blink tether asker arm two_a; do
-    if ! "$METTLE" --release "examples/mcu/$name.mettle" --target riscv32-none --board pico2 \
-        --emit-flat "$OUT/pico2_$name.bin" -I ports/pico2 -I ports/mcu >> "$log" 2>&1; then
+step_pico2() {
+  local log="$OUT/pico2.log" name got
+  if built pico2 1; then
+    while read -r name; do
       echo "FAIL  pico2/$name build (see $log)"
       fails=$((fails + 1))
-      built=0
-    fi
-  done
-  sim="$(dirname "$METTLE")/../tools/riscv-sim/rvsim.c"
-  if [ "$built" -eq 1 ] && [ -f "$sim" ] && command -v gcc > /dev/null 2>&1 &&
-     gcc -std=c99 -O2 -o "$OUT/rvsim" "$sim" -lm >> "$log" 2>&1; then
+    done < "$OUT/pico2.unbuilt"
+  elif built pico2; then
     got=$(timeout 30 "$OUT/rvsim" --machine rp2350 --load "$OUT/pico2_blink.bin" --until-ms 3000 2>> "$log" | tr -d '\r\n')
     if [ "$got" = "12345" ]; then
       echo "ok    pico2/blink [on the chip's model, $(stat -c %s "$OUT/pico2_blink.bin") bytes; tether, asker, arm and two build]"
@@ -213,27 +460,19 @@ if [ "$#" -eq 0 ]; then
       echo "FAIL  pico2/blink printed '$got' on the model"
       fails=$((fails + 1))
     fi
-  elif [ "$built" -eq 1 ]; then
+  else
     echo "ok    pico2 [blink, tether, asker, arm and two build; no model here to run them on]"
   fi
-fi
+}
 
 # A board that shares work with the machine on its line: the six jobs only
 # the board can do all go to it, and it takes some of the rest. Then the
 # board is lost in the middle of a batch, then it is reached from a machine
 # that is not the one on its line, and last a board whose jobs take 700 ms
-# each is waited for. Last the board asks the computer for work.
-if [ "$#" -eq 0 ] && command -v qemu-system-riscv32 > /dev/null 2>&1; then
-  bin="$OUT/arm.bin"
-  log="$OUT/arm.log"
-  if ! "$METTLE" --release examples/mcu/arm.mettle --target riscv32-none --board qemu-virt \
-      --emit-flat "$bin" -I ports/mcu > "$log" 2>&1 ||
-     ! "$METTLE" --release tests/mcu/slow_board.mettle --target riscv32-none --board qemu-virt \
-      --emit-flat "$OUT/slow_board.bin" -I ports/mcu >> "$log" 2>&1 ||
-     ! "$METTLE" --release tests/mcu/asking_board.mettle --target riscv32-none --board qemu-virt \
-      --emit-flat "$OUT/asking_board.bin" -I ports/mcu >> "$log" 2>&1 ||
-     ! "$METTLE" --build -s --release examples/mcu/arm_host.mettle -I ports/host -o "$OUT/arm_host" >> "$log" 2>&1 ||
-     ! "$METTLE" --build -s --release tests/mcu/arm_test.mettle -I ports/host -o "$OUT/arm_test" >> "$log" 2>&1; then
+# each is waited for.
+step_arm() {
+  local bin="$OUT/arm.bin" log="$OUT/arm.log" base at run port prog mode board_bin host_pid board code
+  if ! built arm; then
     echo "FAIL  mcu/arm build (see $log)"
     fails=$((fails + 1))
   else
@@ -251,6 +490,7 @@ if [ "$#" -eq 0 ] && command -v qemu-system-riscv32 > /dev/null 2>&1; then
       if [ "$run" = "arm_test asks" ]; then
         board_bin="$OUT/asking_board.bin"
       fi
+      # shellcheck disable=SC2086
       timeout 60 "$OUT/$prog" "$port" $mode > "$log.host" 2>&1 &
       host_pid=$!
       sleep 0.3
@@ -269,14 +509,12 @@ if [ "$#" -eq 0 ] && command -v qemu-system-riscv32 > /dev/null 2>&1; then
       fi
     done
   fi
-fi
+}
 
 # Both harts of one board: the cores layer with a node on each.
-if [ "$#" -eq 0 ] && command -v qemu-system-riscv32 > /dev/null 2>&1; then
-  bin="$OUT/harts.bin"
-  log="$OUT/harts.log"
-  if ! "$METTLE" --release examples/mcu/harts.mettle --target riscv32-none --board qemu-virt --isa rv32imac \
-      --emit-flat "$bin" -I ports/harts -I ports/mcu > "$log" 2>&1; then
+step_harts() {
+  local bin="$OUT/harts.bin" log="$OUT/harts.log" got
+  if ! built harts; then
     echo "FAIL  mcu/harts build (see $log)"
     fails=$((fails + 1))
   else
@@ -287,14 +525,13 @@ if [ "$#" -eq 0 ] && command -v qemu-system-riscv32 > /dev/null 2>&1; then
       *) echo "FAIL  mcu/harts printed '$got'"; fails=$((fails + 1)) ;;
     esac
   fi
-fi
+}
 
 # Two boards as one: each in its own QEMU, their serial lines joined.
-if [ "$#" -eq 0 ] && command -v qemu-system-riscv32 > /dev/null 2>&1 && [ -f "$OUT/tether.bin" ]; then
-  bin="$OUT/asker.bin"
-  log="$OUT/pair.log"
-  if ! "$METTLE" --release examples/mcu/asker.mettle --target riscv32-none --board qemu-virt \
-      --emit-flat "$bin" -I ports/mcu > "$log" 2>&1; then
+step_pair() {
+  local bin="$OUT/asker.bin" log="$OUT/pair.log" port other asked answered
+  [ -f "$OUT/tether.bin" ] || return
+  if ! built pair; then
     echo "FAIL  mcu/pair build (see $log)"
     fails=$((fails + 1))
   else
@@ -316,16 +553,13 @@ if [ "$#" -eq 0 ] && command -v qemu-system-riscv32 > /dev/null 2>&1 && [ -f "$O
       fails=$((fails + 1))
     fi
   fi
-fi
+}
 
 # Two boards that share work with no bigger machine: each does one kind for
 # the other and asks the other for the kind it cannot do.
-if [ "$#" -eq 0 ] && command -v qemu-system-riscv32 > /dev/null 2>&1; then
-  log="$OUT/two.log"
-  if ! "$METTLE" --release examples/mcu/two_a.mettle --target riscv32-none --board qemu-virt \
-      --emit-flat "$OUT/two_a.bin" -I ports/mcu > "$log" 2>&1 ||
-     ! "$METTLE" --release examples/mcu/two_b.mettle --target riscv32-none --board qemu-virt \
-      --emit-flat "$OUT/two_b.bin" -I ports/mcu >> "$log" 2>&1; then
+step_two() {
+  local log="$OUT/two.log" port other first second
+  if ! built two; then
     echo "FAIL  mcu/two build (see $log)"
     fails=$((fails + 1))
   else
@@ -347,33 +581,37 @@ if [ "$#" -eq 0 ] && command -v qemu-system-riscv32 > /dev/null 2>&1; then
       fails=$((fails + 1))
     fi
   fi
-fi
+}
 
-# The same layers for 64-bit ARM Linux (a Raspberry Pi, a Jetson): every
-# test and example of the new layers is built for it. They are not run
-# here: linking needs an ARM machine.
-if [ "$#" -eq 0 ]; then
-  arm_fails=0
-  for src in tests/t_actor tests/t_cores tests/t_cross tests/t_time tests/t_wheel tests/t_places \
-      tests/t_life tests/t_link tests/t_seal tests/t_door tests/t_far tests/t_parcel tests/t_poll \
-      tests/t_proc tests/t_tether tests/t_batch tests/t_machine tests/t_three tests/t_own \
-      tests/t_serial tests/t_back tests/t_once examples/tiles examples/render examples/share examples/picture \
-      examples/run examples/count examples/spread examples/far examples/talk \
-      examples/mcu/arm_host examples/mcu/tether_host examples/mcu/relay_host tests/mcu/arm_test; do
-    name=$(basename "$src")
-    log="$OUT/arm64_$name.log"
-    if ! "$METTLE" -s --release --target aarch64-linux "$src.mettle" -I ports/arm64 -I ports/host \
-        -o "$OUT/arm64_$name.o" > "$log" 2>&1; then
-      echo "FAIL  arm64/$name build (see $log)"
-      arm_fails=$((arm_fails + 1))
-    fi
-  done
-  if [ "$arm_fails" -eq 0 ]; then
+# The same layers for 64-bit ARM Linux (a Raspberry Pi, a Jetson): built,
+# not run here.
+step_arm64() {
+  local name
+  if built arm64; then
     echo "ok    arm64 [the new layers' tests and examples build for ARM Linux; not run here]"
+  else
+    while read -r name; do
+      echo "FAIL  arm64/$name build (see $OUT/arm64_$name.log)"
+      fails=$((fails + 1))
+    done < "$OUT/arm64.unbuilt"
   fi
-  fails=$((fails + arm_fails))
+}
+
+# In the order the steps have always run.
+if [ "$boards" -eq 1 ]; then
+  echo "..    board steps ($((SECONDS - started))s so far)"
+  [ "$qemu" -eq 1 ] && step_blink
+  [ "$qemu" -eq 1 ] && step_tether
+  [ "$qemu" -eq 1 ] && step_relay
+  step_pico2
+  [ "$qemu" -eq 1 ] && step_arm
+  [ "$qemu" -eq 1 ] && step_harts
+  [ "$qemu" -eq 1 ] && step_pair
+  [ "$qemu" -eq 1 ] && step_two
+  step_arm64
 fi
 
+echo "..    took $((SECONDS - started))s"
 if [ "$fails" -eq 0 ]; then
   echo "PASS"
 else
