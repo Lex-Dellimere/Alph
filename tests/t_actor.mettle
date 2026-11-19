@@ -1,5 +1,6 @@
 // The core on its own (src/actor): messages in order, requests and replies,
-// a full mailbox, a dead actor, a reused slot, and sends from another thread.
+// a full mailbox, a dead actor, a reused slot, a slot used until its pids
+// wrap, and sends from another thread.
 
 import "std/io";
 import "std/thread";
@@ -16,6 +17,9 @@ const FROM_THREAD: Word = 20000;
 var g_node: AlphNode;
 var g_actors: AlphActor[8];
 var g_mail: AlphMsg[64];
+var g_one: AlphNode;
+var g_one_actor: AlphActor[1];
+var g_one_mail: AlphMsg[2];
 var g_failures: int32 = 0;
 var g_rounds: Word = 0;
 var g_bad_ref: Word = 0;
@@ -33,6 +37,7 @@ fn expect(ok: bool, what: string) {
 
 fn ponger(a: AlphActor*, m: AlphMsg*) -> Word {
   if (m->tag == QUIT) {
+    a->node->stop();
     return 1;
   }
   a->reply(m, PONG, m->arg + 1);
@@ -66,6 +71,7 @@ fn pinger(a: AlphActor*, m: AlphMsg*) -> Word {
 // Counts NOTEs, which must arrive in the order of their args.
 fn sink(a: AlphActor*, m: AlphMsg*) -> Word {
   if (m->tag == QUIT) {
+    a->node->stop();
     return 1;
   }
   if (m->arg != g_notes) {
@@ -76,6 +82,7 @@ fn sink(a: AlphActor*, m: AlphMsg*) -> Word {
 }
 
 fn idle(a: AlphActor*, m: AlphMsg*) -> Word {
+  a->node->stop();
   return 1;
 }
 
@@ -109,14 +116,39 @@ fn main() -> int32 {
   expect(g_node.send(quiet + 1, NOTE, 0) == ALPH_GONE, "an unused slot is gone");
   expect(g_node.send(0, NOTE, 0) == ALPH_GONE, "pid 0 is gone");
 
-  // It exits on its first message; its slot's next actor has a new pid.
+  // It exits on its first message. The slot free the longest is used next.
   g_node.run();
   expect(g_node.send(quiet, NOTE, 0) == ALPH_GONE, "an exited actor is gone");
   var again: Word = g_node.spawn(&idle, 0);
-  expect(again != quiet, "a reused slot gives a new pid");
+  expect(again != quiet, "the next actor has a new pid");
   expect(g_node.send(quiet, NOTE, 0) == ALPH_GONE, "the old pid stays gone");
   expect(g_node.send(again, NOTE, 0) == ALPH_OK, "the new one takes mail");
   g_node.run();
+
+  // A slot's pids never reach 0 or go negative: the generation wraps to 1.
+  // The slot starts three actors short of its last generation.
+  var step: Word = (Word)((Word)1 << ALPH_INDEX_BITS);
+  var last_gen: Word = (Word)(((Word)1 << ALPH_PLACE_SHIFT) - step);
+  g_one.init(&g_one_actor[0], 1, &g_one_mail[0], 2);
+  g_one_actor[0].pid = last_gen - 3 * step;
+  var before: Word = 0;
+  var bad_pids: Word = 0;
+  var wrapped: Word = 0;
+  for i in 0..8 {
+    var pid: Word = g_one.spawn(&idle, 0);
+    if (pid <= 0 || (Word)(pid >> ALPH_PLACE_SHIFT) != 0 || (Word)(pid & (step - 1)) != 0 || pid == before) {
+      bad_pids = bad_pids + 1;
+    }
+    if (pid == step) {
+      wrapped = wrapped + 1;
+    }
+    before = pid;
+    g_one.send(pid, NOTE, 0);
+    g_one.run();
+    expect(g_one.send(pid, NOTE, 0) == ALPH_GONE, "the pid before is gone");
+  }
+  expect(bad_pids == 0, "every pid of the slot is above 0, in place 0, at index 0 ({bad_pids} were not)");
+  expect(wrapped == 1, "after its last generation the slot starts again at 1");
 
   // Requests and replies, one at a time.
   var state: Pinger;

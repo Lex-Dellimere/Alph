@@ -1,10 +1,14 @@
 // One hart, no OS: a microcontroller. The gate masks interrupts.
 
 export type Word = int32;
-export const ALPH_INDEX_BITS: Word = 16;
+export const ALPH_INDEX_BITS: Word = 10;   // 1,024 actors in a node
+export const ALPH_PLACE_SHIFT: Word = 23;  // 13 bits of generation, then 8 of place
 
 export struct AlphGate {
   unused: int32;
+}
+
+export fn AlphGate_init__ptr(g: AlphGate*) {
 }
 
 export fn AlphGate_enter__ptr(g: AlphGate*) -> int32 {

@@ -1,0 +1,220 @@
+// Nodes on several threads (src/cores): a token round a ring of cores, three
+// cores sending to one, requests and replies between cores, where spawn puts
+// actors, and pids that name no core.
+
+import "std/io";
+import "alph/actor/actor";
+import "alph/cores/cores";
+
+const CORES: Word = 4;
+const SLOTS: Word = 8;
+const ROOM: Word = 8;
+const LAPS: Word = 20000;
+const NOTES: Word = 20000;
+const ROUNDS: Word = 20000;
+
+const GO: Word = 1;
+const TOKEN: Word = 2;
+const NOTE: Word = 3;
+const MORE: Word = 4;
+const PING: Word = 5;
+const PONG: Word = 6;
+
+var g_cores: AlphCores;
+var g_core: AlphCore[4];
+var g_actors: AlphActor[32];
+var g_mail: AlphMsg[256];
+var g_failures: int32 = 0;
+
+fn expect(ok: bool, what: string) {
+  if (!ok) {
+    println("FAIL {what}");
+    g_failures = g_failures + 1;
+  }
+}
+
+fn place_of(pid: Word) -> Word {
+  return (Word)(pid >> ALPH_PLACE_SHIFT);
+}
+
+// The token's arg counts hops. Each core must see every fourth one.
+struct Hop {
+  next: Word;
+  expect: Word;
+  bad: Word;
+}
+
+fn hop(a: AlphActor*, m: AlphMsg*) -> Word {
+  var h: Hop* = (Hop*)a->state;
+  if (m->arg != h->expect) {
+    h->bad = h->bad + 1;
+  }
+  h->expect = m->arg + CORES;
+  if (m->arg == LAPS * CORES) {
+    a->cores()->stop();
+    return 1;
+  }
+  if (a->send(h->next, TOKEN, m->arg + 1) != ALPH_OK) {
+    h->bad = h->bad + 1;
+  }
+  return 0;
+}
+
+// Sends NOTES numbered notes. A full mailbox is tried again on the next turn.
+struct Source {
+  sink: Word;
+  sent: Word;
+  refused: Word;
+}
+
+fn source(a: AlphActor*, m: AlphMsg*) -> Word {
+  var s: Source* = (Source*)a->state;
+  while (s->sent < NOTES) {
+    if (a->send(s->sink, NOTE, s->sent) != ALPH_OK) {
+      s->refused = s->refused + 1;
+      a->send(a->pid, MORE, 0);
+      return 0;
+    }
+    s->sent = s->sent + 1;
+  }
+  return 1;
+}
+
+struct Sink {
+  next: Word[4];
+  total: Word;
+  bad: Word;
+}
+
+fn sink(a: AlphActor*, m: AlphMsg*) -> Word {
+  var s: Sink* = (Sink*)a->state;
+  var from: Word = place_of(m->from);
+  if (m->arg != s->next[from]) {
+    s->bad = s->bad + 1;
+  }
+  s->next[from] = m->arg + 1;
+  s->total = s->total + 1;
+  if (s->total == NOTES * (CORES - 1)) {
+    a->cores()->stop();
+    return 1;
+  }
+  return 0;
+}
+
+fn ponger(a: AlphActor*, m: AlphMsg*) -> Word {
+  a->reply(m, PONG, m->arg + 1);
+  return 0;
+}
+
+struct Pinger {
+  ponger: Word;
+  ref: Word;
+  rounds: Word;
+  bad: Word;
+}
+
+fn pinger(a: AlphActor*, m: AlphMsg*) -> Word {
+  var p: Pinger* = (Pinger*)a->state;
+  if (m->tag == GO) {
+    p->ref = a->ask(p->ponger, PING, 0);
+    return 0;
+  }
+  if (m->ref != p->ref || place_of(m->from) != place_of(p->ponger)) {
+    p->bad = p->bad + 1;
+  }
+  p->rounds = m->arg;
+  if (m->arg >= ROUNDS) {
+    a->cores()->stop();
+    return 1;
+  }
+  p->ref = a->ask(p->ponger, PING, m->arg);
+  return 0;
+}
+
+fn idle(a: AlphActor*, m: AlphMsg*) -> Word {
+  return 1;
+}
+
+fn main() -> int32 {
+  g_cores.init(&g_core[0], CORES, &g_actors[0], SLOTS, &g_mail[0], ROOM);
+
+  // A token goes round the cores.
+  var hops: Hop[4];
+  var ring: Word[4];
+  for i in 0..CORES {
+    hops[i].expect = (Word)i;
+    hops[i].bad = 0;
+    ring[i] = g_cores.spawn_on((Word)i, &hop, (rawptr)&hops[i]);
+    expect(place_of(ring[i]) == i, "spawn_on puts the actor on its core");
+  }
+  for i in 0..CORES {
+    hops[i].next = ring[(i + 1) % CORES];
+  }
+  g_cores.send(ring[0], TOKEN, 0);
+  g_cores.run();
+  var ring_bad: Word = 0;
+  for i in 0..CORES {
+    ring_bad = ring_bad + hops[i].bad;
+  }
+  expect(ring_bad == 0, "every hop arrived, in order ({ring_bad} did not)");
+  expect(hops[0].expect == LAPS * CORES + CORES, "the token went round {LAPS} times");
+  expect(g_cores.send(ring[0], TOKEN, 0) == ALPH_GONE, "an actor that ended on another core is gone");
+
+  // Three cores send to one.
+  var drain: Sink;
+  for i in 0..CORES {
+    drain.next[i] = 0;
+  }
+  drain.total = 0;
+  drain.bad = 0;
+  var sources: Source[4];
+  var sink_pid: Word = g_cores.spawn_on(0, &sink, (rawptr)&drain);
+  for i in 1..CORES {
+    sources[i].sink = sink_pid;
+    sources[i].sent = 0;
+    sources[i].refused = 0;
+    g_cores.send(g_cores.spawn_on((Word)i, &source, (rawptr)&sources[i]), GO, 0);
+  }
+  g_cores.run();
+  expect(drain.total == NOTES * (CORES - 1), "every note arrived ({drain.total})");
+  expect(drain.bad == 0, "each core's notes in order ({drain.bad} were not)");
+  var refused: Word = sources[1].refused + sources[2].refused + sources[3].refused;
+
+  // Requests and replies between two cores.
+  var asker: Pinger;
+  asker.ponger = g_cores.spawn_on(2, &ponger, 0);
+  asker.rounds = 0;
+  asker.bad = 0;
+  g_cores.send(g_cores.spawn_on(1, &pinger, (rawptr)&asker), GO, 0);
+  g_cores.run();
+  expect(asker.rounds == ROUNDS, "every round ran ({asker.rounds})");
+  expect(asker.bad == 0, "every reply came from the ponger with its request's ref ({asker.bad} did not)");
+
+  // Spawn picks the core with the fewest actors, so uneven cores even out.
+  for i in 0..7 {
+    g_cores.spawn(&idle, 0);
+  }
+  var least: Word = g_core[0].node.live;
+  var most: Word = least;
+  for i in 1..CORES {
+    var live: Word = g_core[i].node.live;
+    if (live < least) {
+      least = live;
+    }
+    if (live > most) {
+      most = live;
+    }
+  }
+  expect(most - least <= 1, "spawn evens the cores out (fewest {least}, most {most})");
+
+  // Pids that name no core.
+  var nowhere: Word = (Word)((CORES << ALPH_PLACE_SHIFT) | ((Word)1 << ALPH_INDEX_BITS));
+  expect(g_cores.send(nowhere, NOTE, 0) == ALPH_GONE, "a core that does not exist is gone");
+  expect(g_cores.send(-5, NOTE, 0) == ALPH_GONE, "a negative pid is gone");
+
+  if (g_failures != 0) {
+    return 1;
+  }
+  println("cores ok: {LAPS} laps of {CORES} cores, {drain.total} notes into one core ({refused} refused and sent again), {asker.rounds} requests");
+  return 0;
+}

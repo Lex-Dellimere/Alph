@@ -92,17 +92,24 @@ It checks that `docs/api.md` matches the source, then builds every test and exam
 
 ## The small core
 
-alph is being rebuilt on a core small enough for a microcontroller: actors, messages and a run loop in one file, [src/actor/actor.mettle](src/actor/actor.mettle). The same source runs on a bare 32-bit RISC-V board in a 2.4 KB image and in a Linux process. [docs/design.md](docs/design.md) says where this is going: one runtime that puts work on a core, a GPU or another machine, whichever is cheapest.
+alph is being rebuilt on a core small enough for a microcontroller: actors, messages and a run loop in one file, [src/actor/actor.mettle](src/actor/actor.mettle). The same source runs on a bare 32-bit RISC-V board in a 2.4 KB image and in a Linux process, where [src/cores/cores.mettle](src/cores/cores.mettle) runs one node per thread and an actor sends to another core the way it sends next door. [docs/design.md](docs/design.md) says where this is going: one runtime that puts work on a core, a GPU or another machine, whichever is cheapest.
 
 ```bash
 mettle --release examples/mcu/blink.mettle --target riscv32-none --board qemu-virt --emit-flat blink.bin -I ports/mcu
 qemu-system-riscv32 -M virt -bios none -nographic -device loader,file=blink.bin,addr=0x80000000,force-raw=on
 ```
 
+On Linux, [examples/spread.mettle](examples/spread.mettle) counts primes on four cores:
+
+```bash
+mettle --build --release examples/spread.mettle -I ports/host -o spread
+```
+
 ## Layout
 
 ```text
 src/actor/actor.mettle      the small core: actors, messages, the run loop
+src/cores/cores.mettle      the small core on several threads, one node each
 ports/mcu, ports/host       what differs per device, picked with -I ports/<name>
 src/alph.mettle             the first runtime in one import
 src/core/node.mettle        the node: actors, schedulers, messages, links, monitors, requests, timers,

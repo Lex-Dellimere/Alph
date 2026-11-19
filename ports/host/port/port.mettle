@@ -1,37 +1,93 @@
-// A 64-bit Linux process: any thread may send, one thread runs the actors.
+// An x86-64 Linux process: any thread may send, one thread runs the actors.
 
 export type Word = int64;
-export const ALPH_INDEX_BITS: Word = 32;
+export const ALPH_INDEX_BITS: Word = 24;   // 16 million actors in a node
+export const ALPH_PLACE_SHIFT: Word = 48;  // 24 bits of generation, then 15 of place
 
+const SYS_SCHED_YIELD: int64 = 24;
 const SYS_FUTEX: int64 = 202;
 const FUTEX_WAIT: int64 = 128;  // private
 const FUTEX_WAKE: int64 = 129;
+const SPINS: int32 = 100;      // tries at the lock before giving up the CPU
+const IDLE_SPINS: int32 = 2000;  // looks for new mail before sleeping
+const AWAKE: int32 = 0;
+const LOOKING: int32 = 1;  // spinning: a wake only has to change wakes
+const ASLEEP: int32 = 2;   // in the kernel: a wake is a system call
 
 extern fn mettle_atomic_exchange_i32(target: int32*, value: int32) -> int32 with none = "mettle_atomic_exchange_i32";
+extern fn mettle_atomic_compare_exchange_i32(target: int32*, exchange: int32, comparand: int32) -> int32 with none = "mettle_atomic_compare_exchange_i32";
 
 export struct AlphGate {
   lock: int32;
   wakes: int32;
+  state: int32;
+  owed: int32;  // a wake to make once the lock is free
 }
 
+export fn AlphGate_init__ptr(g: AlphGate*) {
+  g->lock = 0;
+  g->wakes = 0;
+  g->state = AWAKE;
+  g->owed = 0;
+}
+
+// A compare-and-swap, not an exchange: on every CPU it makes what was
+// written inside the gate visible before the lock reads as free.
+fn alph_unlock(g: AlphGate*) {
+  mettle_atomic_compare_exchange_i32(&g->lock, 0, 1);
+}
+
+// Spins, then yields: the holder may have lost its CPU.
 export fn AlphGate_enter__ptr(g: AlphGate*) -> int32 {
+  var tries: int32 = 0;
   while (mettle_atomic_exchange_i32(&g->lock, 1) != 0) {
+    tries = tries + 1;
+    if (tries == SPINS) {
+      tries = 0;
+      syscall(SYS_SCHED_YIELD);
+    }
   }
   return 0;
 }
 
 export fn AlphGate_leave__ptr(g: AlphGate*, was: int32) {
-  mettle_atomic_exchange_i32(&g->lock, 0);
+  var owed: int32 = g->owed;
+  g->owed = 0;
+  alph_unlock(g);
+  if (owed != 0) {
+    syscall(SYS_FUTEX, (int64)&g->wakes, FUTEX_WAKE, 1);
+  }
 }
 
-// A wake between the leave and the wait changes wakes, so the wait returns.
+// Mail usually comes back within microseconds, so look for a while first:
+// a sleep and its wake cost two system calls. A wake between the leave and
+// the wait changes wakes, so the wait returns.
 export fn AlphGate_sleep__ptr(g: AlphGate*, was: int32) {
   var seen: int32 = g->wakes;
-  mettle_atomic_exchange_i32(&g->lock, 0);
+  g->state = LOOKING;
+  alph_unlock(g);
+  for i in 0..IDLE_SPINS {
+    if (mettle_atomic_compare_exchange_i32(&g->wakes, seen, seen) != seen) {
+      return;
+    }
+  }
+  g->enter();
+  if (g->wakes != seen) {
+    g->leave(0);
+    return;
+  }
+  g->state = ASLEEP;
+  alph_unlock(g);
   syscall(SYS_FUTEX, (int64)&g->wakes, FUTEX_WAIT, (int64)seen, 0);
 }
 
+// Called inside the gate. Costs nothing while the node is running.
 export fn AlphGate_wake__ptr(g: AlphGate*) {
-  g->wakes = g->wakes + 1;
-  syscall(SYS_FUTEX, (int64)&g->wakes, FUTEX_WAKE, 1);
+  if (g->state != AWAKE) {
+    if (g->state == ASLEEP) {
+      g->owed = 1;
+    }
+    g->state = AWAKE;
+    mettle_atomic_exchange_i32(&g->wakes, g->wakes + 1);
+  }
 }

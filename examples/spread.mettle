@@ -1,0 +1,97 @@
+// Counts the primes below a million on four cores at once. The boss hands
+// the range out in chunks. A worker that answers gets the next chunk, so a
+// core that is free does more of the work.
+//
+//   mettle --build --release examples/spread.mettle -I ports/host -o spread
+
+import "std/io";
+import "alph/actor/actor";
+import "alph/cores/cores";
+
+const CORES: Word = 4;
+const CHUNK: Word = 10000;
+const CHUNKS: Word = 100;
+
+const GO: Word = 1;
+const COUNT: Word = 2;  // arg: which chunk
+const DONE: Word = 3;   // arg: the primes in it
+
+var g_cores: AlphCores;
+var g_core: AlphCore[4];
+var g_actors: AlphActor[8];
+var g_mail: AlphMsg[64];
+
+fn is_prime(n: Word) -> bool {
+  if (n < 2) {
+    return false;
+  }
+  var d: Word = 2;
+  while (d * d <= n) {
+    if (n % d == 0) {
+      return false;
+    }
+    d = d + 1;
+  }
+  return true;
+}
+
+fn worker(a: AlphActor*, m: AlphMsg*) -> Word {
+  var n: Word = (Word)(m->arg * CHUNK);
+  var end: Word = n + CHUNK;
+  var found: Word = 0;
+  while (n < end) {
+    if (is_prime(n)) {
+      found = found + 1;
+    }
+    n = n + 1;
+  }
+  a->reply(m, DONE, found);
+  return 0;
+}
+
+struct Boss {
+  workers: Word[4];
+  next: Word;
+  back: Word;
+  primes: Word;
+}
+
+fn boss(a: AlphActor*, m: AlphMsg*) -> Word {
+  var b: Boss* = (Boss*)a->state;
+  if (m->tag == GO) {
+    for i in 0..CORES {
+      a->send(b->workers[i], COUNT, b->next);
+      b->next = b->next + 1;
+    }
+    return 0;
+  }
+  b->primes = b->primes + m->arg;
+  b->back = b->back + 1;
+  if (b->next < CHUNKS) {
+    a->send(m->from, COUNT, b->next);
+    b->next = b->next + 1;
+  }
+  if (b->back == CHUNKS) {
+    println("{b->primes} primes below {CHUNK * CHUNKS}");
+    a->cores()->stop();
+    return 1;
+  }
+  return 0;
+}
+
+fn main() -> int32 {
+  g_cores.init(&g_core[0], CORES, &g_actors[0], 2, &g_mail[0], 8);
+  var b: Boss;
+  b.next = 0;
+  b.back = 0;
+  b.primes = 0;
+  for i in 0..CORES {
+    b.workers[i] = g_cores.spawn_on((Word)i, &worker, 0);
+  }
+  g_cores.send(g_cores.spawn(&boss, (rawptr)&b), GO, 0);
+  g_cores.run();
+  if (b.primes != 78498) {
+    return 1;
+  }
+  return 0;
+}
