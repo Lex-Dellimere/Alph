@@ -511,7 +511,7 @@ The `mcu` port runs the core and timers on one hart with no OS. The port gives y
 - A gate that keeps senders from each other by turning interrupts off, and a wait that sleeps on `wfi` until an interrupt.
 - A timer alarm from the board's timer interrupt, so `AlphTime` works as on the host.
 
-The program does what any interrupt program does: it provides `mettle_trap`, installs the traps and enables interrupts. There is no guard on a microcontroller. A crash is the board's trap, and your `mettle_trap` decides what happens. This is [examples/mcu/blink.mettle](../examples/mcu/blink.mettle):
+The program does what any interrupt program does: it provides `mettle_trap`, calls `alph_board_start()` (from `port/board`) first in `main`, and enables interrupts. There is no guard on a microcontroller. A crash is the board's trap, and your `mettle_trap` decides what happens. This is [examples/mcu/blink.mettle](../examples/mcu/blink.mettle):
 
 ```mettle
 @interrupt fn mettle_trap() {
@@ -519,10 +519,10 @@ The program does what any interrupt program does: it provides `mettle_trap`, ins
 }
 
 fn main() -> int32 {
+  alph_board_start();
   g_node.init(&g_actors[0], 2, &g_mail[0], 4);
   g_time.init(&g_node, &g_timers[0], 2);
   ...
-  mettle_board_trap_install();
   mettle_irq_enable();
   g_time.after(1, clock_pid, TICK, 0);
   g_node.run();
@@ -539,6 +539,14 @@ qemu-system-riscv32 -M virt -bios none -nographic -device loader,file=blink.bin,
 ```
 
 The whole image of this program, board startup included, is 3,256 bytes: about 1.3 KB of core, 1.1 KB of timers and alarm, and the rest the board and the program. `check.sh` fails the build above 5 KB.
+
+**A Raspberry Pi Pico 2.** The examples in `examples/mcu` are the same source for a Pico 2, on its RISC-V cores. Build with the Pico's port in front of the one-hart port. A program calls `alph_board_start()` first in `main`, which does what each board needs:
+
+```bash
+mettle --release examples/mcu/blink.mettle --target riscv32-none --board pico2 --emit-flat blink.uf2 -I ports/pico2 -I ports/mcu
+```
+
+Hold BOOTSEL while plugging the board in and copy `blink.uf2` onto the `RP2350` drive. UART0 is TX on GP0 and RX on GP1 at 115200 baud, through a 3.3 V adapter. The tether uses UART0 as its line. These have run on the compiler's model of the chip, not yet on a real board.
 
 **Both cores of a chip.** On a board with several harts, build with `-I ports/harts -I ports/mcu` and use `AlphCores` as on Linux: core i runs on hart i. [examples/mcu/harts.mettle](../examples/mcu/harts.mettle) counts primes on two harts. The board's timer and its serial input serve hart 0, so timers and the tether belong to the first core's node. It needs the A extension (`--isa rv32imac`), and on the boards Mettle has today only `qemu-virt` can start a second hart.
 
@@ -559,9 +567,9 @@ fn answerer(a: AlphActor*, m: AlphMsg*) -> Word {
 }
 
 fn main() -> int32 {
+  alph_board_start();
   g_node.init(&g_actors[0], 2, &g_mail[0], 4);
-  mettle_board_trap_install();
-  g_tether.init(&g_node, 1, 0, 1);
+  g_tether.init(&g_node, 1, 0, 256);
   g_node.spawn(&answerer, 0);
   mettle_irq_enable();
   g_node.run();

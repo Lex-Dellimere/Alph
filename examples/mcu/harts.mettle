@@ -9,6 +9,7 @@
 //   qemu-system-riscv32 -M virt -smp 2 -bios none -nographic \
 //       -device loader,file=harts.bin,addr=0x80000000,force-raw=on
 
+import "port/board";
 import "alph/actor/actor";
 import "alph/cores/cores";
 
@@ -106,11 +107,11 @@ fn print(n: Word) {
 }
 
 fn main() -> int32 {
+  alph_board_start();
   var b: Boss;
   b.next = 0;
   b.back = 0;
   b.primes = 0;
-  mettle_board_trap_install();
   g_cores.init(&g_core[0], CORES, &g_actors[0], 2, &g_mail[0], 4);
   for i in 0..CORES {
     b.workers[i] = g_cores.spawn_on((Word)i, &worker, 0);

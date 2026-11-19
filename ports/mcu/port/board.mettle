@@ -1,0 +1,7 @@
+// What a board needs before alph runs on it. Call it first in main. Other
+// boards have their own in their port's folder, so a program is the same
+// source on each.
+
+export fn alph_board_start() {
+  mettle_board_trap_install();
+}

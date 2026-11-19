@@ -6,6 +6,7 @@
 //   mettle --release examples/mcu/tether.mettle --target riscv32-none \
 //       --board qemu-virt --emit-flat tether.bin -I ports/mcu
 
+import "port/board";
 import "alph/actor/actor";
 import "alph/tether/tether";
 
@@ -34,8 +35,8 @@ fn answerer(a: AlphActor*, m: AlphMsg*) -> Word {
 // The board is place 1. Every other place is down the line: the machine at
 // its other end, and any machine that one passes mail on to.
 fn main() -> int32 {
+  alph_board_start();
   g_node.init(&g_actors[0], 2, &g_mail[0], 4);
-  mettle_board_trap_install();
   g_tether.init(&g_node, 1, 0, 256);
   g_node.spawn(&answerer, 0);
   mettle_irq_enable();

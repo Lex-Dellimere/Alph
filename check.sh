@@ -181,6 +181,36 @@ if [ "$#" -eq 0 ] && command -v qemu-system-riscv32 > /dev/null 2>&1 && [ -f "$O
   fi
 fi
 
+# The same board programs for a Raspberry Pi Pico 2. They are built, and the
+# blink runs on the compiler's model of the chip when a C compiler is here
+# to build that model.
+if [ "$#" -eq 0 ]; then
+  log="$OUT/pico2.log"
+  : > "$log"
+  built=1
+  for name in blink tether asker; do
+    if ! "$METTLE" --release "examples/mcu/$name.mettle" --target riscv32-none --board pico2 \
+        --emit-flat "$OUT/pico2_$name.bin" -I ports/pico2 -I ports/mcu >> "$log" 2>&1; then
+      echo "FAIL  pico2/$name build (see $log)"
+      fails=$((fails + 1))
+      built=0
+    fi
+  done
+  sim="$(dirname "$METTLE")/../tools/riscv-sim/rvsim.c"
+  if [ "$built" -eq 1 ] && [ -f "$sim" ] && command -v gcc > /dev/null 2>&1 &&
+     gcc -std=c99 -O2 -o "$OUT/rvsim" "$sim" -lm >> "$log" 2>&1; then
+    got=$(timeout 30 "$OUT/rvsim" --machine rp2350 --load "$OUT/pico2_blink.bin" --until-ms 3000 2>> "$log" | tr -d '\r\n')
+    if [ "$got" = "12345" ]; then
+      echo "ok    pico2/blink [on the chip's model, $(stat -c %s "$OUT/pico2_blink.bin") bytes; tether and asker build]"
+    else
+      echo "FAIL  pico2/blink printed '$got' on the model"
+      fails=$((fails + 1))
+    fi
+  elif [ "$built" -eq 1 ]; then
+    echo "ok    pico2 [blink, tether and asker build; no model here to run them on]"
+  fi
+fi
+
 # Both harts of one board: the cores layer with a node on each.
 if [ "$#" -eq 0 ] && command -v qemu-system-riscv32 > /dev/null 2>&1; then
   bin="$OUT/harts.bin"

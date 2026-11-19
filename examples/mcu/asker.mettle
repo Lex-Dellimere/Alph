@@ -9,6 +9,7 @@
 //   mettle --release examples/mcu/asker.mettle --target riscv32-none \
 //       --board qemu-virt --emit-flat asker.bin -I ports/mcu
 
+import "port/board";
 import "alph/actor/actor";
 import "alph/time/time";
 import "alph/tether/tether";
@@ -72,12 +73,12 @@ var g_asker: Asker;
 // This board is place 0. The other board is place 1, and its one actor is
 // the first it spawned.
 fn main() -> int32 {
+  alph_board_start();
   g_asker.other = (Word)(((Word)1 << ALPH_PLACE_SHIFT) | ((Word)1 << ALPH_INDEX_BITS));
   g_asker.number = 0;
   g_asker.answered = 0;
   g_asker.wrong = 0;
   g_node.init(&g_actors[0], 2, &g_mail[0], 4);
-  mettle_board_trap_install();
   g_tether.init(&g_node, 0, 1, 1);
   g_time.init(&g_node, &g_timers[0], 2);
   var me: Word = g_node.spawn(&asker, (rawptr)&g_asker);

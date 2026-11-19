@@ -62,7 +62,7 @@ This is [examples/count.mettle](examples/count.mettle). The node owns no memory:
 | Names and the door | Find an actor on another machine by name, and watch it | [src/name](src/name/name.mettle), [src/door](src/door/door.mettle) |
 | Seals | A link only the holders of one key can read or speak on | [src/seal](src/seal/seal.mettle) |
 | Tether | A microcontroller tied to a bigger machine by its serial line: each side's actors reach the other's by pid. That machine can pass the board's mail on, so the whole network reaches it | [src/tether](src/tether/tether.mettle) |
-| Ports | What differs per device: `mcu` (one hart, no OS), `harts` (several harts, no OS) and `host` (x86-64 Linux) | [ports](ports) |
+| Ports | What differs per device: `mcu` (one hart, no OS), `harts` (several harts, no OS), `pico2` (a Raspberry Pi Pico 2) and `host` (x86-64 Linux) | [ports](ports) |
 
 [docs/start.md](docs/start.md) shows how to use each of these. [docs/design.md](docs/design.md) explains why they are built this way, what was measured, and what is not built yet.
 
@@ -126,6 +126,12 @@ mettle --build -s --release examples/mcu/tether_host.mettle -I ports/host -o tet
 qemu-system-riscv32 -M virt -bios none -display none -monitor none -serial tcp:127.0.0.1:7421 -device loader,file=tether.bin,addr=0x80000000,force-raw=on
 ```
 
+The same programs for a Raspberry Pi Pico 2 (its RISC-V cores). They have run on the compiler's model of the chip, not yet on a real board:
+
+```bash
+mettle --release examples/mcu/blink.mettle --target riscv32-none --board pico2 --emit-flat blink.uf2 -I ports/pico2 -I ports/mcu
+```
+
 Both harts of one board, [examples/mcu/harts.mettle](examples/mcu/harts.mettle), the same `AlphCores` as on Linux:
 
 ```bash
@@ -173,7 +179,7 @@ src/name/name.mettle        names: a number for a pid
 src/door/door.mettle        the door: find and watch actors on other machines
 src/seal/seal.mettle        seals: an encrypted and signed link (needs the cryptex package)
 src/tether/tether.mettle    tether: a board and a bigger machine on a serial line
-ports/mcu, ports/harts, ports/host
+ports/mcu, ports/harts, ports/pico2, ports/host
                             what differs per device, picked with -I ports/<name>
 src/alph.mettle             the first runtime in one import
 src/core, src/heal, src/work, src/net, src/io, src/sched, src/sys

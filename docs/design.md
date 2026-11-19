@@ -56,9 +56,10 @@ What differs between devices is in a port, a folder picked at build time with `-
 |---|---|---|---|---|---|---|
 | `mcu` | one hart, no OS | 32 bits | 1,024 | 256 | `wfi` | interrupts off |
 | `harts` | several harts, no OS | 32 bits | 1,024 | 256 | `wfi`, woken by the software interrupt | interrupts off and a lock |
+| `pico2` | a Raspberry Pi Pico 2, one of its RISC-V cores | as `mcu` | | | | |
 | `host` | an x86-64 Linux process | 64 bits | 16 million | 32,768 | looks for mail for about 10 µs, then a futex | a spin lock |
 
-A port is a few files of 30 to 130 lines each: the gate, the alarm, the guard that catches a crash, how a core is started, and the wire or line to other machines. Ports stack: `harts` has only what differs from `mcu`, and is built with `-I ports/harts -I ports/mcu`. A new device is a new port.
+A port is a few files of 30 to 130 lines each: the gate, the alarm, the guard that catches a crash, how a core is started, and the wire or line to other machines. Ports stack: `harts` and `pico2` have only what differs from `mcu`, and are built with `-I ports/harts -I ports/mcu` or `-I ports/pico2 -I ports/mcu`. A board program calls `alph_board_start()` first, which is the port's, so the examples in `examples/mcu` are the same source on a QEMU board and on a Pico 2. On the Pico 2 they have run on the compiler's model of the chip, not yet on a real board: the blink prints its five counts from five timer interrupts, and the tether answers every question whole. A new device is a new port.
 
 ## Size
 

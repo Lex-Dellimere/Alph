@@ -1,0 +1,21 @@
+// A Raspberry Pi Pico 2, on its RISC-V cores. Build with
+// -I ports/pico2 -I ports/mcu --board pico2: this folder has what differs
+// on this board, and the rest is the one-hart port's.
+
+// The board's own trap install sends every trap to mettle_trap, so the
+// port's timer and console handlers would never run. This installs the
+// compiler's table of one handler per cause.
+@naked fn alph_board_vectors() {
+  asm {
+    la t0, mettle_trap_vector
+    csrw mtvec, t0
+    ret
+  }
+}
+
+// What the board needs before alph runs on it: its clocks, timer and UART0
+// come out of reset in pico2_init. Call it first in main.
+export fn alph_board_start() {
+  pico2_init();
+  alph_board_vectors();
+}
