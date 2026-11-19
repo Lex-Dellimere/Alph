@@ -30,6 +30,7 @@ import "alph/actor/actor";
 import "alph/cores/cores";
 import "alph/life/life";
 import "alph/time/time";
+import "alph/link/link";
 
 export const ALPH_CPU: Word = 0;
 export const ALPH_GPU: Word = 1;
@@ -56,6 +57,8 @@ export struct AlphJob {
   data: rawptr;
   in: Word;      // what a job that can go to another machine is given,
   out: Word;     // and what it gives back
+  bytes: uint8*; // bytes that go with it to another machine, up to ALPH_PARCEL_BYTES,
+  count: Word;   // and how many: 0 for none
   home: Word;    // where its data is: ALPH_CPU, ALPH_GPU or ALPH_NOWHERE. alph sets it to where the job ran
   status: Word;  // ALPH_OK, ALPH_GONE when no place can run it, ALPH_FULL to ask again
   way: Word;     // how it was run
@@ -110,6 +113,7 @@ export struct AlphPlaces {
   kinds: AlphKind*;
   kind_count: Word;
   time: AlphTime*;  // for far jobs that are never answered, 0 for none
+  link: AlphLink*;  // for far jobs that carry bytes, 0 for none
   late: Word;       // far jobs given up on and placed again
 }
 
@@ -164,6 +168,7 @@ export fn AlphPlaces_init__ptr(p: AlphPlaces*, places: AlphPlace*, room: Word, k
   p->kinds = kinds;
   p->kind_count = count;
   p->time = 0;
+  p->link = 0;
   p->late = 0;
   for i in 0..count {
     kinds[i].off[0] = 1;
@@ -228,6 +233,14 @@ export fn AlphPlaces_far__ptr(p: AlphPlaces*, kind: Word, worker: Word) {
 // costs a wait, not the job. Without it such a job waits for ever.
 export fn AlphPlaces_clock__ptr(p: AlphPlaces*, time: AlphTime*) {
   p->time = time;
+}
+
+// Gives the places the link, so a job for another machine can carry bytes
+// (job->bytes and job->count). Its worker then gets ALPH_WORK with a parcel
+// in arg, which it gives back to its own link when it has read it, and the
+// job's in is not sent. Give the link its parcels first.
+export fn AlphPlaces_net__ptr(p: AlphPlaces*, link: AlphLink*) {
+  p->link = link;
 }
 
 // A new place that runs jobs one way. Spawn alph_place_run with it as the
@@ -661,7 +674,11 @@ export fn alph_place_run(a: AlphActor*, m: AlphMsg*) -> Word {
     var ask: AlphMsg = { tag: ALPH_WORK, from: a->pid, arg: job->in, ref: job->far_ref };
     var out: Word = ALPH_GONE;
     if (job->far_to != 0 && k->off[ALPH_FAR] == 0) {
-      out = a->node->put(job->far_to, &ask);
+      if (job->count > 0 && p->link != 0) {
+        out = p->link->send_bytes(a->pid, job->far_to, ALPH_WORK, job->far_ref, job->bytes, job->count);
+      } else {
+        out = a->node->put(job->far_to, &ask);
+      }
     }
     if (out == ALPH_OK) {
       job->next = x->open;

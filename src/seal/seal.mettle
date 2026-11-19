@@ -87,7 +87,7 @@ fn alph_seal_open(ctx: rawptr, out: uint8*, sealed: uint8*, count: int64, place:
   for i in 0..24 {
     nonce.b[i] = sealed[i];
   }
-  if (cr_aead_decrypt(out, 80, &plain, &sealed[HEAD], count - HEAD, &sealed[0], HEAD, &nonce, &s->key) != CR_OK) {
+  if (cr_aead_decrypt(out, ALPH_DATAGRAM, &plain, &sealed[HEAD], count - HEAD, &sealed[0], HEAD, &nonce, &s->key) != CR_OK) {
     return 0;
   }
   *place = (uint32)alph_seal_get(&sealed[0], 4);

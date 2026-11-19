@@ -1,0 +1,286 @@
+// Bytes with a message (src/link parcels), between two machines in one
+// process: three hundred parcels of every size cross with messages being
+// lost on the way, each arrives once, whole and in order; a machine with no
+// parcel free takes no more until one is given back, and nothing is lost;
+// bytes for an actor on the same machine arrive the same way; too many
+// bytes are refused.
+
+import "std/io";
+import "std/thread";
+import "alph/actor/actor";
+import "alph/cores/cores";
+import "alph/link/link";
+
+const GO: Word = 1;
+const DATA: Word = 2;   // with a parcel: ref is its number
+const SUM: Word = 3;    // the answer: arg is the sum of its bytes, ref its number
+const MORE: Word = 4;
+const GIVE_BACK: Word = 5;
+const TOTAL: Word = 300;
+
+var g_a: AlphCores;
+var g_a_core: AlphCore[2];
+var g_a_actors: AlphActor[4];
+var g_a_mail: AlphMsg[32];
+var g_a_link: AlphLink;
+var g_a_peers: AlphPeer[1];
+var g_a_parcels: AlphParcel[8];
+
+var g_b: AlphCores;
+var g_b_core: AlphCore[2];
+var g_b_actors: AlphActor[4];
+var g_b_mail: AlphMsg[32];
+var g_b_link: AlphLink;
+var g_b_peers: AlphPeer[1];
+var g_b_parcels: AlphParcel[4];
+
+var g_checker: Word = 0;
+var g_failures: int32 = 0;
+
+fn expect(ok: bool, what: string) {
+  if (!ok) {
+    println("FAIL {what}");
+    g_failures = g_failures + 1;
+  }
+}
+
+// Parcel n has this many bytes, and byte i of it is this.
+fn size_of(n: Word) -> Word {
+  return (Word)(1 + (n * 37) % 1024);
+}
+
+fn byte_of(n: Word, i: Word) -> uint8 {
+  return (uint8)((n * 7 + i * 3) & 255);
+}
+
+// On machine B: checks each parcel, gives it back and answers with its sum.
+// While it hoards, it keeps the parcels.
+struct Checker {
+  link: AlphLink*;  // its machine's link, which its parcels go back to
+  next: Word;
+  bad: Word;
+  hoard: Word;
+  kept: AlphParcel*[4];
+  keeping: Word;
+}
+
+fn checker(a: AlphActor*, m: AlphMsg*) -> Word {
+  var c: Checker* = (Checker*)a->state;
+  if (m->tag == GIVE_BACK) {
+    for i in 0..c->keeping {
+      c->link->release(c->kept[i]);
+    }
+    c->keeping = 0;
+    c->hoard = 0;
+    return 0;
+  }
+  var p: AlphParcel* = (AlphParcel*)m->arg;
+  var n: Word = m->ref;
+  var sum: Word = 0;
+  if (n != c->next || p->count != size_of(n)) {
+    c->bad = c->bad + 1;
+  }
+  c->next = n + 1;
+  for i in 0..p->count {
+    if (p->bytes[i] != byte_of(n, (Word)i)) {
+      c->bad = c->bad + 1;
+    }
+    sum = sum + (Word)p->bytes[i];
+  }
+  if (c->hoard != 0 && c->keeping < 4) {
+    c->kept[c->keeping] = p;
+    c->keeping = c->keeping + 1;
+  } else {
+    c->link->release(p);
+  }
+  if (a->reply(m, SUM, sum) != ALPH_OK) {
+    c->bad = c->bad + 1;
+  }
+  return 0;
+}
+
+// On machine A: sends the parcels, at most four not yet answered, and
+// checks the answers.
+struct Sender {
+  to: Word;
+  total: Word;
+  sent: Word;
+  back: Word;
+  bad: Word;
+  refused: Word;
+}
+
+fn sender(a: AlphActor*, m: AlphMsg*) -> Word {
+  var s: Sender* = (Sender*)a->state;
+  var bytes: uint8[1024];
+  if (m->tag == SUM) {
+    var want: Word = 0;
+    for i in 0..size_of(m->ref) {
+      want = want + (Word)byte_of(m->ref, (Word)i);
+    }
+    if (m->ref != s->back || m->arg != want) {
+      s->bad = s->bad + 1;
+    }
+    s->back = s->back + 1;
+  }
+  while (s->sent < s->total && s->sent - s->back < 4) {
+    var count: Word = size_of(s->sent);
+    for i in 0..count {
+      bytes[i] = byte_of(s->sent, (Word)i);
+    }
+    var out: Word = g_a_link.send_bytes(a->pid, s->to, DATA, s->sent, &bytes[0], count);
+    if (out == ALPH_FULL) {
+      s->refused = s->refused + 1;
+      a->send(a->pid, MORE, 0);
+      return 0;
+    }
+    if (out != ALPH_OK) {
+      s->bad = s->bad + 1000;
+      a->cores()->stop();
+      return 0;
+    }
+    s->sent = s->sent + 1;
+  }
+  if (s->back == s->total) {
+    a->cores()->stop();
+  }
+  return 0;
+}
+
+fn b_main(arg: cstring) -> uint32 {
+  g_b.run();
+  return 0;
+}
+
+fn main() -> int32 {
+  var port_a: int64 = 13000 + (syscall(39) % 2000) * 2;
+  var port_b: int64 = port_a + 1;
+  var here: uint32 = alph_ip4(127, 0, 0, 1);
+  var s: Sender;
+  var c: Checker;
+  var local: Checker;
+  s.sent = 0;
+  s.back = 0;
+  s.bad = 0;
+  s.refused = 0;
+  c.link = &g_b_link;
+  local.link = &g_a_link;
+  c.next = 0;
+  c.bad = 0;
+  c.hoard = 0;
+  c.keeping = 0;
+  local.next = 0;
+  local.bad = 0;
+  local.hoard = 0;
+  local.keeping = 0;
+
+  g_a.init(&g_a_core[0], 2, &g_a_actors[0], 2, &g_a_mail[0], 8);
+  g_a_link.init(&g_a, 0, &g_a_peers[0], 1);
+  g_a_link.peer(2, 2, here, port_b);
+  var sender_pid: Word = g_a.spawn_on(0, &sender, (rawptr)&s);
+
+  g_b.init(&g_b_core[0], 2, &g_b_actors[0], 2, &g_b_mail[0], 8);
+  g_b_link.init(&g_b, 2, &g_b_peers[0], 1);
+  g_b_link.peer(0, 2, here, port_a);
+  g_b_link.parcels(&g_b_parcels[0], 4);
+  g_checker = g_b.spawn_on(1, &checker, (rawptr)&c);
+
+  // No parcels given to A's link yet, and too many bytes.
+  var few: uint8[8];
+  expect(g_a_link.send_bytes(0, g_checker, DATA, 0, &few[0], 8) == ALPH_GONE, "bytes for a machine not yet heard are refused");
+  g_a_link.parcels(&g_a_parcels[0], 8);
+  expect(g_a_link.send_bytes(0, sender_pid, DATA, 0, &few[0], 1025) == ALPH_GONE, "more bytes than a parcel holds are refused");
+  expect(g_a_link.send_bytes(0, sender_pid, DATA, 0, &few[0], 0) == ALPH_GONE, "and so are none");
+
+  expect(g_a_link.start(port_a) == ALPH_OK && g_b_link.start(port_b) == ALPH_OK, "both machines listen");
+  var b_thread: int64 = CreateThread(0, 0, &b_main, 0, 0, 0);
+  var waited: int32 = 0;
+  while (!g_a_link.reaches(2) && waited < 3000) {
+    Sleep(1);
+    waited = waited + 1;
+  }
+  expect(g_a_link.reaches(2), "A hears B");
+
+  // Three hundred parcels of every size, with messages lost on the way.
+  g_a_link.lose = 4;
+  g_b_link.lose = 5;
+  s.to = g_checker;
+  s.total = TOTAL;
+  g_a.send(sender_pid, GO, 0);
+  g_a.run();
+  g_a_link.lose = 0;
+  g_b_link.lose = 0;
+  expect(s.back == TOTAL && s.bad == 0, "every parcel is answered with the right sum, in order ({s.back} of {TOTAL}, {s.bad} bad)");
+  expect(c.bad == 0, "each arrived once, whole and in its turn ({c.bad} did not)");
+  expect(g_a_link.resent > 0, "though some were sent again ({g_a_link.resent})");
+  var used: Word = 0;
+  for i in 0..8 {
+    used = used + g_a_parcels[i].used;
+  }
+  for i in 0..4 {
+    used = used + g_b_parcels[i].used;
+  }
+  expect(used == 0, "every parcel is back in its pool ({used} are not)");
+
+  // B keeps the next four parcels: it has no more, so it takes no more, and
+  // the fifth waits on A until B gives one back. Nothing is lost.
+  c.hoard = 1;
+  s.sent = TOTAL;
+  s.back = TOTAL;
+  s.total = TOTAL + 6;
+  g_a.send(sender_pid, GO, 0);
+  waited = 0;
+  while (s.back < TOTAL + 4 && waited < 3000) {
+    g_a_core[0].node.turn();
+    Sleep(1);
+    waited = waited + 1;
+  }
+  for i in 0..300 {
+    g_a_core[0].node.turn();
+    Sleep(1);
+  }
+  expect(s.back == TOTAL + 4, "with B's four parcels kept, four are answered and the fifth waits ({s.back - TOTAL})");
+  g_b.send(g_checker, GIVE_BACK, 0);
+  g_a.run();
+  expect(s.back == TOTAL + 6 && s.bad == 0 && c.bad == 0, "once B gives them back the rest arrive, none lost ({s.back - TOTAL} of 6)");
+
+  // Bytes for an actor on the same machine.
+  var near: Word = g_a.spawn_on(1, &checker, (rawptr)&local);
+  var bytes: uint8[1024];
+  for i in 0..size_of(0) {
+    bytes[i] = byte_of(0, (Word)i);
+  }
+  expect(g_a_link.send_bytes(sender_pid, near, DATA, 0, &bytes[0], size_of(0)) == ALPH_OK, "bytes for an actor on this machine are taken");
+  g_a_core[1].node.turn();
+  expect(local.next == 1 && local.bad == 0, "and arrive whole");
+  used = 0;
+  for i in 0..8 {
+    used = used + g_a_parcels[i].used;
+  }
+  expect(used == 0, "and its parcel is back in A's pool ({used} are not)");
+
+  // Half the pool is kept for what arrives: with eight parcels and B not
+  // answering, the fifth is refused.
+  var taken: Word = 0;
+  g_b_link.deaf = 1;
+  for i in 0..8 {
+    if (g_a_link.send_bytes(sender_pid, g_checker, DATA, c.next + (Word)i, &bytes[0], 8) != ALPH_OK) {
+      break;
+    }
+    taken = taken + 1;
+  }
+  expect(taken == 4, "what is sent leaves half the pool for what arrives ({taken} of 8 taken)");
+
+  g_b_link.stop();
+  g_b.stop();
+  thread_join_infinite(b_thread);
+  thread_close(b_thread);
+  g_b_link.close();
+  g_a_link.stop();
+  g_a_link.close();
+  if (g_failures != 0) {
+    return 1;
+  }
+  println("parcel ok: {TOTAL} parcels of 1 to 1,024 bytes crossed whole and in order, {g_a_link.resent} sent again");
+  return 0;
+}

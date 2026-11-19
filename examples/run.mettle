@@ -1,0 +1,344 @@
+// Runs a list of commands on two machines, as a build would: each command
+// goes to a core here or to the other machine, wherever it should be done
+// first, and its exit status comes back. The command's text crosses as the
+// bytes of a job. The other machine runs it on its own cores, by the same
+// places it would use for its own work. If the other machine is not there,
+// or is lost, the commands are run here.
+//
+// With no arguments both machines run in this one process:
+//
+//   mettle --build -s --release examples/run.mettle -I ports/host -o run
+//   ./run
+//
+// On two computers, start one as the helper and the other as the boss, each
+// with the other's address:
+//
+//   ./run helper 192.168.1.10
+//   ./run boss 192.168.1.20
+
+import "std/io";
+import "std/thread";
+import "port/net";
+import "port/proc";
+import "alph/actor/actor";
+import "alph/cores/cores";
+import "alph/time/time";
+import "alph/link/link";
+import "alph/name/name";
+import "alph/life/life";
+import "alph/door/door";
+import "alph/place/place";
+
+const COMMANDS: Word = 12;
+const RUN: Word = 0;        // the one kind of job: a command, out its exit status
+const HELPER: Word = 1;     // the name the helper machine gives the actor that takes commands
+const GO: Word = 1;
+const QUIT: Word = 2;
+const BUSY: Word = -1;      // the helper's answer when it has no room: ask again
+const BOSS_PORT: int64 = 7441;
+const HELPER_PORT: int64 = 7442;
+
+// What a build might run. Each takes a moment and ends with its own status.
+var g_commands: cstring[12];
+
+struct Machine {
+  cores: AlphCores;
+  core: AlphCore[3];
+  actors: AlphActor[12];
+  mail: AlphMsg[192];
+  link: AlphLink;
+  peers: AlphPeer[1];
+  parcels: AlphParcel[8];
+  names: AlphNames;
+  name_slots: AlphName[2];
+  life: AlphLife;
+  watches: AlphWatch[2];
+  keeps: AlphKeep[1];
+  door: AlphDoor;
+  places: AlphPlaces;
+  seats: AlphPlace[3];
+  kinds: AlphKind[1];
+}
+
+var g_boss_machine: Machine;
+var g_helper_machine: Machine;
+
+// A command run on a core: the core's thread waits for it, which is its work.
+fn run_here(job: AlphJob*) -> Word {
+  var program: int64 = alph_proc_start((cstring)job->data);
+  job->out = 127;
+  if (program >= 0) {
+    job->out = (Word)alph_proc_wait(program);
+    alph_close(program);
+  }
+  return 0;
+}
+
+// A machine as far as its door and its places: two cores that run commands.
+fn machine(m: Machine*, first: Word, other: Word, ip: uint32, port: int64) {
+  m->cores.init(&m->core[0], 3, &m->actors[0], 4, &m->mail[0], 16);
+  m->link.init(&m->cores, first, &m->peers[0], 1);
+  m->link.peer(other, 3, ip, port);
+  m->link.parcels(&m->parcels[0], 8);
+  m->names.init(&m->name_slots[0], 2);
+  m->life.init(&m->cores, &m->watches[0], 2, &m->keeps[0], 1);
+  m->door.init(&m->cores, &m->link, &m->names, &m->life);
+  m->places.init(&m->seats[0], 3, &m->kinds[0], 1);
+  m->places.kind(RUN, &run_here, 0);
+  m->places.net(&m->link);
+  m->places.on_core(&m->cores, 1, ALPH_CPU);
+  m->places.on_core(&m->cores, 2, ALPH_CPU);
+}
+
+// On the helper machine: takes a command from the boss, has this machine's
+// places run it, and sends the status back.
+struct Taken {
+  job: AlphJob;
+  text: uint8[1024];
+  from: Word;
+  ref: Word;
+  busy: bool;
+}
+
+var g_taken: Taken[8];
+
+fn taker(a: AlphActor*, m: AlphMsg*) -> Word {
+  var mine: Machine* = &g_helper_machine;
+  if (m->tag == QUIT) {
+    a->cores()->stop();
+    return 0;
+  }
+  if (m->tag == ALPH_WORK) {
+    var parcel: AlphParcel* = (AlphParcel*)m->arg;
+    var answer: AlphMsg = { tag: ALPH_WORKED, from: a->pid, arg: BUSY, ref: m->ref };
+    for i in 0..8 {
+      var t: Taken* = &g_taken[i];
+      if (!t->busy) {
+        for at in 0..parcel->count {
+          t->text[at] = parcel->bytes[at];
+        }
+        t->job.kind = RUN;
+        t->job.size = 1;
+        t->job.home = ALPH_NOWHERE;
+        t->job.count = 0;
+        t->job.data = (rawptr)&t->text[0];
+        t->from = m->from;
+        t->ref = m->ref;
+        if (mine->places.ask(a, &t->job) > 0) {
+          t->busy = true;
+          mine->link.release(parcel);
+          return 0;
+        }
+        break;
+      }
+    }
+    mine->link.release(parcel);
+    a->node->put(m->from, &answer);  // no room: the boss asks again
+    return 0;
+  }
+  if (m->tag == ALPH_DONE) {
+    var t: Taken* = (Taken*)m->arg;  // the job is the first thing in it
+    var answer: AlphMsg = { tag: ALPH_WORKED, from: a->pid, arg: t->job.out, ref: t->ref };
+    a->node->put(t->from, &answer);
+    t->busy = false;
+  }
+  return 0;
+}
+
+// On the boss machine: hands the commands out and notes how each ended.
+struct Boss {
+  sent: Word;
+  back: Word;
+  here: Word;
+  there: Word;
+  status: Word[12];
+  far_place: Word;
+  helper: Word;
+  jobs: AlphJob[4];
+  free: AlphJob*;
+}
+
+fn boss(a: AlphActor*, m: AlphMsg*) -> Word {
+  var b: Boss* = (Boss*)a->state;
+  var mine: Machine* = &g_boss_machine;
+  if (m->tag == ALPH_UP) {
+    mine->door.find(a, m->arg, HELPER);
+  } else if (m->tag == ALPH_HERE && m->arg != 0) {
+    b->helper = m->arg;
+    mine->places.far(RUN, b->helper);
+    mine->door.watch(b->far_place, b->helper);
+  } else if (m->tag == ALPH_DONE) {
+    var done: AlphJob* = (AlphJob*)m->arg;
+    if (done->status == ALPH_OK && done->out != BUSY) {
+      b->status[done->in] = done->out;
+      b->back = b->back + 1;
+      if (done->way == ALPH_FAR) {
+        b->there = b->there + 1;
+      } else {
+        b->here = b->here + 1;
+      }
+    } else {
+      b->sent = b->sent - 1;  // not run: this command is asked for again below
+      g_commands[COMMANDS - 1 - b->sent] = (cstring)done->data;
+    }
+    done->next = b->free;
+    b->free = done;
+  }
+  while (b->sent < COMMANDS && b->free != 0) {
+    var job: AlphJob* = b->free;
+    var text: cstring = g_commands[COMMANDS - 1 - b->sent];
+    var length: Word = 0;
+    while (text[length] != 0) {
+      length = length + 1;
+    }
+    b->free = job->next;
+    job->kind = RUN;
+    job->size = 1;
+    job->home = ALPH_NOWHERE;
+    job->data = (rawptr)text;
+    job->bytes = (uint8*)text;
+    job->count = length + 1;
+    job->in = (Word)(text[length - 1] - 48);  // each command ends "exit N": N is its number
+    if (text[length - 2] != 32) {
+      job->in = (Word)(text[length - 2] - 48) * 10 + job->in;
+    }
+    if (mine->places.ask(a, job) < 0) {
+      job->next = b->free;
+      b->free = job;
+      break;
+    }
+    b->sent = b->sent + 1;
+  }
+  if (b->back == COMMANDS) {
+    if (b->helper != 0) {
+      a->send(b->helper, QUIT, 0);
+    }
+    a->cores()->stop();
+  }
+  return 0;
+}
+
+var g_boss: Boss;
+var g_time: AlphTime;
+var g_timers: AlphTimer[2];
+
+fn run_boss(helper_ip: uint32) -> int32 {
+  var m: Machine* = &g_boss_machine;
+  machine(m, 0, 3, helper_ip, HELPER_PORT);
+  var boss_pid: Word = m->cores.spawn_on(0, &boss, (rawptr)&g_boss);
+  m->door.tell(boss_pid);
+  g_boss.far_place = m->places.on_core(&m->cores, 0, ALPH_FAR);
+  g_time.init(&m->core[0].node, &g_timers[0], 2);
+  m->places.clock(&g_time);
+  g_boss.free = 0;
+  for i in 0..4 {
+    g_boss.jobs[i].next = g_boss.free;
+    g_boss.free = &g_boss.jobs[i];
+  }
+  if (m->link.start(BOSS_PORT) != ALPH_OK) {
+    println("port {BOSS_PORT} is taken");
+    return 1;
+  }
+  // A moment for the helper to be heard, as a build would have while it
+  // works out what to run. Without a helper the commands are run here.
+  thread_sleep_ms(150);
+  m->core[0].node.turn();
+  m->cores.send(boss_pid, GO, 0);
+  m->cores.run();
+  thread_sleep_ms(100);  // the last word to the helper is still to cross
+  g_time.stop();
+  m->link.stop();
+  var right: Word = 0;
+  for i in 0..COMMANDS {
+    if (g_boss.status[i] == (Word)i) {
+      right = right + 1;
+    }
+  }
+  println("{COMMANDS} commands run, {right} with the status they should have: {g_boss.here} here, {g_boss.there} on the other machine");
+  if (right != COMMANDS) {
+    return 1;
+  }
+  return 0;
+}
+
+fn start_helper(boss_ip: uint32) -> bool {
+  var m: Machine* = &g_helper_machine;
+  machine(m, 3, 0, boss_ip, BOSS_PORT);
+  m->names.set(HELPER, m->cores.spawn_on(0, &taker, 0));
+  return m->link.start(HELPER_PORT) == ALPH_OK;
+}
+
+fn helper_main(arg: cstring) -> uint32 {
+  g_helper_machine.cores.run();
+  return 0;
+}
+
+// The address a.b.c.d in text as one number, 0 when it is not one.
+fn address(text: cstring) -> uint32 {
+  var part: int64[4];
+  var at: int32 = 0;
+  var i: int32 = 0;
+  part[0] = 0;
+  while (text[i] != 0) {
+    if (text[i] == 46 && at < 3) {
+      at = at + 1;
+      part[at] = 0;
+    } else if (text[i] >= 48 && text[i] <= 57) {
+      part[at] = part[at] * 10 + (int64)(text[i] - 48);
+    } else {
+      return 0;
+    }
+    i = i + 1;
+  }
+  if (at != 3) {
+    return 0;
+  }
+  return alph_ip4(part[0], part[1], part[2], part[3]);
+}
+
+fn main(argc: int32, argv: cstring*) -> int32 {
+  alph_proc_env(argv + argc + 1);
+  // Stand-ins for the steps of a build: each counts for a while and ends
+  // with its own number.
+  g_commands[0] = "i=0; while [ $i -lt 30000 ]; do i=$((i+1)); done; exit 0";
+  g_commands[1] = "i=0; while [ $i -lt 30000 ]; do i=$((i+1)); done; exit 1";
+  g_commands[2] = "i=0; while [ $i -lt 30000 ]; do i=$((i+1)); done; exit 2";
+  g_commands[3] = "i=0; while [ $i -lt 30000 ]; do i=$((i+1)); done; exit 3";
+  g_commands[4] = "i=0; while [ $i -lt 30000 ]; do i=$((i+1)); done; exit 4";
+  g_commands[5] = "i=0; while [ $i -lt 30000 ]; do i=$((i+1)); done; exit 5";
+  g_commands[6] = "i=0; while [ $i -lt 30000 ]; do i=$((i+1)); done; exit 6";
+  g_commands[7] = "i=0; while [ $i -lt 30000 ]; do i=$((i+1)); done; exit 7";
+  g_commands[8] = "i=0; while [ $i -lt 30000 ]; do i=$((i+1)); done; exit 8";
+  g_commands[9] = "i=0; while [ $i -lt 30000 ]; do i=$((i+1)); done; exit 9";
+  g_commands[10] = "i=0; while [ $i -lt 30000 ]; do i=$((i+1)); done; exit 10";
+  g_commands[11] = "i=0; while [ $i -lt 30000 ]; do i=$((i+1)); done; exit 11";
+  if (argc == 3) {
+    var ip: uint32 = address(argv[2]);
+    if (ip == 0) {
+      println("the address should look like 192.168.1.10");
+      return 2;
+    }
+    if (argv[1][0] == 104) {  // h: the helper
+      if (!start_helper(ip)) {
+        println("port {HELPER_PORT} is taken");
+        return 1;
+      }
+      println("helping: waiting for commands");
+      g_helper_machine.cores.run();
+      g_helper_machine.link.stop();
+      return 0;
+    }
+    return run_boss(ip);
+  }
+  var here: uint32 = alph_ip4(127, 0, 0, 1);
+  if (!start_helper(here)) {
+    println("port {HELPER_PORT} is taken");
+    return 1;
+  }
+  var helper: int64 = CreateThread(0, 0, &helper_main, 0, 0, 0);
+  var out: int32 = run_boss(here);
+  thread_join_infinite(helper);
+  thread_close(helper);
+  g_helper_machine.link.stop();
+  return out;
+}
