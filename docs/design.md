@@ -65,7 +65,7 @@ For the smallest tiles alph beats both, because it uses both. For the rest it ma
 
 `src/link` joins machines over UDP. Each machine owns a run of place numbers, so a pid says which machine its actor is on, and an actor sends to it the way it sends next door. A message is one datagram. On the wire a pid is its three parts, because a 32-bit board and a 64-bit server pack them differently.
 
-- Messages to a machine are numbered, and the machine says how far it has them. What it has not got in 40 ms is sent again. So messages arrive once and in order while both machines are up. A message for an actor whose mailbox is full is not taken either: it is sent again, and what is behind it waits, so a full mailbox slows a sender down and loses nothing.
+- Messages to a machine are numbered, and the machine says how far it has them. What it has not got in 40 ms is sent again. So messages arrive once and in order while both machines are up. A message for an actor whose mailbox is full is not taken either: it is sent again, and what is behind it waits, so a full mailbox slows a sender down and loses nothing. An actor with no room for half a second is not reading, and its message is then dropped: one stuck actor must not hold up everything else its machine is sent.
 - Every machine tells its peers it is alive 20 times a second. One quiet for half a second is down: sends to it are refused and a watcher actor is told.
 - A machine only out of reach carries on where it was. One that was restarted counts as a new machine, so mail meant for the old one is not handed to the new.
 
@@ -108,7 +108,7 @@ The board runs one job at a time, so a machine sends it at most four and a place
 
 ### Done at most once
 
-A job whose answer is lost is placed again, so it can be done twice. For work that changes something that is wrong, so a kind can be marked as done at most once. The rule the asker then follows: a job not answered is sent again to the same worker under the same ref, and never placed anywhere else. The worker remembers, for each of four askers, the last four jobs it did and what each gave, and answers a job sent again from that memory.
+A job whose answer is lost is placed again, so it can be done twice. For work that changes something that is wrong, so a kind can be marked as done at most once. The rule the asker then follows: a job not answered is sent again to the same worker under the same ref, and never placed anywhere else. The worker remembers, for each of eight askers, the last four jobs it did and what each gave, and answers a job sent again from that memory.
 
 What makes this hard is everything else that can happen: a copy that arrives late, a worker that was restarted and remembers nothing, an asker that was restarted and numbers its jobs from the start again, a worker wrongly taken for lost. The first design was explored by a program that tries every order of those events for small sizes. It found seven ways to do a job twice or to answer one job with another's result, the shortest in eight steps. The design that came through millions of states with none is this:
 

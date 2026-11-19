@@ -27,7 +27,9 @@ fn alph_board_serve_once(a: AlphActor*, m: AlphMsg*) -> Word {
   var run: fn(Word) -> Word = k->run;
   var answer: AlphMsg = { tag: ALPH_WORKED, from: a->pid, arg: 0, ref: m->ref };
   if (m->tag == ALPH_HELLO) {
-    k->memory.hello(m->from, m->ref);
+    if (!k->memory.hello(m->from, m->ref)) {
+      return 0;
+    }
     answer.tag = ALPH_HELLO;
   } else if (m->tag == ALPH_WORK_ONCE) {
     var seen: Word = k->memory.seen(m->from, m->ref, &answer.arg);

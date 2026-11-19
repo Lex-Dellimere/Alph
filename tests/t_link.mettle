@@ -144,11 +144,16 @@ fn sink(a: AlphActor*, m: AlphMsg*) -> Word {
 var g_slow: Word = 0;
 var g_slow_got: Word = 0;
 var g_slow_bad: Word = 0;
+var g_slow_stuck: int32 = 0;
 
 // On machine B: takes two milliseconds over each NOTE, and checks they come
 // in the order they were numbered.
 fn slow(a: AlphActor*, m: AlphMsg*) -> Word {
-  if (m->tag == NOTE) {
+  // Stuck: it stays in its handler, so its mailbox fills and stays full.
+  while (g_slow_stuck != 0) {
+    Sleep(5);
+  }
+  if (m->tag == NOTE && m->arg < 100) {
     if (m->arg != g_slow_got) {
       g_slow_bad = g_slow_bad + 1;
     }
@@ -168,7 +173,7 @@ fn start_b(port_a: int64, port_b: int64) {
   g_b_link.init(&g_b, 2, &g_b_peers[0], 2);
   g_b_link.peer(0, 2, alph_ip4(127, 0, 0, 1), port_a);
   g_ponger = g_b.spawn_on(1, &ponger, 0);
-  g_slow = g_b.spawn_on(1, &slow, 0);
+  g_slow = g_b.spawn_on(0, &slow, 0);  // a core of its own: when it is stuck the ponger still runs
   expect(g_b_link.start(port_b) == ALPH_OK, "machine B listens");
   g_b_thread = CreateThread(0, 0, &b_main, 0, 0, 0);
 }
@@ -290,6 +295,27 @@ fn main() -> int32 {
   expect(g_slow_bad == 0, "in the order they were sent ({g_slow_bad} out of order)");
   expect(g_b_link.full > 0, "because the ones that found it full were sent again ({g_b_link.full} times)");
   var held: Word = g_b_link.full;
+
+  // An actor that does not read at all: after half a second its message is
+  // dropped, and mail for the other actors of its machine crosses again.
+  g_slow_stuck = 1;
+  sent = 0;
+  tries = 0;
+  while (sent < 12 && tries < 20000) {
+    if (g_a.send(g_slow, NOTE, 100 + sent) == ALPH_OK) {
+      sent = sent + 1;
+    } else {
+      Sleep(1);
+    }
+    tries = tries + 1;
+  }
+  d.rounds = 0;
+  d.want = 20;
+  d.ref = g_a_actors[0].ask(g_ponger, PING, 0);
+  g_a.run();
+  expect(d.rounds == 20 && d.bad == 0, "mail still crosses behind an actor that does not read ({d.rounds} of 20 rounds)");
+  expect(g_b_link.shed > 0, "because what it would not take was dropped after half a second ({g_b_link.shed})");
+  g_slow_stuck = 0;
 
   // What a faulty machine might send, from a third socket claiming to be B.
   var notes: Word = 0;

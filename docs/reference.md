@@ -1307,7 +1307,8 @@ export struct AlphPlace {
   once_at: Word[16];     // when it was sent
   once_run: Word[16];    // the run it started
   pace: Word[16];     // a far place, by kind: ns from one answer to the next while it has work, 0 when not known
-  busy: Word;         // it still had work when its last answer came
+  busy: Word;         // it still had work when its last answer came,
+  paced: Word;        // and when that was
   own: AlphTimes*;    // a far place's own times, one for each of its first own_kinds kinds, 0 for none
   own_kinds: Word;
 }
@@ -1551,7 +1552,7 @@ export const ALPH_SHARED: Word = 1073741824;  // the name of the worker for a sh
 
 What a worker remembers so that a job is never done twice. An asker
 that wants that sends its jobs as ALPH_WORK_ONCE and says ALPH_HELLO
-first. The worker keeps, for each of four askers, the last four jobs it
+first. The worker keeps, for each of eight askers, the last four jobs it
 did for it and what each gave. A job sent again is answered from that
 memory and not done again.
 
@@ -1578,17 +1579,17 @@ export const ALPH_ONCE_STRANGER: Word = 4;  // not of this asker's run: refuse w
 
 ```mettle
 export struct AlphOnce {
-  asker: Word[4];   // who, 0 for a free row
-  floor: Word[4];   // refs at or under it are old
-  last: Word[4];    // when the row was last used: the least is given up for a fifth asker
-  ref: Word[16];    // four for each asker, 0 for none
-  out: Word[16];
-  busy: Word[16];
+  asker: Word[8];   // who, 0 for a free row
+  floor: Word[8];   // refs at or under it are old
+  last: Word[8];    // when the row was last used: the least is given up for a ninth asker
+  ref: Word[32];    // four for each asker, 0 for none
+  out: Word[32];
+  busy: Word[32];
   clock: Word;
 }
 ```
 
-What one worker remembers: four askers, and four jobs for each.
+What one worker remembers: eight askers, and four jobs for each.
 
 ### `AlphOnce_init__ptr`
 
@@ -1603,14 +1604,16 @@ Forgets everything: no asker is known.
 ### `AlphOnce_hello__ptr`
 
 ```mettle
-export fn AlphOnce_hello__ptr(o: AlphOnce*, from: Word, h: Word)
+export fn AlphOnce_hello__ptr(o: AlphOnce*, from: Word, h: Word) -> bool
 ```
 
 Call it as `o->hello(from, h)`, or `o.hello(from, h)` on a value.
 
 An asker's hello: a new run of refs starts at h, and what was remembered
-of that asker is forgotten. With four askers known already, the one
-heard from longest ago is given up.
+of that asker is forgotten. With eight askers known already, the one
+heard from longest ago is given up, unless a job of its is being done
+right now. Returns false when no row can be had: the hello is then not
+answered, and the asker says it again.
 
 ### `AlphOnce_seen__ptr`
 
@@ -1998,7 +2001,9 @@ twenty-fifth of a second is sent again: so between two machines messages
 arrive once and in the order they were sent, for as long as both are up.
 A message for an actor whose mailbox is full is not taken: it is sent
 again, and what is behind it waits, so a full mailbox slows a sender down
-and loses nothing. Every machine tells its peers it is alive 20 times a second.
+and loses nothing. An actor that has had no room for half a second is
+not reading: its message is then dropped, so it cannot hold up the rest.
+Every machine tells its peers it is alive 20 times a second.
 One that stays quiet for half a second is down: sends to it return
 ALPH_GONE and the watcher is told. If it was only out of reach, what was
 on its way is sent again when it is back. A machine that was restarted is
@@ -2060,6 +2065,8 @@ export struct AlphPeer {
   got: uint32;        // every message from it up to this one was taken
   owed: Word;         // messages taken since it was last told so
   waiting_since: Word;
+  stuck: uint32;      // the message being refused because its actor has no room,
+  stuck_at: Word;     // and since when
   again_ms: Word;     // how long its word is waited for before sending again
   window: AlphPacket[64];  // the messages it has not yet said it has
   held: AlphParcel*[64];   // and the bytes of those that carry any
@@ -2095,7 +2102,8 @@ export struct AlphLink {
   open: fn(rawptr, uint8*, uint8*, int64, uint32*, Word*, Word*) -> int64;
   sealer: rawptr;
   refused: Word;  // datagrams not sealed with the key, or already heard
-  full: Word;     // messages left to be sent again because their actor had no room
+  full: Word;     // messages left to be sent again because their actor had no room,
+  shed: Word;     // and messages dropped because it had none for half a second
   // Mail for a place that is neither on these cores nor a peer's goes to
   // beyond, if it is set: a board on this machine's serial line, say.
   beyond: fn(AlphLink*, Word, AlphMsg*) -> Word;
@@ -2600,9 +2608,12 @@ Closes the socket.
 A line of bytes to one other machine: any descriptor that carries bytes
 both ways, such as a serial port or a TCP connection. A thread reads it
 and hands each byte that arrives to take. A process has up to four
-lines. Each is opened, then set up, before the next is opened. Senders
-pick a line with alph_line_use, which they hold until alph_line_unlock,
-so one message at a time goes out, on whichever line.
+lines. Each is opened, then set up, before the next is opened. A sender
+takes a line with alph_line_use for one whole message and gives it back
+with alph_line_unlock, so two senders' bytes do not mix. Each line has a
+lock of its own, and a write never waits: a line whose other end has
+stopped reading loses what does not fit, and holds up no other line.
+The calls that name no line work on the line the calling thread holds.
 
 ### `alph_line_open`
 
@@ -2622,40 +2633,13 @@ export fn alph_line_which() -> Word
 
 Which line was opened last: 0 for the first.
 
-### `alph_line_start`
-
-```mettle
-export fn alph_line_start(take: fn(rawptr, int32) -> void, ctx: rawptr)
-```
-
-Says where the bytes that arrive on the line in use go, and starts
-reading it. Called again, it only changes where they go: one thread
-reads a line.
-
-### `alph_line_put`
-
-```mettle
-export fn alph_line_put(byte: uint8)
-```
-
-Puts one byte on the line in use. It goes out at the next flush, or when 128 are waiting.
-
-### `alph_line_flush`
-
-```mettle
-export fn alph_line_flush()
-```
-
-Sends what was put. If the other end is gone the rest is dropped.
-
 ### `alph_line_use`
 
 ```mettle
 export fn alph_line_use(line: Word)
 ```
 
-Takes the lines for one whole message on line `line`, so two senders'
-bytes do not mix. Give them back with alph_line_unlock.
+Takes a line for one whole message. Give it back with alph_line_unlock.
 
 ### `alph_line_lock`
 
@@ -2663,8 +2647,7 @@ bytes do not mix. Give them back with alph_line_unlock.
 export fn alph_line_lock()
 ```
 
-Held while one whole message is put and flushed, so two senders' bytes
-do not mix.
+Takes the line opened last: for a program with one line.
 
 ### `alph_line_unlock`
 
@@ -2672,7 +2655,33 @@ do not mix.
 export fn alph_line_unlock()
 ```
 
-Lets the next sender have the line.
+Lets the next sender have the line this thread holds.
+
+### `alph_line_start`
+
+```mettle
+export fn alph_line_start(take: fn(rawptr, int32) -> void, ctx: rawptr)
+```
+
+Says where the bytes that arrive on the line go, and starts reading it.
+Called again, it only changes where they go: one thread reads a line.
+
+### `alph_line_put`
+
+```mettle
+export fn alph_line_put(byte: uint8)
+```
+
+Puts one byte on the line. It goes out at the next flush, or when 128 are waiting.
+
+### `alph_line_flush`
+
+```mettle
+export fn alph_line_flush()
+```
+
+Sends what was put. It does not wait: if the other end is gone, or has
+stopped reading and the way to it is full, the rest is dropped.
 
 ## port/serial (host port)
 

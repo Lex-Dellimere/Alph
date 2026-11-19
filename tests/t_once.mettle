@@ -87,7 +87,9 @@ fn worker(a: AlphActor*, m: AlphMsg*) -> Word {
   }
   var answer: AlphMsg = { tag: ALPH_WORKED, from: a->pid, arg: 0, ref: m->ref };
   if (m->tag == ALPH_HELLO) {
-    g_memory.hello(m->from, m->ref);
+    if (!g_memory.hello(m->from, m->ref)) {
+      return 0;
+    }
     answer.tag = ALPH_HELLO;
   } else if (m->tag == ALPH_WORK_ONCE) {
     var seen: Word = g_memory.seen(m->from, m->ref, &answer.arg);
@@ -202,13 +204,15 @@ fn main() -> int32 {
   o.hello(7, 8192);
   expect(o.seen(7, 4101, &out) == ALPH_ONCE_STRANGER, "after a new hello the old run is a stranger's");
   expect(o.seen(7, 8193, &out) == ALPH_ONCE_RUN, "and the new run starts with nothing remembered");
-  o.hello(8, 4096);
-  o.hello(9, 4096);
-  o.hello(10, 4096);
-  expect(o.seen(7, 8193, &out) == ALPH_ONCE_RUN, "four askers are known at once");
-  o.hello(11, 4096);
-  expect(o.seen(8, 4097, &out) == ALPH_ONCE_STRANGER, "a fifth takes the place of the one heard from longest ago");
-  expect(o.seen(7, 8193, &out) == ALPH_ONCE_RUN && o.seen(11, 4097, &out) == ALPH_ONCE_RUN, "and the others stay");
+  for other in 8..15 {
+    o.hello((Word)other, 4096);
+  }
+  expect(o.seen(7, 8193, &out) == ALPH_ONCE_RUN, "eight askers are known at once");
+  o.begin(8, 4097);
+  expect(o.hello(15, 4096), "a ninth is taken in");
+  expect(o.seen(8, 4097, &out) == ALPH_ONCE_BUSY, "but not in place of one with a job being done");
+  expect(o.seen(9, 4097, &out) == ALPH_ONCE_STRANGER, "it takes the place of the idle one heard from longest ago");
+  expect(o.seen(7, 8193, &out) == ALPH_ONCE_RUN && o.seen(15, 4097, &out) == ALPH_ONCE_RUN, "and the others stay");
 
   // The asker is place 0, the worker place 4, and a bad way between them.
   g_a.init(&g_a_core[0], 1, &g_a_actors[0], 4, &g_a_mail[0], 16);

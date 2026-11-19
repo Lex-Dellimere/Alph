@@ -292,16 +292,21 @@ fn alph_machine_serve(a: AlphActor*, msg: AlphMsg*) -> Word {
     var t: AlphTaken* = (AlphTaken*)msg->arg;  // the job is the first thing in it
     var answer: AlphMsg = { tag: ALPH_WORKED, from: a->pid, arg: t->job.out, ref: t->ref };
     var sent: Word = ALPH_OK;
-    if (t->once != 0 && t->job.status == ALPH_OK) {
+    // Noted once: this message comes round again when the answer could
+    // not be sent, and by then a copy sent again may have been begun.
+    if (t->once == 1 && t->job.status == ALPH_OK) {
       m->done[s->kind].done(t->from, t->ref, t->job.out);
-    } else if (t->once != 0) {
+    } else if (t->once == 1) {
       m->done[s->kind].undo(t->from, t->ref);  // not done: a copy sent again may be
+    }
+    if (t->once == 1) {
+      t->once = 2;
     }
     if (t->job.status != ALPH_OK) {
       answer.tag = ALPH_REFUSED;
       answer.arg = t->job.status;  // full for now, or gone: no place here can run it
       sent = a->node->put(t->from, &answer);
-    } else if (t->job.back_count > 0 && t->once == 0) {
+    } else if (t->job.back_count > 0 && t->once == 0) {  // a job done at most once gives no bytes back
       for i in 0..8 {
         t->back[i] = (uint8)(((int64)t->job.out >> ((int64)i * 8)) & 255);
       }
@@ -316,9 +321,10 @@ fn alph_machine_serve(a: AlphActor*, msg: AlphMsg*) -> Word {
     return 0;
   }
   if (msg->tag == ALPH_HELLO) {
-    m->done[s->kind].hello(msg->from, msg->ref);
-    var hello: AlphMsg = { tag: ALPH_HELLO, from: a->pid, arg: 0, ref: msg->ref };
-    a->node->put(msg->from, &hello);
+    if (m->done[s->kind].hello(msg->from, msg->ref)) {
+      var hello: AlphMsg = { tag: ALPH_HELLO, from: a->pid, arg: 0, ref: msg->ref };
+      a->node->put(msg->from, &hello);
+    }
     return 0;
   }
   var once: Word = 0;

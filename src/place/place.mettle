@@ -158,7 +158,8 @@ export struct AlphPlace {
   once_at: Word[16];     // when it was sent
   once_run: Word[16];    // the run it started
   pace: Word[16];     // a far place, by kind: ns from one answer to the next while it has work, 0 when not known
-  busy: Word;         // it still had work when its last answer came
+  busy: Word;         // it still had work when its last answer came,
+  paced: Word;        // and when that was
   own: AlphTimes*;    // a far place's own times, one for each of its first own_kinds kinds, 0 for none
   own_kinds: Word;
 }
@@ -445,6 +446,7 @@ export fn AlphPlaces_add__ptr(p: AlphPlaces*, way: Word) -> AlphPlace* {
     x->answered = 0;
     x->gave_next = 0;
     x->busy = 0;
+    x->paced = 0;
     for k in 0..16 {
       x->pace[k] = 0;
       x->once_known[k] = 0;
@@ -642,6 +644,9 @@ fn alph_place_route(p: AlphPlaces*, x: AlphPlace*, job: AlphJob*, pid: Word*, ta
 fn alph_place_left(p: AlphPlaces*, x: AlphPlace*, job: AlphJob*) {
   x->backlog = x->backlog - job->owed;
   x->waiting = x->waiting - 1;
+  if (x->waiting == 0) {
+    x->busy = 0;  // the next answer follows idle time: no sample of its pace
+  }
 }
 
 // Sends a job to the place where it should finish first. The answer is an
@@ -948,17 +953,17 @@ export fn alph_place_run(a: AlphActor*, m: AlphMsg*) -> Word {
       parcel = (AlphParcel*)m->arg;
     }
     x->answers = x->answers + 1;
-    var gap: Word = alph_place_ns() - x->answered;
-    x->answered = x->answered + gap;
+    x->answered = alph_place_ns();
+    var gap: Word = x->answered - x->paced;
     var job: AlphJob* = x->open;
     var before: AlphJob* = 0;
     while (job != 0 && (job->far_ref != m->ref || (m->ref >= ONCE && job->far_to != m->from))) {
       before = job;
       job = job->next;
     }
-    if (job != 0 && job->far_ref >= ONCE && m->tag == ALPH_REFUSED && m->arg != ALPH_LOST && job->far_resent != 0) {
-      // Refused, but this job was sent more than once and another copy
-      // may have been taken: only an answer settles it.
+    if (job != 0 && job->far_ref >= ONCE && m->tag == ALPH_REFUSED && m->arg == ALPH_FULL && job->far_resent != 0) {
+      // Refused for now, but this job was sent more than once and another
+      // copy may have been taken: only an answer settles it.
       job = 0;
     }
     if (job == 0 && m->tag != ALPH_REFUSED) {
@@ -1021,6 +1026,7 @@ export fn alph_place_run(a: AlphActor*, m: AlphMsg*) -> Word {
           x->pace[job->kind] = pace;
         }
         alph_place_ran(p, x, job, job->ns, 0);
+        x->paced = x->answered;
         x->busy = 0;
         if (x->waiting > 0) {
           x->busy = 1;
@@ -1033,10 +1039,15 @@ export fn alph_place_run(a: AlphActor*, m: AlphMsg*) -> Word {
         // work stops going there until it is tried again. Either way the
         // job goes to whichever place is best now.
         var k: AlphKind* = &p->kinds[job->kind];
-        if (m->arg == ALPH_LOST) {
+        if (m->arg == ALPH_LOST || (job->far_ref >= ONCE && job->far_resent != 0)) {
           // The worker does not know this run of refs: it was restarted, or
-          // gave this machine up. Nothing out to it can be told done or not.
+          // gave this machine up. Or it will never do the kind again, and
+          // this job went out more than once. Nothing out to it can be
+          // told done or not.
           var kind: Word = job->kind;
+          if (m->arg == ALPH_GONE) {
+            alph_place_shut_far(p, x, kind);
+          }
           alph_place_lose(p, x, job);
           alph_place_lose_all(p, x, m->from);
           x->once_known[kind] = 0;
@@ -1080,7 +1091,8 @@ export fn alph_place_run(a: AlphActor*, m: AlphMsg*) -> Word {
     while (job != 0) {
       var after: AlphJob* = job->next;
       if (job->far_to == m->from && job->far_ref >= ONCE) {
-        alph_place_lose(p, x, job);  // done or not, no one can say
+        x->once_known[job->kind] = 0;  // its worker is said hello to again
+        alph_place_lose(p, x, job);    // done or not, no one can say
       } else if (job->far_to == m->from) {
         alph_place_elsewhere(a, p, x, job);
       } else {
