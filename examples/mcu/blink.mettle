@@ -1,6 +1,6 @@
-// alph on a bare 32-bit RISC-V board, no OS. The timer interrupt sends TICK
-// to the clock actor, which counts and tells the lamp. The lamp prints the
-// count and stops the node at 5.
+// alph on a bare 32-bit RISC-V board, no OS. A timer sends TICK to the clock
+// actor every millisecond. The clock counts and tells the lamp, which prints
+// the count and stops the node at 5.
 //
 //   mettle --release examples/mcu/blink.mettle --target riscv32-none \
 //       --board qemu-virt --emit-flat blink.bin -I ports/mcu
@@ -8,24 +8,18 @@
 //       -device loader,file=blink.bin,addr=0x80000000,force-raw=on
 
 import "alph/actor/actor";
+import "alph/time/time";
 
 const TICK: Word = 1;
 const LAMP: Word = 2;
-const TICK_US: int64 = 1000;
 
 var g_node: AlphNode;
-var g_actors: AlphActor[4];
-var g_mail: AlphMsg[16];
-var g_clock: Word = 0;
+var g_actors: AlphActor[2];
+var g_mail: AlphMsg[8];
+var g_time: AlphTime;
+var g_timers: AlphTimer[2];
 var g_lamp: Word = 0;
-var g_next: int64 = 0;
 var g_count: Word = 0;
-
-@interrupt fn mettle_trap_timer() {
-  g_next = g_next + TICK_US;
-  mettle_board_timer_at(g_next);
-  g_node.send(g_clock, TICK, 0);
-}
 
 @interrupt fn mettle_trap() {
   mettle_board_exit(99);
@@ -44,18 +38,19 @@ fn clock(a: AlphActor*, m: AlphMsg*) -> Word {
   var count: Word* = (Word*)a->state;
   *count = *count + 1;
   a->send(g_lamp, LAMP, *count);
+  g_time.after(1, a->pid, TICK, 0);
   return 0;
 }
 
 fn main() -> int32 {
-  g_node.init(&g_actors[0], 4, &g_mail[0], 4);
+  g_node.init(&g_actors[0], 2, &g_mail[0], 4);
+  g_time.init(&g_node, &g_timers[0], 2);
   g_lamp = g_node.spawn(&lamp, 0);
-  g_clock = g_node.spawn(&clock, (rawptr)&g_count);
+  var clock_pid: Word = g_node.spawn(&clock, (rawptr)&g_count);
   mettle_board_trap_install();
-  g_next = mettle_board_time_us() + TICK_US;
-  mettle_board_timer_at(g_next);
   mettle_irq_enable();
+  g_time.after(1, clock_pid, TICK, 0);
   g_node.run();
-  mettle_board_timer_cancel();
+  g_time.stop();
   return (int32)g_count;
 }

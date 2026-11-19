@@ -18,6 +18,12 @@ Everything else is something that sends messages. A timer interrupt sends a tick
 
 The node owns no memory. The caller hands it the actor slots and the mailboxes, so a board with 2 KB of RAM and a server with a million actors use the same code.
 
+## Time
+
+A timer is something that sends a message later, so it is a layer (`src/time`), not part of the core. `after` sends a message in so many milliseconds and returns a ref, `cancel` takes it back. The port's alarm rings when the soonest timer is due: the board's timer interrupt on `mcu`, one sleeping thread on `host`.
+
+Every operation looks at every timer slot. That is the smallest code and right for tens of timers. A server with thousands needs a timer wheel behind the same four functions, which is not built.
+
 ## Ports
 
 What differs between devices is in a port, a folder picked at build time with `-I ports/<name>`:
@@ -27,11 +33,11 @@ What differs between devices is in a port, a folder picked at build time with `-
 | `mcu` | one hart, no OS | 32 bits | 1,024 | 256 | `wfi` | interrupts off |
 | `host` | an x86-64 Linux process | 64 bits | 16 million | 32,768 | looks for mail for about 10 µs, then a futex | a spin lock |
 
-A port is one file of 30 to 100 lines. A new device is a new port.
+A port is two files, the gate and the alarm, of 30 to 100 lines each. A new device is a new port.
 
 ## Size
 
-`examples/mcu/blink.mettle` is two actors driven by a timer interrupt on 32-bit RISC-V. The whole image, board startup included, is 2,440 bytes. The core's share is about 1.2 KB. `check.sh` builds it, runs it in QEMU and fails above 5 KB.
+`examples/mcu/blink.mettle` is two actors and a timer on 32-bit RISC-V. The whole image, board startup included, is 3,192 bytes: about 1.2 KB of core, 1.1 KB of timers and alarm, the rest the board and the program. `check.sh` builds it, runs it in QEMU and fails above 5 KB.
 
 ## Places
 

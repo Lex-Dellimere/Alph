@@ -1,10 +1,11 @@
 // Nodes on several threads (src/cores): a token round a ring of cores, three
-// cores sending to one, requests and replies between cores, where spawn puts
-// actors, and pids that name no core.
+// cores sending to one, requests and replies between cores, a timer for an
+// actor on another core, where spawn puts actors, and pids that name no core.
 
 import "std/io";
 import "alph/actor/actor";
 import "alph/cores/cores";
+import "alph/time/time";
 
 const CORES: Word = 4;
 const SLOTS: Word = 8;
@@ -19,11 +20,14 @@ const NOTE: Word = 3;
 const MORE: Word = 4;
 const PING: Word = 5;
 const PONG: Word = 6;
+const DUE: Word = 7;
 
 var g_cores: AlphCores;
 var g_core: AlphCore[4];
 var g_actors: AlphActor[32];
 var g_mail: AlphMsg[256];
+var g_time: AlphTime;
+var g_timers: AlphTimer[4];
 var g_failures: int32 = 0;
 
 fn expect(ok: bool, what: string) {
@@ -131,6 +135,13 @@ fn pinger(a: AlphActor*, m: AlphMsg*) -> Word {
   return 0;
 }
 
+fn sleeper(a: AlphActor*, m: AlphMsg*) -> Word {
+  var woke: Word* = (Word*)a->state;
+  *woke = m->arg;
+  a->cores()->stop();
+  return 1;
+}
+
 fn idle(a: AlphActor*, m: AlphMsg*) -> Word {
   return 1;
 }
@@ -189,6 +200,14 @@ fn main() -> int32 {
   g_cores.run();
   expect(asker.rounds == ROUNDS, "every round ran ({asker.rounds})");
   expect(asker.bad == 0, "every reply came from the ponger with its request's ref ({asker.bad} did not)");
+
+  // A timer set through one core's node reaches an actor on another.
+  var woke: Word = 0;
+  g_time.init(&g_core[0].node, &g_timers[0], 4);
+  g_time.after(3, g_cores.spawn_on(3, &sleeper, (rawptr)&woke), DUE, 7);
+  g_cores.run();
+  g_time.stop();
+  expect(woke == 7, "a timer reaches an actor on another core");
 
   // Spawn picks the core with the fewest actors, so uneven cores even out.
   for i in 0..7 {
