@@ -1,0 +1,37 @@
+// A 64-bit Linux process: any thread may send, one thread runs the actors.
+
+export type Word = int64;
+export const ALPH_INDEX_BITS: Word = 32;
+
+const SYS_FUTEX: int64 = 202;
+const FUTEX_WAIT: int64 = 128;  // private
+const FUTEX_WAKE: int64 = 129;
+
+extern fn mettle_atomic_exchange_i32(target: int32*, value: int32) -> int32 with none = "mettle_atomic_exchange_i32";
+
+export struct AlphGate {
+  lock: int32;
+  wakes: int32;
+}
+
+export fn AlphGate_enter__ptr(g: AlphGate*) -> int32 {
+  while (mettle_atomic_exchange_i32(&g->lock, 1) != 0) {
+  }
+  return 0;
+}
+
+export fn AlphGate_leave__ptr(g: AlphGate*, was: int32) {
+  mettle_atomic_exchange_i32(&g->lock, 0);
+}
+
+// A wake between the leave and the wait changes wakes, so the wait returns.
+export fn AlphGate_sleep__ptr(g: AlphGate*, was: int32) {
+  var seen: int32 = g->wakes;
+  mettle_atomic_exchange_i32(&g->lock, 0);
+  syscall(SYS_FUTEX, (int64)&g->wakes, FUTEX_WAIT, (int64)seen, 0);
+}
+
+export fn AlphGate_wake__ptr(g: AlphGate*) {
+  g->wakes = g->wakes + 1;
+  syscall(SYS_FUTEX, (int64)&g->wakes, FUTEX_WAKE, 1);
+}

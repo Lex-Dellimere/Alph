@@ -17,6 +17,7 @@ cd "$ROOT" || exit 2
 METTLE="${METTLE:-$ROOT/../Mettle/bin/mettle}"
 OUT="build/check"
 MODES=("-s" "-s --release")
+MCU_LIMIT=5120  # bytes: the whole RISC-V image, board startup included
 mkdir -p "$OUT"
 
 # mettle.deps is generated (mbuild writes it on every build). Without mbuild,
@@ -64,7 +65,7 @@ for src in "${tests[@]}"; do
     exe="$OUT/$name.$tag"
     log="$OUT/$name.$tag.log"
     # shellcheck disable=SC2086
-    if ! "$METTLE" --build $mode "$src" -o "$exe" > "$log" 2>&1; then
+    if ! "$METTLE" --build $mode "$src" -I ports/host -o "$exe" > "$log" 2>&1; then
       echo "FAIL  $name [$mode] build (see $log)"
       tail -n 8 "$log" | sed 's/^/      /'
       fails=$((fails + 1))
@@ -79,6 +80,27 @@ for src in "${tests[@]}"; do
     fi
   done
 done
+
+# The core on a bare 32-bit RISC-V board: it must run and stay small.
+if [ "$#" -eq 0 ] && command -v qemu-system-riscv32 > /dev/null 2>&1; then
+  bin="$OUT/blink.bin"
+  log="$OUT/blink.log"
+  if ! "$METTLE" --release examples/mcu/blink.mettle --target riscv32-none --board qemu-virt \
+      --emit-flat "$bin" -I ports/mcu > "$log" 2>&1; then
+    echo "FAIL  mcu/blink build (see $log)"
+    fails=$((fails + 1))
+  else
+    size=$(stat -c %s "$bin")
+    got=$(timeout 20 qemu-system-riscv32 -M virt -bios none -nographic \
+      -device loader,file="$bin",addr=0x80000000,force-raw=on 2>> "$log" | tr -d '\r\n')
+    if [ "$got" = "12345" ] && [ "$size" -lt "$MCU_LIMIT" ]; then
+      echo "ok    mcu/blink [riscv32, $size bytes]"
+    else
+      echo "FAIL  mcu/blink printed '$got', $size bytes (limit $MCU_LIMIT)"
+      fails=$((fails + 1))
+    fi
+  fi
+fi
 
 if [ "$fails" -eq 0 ]; then
   echo "PASS"

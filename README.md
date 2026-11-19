@@ -90,10 +90,21 @@ To use distribution, also `import "alph/net/dist"` and map the cryptex package i
 
 It checks that `docs/api.md` matches the source, then builds every test and example in debug and release and runs it. After changing a doc comment, run `tools/apidoc.sh` to rebuild the reference.
 
+## The small core
+
+alph is being rebuilt on a core small enough for a microcontroller: actors, messages and a run loop in one file, [src/actor/actor.mettle](src/actor/actor.mettle). The same source runs on a bare 32-bit RISC-V board in a 2.4 KB image and in a Linux process. [docs/design.md](docs/design.md) says where this is going: one runtime that puts work on a core, a GPU or another machine, whichever is cheapest.
+
+```bash
+mettle --release examples/mcu/blink.mettle --target riscv32-none --board qemu-virt --emit-flat blink.bin -I ports/mcu
+qemu-system-riscv32 -M virt -bios none -nographic -device loader,file=blink.bin,addr=0x80000000,force-raw=on
+```
+
 ## Layout
 
 ```text
-src/alph.mettle             the runtime in one import
+src/actor/actor.mettle      the small core: actors, messages, the run loop
+ports/mcu, ports/host       what differs per device, picked with -I ports/<name>
+src/alph.mettle             the first runtime in one import
 src/core/node.mettle        the node: actors, schedulers, messages, links, monitors, requests, timers,
                             names and groups, IO and TCP, child processes, shutdown and signals
 src/core/mailbox.mettle     messages and the bounded mailbox

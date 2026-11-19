@@ -1,0 +1,25 @@
+// One hart, no OS: a microcontroller. The gate masks interrupts.
+
+export type Word = int32;
+export const ALPH_INDEX_BITS: Word = 16;
+
+export struct AlphGate {
+  unused: int32;
+}
+
+export fn AlphGate_enter__ptr(g: AlphGate*) -> int32 {
+  return mettle_irq_disable();
+}
+
+export fn AlphGate_leave__ptr(g: AlphGate*, was: int32) {
+  mettle_irq_restore(was);
+}
+
+// wfi wakes on a pending interrupt even while masked, so nothing is missed.
+export fn AlphGate_sleep__ptr(g: AlphGate*, was: int32) {
+  mettle_irq_wait();
+  mettle_irq_restore(was);
+}
+
+export fn AlphGate_wake__ptr(g: AlphGate*) {
+}

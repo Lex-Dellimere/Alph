@@ -1,0 +1,144 @@
+// The core on its own (src/actor): messages in order, requests and replies,
+// a full mailbox, a dead actor, a reused slot, and sends from another thread.
+
+import "std/io";
+import "std/thread";
+import "alph/actor/actor";
+
+const PING: Word = 1;
+const PONG: Word = 2;
+const GO: Word = 3;
+const NOTE: Word = 4;
+const QUIT: Word = 5;
+const ROUNDS: Word = 100000;
+const FROM_THREAD: Word = 20000;
+
+var g_node: AlphNode;
+var g_actors: AlphActor[8];
+var g_mail: AlphMsg[64];
+var g_failures: int32 = 0;
+var g_rounds: Word = 0;
+var g_bad_ref: Word = 0;
+var g_notes: Word = 0;
+var g_out_of_order: Word = 0;
+var g_sink: Word = 0;
+var g_refused: int32 = 0;
+
+fn expect(ok: bool, what: string) {
+  if (!ok) {
+    println("FAIL {what}");
+    g_failures = g_failures + 1;
+  }
+}
+
+fn ponger(a: AlphActor*, m: AlphMsg*) -> Word {
+  if (m->tag == QUIT) {
+    return 1;
+  }
+  a->reply(m, PONG, m->arg + 1);
+  return 0;
+}
+
+struct Pinger {
+  ponger: Word;
+  ref: Word;
+}
+
+fn pinger(a: AlphActor*, m: AlphMsg*) -> Word {
+  var p: Pinger* = (Pinger*)a->state;
+  if (m->tag == GO) {
+    p->ponger = m->arg;
+    p->ref = a->ask(p->ponger, PING, 0);
+    return 0;
+  }
+  if (m->ref != p->ref) {
+    g_bad_ref = g_bad_ref + 1;
+  }
+  g_rounds = m->arg;
+  if (m->arg >= ROUNDS) {
+    a->send(p->ponger, QUIT, 0);
+    return 1;
+  }
+  p->ref = a->ask(p->ponger, PING, m->arg);
+  return 0;
+}
+
+// Counts NOTEs, which must arrive in the order of their args.
+fn sink(a: AlphActor*, m: AlphMsg*) -> Word {
+  if (m->tag == QUIT) {
+    return 1;
+  }
+  if (m->arg != g_notes) {
+    g_out_of_order = g_out_of_order + 1;
+  }
+  g_notes = g_notes + 1;
+  return 0;
+}
+
+fn idle(a: AlphActor*, m: AlphMsg*) -> Word {
+  return 1;
+}
+
+// Another thread: sends in order, waiting out a full mailbox.
+fn outside(arg: cstring) -> uint32 {
+  var i: Word = 0;
+  while (i < FROM_THREAD) {
+    var out: Word = g_node.send(g_sink, NOTE, i);
+    if (out == ALPH_OK) {
+      i = i + 1;
+    } else if (out == ALPH_FULL) {
+      atomic_inc_i32(&g_refused);
+    } else {
+      return 1;
+    }
+  }
+  while (g_node.send(g_sink, QUIT, 0) == ALPH_FULL) {
+  }
+  return 0;
+}
+
+fn main() -> int32 {
+  g_node.init(&g_actors[0], 8, &g_mail[0], 8);
+
+  // A full mailbox refuses, a pid that never lived is gone.
+  var quiet: Word = g_node.spawn(&idle, 0);
+  for i in 0..8 {
+    expect(g_node.send(quiet, NOTE, 0) == ALPH_OK, "a mailbox takes its 8 messages");
+  }
+  expect(g_node.send(quiet, NOTE, 0) == ALPH_FULL, "the 9th is refused");
+  expect(g_node.send(quiet + 1, NOTE, 0) == ALPH_GONE, "an unused slot is gone");
+  expect(g_node.send(0, NOTE, 0) == ALPH_GONE, "pid 0 is gone");
+
+  // It exits on its first message; its slot's next actor has a new pid.
+  g_node.run();
+  expect(g_node.send(quiet, NOTE, 0) == ALPH_GONE, "an exited actor is gone");
+  var again: Word = g_node.spawn(&idle, 0);
+  expect(again != quiet, "a reused slot gives a new pid");
+  expect(g_node.send(quiet, NOTE, 0) == ALPH_GONE, "the old pid stays gone");
+  expect(g_node.send(again, NOTE, 0) == ALPH_OK, "the new one takes mail");
+  g_node.run();
+
+  // Requests and replies, one at a time.
+  var state: Pinger;
+  var po: Word = g_node.spawn(&ponger, 0);
+  var pi: Word = g_node.spawn(&pinger, (rawptr)&state);
+  g_node.send(pi, GO, po);
+  g_node.run();
+  expect(g_rounds == ROUNDS, "every round ran ({g_rounds})");
+  expect(g_bad_ref == 0, "every reply carried its request's ref ({g_bad_ref} did not)");
+
+  // Sends from another thread while the node runs.
+  g_sink = g_node.spawn(&sink, 0);
+  var t: int64 = CreateThread(0, 0, &outside, 0, 0, 0);
+  g_node.run();
+  thread_join_infinite(t);
+  thread_close(t);
+  expect(g_notes == FROM_THREAD, "every message from the thread arrived ({g_notes})");
+  expect(g_out_of_order == 0, "in order ({g_out_of_order} were not)");
+
+  if (g_failures != 0) {
+    return 1;
+  }
+  println("actor ok: {g_rounds} requests, {g_notes} messages from a thread ({g_refused} refused and sent again)");
+  return 0;
+}

@@ -1,0 +1,61 @@
+// alph on a bare 32-bit RISC-V board, no OS. The timer interrupt sends TICK
+// to the clock actor, which counts and tells the lamp. The lamp prints the
+// count and stops the node at 5.
+//
+//   mettle --release examples/mcu/blink.mettle --target riscv32-none \
+//       --board qemu-virt --emit-flat blink.bin -I ports/mcu
+//   qemu-system-riscv32 -M virt -bios none -nographic \
+//       -device loader,file=blink.bin,addr=0x80000000,force-raw=on
+
+import "alph/actor/actor";
+
+const TICK: Word = 1;
+const LAMP: Word = 2;
+const TICK_US: int64 = 1000;
+
+var g_node: AlphNode;
+var g_actors: AlphActor[4];
+var g_mail: AlphMsg[16];
+var g_clock: Word = 0;
+var g_lamp: Word = 0;
+var g_next: int64 = 0;
+var g_count: Word = 0;
+
+@interrupt fn mettle_trap_timer() {
+  g_next = g_next + TICK_US;
+  mettle_board_timer_at(g_next);
+  g_node.send(g_clock, TICK, 0);
+}
+
+@interrupt fn mettle_trap() {
+  mettle_board_exit(99);
+}
+
+fn lamp(a: AlphActor*, m: AlphMsg*) -> Word {
+  mettle_board_putc((uint8)(48 + m->arg));
+  mettle_board_putc(10);
+  if (m->arg >= 5) {
+    a->node->stop();
+  }
+  return 0;
+}
+
+fn clock(a: AlphActor*, m: AlphMsg*) -> Word {
+  var count: Word* = (Word*)a->state;
+  *count = *count + 1;
+  a->send(g_lamp, LAMP, *count);
+  return 0;
+}
+
+fn main() -> int32 {
+  g_node.init(&g_actors[0], 4, &g_mail[0], 4);
+  g_lamp = g_node.spawn(&lamp, 0);
+  g_clock = g_node.spawn(&clock, (rawptr)&g_count);
+  mettle_board_trap_install();
+  g_next = mettle_board_time_us() + TICK_US;
+  mettle_board_timer_at(g_next);
+  mettle_irq_enable();
+  g_node.run();
+  mettle_board_timer_cancel();
+  return (int32)g_count;
+}

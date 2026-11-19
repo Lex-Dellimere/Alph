@@ -1,0 +1,214 @@
+// alph's core: actors, messages and the loop that runs them.
+//
+// An actor is a state and a handler. A message is four words. A node holds
+// the actors and runs one message at a time. Everything else (time, IO, a
+// GPU, other machines) is something that sends messages.
+//
+// The node owns no memory: the caller hands it the actor slots and the
+// mailboxes. What differs between devices lives in the port, picked at
+// build time with -I ports/<name>.
+
+import "port/port";
+
+export const ALPH_OK: Word = 0;
+export const ALPH_FULL: Word = -1;  // the mailbox is full
+export const ALPH_GONE: Word = -2;  // no such actor
+
+export struct AlphMsg {
+  tag: Word;
+  from: Word;
+  arg: Word;
+  ref: Word;
+}
+
+export struct AlphActor {
+  next: AlphActor*;
+  node: AlphNode*;
+  pid: Word;     // this slot's pid; the next one's once the actor is gone
+  alive: Word;
+  queued: Word;  // on the run queue, or running
+  handle: fn(AlphActor*, AlphMsg*) -> Word with alloc, syscall, asm;
+  state: rawptr;
+  mail: AlphMsg*;
+  head: Word;
+  count: Word;
+}
+
+export struct AlphNode {
+  gate: AlphGate;
+  actors: AlphActor*;
+  slots: Word;
+  room: Word;   // messages a mailbox holds
+  free: AlphActor*;
+  first: AlphActor*;
+  last: AlphActor*;
+  live: Word;
+  stopped: Word;
+  refs: Word;   // the last ref given out
+}
+
+// mail holds slots * room messages.
+export fn AlphNode_init__ptr(n: AlphNode*, actors: AlphActor*, slots: Word, mail: AlphMsg*, room: Word) {
+  n->actors = actors;
+  n->slots = slots;
+  n->room = room;
+  n->free = 0;
+  n->first = 0;
+  n->last = 0;
+  n->live = 0;
+  n->stopped = 0;
+  n->refs = 0;
+  var i: Word = slots;
+  while (i > 0) {
+    i = i - 1;
+    var a: AlphActor* = &actors[i];
+    a->node = n;
+    a->pid = (Word)(((Word)1 << ALPH_INDEX_BITS) | i);
+    a->alive = 0;
+    a->mail = &mail[i * room];
+    a->next = n->free;
+    n->free = a;
+  }
+}
+
+// Returns the new actor's pid, or 0 when every slot is taken.
+export fn AlphNode_spawn__ptr(n: AlphNode*, handle: fn(AlphActor*, AlphMsg*) -> Word with alloc, syscall, asm,
+                              state: rawptr) -> Word {
+  var was: int32 = n->gate.enter();
+  var a: AlphActor* = n->free;
+  var pid: Word = 0;
+  if (a != 0) {
+    n->free = a->next;
+    a->handle = handle;
+    a->state = state;
+    a->head = 0;
+    a->count = 0;
+    a->queued = 0;
+    a->alive = 1;
+    n->live = n->live + 1;
+    pid = a->pid;
+  }
+  n->gate.leave(was);
+  return pid;
+}
+
+fn alph_enqueue(n: AlphNode*, a: AlphActor*) {
+  a->next = 0;
+  if (n->last != 0) {
+    n->last->next = a;
+  } else {
+    n->first = a;
+  }
+  n->last = a;
+}
+
+fn alph_put(n: AlphNode*, to: Word, m: AlphMsg*) -> Word {
+  var i: Word = (Word)(to & (((Word)1 << ALPH_INDEX_BITS) - 1));
+  if (i >= n->slots) {
+    return ALPH_GONE;
+  }
+  var a: AlphActor* = &n->actors[i];
+  var out: Word = ALPH_GONE;
+  var was: int32 = n->gate.enter();
+  if (a->alive != 0 && a->pid == to) {
+    out = ALPH_FULL;
+    if (a->count < n->room) {
+      var at: Word = a->head + a->count;
+      if (at >= n->room) {
+        at = at - n->room;
+      }
+      a->mail[at] = *m;
+      a->count = a->count + 1;
+      if (a->queued == 0) {
+        a->queued = 1;
+        alph_enqueue(n, a);
+        n->gate.wake();
+      }
+      out = ALPH_OK;
+    }
+  }
+  n->gate.leave(was);
+  return out;
+}
+
+// From outside an actor: another thread, an interrupt, main.
+export fn AlphNode_send__ptr(n: AlphNode*, to: Word, tag: Word, arg: Word) -> Word {
+  var m: AlphMsg = { tag: tag, from: 0, arg: arg, ref: 0 };
+  return alph_put(n, to, &m);
+}
+
+export fn AlphActor_send__ptr(a: AlphActor*, to: Word, tag: Word, arg: Word) -> Word {
+  var m: AlphMsg = { tag: tag, from: a->pid, arg: arg, ref: 0 };
+  return alph_put(a->node, to, &m);
+}
+
+// Sends a request. Returns its ref (above 0), which the reply carries, or
+// ALPH_FULL or ALPH_GONE.
+export fn AlphActor_ask__ptr(a: AlphActor*, to: Word, tag: Word, arg: Word) -> Word {
+  var n: AlphNode* = a->node;
+  var was: int32 = n->gate.enter();
+  n->refs = n->refs + 1;
+  var ref: Word = n->refs;
+  n->gate.leave(was);
+  var m: AlphMsg = { tag: tag, from: a->pid, arg: arg, ref: ref };
+  var out: Word = alph_put(n, to, &m);
+  if (out != ALPH_OK) {
+    return out;
+  }
+  return ref;
+}
+
+// Answers m: the same ref goes back to its sender.
+export fn AlphActor_reply__ptr(a: AlphActor*, m: AlphMsg*, tag: Word, arg: Word) -> Word {
+  var r: AlphMsg = { tag: tag, from: a->pid, arg: arg, ref: m->ref };
+  return alph_put(a->node, m->from, &r);
+}
+
+// Makes run return once the handler in progress is done.
+export fn AlphNode_stop__ptr(n: AlphNode*) {
+  var was: int32 = n->gate.enter();
+  n->stopped = 1;
+  n->gate.wake();
+  n->gate.leave(was);
+}
+
+// Runs actors until none is left, or stop. A handler that returns non-zero
+// ends its actor. With nothing to do the node sleeps until a message arrives.
+export fn AlphNode_run__ptr(n: AlphNode*) {
+  var m: AlphMsg;
+  while (n->live > 0 && n->stopped == 0) {
+    var was: int32 = n->gate.enter();
+    var a: AlphActor* = n->first;
+    if (a == 0) {
+      n->gate.sleep(was);
+      continue;
+    }
+    n->first = a->next;
+    if (n->first == 0) {
+      n->last = 0;
+    }
+    m = a->mail[a->head];
+    a->head = a->head + 1;
+    if (a->head == n->room) {
+      a->head = 0;
+    }
+    a->count = a->count - 1;
+    n->gate.leave(was);
+
+    var end: Word = a->handle(a, &m);
+
+    was = n->gate.enter();
+    if (end != 0) {
+      a->alive = 0;
+      a->pid = a->pid + ((Word)1 << ALPH_INDEX_BITS);
+      a->next = n->free;
+      n->free = a;
+      n->live = n->live - 1;
+    } else if (a->count > 0) {
+      alph_enqueue(n, a);
+    } else {
+      a->queued = 0;
+    }
+    n->gate.leave(was);
+  }
+}
