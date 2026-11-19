@@ -59,6 +59,10 @@ Placement is one decision made from measured costs, not three separate features.
 
    For the smallest tiles alph beats both, because it uses both. For the rest it matches the GPU. One limit is real: alph predicts a job's time from its size, and a Mandelbrot tile's time depends on where in the picture it is.
 
+3. **Machines.** Started, as `src/link`. Each machine owns a run of place numbers, so a pid says which machine its actor is on and an actor sends to it the way it sends next door. A message crosses in one UDP datagram. On the wire a pid is its three parts, because a 32-bit board and a 64-bit server pack them differently. Every machine tells its peers it is alive 20 times a second. One that stays quiet for half a second is down: sends to it are refused and a watcher actor is told. A machine that comes back counts as a new one, so mail meant for the old one is not handed to the new. Measured between two machines in one process over this computer's loopback: a request and its reply in under 40 µs, a lost machine noticed in 500 to 570 ms over 50 runs.
+
+   What it does not do yet: a message arrives once or not at all, and nothing is sent again; nothing is encrypted or signed, so it is for a network you trust; peers are listed by hand; a job from `src/place` cannot go to another machine; and there is no link for the `mcu` port. The first runtime's `src/net/dist` has encryption and remote links and monitors, which move over later.
+
 ## Crossings
 
 A message to another core moves cache lines over the memory bus. A job for the GPU moves data over PCIe. A message to another machine is a datagram. These are one thing, a crossing, and data is what makes a crossing expensive: a message is four words, data is megabytes. Two rules follow.
@@ -68,10 +72,6 @@ A message to another core moves cache lines over the memory bus. A job for the G
 **A crossing carries everything that is waiting.** One lock, one launch or one datagram for a batch, not one each. The fetch above is this rule by hand. It is not yet built into the cores or the link, where every message still crosses alone.
 
 What is not built: alph does not yet know where a job's data is. The program keeps its data on the GPU and asks for the fetch itself. Next is a home for each piece of data, counted when a place is chosen, so that a job with its data on the GPU is not sent to a core that would have to pull the data across first.
-
-3. **Machines.** Started, as `src/link`. Each machine owns a run of place numbers, so a pid says which machine its actor is on and an actor sends to it the way it sends next door. A message crosses in one UDP datagram. On the wire a pid is its three parts, because a 32-bit board and a 64-bit server pack them differently. Every machine tells its peers it is alive 20 times a second. One that stays quiet for half a second is down: sends to it are refused and a watcher actor is told. A machine that comes back counts as a new one, so mail meant for the old one is not handed to the new. Measured between two machines in one process over this computer's loopback: a request and its reply in under 40 µs, a lost machine noticed in 500 to 570 ms over 50 runs.
-
-   What it does not do yet: a message arrives once or not at all, and nothing is sent again; nothing is encrypted or signed, so it is for a network you trust; peers are listed by hand; a job from `src/place` cannot go to another machine; and there is no link for the `mcu` port. The first runtime's `src/net/dist` has encryption and remote links and monitors, which move over later.
 
 ## The old runtime
 
