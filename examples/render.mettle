@@ -4,7 +4,8 @@
 // it should finish first.
 //
 // Work travels, data stays: a tile rendered on the GPU stays there. When the
-// picture is done, what the GPU holds crosses to the host once, in one piece.
+// picture is done the boss asks for it on the host, and alph has the GPU's
+// place bring what it holds across once, in one piece.
 // Copying each tile back as it finished cost three times as much for small
 // tiles, nearly all of it the crossing.
 //
@@ -27,7 +28,7 @@ const WINDOW: Word = 8;  // tiles out at once
 const EITHER: Word = 0;
 const CORES_ONLY: Word = 1;
 const GPU_ONLY: Word = 2;
-const FETCH: Word = 3;  // brings what the GPU holds to the host
+const FETCH: Word = 3;  // a job only a core can run, on data that is on the GPU: alph brings it
 const GO: Word = 1;
 const STEPS: Word = 13;
 
@@ -107,11 +108,17 @@ fn tile_on_gpu(job: AlphJob*) -> Word {
   return 0;
 }
 
-// One crossing for everything the GPU holds.
-fn fetch_on_gpu(job: AlphJob*) -> Word {
+// One crossing for everything the GPU holds. alph runs this on the GPU's
+// place when a core is to run a job whose data is on the GPU.
+fn bring_picture(job: AlphJob*) -> Word {
   if (g_gpu_state != 1 || gpu_to_host((uint8*)&g_fetched[0], g_device, (int64)PIXELS * 4) != 0) {
     return 1;
   }
+  return 0;
+}
+
+// The picture is on the host by the time a core runs this.
+fn picture_here(job: AlphJob*) -> Word {
   return 0;
 }
 
@@ -213,6 +220,7 @@ fn boss(a: AlphActor*, m: AlphMsg*) -> Word {
       t->count = s->tile;
       job->kind = s->kind;
       job->size = (Word)s->tile;
+      job->home = ALPH_NOWHERE;  // a tile is made, not moved
       var out: Word = g_places.ask(a, job);
       if (out < 0) {
         job->next = b->free;
@@ -235,6 +243,7 @@ fn boss(a: AlphActor*, m: AlphMsg*) -> Word {
       b->free = fetch->next;
       fetch->kind = FETCH;
       fetch->size = (Word)PIXELS;
+      fetch->home = ALPH_GPU;
       b->fetching = true;
       b->back = b->back - 1;  // the fetch's answer makes the count whole again
       if (g_places.ask(a, fetch) > 0) {
@@ -265,7 +274,8 @@ fn main() -> int32 {
   g_places.kind(EITHER, &tile_on_core, &tile_on_gpu);
   g_places.kind(CORES_ONLY, &tile_on_core, 0);
   g_places.kind(GPU_ONLY, 0, &tile_on_gpu);
-  g_places.kind(FETCH, 0, &fetch_on_gpu);
+  g_places.kind(FETCH, &picture_here, 0);
+  g_places.bring(FETCH, &bring_picture);
   var boss_pid: Word = g_cores.spawn_on(0, &boss, (rawptr)&g_boss);
   g_places.on_core(&g_cores, 1, ALPH_CPU);
   g_places.on_core(&g_cores, 2, ALPH_CPU);

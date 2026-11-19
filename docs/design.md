@@ -71,7 +71,9 @@ A message to another core moves cache lines over the memory bus. A job for the G
 
 **A crossing carries everything that is waiting.** One lock, one launch or one datagram for a batch, not one each. The fetch above is this rule by hand. It is not yet built into the cores or the link, where every message still crosses alone.
 
-What is not built: alph does not yet know where a job's data is. The program keeps its data on the GPU and asks for the fetch itself. Next is a home for each piece of data, counted when a place is chosen, so that a job with its data on the GPU is not sent to a core that would have to pull the data across first.
+alph knows where a job's data is. A job names its data's home: the host, the GPU, or nowhere yet. alph keeps separate times for a job run where its data is and one run away from it, so the cost of the crossing is part of choosing a place and a job tends to stay with its data. In the test, where crossing costs 400 µs either way, 197 of 200 jobs with data on the host stayed on the cores and 191 of 200 with data on the GPU stayed on the GPU. When a core is to run a job whose data is on the GPU, the GPU's own place brings the data first, because only that thread may touch the GPU. A program asks for its data on the host the same way: a job only a core can run, on data that is on the GPU. That is how the render example gets its picture back.
+
+What was tried and did not help: letting a node take eight messages in one visit to its lock, where it took one. The 8-core storm, the two-core ping and the single-node ping all measured the same within noise, so it was taken out. The cost of a message between cores is the cache lines the sender and the receiver both touch, not how often the receiver takes its lock. Removing it needs a queue per pair of cores that the sender writes without touching anything the receiver owns, which changes what a full mailbox can tell a sender. Not built.
 
 ## The old runtime
 

@@ -10,6 +10,12 @@
 // once the time spent since is 16 times what a run of it costs, so a wrong
 // number costs little and is found.
 //
+// Work travels, data stays. A job says where its data is: its home. Running
+// it the other way means the data must cross first, so alph keeps separate
+// times for a job run where its data is and one run away from it, and a job
+// tends to stay with its data. Data on the GPU that a core needs is brought
+// by the GPU's own place, the only thread that may touch the GPU.
+//
 // The program writes the two ways. alph only times them, so nothing here
 // knows what a GPU is. x86-64 Linux, like the cores.
 
@@ -19,9 +25,11 @@ import "alph/cores/cores";
 
 export const ALPH_CPU: Word = 0;
 export const ALPH_GPU: Word = 1;
+export const ALPH_NOWHERE: Word = -1;  // a job's home when it has no data yet
 export const ALPH_RUN: Word = -1;    // to a place: run the job in arg
 export const ALPH_DONE: Word = -2;   // from a place: the job in arg is done
 const ALPH_NUDGE: Word = -3;
+const ALPH_BRING: Word = -6;         // to the GPU's place: bring the job's data to the host, then pass it on
 const WAYS: Word = 2;
 const SIZES: Word = 32;              // sizes are told apart by their power of two
 const FRESH: Word = 16;
@@ -31,24 +39,32 @@ export struct AlphJob {
   kind: Word;
   size: Word;    // how much work, in the program's own unit
   data: rawptr;
+  home: Word;    // where its data is: ALPH_CPU, ALPH_GPU or ALPH_NOWHERE. alph sets it to where the job ran
   status: Word;  // ALPH_OK, ALPH_GONE when no place can run it, ALPH_FULL to ask again
   way: Word;     // how it was run
-  ns: Word;      // how long that took
+  ns: Word;      // how long that took, bringing its data included
   asker: Word;
   ref: Word;
   owed: Word;
+  at: Word;      // which of the kind's times this run is, and
+  other: Word;   // which it would have been the other way
+  moved: Word;   // ns spent bringing its data
+  to: AlphPlace*;
   next: AlphJob*;
 }
 
 export struct AlphKind {
   cpu: fn(AlphJob*) -> Word;
   gpu: fn(AlphJob*) -> Word;
+  bring: fn(AlphJob*) -> Word;
   off: Word[2];    // this way cannot run the kind
   warm: Word[2];   // its first run is over: that one pays for starting up
-  est: Word[64];   // ns a job of this size takes on average, 0 when not known
-  low: Word[64];   // ns it takes when nothing gets in its way
-  last: Word[64];  // the time before, 0 when there was none
-  since: Word[64]; // ns of work done the other way since this one was timed
+  // Times are kept by way, by whether the data was at home there or had to
+  // cross, and by size.
+  est: Word[128];   // ns a job takes on average, 0 when not known
+  low: Word[128];   // ns it takes when nothing gets in its way
+  last: Word[128];  // the time before, 0 when there was none
+  since: Word[128]; // ns of work done the other way since this one was timed
 }
 
 export struct AlphPlace {
@@ -77,14 +93,26 @@ fn alph_place_ns() -> Word {
   return (Word)(ts[0] * 1000000000 + ts[1]);
 }
 
-fn alph_place_slot(way: Word, size: Word) -> Word {
+// Whether a job's data would have to cross to run this way.
+fn alph_place_away(job: AlphJob*, way: Word) -> Word {
+  if (job->home == ALPH_NOWHERE || job->home == way) {
+    return 0;
+  }
+  return 1;
+}
+
+fn alph_place_row(job: AlphJob*, way: Word) -> Word {
+  return (Word)((way * 2 + alph_place_away(job, way)) * SIZES);
+}
+
+fn alph_place_size(size: Word) -> Word {
   var b: Word = 0;
   var s: Word = size;
   while (s > 1 && b < SIZES - 1) {
     s = (Word)(s >> 1);
     b = b + 1;
   }
-  return (Word)(way * SIZES + b);
+  return b;
 }
 
 // places holds room places, kinds holds count kinds.
@@ -109,6 +137,7 @@ export fn AlphPlaces_kind__ptr(p: AlphPlaces*, kind: Word, cpu: fn(AlphJob*) -> 
   var k: AlphKind* = &p->kinds[kind];
   k->cpu = cpu;
   k->gpu = gpu;
+  k->bring = 0;
   k->off[ALPH_CPU] = 0;
   k->off[ALPH_GPU] = 0;
   if (cpu == 0) {
@@ -120,12 +149,20 @@ export fn AlphPlaces_kind__ptr(p: AlphPlaces*, kind: Word, cpu: fn(AlphJob*) -> 
   for i in 0..2 {
     k->warm[i] = 0;
   }
-  for i in 0..64 {
+  for i in 0..128 {
     k->est[i] = 0;
     k->low[i] = 0;
     k->last[i] = 0;
     k->since[i] = 0;
   }
+}
+
+// Says how a kind's data on the GPU is brought to the host. It runs on the
+// GPU's place and returns 0, or non-zero when it could not, after which it
+// is not tried again. Without it, a job whose data is on the GPU runs only
+// there. Call it after kind.
+export fn AlphPlaces_bring__ptr(p: AlphPlaces*, kind: Word, bring: fn(AlphJob*) -> Word) {
+  p->kinds[kind].bring = bring;
 }
 
 // A new place that runs jobs one way. Spawn alph_place_run with it as the
@@ -170,17 +207,16 @@ export fn AlphPlaces_on_core__ptr(p: AlphPlaces*, cores: AlphCores*, core: Word,
 // through the two nearest sizes that were timed. 0 with fewer than two. So a
 // way already known to be slow for big jobs is not tried on a bigger one
 // just to find out.
-fn alph_place_guess(k: AlphKind*, way: Word, size: Word) -> Word {
-  var mine: Word = (Word)(alph_place_slot(way, size) - way * SIZES);
+fn alph_place_guess(k: AlphKind*, row: Word, mine: Word) -> Word {
   var near: Word[2];
   var found: Word = 0;
   var d: Word = 1;
   while (d < SIZES && found < 2) {
-    if (mine - d >= 0 && k->est[way * SIZES + mine - d] != 0) {
+    if (mine - d >= 0 && k->est[row + mine - d] != 0) {
       near[found] = mine - d;
       found = found + 1;
     }
-    if (found < 2 && mine + d < SIZES && k->est[way * SIZES + mine + d] != 0) {
+    if (found < 2 && mine + d < SIZES && k->est[row + mine + d] != 0) {
       near[found] = mine + d;
       found = found + 1;
     }
@@ -191,8 +227,8 @@ fn alph_place_guess(k: AlphKind*, way: Word, size: Word) -> Word {
   }
   var x0: float64 = (float64)((int64)1 << (int64)near[0]);
   var x1: float64 = (float64)((int64)1 << (int64)near[1]);
-  var y0: float64 = (float64)k->est[way * SIZES + near[0]];
-  var y1: float64 = (float64)k->est[way * SIZES + near[1]];
+  var y0: float64 = (float64)k->est[row + near[0]];
+  var y1: float64 = (float64)k->est[row + near[1]];
   var slope: float64 = (y1 - y0) / (x1 - x0);
   if (slope < (float64)0) {
     slope = (float64)0;
@@ -211,17 +247,22 @@ fn alph_place_pick(p: AlphPlaces*, job: AlphJob*) -> AlphPlace* {
   var best: AlphPlace* = 0;
   var best_cost: Word = 0;
   var best_est: Word = 0;
+  var size: Word = alph_place_size(job->size);
   var was: int32 = p->gate.enter();
   for i in 0..p->count {
     var x: AlphPlace* = &p->places[i];
     if (k->off[x->way] != 0) {
       continue;
     }
-    var at: Word = alph_place_slot(x->way, job->size);
+    if (x->way == ALPH_CPU && job->home == ALPH_GPU && k->bring == 0) {
+      continue;
+    }
+    var row: Word = alph_place_row(job, x->way);
+    var at: Word = row + size;
     var est: Word = k->est[at];
     var low: Word = k->low[at];
     if (est == 0) {
-      est = alph_place_guess(k, x->way, job->size);
+      est = alph_place_guess(k, row, size);
       low = est;
     }
     var cost: Word = x->backlog + est;
@@ -241,11 +282,34 @@ fn alph_place_pick(p: AlphPlaces*, job: AlphJob*) -> AlphPlace* {
   }
   if (best != 0) {
     job->owed = best_est;
+    job->at = alph_place_row(job, best->way) + size;
+    job->other = alph_place_row(job, 1 - best->way) + size;
     best->backlog = best->backlog + best_est;
     best->waiting = best->waiting + 1;
   }
   p->gate.leave(was);
   return best;
+}
+
+// Where a job picked for a place goes first, and with what tag: to the
+// place itself, or, when its data is on the GPU and the place is a core, to
+// the GPU's place to be brought. False when there is no such place.
+fn alph_place_route(p: AlphPlaces*, x: AlphPlace*, job: AlphJob*, pid: Word*, tag: Word*) -> bool {
+  *pid = x->pid;
+  *tag = ALPH_RUN;
+  job->moved = 0;
+  if (x->way == ALPH_GPU || job->home != ALPH_GPU) {
+    return true;
+  }
+  for i in 0..p->count {
+    if (p->places[i].way == ALPH_GPU) {
+      *pid = p->places[i].pid;
+      *tag = ALPH_BRING;
+      job->to = x;
+      return true;
+    }
+  }
+  return false;
 }
 
 fn alph_place_left(p: AlphPlaces*, x: AlphPlace*, job: AlphJob*) {
@@ -256,7 +320,7 @@ fn alph_place_left(p: AlphPlaces*, x: AlphPlace*, job: AlphJob*) {
 // Sends a job to the place where it should finish first. The answer is an
 // ALPH_DONE message with the job in arg and the ref this returns. From here
 // until that answer the job is alph's: leave it where it is and do not read
-// or write it. Returns ALPH_FULL when that place's
+// or write it. Set its kind, size and home first. Returns ALPH_FULL when that place's
 // mailbox is full, ALPH_GONE when no place can run the kind or there is no
 // such kind.
 export fn AlphPlaces_ask__ptr(p: AlphPlaces*, a: AlphActor*, job: AlphJob*) -> Word {
@@ -267,7 +331,12 @@ export fn AlphPlaces_ask__ptr(p: AlphPlaces*, a: AlphActor*, job: AlphJob*) -> W
   if (x == 0) {
     return ALPH_GONE;
   }
-  var out: Word = a->ask(x->pid, ALPH_RUN, (Word)job);
+  var pid: Word = 0;
+  var tag: Word = 0;
+  var out: Word = ALPH_GONE;
+  if (alph_place_route(p, x, job, &pid, &tag)) {
+    out = a->ask(pid, tag, (Word)job);
+  }
   if (out < 0) {
     var was: int32 = p->gate.enter();
     alph_place_left(p, x, job);
@@ -291,7 +360,7 @@ fn alph_place_ran(p: AlphPlaces*, x: AlphPlace*, job: AlphJob*, ns: Word, failed
   } else if (k->warm[way] == 0) {
     k->warm[way] = 1;
   } else {
-    var at: Word = alph_place_slot(way, job->size);
+    var at: Word = job->at;
     var seen: Word = ns;
     if (seen < 1) {
       seen = 1;
@@ -311,8 +380,7 @@ fn alph_place_ran(p: AlphPlaces*, x: AlphPlace*, job: AlphJob*, ns: Word, failed
       }
     }
     k->since[at] = 0;
-    var other: Word = alph_place_slot(1 - way, job->size);
-    k->since[other] = k->since[other] + ns;
+    k->since[job->other] = k->since[job->other] + ns;
     x->ran = x->ran + 1;
   }
   p->gate.leave(was);
@@ -335,12 +403,71 @@ fn alph_place_answer(a: AlphActor*, x: AlphPlace*) {
   }
 }
 
+// Sends a job on to the place picked for it, from inside a place. Returns
+// what the put returned, or ALPH_GONE when its data cannot be brought.
+fn alph_place_pass(a: AlphActor*, p: AlphPlaces*, next: AlphPlace*, job: AlphJob*) -> Word {
+  var again: AlphMsg = { tag: ALPH_RUN, from: job->asker, arg: (Word)job, ref: job->ref };
+  var pid: Word = 0;
+  if (!alph_place_route(p, next, job, &pid, &again.tag)) {
+    return ALPH_GONE;
+  }
+  return a->node->put(pid, &again);
+}
+
+fn alph_place_forget(p: AlphPlaces*, x: AlphPlace*, job: AlphJob*) {
+  var was: int32 = p->gate.enter();
+  alph_place_left(p, x, job);
+  p->gate.leave(was);
+}
+
 // The handler of every place.
 export fn alph_place_run(a: AlphActor*, m: AlphMsg*) -> Word {
   var x: AlphPlace* = (AlphPlace*)a->state;
   var p: AlphPlaces* = x->places;
   if (m->tag == ALPH_NUDGE) {
     x->nudged = 0;
+  }
+  if (m->tag == ALPH_BRING) {
+    // The job is counted at the core it is going to, not here. Once it is
+    // put there it is that core's: nothing here touches it again.
+    var job: AlphJob* = (AlphJob*)m->arg;
+    var k: AlphKind* = &p->kinds[job->kind];
+    var to: AlphPlace* = job->to;
+    var began: Word = alph_place_ns();
+    var out: Word = ALPH_GONE;
+    job->asker = m->from;
+    job->ref = m->ref;
+    var bring: fn(AlphJob*) -> Word = k->bring;  // another job's failure may have just cleared it
+    if (bring != 0 && bring(job) == 0) {
+      job->moved = alph_place_ns() - began;
+      job->home = ALPH_CPU;
+      var on: AlphMsg = { tag: ALPH_RUN, from: job->asker, arg: (Word)job, ref: job->ref };
+      out = a->node->put(to->pid, &on);
+      if (out == ALPH_OK) {
+        alph_place_answer(a, x);
+        return 0;
+      }
+      alph_place_forget(p, to, job);
+    } else {
+      // The data cannot be brought: no more jobs of the kind are sent to a
+      // core for data on the GPU, and this one goes wherever is left.
+      var was: int32 = p->gate.enter();
+      k->bring = 0;
+      alph_place_left(p, to, job);
+      p->gate.leave(was);
+      var next: AlphPlace* = alph_place_pick(p, job);
+      if (next != 0) {
+        out = alph_place_pass(a, p, next, job);
+        if (out == ALPH_OK) {
+          alph_place_answer(a, x);
+          return 0;
+        }
+        alph_place_forget(p, next, job);
+      }
+    }
+    job->status = out;
+    job->next = x->unsent;
+    x->unsent = job;
   }
   if (m->tag == ALPH_RUN) {
     var job: AlphJob* = (AlphJob*)m->arg;
@@ -354,25 +481,24 @@ export fn alph_place_run(a: AlphActor*, m: AlphMsg*) -> Word {
     } else {
       failed = k->gpu(job);
     }
-    var ns: Word = alph_place_ns() - began;
+    var ns: Word = alph_place_ns() - began + job->moved;
     alph_place_ran(p, x, job, ns, failed);
     job->status = ALPH_OK;
     job->way = x->way;
     job->ns = ns;
-    if (failed != 0) {
+    if (failed == 0) {
+      job->home = x->way;
+    } else {
       job->status = ALPH_GONE;
       var next: AlphPlace* = alph_place_pick(p, job);
       if (next != 0) {
-        var again: AlphMsg = { tag: ALPH_RUN, from: job->asker, arg: (Word)job, ref: job->ref };
-        var out: Word = a->node->put(next->pid, &again);
+        var out: Word = alph_place_pass(a, p, next, job);
         if (out == ALPH_OK) {
           alph_place_answer(a, x);
           return 0;
         }
         job->status = out;
-        var was: int32 = p->gate.enter();
-        alph_place_left(p, next, job);
-        p->gate.leave(was);
+        alph_place_forget(p, next, job);
       }
     }
     job->next = x->unsent;
