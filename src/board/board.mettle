@@ -6,6 +6,10 @@
 // find out by asking that the board does it (see AlphMachine_board), and
 // from then on the board is one more place their work can go.
 //
+// A board asks for work too (ask): the machine at the other end of the
+// line does the kind, whether that is a computer or another board. So two
+// boards on one line share work with no bigger machine at all.
+//
 // The board runs one job at a time, and nothing else while it does. A
 // machine that hears nothing from it for two seconds takes it for lost, so
 // a job should take well under that.
@@ -32,6 +36,8 @@ export struct AlphBoard {
   tether: AlphTether;
   served: Word;       // jobs done for other machines
   workers: Word[8];   // by kind: the actor that does it, 0 for none
+  helpers: Word[8];   // by kind: the actor down the line that does it, 0 while not known
+  door: Word;
   kinds: AlphBoardKind[8];
   actors: AlphActor[12];
   mail: AlphMsg[96];
@@ -42,6 +48,9 @@ export struct AlphBoard {
 // so the answer is sent as from the worker itself.
 fn alph_board_door(a: AlphActor*, m: AlphMsg*) -> Word {
   var b: AlphBoard* = (AlphBoard*)a->state;
+  if (m->tag == ALPH_HERE && m->arg != 0 && m->ref >= 1 && m->ref <= 8) {
+    b->helpers[m->ref - 1] = m->from;  // the answer to ask's question
+  }
   if (m->tag != ALPH_WHERE) {
     return 0;
   }
@@ -74,10 +83,11 @@ export fn AlphBoard_init__ptr(b: AlphBoard*, place: Word, first: Word, count: Wo
   b->served = 0;
   for k in 0..8 {
     b->workers[k] = 0;
+    b->helpers[k] = 0;
   }
   b->node.init(&b->actors[0], SLOTS, &b->mail[0], ROOM);
   b->tether.init(&b->node, place, first, count);
-  b->node.spawn(&alph_board_door, (rawptr)b);
+  b->door = b->node.spawn(&alph_board_door, (rawptr)b);
 }
 
 // Does a kind of work (0 to 7) for the other machines: run is given a
@@ -96,6 +106,25 @@ export fn AlphBoard_share__ptr(b: AlphBoard*, kind: Word, run: fn(Word) -> Word)
   }
   b->workers[kind] = pid;
   return ALPH_OK;
+}
+
+// Asks the machine at the other end of the line to do a job of a kind it
+// shares. The answer comes to `a` as ALPH_WORKED with the job's out in arg
+// and the ref this returns, or as ALPH_REFUSED when that machine cannot
+// take it. Returns ALPH_FULL while the board does not know yet who does
+// the kind there: it has asked, so ask again shortly. Returns ALPH_GONE
+// for a kind that is not 0 to 7. The line sends nothing again, so a
+// program that must have its answer asks once more when none has come.
+export fn AlphBoard_ask__ptr(b: AlphBoard*, a: AlphActor*, kind: Word, in: Word) -> Word {
+  if (kind < 0 || kind >= 8) {
+    return ALPH_GONE;
+  }
+  if (b->helpers[kind] == 0) {
+    var where_is: AlphMsg = { tag: ALPH_WHERE, from: b->door, arg: ALPH_SHARED + kind, ref: kind + 1 };
+    b->node.put(alph_door_of(b->tether.first), &where_is);
+    return ALPH_FULL;
+  }
+  return a->ask(b->helpers[kind], ALPH_WORK, in);
 }
 
 // Runs the board until stop.

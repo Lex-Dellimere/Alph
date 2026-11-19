@@ -28,17 +28,19 @@ export struct AlphDoor {
   tell: Word;  // the actor that hears of machines coming and going, 0 for none
 }
 
-// The pid of the door on the machine whose places start at first.
-export fn alph_door_of(first: Word) -> Word {
-  return (Word)((first << ALPH_PLACE_SHIFT) | ((Word)1 << ALPH_INDEX_BITS));
-}
-
 fn alph_door_run(a: AlphActor*, m: AlphMsg*) -> Word {
   var d: AlphDoor* = (AlphDoor*)a->state;
   // An answer that cannot be sent yet (the way to that machine is full) is
   // not dropped: the door sends itself the request and answers it later.
   if (m->tag == ALPH_WHERE) {
-    if (a->reply(m, ALPH_HERE, d->names->get(m->arg)) == ALPH_FULL) {
+    // The answer is sent as from the actor found, when there is one. A
+    // board cannot read a pid out of arg (a message's arg crosses its line
+    // as 32 bits), but who a message is from always crosses whole.
+    var here: AlphMsg = { tag: ALPH_HERE, from: a->pid, arg: d->names->get(m->arg), ref: m->ref };
+    if (here.arg != 0) {
+      here.from = here.arg;
+    }
+    if (a->node->put(m->from, &here) == ALPH_FULL) {
       a->node->put(a->pid, m);
     }
   } else if (m->tag == ALPH_WATCH) {

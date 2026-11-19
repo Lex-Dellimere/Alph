@@ -1,0 +1,129 @@
+// Two boards of one device working as one, with no bigger machine: the two
+// chips of a robot's arm, say, joined by a serial line. Each board does one
+// kind of work for the other and asks the other for the kind it cannot do
+// itself. Neither knows the other's actors: a board asks for a kind, and
+// alph finds who does it at the other end of the line.
+//
+// This file is the whole program for both boards. two_a.mettle and
+// two_b.mettle only say which board each is. check.sh runs the pair in two
+// QEMUs.
+//
+//   mettle --release examples/mcu/two_a.mettle --target riscv32-none \
+//       --board qemu-virt --emit-flat two_a.bin -I ports/mcu
+
+import "port/port";
+import "port/board";
+import "alph/actor/actor";
+import "alph/time/time";
+import "alph/board/board";
+
+const LIFT: Word = 0;  // board 0 does it: out is in plus 100
+const GRIP: Word = 1;  // board 1 does it: out is twice in
+const TICK: Word = 1;
+const ASKS: Word = 6;
+
+var g_board: AlphBoard;
+var g_time: AlphTime;
+var g_timers: AlphTimer[2];
+
+struct Asker {
+  kind: Word;      // the kind this board asks the other for
+  next: Word;      // the number it asks about next
+  first: Word;     // the ref this number was first asked about with
+  answered: Word;  // an answer came since the last tick
+  wrong: Word;
+  served: Word;    // jobs done for the other board by the last tick
+  idle: Word;      // ticks since the other board last asked for one
+}
+
+var g_asker: Asker;
+
+@interrupt fn mettle_trap() {
+  mettle_board_exit(99);
+}
+
+fn lift(n: Word) -> Word {
+  return n + 100;
+}
+
+fn grip(n: Word) -> Word {
+  return (Word)(n * 2);
+}
+
+// Asks for one number at a time. The line sends nothing again, so a
+// question with no answer by the next tick is asked once more, and the
+// answer to any asking of it will do. The board
+// stops when it has its six answers and the other board has asked for
+// nothing for a second.
+fn asker(a: AlphActor*, m: AlphMsg*) -> Word {
+  var s: Asker* = (Asker*)a->state;
+  if (m->tag == ALPH_WORKED) {
+    if (s->first <= 0 || m->ref < s->first || s->next >= ASKS) {
+      return 0;  // an answer about a number already done with
+    }
+    var right: Word = s->next + 100;
+    if (s->kind == GRIP) {
+      right = (Word)(s->next * 2);
+    }
+    if (m->arg != right) {
+      s->wrong = s->wrong + 1;
+    }
+    s->next = s->next + 1;
+    s->answered = 1;
+    s->first = 0;
+    if (s->next < ASKS) {
+      s->first = g_board.ask(a, s->kind, s->next);
+    }
+    return 0;
+  }
+  if (m->tag != TICK) {
+    return 0;
+  }
+  s->idle = s->idle + 1;
+  if (g_board.served != s->served) {
+    s->served = g_board.served;
+    s->idle = 0;
+  }
+  if (s->next >= ASKS && s->served >= ASKS && s->idle >= 10) {
+    a->node->stop();
+    return 0;
+  }
+  if (s->answered == 0 && s->next < ASKS) {
+    var ref: Word = g_board.ask(a, s->kind, s->next);
+    if (s->first <= 0) {
+      s->first = ref;
+    }
+  }
+  s->answered = 0;
+  g_time.after(100, a->pid, TICK, 0);
+  return 0;
+}
+
+// Board `place` (0 or 1) does the kind with its own number and asks for
+// the other.
+export fn two(place: Word) -> int32 {
+  alph_board_start();
+  g_board.init(place, 1 - place, 1);
+  g_time.init(&g_board.node, &g_timers[0], 2);
+  if (place == 0) {
+    g_board.share(LIFT, &lift);
+  } else {
+    g_board.share(GRIP, &grip);
+  }
+  g_asker.kind = 1 - place;
+  g_asker.next = 0;
+  g_asker.first = 0;
+  g_asker.answered = 0;
+  g_asker.wrong = 0;
+  g_asker.served = 0;
+  g_asker.idle = 0;
+  var me: Word = g_board.node.spawn(&asker, (rawptr)&g_asker);
+  mettle_irq_enable();
+  g_time.after(100, me, TICK, 0);
+  g_board.run();
+  g_time.stop();
+  if (g_asker.wrong != 0) {
+    return 1;
+  }
+  return 0;
+}

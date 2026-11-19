@@ -4,4 +4,9 @@
 import "port/port";
 
 export const ALPH_WHERE: Word = -10;  // to a door: arg is a name
-export const ALPH_HERE: Word = -11;   // from a door: arg is the pid with that name, or 0
+export const ALPH_HERE: Word = -11;   // from a door: arg is the pid with that name, or 0. It comes as from that actor
+
+// The pid of the door on the machine whose places start at first.
+export fn alph_door_of(first: Word) -> Word {
+  return (Word)((first << ALPH_PLACE_SHIFT) | ((Word)1 << ALPH_INDEX_BITS));
+}

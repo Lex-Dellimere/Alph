@@ -722,6 +722,24 @@ From then on a batch of `ANGLE` jobs goes to the board, and each `PRIMES` job go
 - A machine that is not the one on the board's line calls `beyond(peer, first, count)` in place of `board`, with the peer whose line the board is on.
 - The board does one job at a time and nothing else meanwhile, so keep a job well under two seconds. A machine sends it four jobs at a time. A job is one word in and one word out.
 - The board's own actors are spawned on `g_board.node`.
+- With a real board, open its serial device on the computer with `alph_serial_open("/dev/ttyACM0", 115200)` (from `port/serial`) and give the descriptor to `alph_line_open`.
+
+**A board that asks.** A board asks for work as well: `g_board.ask(a, kind, in)` sends a job to whoever does that kind at the other end of the line, a computer or another board. The answer comes to actor `a` as `ALPH_WORKED`, with the job's out in `arg` and the ref `ask` returned:
+
+```mettle
+fn asker(a: AlphActor*, m: AlphMsg*) -> Word {
+  if (m->tag == ALPH_WORKED) {
+    ...m->arg is the answer...
+  }
+  ...
+  var ref: Word = g_board.ask(a, GRIP, 3);
+  return 0;
+}
+```
+
+- `ask` returns `ALPH_FULL` while the board does not yet know who does the kind there. It has asked, so ask again shortly.
+- The line sends nothing again. A program that must have its answer asks once more on a timer when none has come, and takes the answer to any asking of the same question.
+- Two boards on one line need no computer. In [examples/mcu/two.mettle](../examples/mcu/two.mettle) each board does one kind for the other and asks the other for the kind it cannot do. That one file is the program for both boards, and `two_a.mettle` and `two_b.mettle` only say which board each is.
 
 ## Limits
 
@@ -732,7 +750,8 @@ These are not built yet.
 - Sockets are Linux only, and there is no file IO.
 - A message between two cores costs 150 to 300 ns against about 20 ns inside a node. Removing that needs a queue per pair of cores that the sender writes without touching anything the receiver owns, which changes what a full mailbox can tell a sender. Not built.
 - A microcontroller joins through a serial line to one machine, and nothing lost on that line is sent again.
-- A board does jobs of one word in and one word out, one at a time. It takes work but does not hand its own out through places: its actors ask others by pid.
+- A board's jobs are one word in and one word out, one at a time. A board asks the machine at the other end of its line, not the best of several places.
+- A job whose answer is lost is placed again, so it can be done twice. Jobs done at most once are not built.
 - A full mailbox at the far end of a link drops its message and the sender is not told.
 - Peers are listed by hand.
 - A watch cannot be dropped across machines.

@@ -1,0 +1,7 @@
+// The second of two boards that work as one. The program is two.mettle.
+
+import "two";
+
+fn main() -> int32 {
+  return two(1);
+}

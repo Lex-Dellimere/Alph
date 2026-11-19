@@ -14,8 +14,8 @@
 //   qemu-system-riscv32 -M virt -bios none -display none -monitor none \
 //       -serial tcp:127.0.0.1:7461 -device loader,file=arm.bin,addr=0x80000000,force-raw=on
 //
-// With a real board, open its serial device and give that descriptor to
-// alph_line_open.
+// With a real board, open its serial device with alph_serial_open (from
+// port/serial) and give that descriptor to alph_line_open.
 
 import "std/io";
 import "std/thread";

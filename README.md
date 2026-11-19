@@ -62,7 +62,7 @@ This is [examples/count.mettle](examples/count.mettle). The node owns no memory:
 | Names and the door | Find an actor on another machine by name, and watch it | [src/name](src/name/name.mettle), [src/door](src/door/door.mettle) |
 | Seals | A link only the holders of one key can read or speak on | [src/seal](src/seal/seal.mettle) |
 | Tether | A microcontroller tied to a bigger machine by its serial line: each side's actors reach the other's by pid. That machine can pass the board's mail on, so the whole network reaches it | [src/tether](src/tether/tether.mettle) |
-| Board | The short way for a microcontroller: it says which kinds of work it does, and the bigger machines send it jobs as they would to any other place | [src/board](src/board/board.mettle) |
+| Board | The short way for a microcontroller: it says which kinds of work it does, and the bigger machines send it jobs as they would to any other place. It asks for work too, so two boards share work with no computer between them | [src/board](src/board/board.mettle) |
 | Machine and batch | The short way: a machine set up in one call, and one kind of work handed out in pieces to cores, the GPU, other machines and boards | [src/machine](src/machine/machine.mettle), [src/batch](src/batch/batch.mettle) |
 | Ports | What differs per device: `mcu` (one hart, no OS), `harts` (several harts, no OS), `pico2` (a Raspberry Pi Pico 2) and `host` (x86-64 Linux) | [ports](ports) |
 
@@ -157,11 +157,20 @@ Two boards on one serial line, with no other machine: [examples/mcu/asker.mettle
 
 A computer and a board working as one machine, [examples/mcu/arm.mettle](examples/mcu/arm.mettle) and [examples/mcu/arm_host.mettle](examples/mcu/arm_host.mettle): the chip in a robot's arm, say, on the serial line of the computer that plans. The computer asks for joint angles, which only the board can read, and for primes, which both can count. It never says where either is done. Every angle comes from the board, and the board counts some of the primes. The function that counts is one file built into both programs. The board's image is 4.5 KB:
 
+With a real board in place of QEMU, the computer opens the board's serial device with `alph_serial_open("/dev/ttyACM0", 115200)` and gives it to `alph_line_open`.
+
 ```bash
 mettle --release examples/mcu/arm.mettle --target riscv32-none --board qemu-virt --emit-flat arm.bin -I ports/mcu
 mettle --build -s --release examples/mcu/arm_host.mettle -I ports/host -o arm_host
 ./arm_host 7461 &
 qemu-system-riscv32 -M virt -bios none -display none -monitor none -serial tcp:127.0.0.1:7461 -device loader,file=arm.bin,addr=0x80000000,force-raw=on
+```
+
+Two boards that share work with no computer at all, [examples/mcu/two.mettle](examples/mcu/two.mettle): the two chips of one arm, joined by a serial line. Each does one kind of work for the other and asks the other for the kind it cannot do. Neither knows the other's actors: a board asks for a kind and alph finds who does it down the line. One file is the program for both boards. `check.sh` runs the pair in two QEMUs:
+
+```bash
+mettle --release examples/mcu/two_a.mettle --target riscv32-none --board qemu-virt --emit-flat two_a.bin -I ports/mcu
+mettle --release examples/mcu/two_b.mettle --target riscv32-none --board qemu-virt --emit-flat two_b.bin -I ports/mcu
 ```
 
 ## What it does not do yet
@@ -171,7 +180,8 @@ qemu-system-riscv32 -M virt -bios none -display none -monitor none -serial tcp:1
 - Sockets are Linux only, and there is no file IO.
 - A message between two cores costs 150 to 300 ns against about 20 ns inside a node.
 - A microcontroller joins through a serial line to one machine, and nothing lost on that line is sent again.
-- A board does jobs of one word in and one word out, one at a time. It takes work but does not hand its own out.
+- A board's jobs are one word in and one word out, one at a time. A board asks the machine at the other end of its line, not the best of several places.
+- A job whose answer is lost is placed again, so it can be done twice. Work that must not be, such as moving an arm, needs care until jobs done at most once are built.
 
 ## Test
 

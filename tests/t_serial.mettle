@@ -1,0 +1,116 @@
+// A serial device opened for a line (port/serial): bytes cross it both
+// ways exactly as they were sent. The device here is a pseudo-terminal,
+// which takes the same settings as a real serial port.
+
+import "std/io";
+import "port/serial";
+
+const TIOCSPTLCK: int64 = 1074025521;
+const TIOCGPTN: int64 = 2147767344;
+
+var g_failures: int32 = 0;
+
+fn expect(ok: bool, what: string) {
+  if (!ok) {
+    println("FAIL {what}");
+    g_failures = g_failures + 1;
+  }
+}
+
+// Writes n in decimal at out, returns how many digits.
+fn digits(out: uint8*, n: int32) -> int32 {
+  var text: uint8[12];
+  var count: int32 = 0;
+  var v: int32 = n;
+  if (v == 0) {
+    text[0] = 48;
+    count = 1;
+  }
+  while (v > 0) {
+    text[count] = (uint8)(48 + v % 10);
+    v = v / 10;
+    count = count + 1;
+  }
+  for i in 0..count {
+    out[i] = text[count - 1 - i];
+  }
+  return count;
+}
+
+fn main() -> int32 {
+  var master: int64 = syscall(2, (int64)"/dev/ptmx", 2 | 256, 0);
+  expect(master >= 0, "a pseudo-terminal can be made");
+  if (master < 0) {
+    return 1;
+  }
+  var unlock: int32 = 0;
+  var number: int32 = -1;
+  syscall(16, master, TIOCSPTLCK, (int64)&unlock);
+  syscall(16, master, TIOCGPTN, (int64)&number);
+  var path: uint8[32];
+  var prefix: cstring = "/dev/pts/";
+  var at: int32 = 0;
+  while (prefix[at] != 0) {
+    path[at] = (uint8)prefix[at];
+    at = at + 1;
+  }
+  at = at + digits(&path[at], number);
+  path[at] = 0;
+
+  var line: int64 = alph_serial_open((cstring)&path[0], 115200);
+  expect(line >= 0, "the device opens as a line ({line})");
+  expect(alph_serial_open("/dev/no-such-device", 115200) < 0, "a device that is not there does not");
+
+  // Every byte value that a terminal would otherwise change or act on.
+  var sent: uint8[8];
+  sent[0] = 10;   // newline
+  sent[1] = 13;   // carriage return
+  sent[2] = 3;    // interrupt
+  sent[3] = 4;    // end of input
+  sent[4] = 17;   // flow control on
+  sent[5] = 19;   // and off
+  sent[6] = 192;  // the tether's end mark
+  sent[7] = 255;
+  var got: uint8[16];
+  expect(syscall(1, master, (int64)&sent[0], 8) == 8, "eight bytes go in at the far end");
+  var have: int64 = 0;
+  while (have < 8) {
+    var n: int64 = syscall(0, line, (int64)&got[have], 16 - have);
+    if (n <= 0) {
+      break;
+    }
+    have = have + n;
+  }
+  var same: bool = have == 8;
+  for i in 0..8 {
+    if (got[i] != sent[i]) {
+      same = false;
+    }
+  }
+  expect(same, "and come out of the line as they were ({have} bytes)");
+
+  expect(syscall(1, line, (int64)&sent[0], 8) == 8, "eight bytes go into the line");
+  have = 0;
+  while (have < 8) {
+    var n: int64 = syscall(0, master, (int64)&got[have], 16 - have);
+    if (n <= 0) {
+      break;
+    }
+    have = have + n;
+  }
+  same = have == 8;
+  for i in 0..8 {
+    if (got[i] != sent[i]) {
+      same = false;
+    }
+  }
+  expect(same, "and come out at the far end as they were ({have} bytes)");
+
+  syscall(3, line);
+  syscall(3, master);
+  if (g_failures != 0) {
+    return 1;
+  }
+  println("serial ok: a device opened as a line carries every byte unchanged, both ways");
+  return 0;
+}
