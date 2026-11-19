@@ -383,6 +383,22 @@ g_places.ask(a, fetch);
 
 Between two machines that are both up, messages arrive once and in order. What a machine has not got in 40 ms is sent again. Every machine tells its peers it is alive 20 times a second, and one that stays quiet for half a second is down. A send to a machine that is down, or not heard yet, returns `ALPH_GONE`. A send returns `ALPH_FULL` when too many messages to that machine are still waiting for its word. A machine that was only out of reach carries on where it was. A machine that was restarted counts as a new one, so mail meant for the old one is not handed to the new. A full mailbox at the far end drops the message and the sender is not told, so for a message that must arrive, ask and wait for the reply.
 
+**Bytes with a message.** A message between machines can carry up to 1,024 bytes in a parcel. Give the link a pool of parcels with `parcels(pool, room)` before `start`, then send with `send_bytes(from, to, tag, ref, bytes, count)`. The actor it is for gets the message with the parcel in `arg`, reads it, and gives it back to its own machine's link with `release`. This is from `tests/t_parcel.mettle`:
+
+```mettle
+var g_a_parcels: AlphParcel[8];
+
+g_a_link.parcels(&g_a_parcels[0], 8);
+g_a_link.send_bytes(a->pid, s->to, DATA, s->sent, &bytes[0], count);
+
+// in the actor it was sent to:
+var p: AlphParcel* = (AlphParcel*)m->arg;
+// read p->bytes[0] to p->bytes[p->count - 1]
+c->link->release(p);
+```
+
+Parcels arrive once and in order, like every message. `send_bytes` returns `ALPH_FULL` when too few parcels are free or too much is waiting for that machine: half the pool is kept for what arrives. An actor that keeps its parcels stops its machine taking more, so give them back as soon as they are read.
+
 **Sealing the link.** A link is in the clear unless you seal it. `AlphSeal` encrypts and signs every datagram with one 32-byte key that every machine of the network is given. A datagram made without the key, changed on the way or played a second time is dropped, and so is everything from a run of a machine earlier than the latest one heard. Call `init(link, key)` once, after the link's `init` and before its `start`. It returns `ALPH_GONE` when the link is sealed already or the system gave no random bytes. This is from `tests/t_seal.mettle`:
 
 ```mettle
@@ -452,7 +468,7 @@ g_places.far(PRIMES, b->helper);
 g_boss_machine.door.watch(b->far_place, b->helper);
 ```
 
-Fill in a job with `job->in` and `job->home = ALPH_NOWHERE`, and ask as before. In the `ALPH_DONE` answer, `way` is `ALPH_FAR` when the other machine did it, and `out` is what the worker answered. A job with data of its own cannot leave the machine. On the other machine the worker is sent `ALPH_WORK` with the job's `in` as `arg`. It answers `ALPH_WORKED` with the job's `out`:
+Fill in a job with `job->in` and `job->home = ALPH_NOWHERE`, and ask as before. A job can carry bytes instead of `in`: set `job->bytes` and `job->count`, and give the places the link with `net(link)`. The worker then gets `ALPH_WORK` with a parcel in `arg`. [examples/run.mettle](../examples/run.mettle) sends commands to run this way. In the `ALPH_DONE` answer, `way` is `ALPH_FAR` when the other machine did it, and `out` is what the worker answered. A job with data of its own cannot leave the machine. On the other machine the worker is sent `ALPH_WORK` with the job's `in` as `arg`. It answers `ALPH_WORKED` with the job's `out`:
 
 ```mettle
 fn worker(a: AlphActor*, m: AlphMsg*) -> Word {
@@ -555,7 +571,7 @@ A message goes over once: a byte lost on the line loses it. A pid from the bigge
 These are not built yet.
 
 - A sealed link has one key for the whole network: any holder can speak as any machine, and someone who gets the key later can read what they recorded before.
-- A job with data of its own cannot go to another machine, only a job of one word in and one word out.
+- A job for another machine carries at most 1,024 bytes, and one word comes back.
 - Timers look at every timer slot: right for tens of timers, not thousands. A timer wheel behind the same four functions is not built.
 - Sockets are Linux only, and there is no file IO.
 - A message between two cores costs 150 to 300 ns against about 20 ns inside a node. Removing that needs a queue per pair of cores that the sender writes without touching anything the receiver owns, which changes what a full mailbox can tell a sender. Not built.

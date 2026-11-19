@@ -58,7 +58,7 @@ This is [examples/count.mettle](examples/count.mettle). The node owns no memory:
 | Places | A job goes to a core, the GPU or another machine, whichever alph has timed as finishing it first. A job stays where its data is | [src/place](src/place/place.mettle) |
 | Polls | A socket sends a message when it is ready, so no handler waits. TCP calls that go with it, and other programs: start one and get a message when it ends | [src/poll](src/poll/poll.mettle) |
 | Lives | Watch an actor to be told when it ends and why. Keep one, and a crash restarts it in place with the same pid | [src/life](src/life/life.mettle) |
-| Links | Other machines over UDP. Messages arrive once and in order, and a lost machine is noticed in half a second | [src/link](src/link/link.mettle) |
+| Links | Other machines over UDP. Messages arrive once and in order, can carry up to 1,024 bytes, and a lost machine is noticed in half a second | [src/link](src/link/link.mettle) |
 | Names and the door | Find an actor on another machine by name, and watch it | [src/name](src/name/name.mettle), [src/door](src/door/door.mettle) |
 | Seals | A link only the holders of one key can read or speak on | [src/seal](src/seal/seal.mettle) |
 | Tether | A microcontroller tied to a bigger machine by its serial line: each side's actors reach the other's by pid. That machine can pass the board's mail on, so the whole network reaches it | [src/tether](src/tether/tether.mettle) |
@@ -84,6 +84,12 @@ Work spread over four cores, [examples/spread.mettle](examples/spread.mettle):
 
 ```bash
 mettle --build -s --release examples/spread.mettle -I ports/host -o spread
+```
+
+A list of commands run on two machines, as a build would, [examples/run.mettle](examples/run.mettle): each goes to a core here or to the other machine, and its exit status comes back. It takes the same arguments as `far`:
+
+```bash
+mettle --build -s --release examples/run.mettle -I ports/host -o run
 ```
 
 Tiles of a picture rendered on cores or on the GPU, whichever should finish each first, with the same pixels either way, [examples/render.mettle](examples/render.mettle). Without a GPU it runs on the cores:
@@ -123,7 +129,7 @@ qemu-system-riscv32 -M virt -bios none -display none -monitor none -serial tcp:1
 ## What it does not do yet
 
 - A sealed link has one key for the whole network: any holder can speak as any machine, and someone who gets the key later can read what they recorded before.
-- A job with data of its own cannot go to another machine, only a job of one word in and one word out.
+- A job for another machine carries at most 1,024 bytes, and one word comes back.
 - Timers look at every timer slot: right for tens of timers, not thousands.
 - Sockets are Linux only, and there is no file IO.
 - A message between two cores costs 150 to 300 ns against about 20 ns inside a node.
