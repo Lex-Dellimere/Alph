@@ -97,6 +97,8 @@ Placement is one decision made from measured costs, not three separate features.
 
 5. **A board among bigger machines.** Built as `src/tether`: a node tied to one other machine by a line of bytes, such as a board's serial port. It is the small way for a microcontroller to be a place: no numbering, no beats, nothing sent again. A message is 34 bytes on the line. `examples/mcu/tether.mettle` is a board whose one actor answers a number with the next one, in a 3,784-byte image, and `examples/mcu/tether_host.mettle` is a Linux process at the other end of its serial line. `check.sh` runs the board in QEMU with the process on its line: 200 requests and replies, each actor reaching the other by its pid. A pid from a bigger machine has to fit the board's 32-bit word, which holds for actors spawned at the start.
 
+   Two boards can be tied to each other the same way, with no bigger machine at all. `examples/mcu/asker.mettle` is a board that asks the first one for fifty numbers, and `check.sh` runs the pair, each in its own QEMU with their serial lines joined. That is the case of one device with several chips: each chip is a place, and the program is one program.
+
    The machine on the line can also pass the board's mail on (`src/tether/relay.mettle`). The other machines of the link are told the board's places are reached through it, and then any of them reaches the board's actors by pid, and the board theirs. `examples/mcu/relay_host.mettle` is the same board asked for numbers by a third machine, through the one on its line, and `check.sh` runs that too. Not built: a board on the UDP link itself, and a line that sends again what was lost.
 
 ## Crossings

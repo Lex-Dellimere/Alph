@@ -552,7 +552,9 @@ fn main() -> int32 {
 }
 ```
 
-`init(node, place, first, count)` makes the node place `place` and sends mail for places `first` to `first + count - 1` down the line. Call it before the first spawn. The other end is the same layer on the host port, given the line's descriptor with `alph_line_open(fd)` first, as [examples/mcu/tether_host.mettle](../examples/mcu/tether_host.mettle) does with a TCP connection from QEMU. The machine on the line can pass the board's mail on to the rest of the network. On that machine call `relay(link, first, count)` in place of `init`, after the link's `init` and before its `start` (it is in `alph/tether/relay`). On the other machines call `link.through(peer, first, count)` to say the board's places are reached through that peer. [examples/mcu/relay_host.mettle](../examples/mcu/relay_host.mettle) does both:
+`init(node, place, first, count)` makes the node place `place` and sends mail for places `first` to `first + count - 1` down the line. Call it before the first spawn. The other end is the same layer on the host port, given the line's descriptor with `alph_line_open(fd)` first, as [examples/mcu/tether_host.mettle](../examples/mcu/tether_host.mettle) does with a TCP connection from QEMU. The other end can be another board. [examples/mcu/asker.mettle](../examples/mcu/asker.mettle) is a board at place 0 that calls `g_tether.init(&g_node, 0, 1, 1)` and asks the board above for numbers. Since the line sends nothing again, the asker sets a timer and asks once more when no answer has come.
+
+The machine on the line can pass the board's mail on to the rest of the network. On that machine call `relay(link, first, count)` in place of `init`, after the link's `init` and before its `start` (it is in `alph/tether/relay`). On the other machines call `link.through(peer, first, count)` to say the board's places are reached through that peer. [examples/mcu/relay_host.mettle](../examples/mcu/relay_host.mettle) does both:
 
 ```mettle
 g_mid_link.init(&g_mid, 0, &g_mid_peers[0], 1);

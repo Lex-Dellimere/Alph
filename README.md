@@ -126,6 +126,8 @@ mettle --build -s --release examples/mcu/tether_host.mettle -I ports/host -o tet
 qemu-system-riscv32 -M virt -bios none -display none -monitor none -serial tcp:127.0.0.1:7421 -device loader,file=tether.bin,addr=0x80000000,force-raw=on
 ```
 
+Two boards on one serial line, with no other machine: [examples/mcu/asker.mettle](examples/mcu/asker.mettle) asks the board above for numbers. Each board's actor reaches the other's by its pid, so a device with several chips is one program. `check.sh` runs the pair in two QEMUs.
+
 ## What it does not do yet
 
 - A sealed link has one key for the whole network: any holder can speak as any machine, and someone who gets the key later can read what they recorded before.

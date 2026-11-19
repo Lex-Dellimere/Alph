@@ -181,6 +181,35 @@ if [ "$#" -eq 0 ] && command -v qemu-system-riscv32 > /dev/null 2>&1 && [ -f "$O
   fi
 fi
 
+# Two boards as one: each in its own QEMU, their serial lines joined.
+if [ "$#" -eq 0 ] && command -v qemu-system-riscv32 > /dev/null 2>&1 && [ -f "$OUT/tether.bin" ]; then
+  bin="$OUT/asker.bin"
+  log="$OUT/pair.log"
+  if ! "$METTLE" --release examples/mcu/asker.mettle --target riscv32-none --board qemu-virt \
+      --emit-flat "$bin" -I ports/mcu > "$log" 2>&1; then
+    echo "FAIL  mcu/pair build (see $log)"
+    fails=$((fails + 1))
+  else
+    port=$((9431 + $$ % 500))
+    timeout 30 qemu-system-riscv32 -M virt -bios none -display none -monitor none \
+      -serial "tcp:127.0.0.1:$port,server=on,wait=off" \
+      -device loader,file="$OUT/tether.bin",addr=0x80000000,force-raw=on >> "$log" 2>&1 &
+    other=$!
+    sleep 0.4
+    timeout 30 qemu-system-riscv32 -M virt -bios none -display none -monitor none \
+      -serial "tcp:127.0.0.1:$port" -device loader,file="$bin",addr=0x80000000,force-raw=on >> "$log" 2>&1
+    asked=$?
+    wait "$other"
+    answered=$?
+    if [ "$asked" -eq 0 ] && [ "$answered" -eq 0 ]; then
+      echo "ok    mcu/pair [two boards, $(stat -c %s "$bin") and $(stat -c %s "$OUT/tether.bin") bytes, on one serial line]"
+    else
+      echo "FAIL  mcu/pair: asking board exit $asked, answering board exit $answered (see $log)"
+      fails=$((fails + 1))
+    fi
+  fi
+fi
+
 if [ "$fails" -eq 0 ]; then
   echo "PASS"
 else
