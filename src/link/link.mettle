@@ -14,7 +14,7 @@
 // a new one, with a new life: what was on its way to the old one is lost,
 // and mail meant for the old one is not handed to the new.
 //
-// Nothing is encrypted or signed yet: use it on a network you trust.
+// A link is in the clear unless it is sealed: see src/seal.
 
 import "std/thread";
 import "port/port";
@@ -71,6 +71,8 @@ export struct AlphPeer {
   gate: AlphGate;     // what follows is shared by senders and the link's thread
   sent: uint32;       // the number of the last message sent to it
   acked: uint32;      // it has every message up to this one
+  heard: Word;        // on a sealed link: the count of the last datagram taken from it,
+  newest: Word;       // and when the latest run of it ever heard began, so nothing recorded can be played again
   got: uint32;        // every message from it up to this one was taken
   owed: Word;         // messages taken since it was last told so
   waiting_since: Word;
@@ -83,7 +85,8 @@ export struct AlphLink {
   peers: AlphPeer*;
   room: Word;
   count: Word;
-  life: uint32;
+  life: uint32;   // this run: the low half of born, never 0
+  born: Word;     // when this run began, in milliseconds
   watcher: Word;
   thread: int64;
   stopping: int32;
@@ -92,6 +95,26 @@ export struct AlphLink {
   lose: Word;     // for tests: one in so many messages is not sent the first time
   lost: Word;
   deaf: Word;     // for tests: hears nothing while this is set
+  // A sealed link: seal turns a datagram into one only the holders of the
+  // key can read or make, open turns it back and says who sent it and which
+  // datagram of theirs it is. Set by src/seal. 0 for a link in the clear.
+  seal: fn(rawptr, uint8*, uint8*, int64) -> int64;
+  open: fn(rawptr, uint8*, uint8*, int64, uint32*, Word*, Word*) -> int64;
+  sealer: rawptr;
+  refused: Word;  // datagrams not sealed with the key, or already heard
+}
+
+// Sends a datagram to a peer, sealed if the link is.
+fn alph_link_out(l: AlphLink*, p: AlphPeer*, bytes: uint8*, count: int64) {
+  if (l->seal == 0) {
+    l->wire.send(p->ip, p->port, bytes, count);
+    return;
+  }
+  var sealed: uint8[128];
+  var n: int64 = l->seal(l->sealer, &sealed[0], bytes, count);
+  if (n > 0) {
+    l->wire.send(p->ip, p->port, &sealed[0], n);
+  }
 }
 
 // Starts the numbering with a peer afresh, because it is a new run of its
@@ -185,7 +208,7 @@ fn alph_link_far(c: AlphCores*, to: Word, m: AlphMsg*) -> Word {
   // Sent inside the gate, so messages reach the wire in their order.
   l->lost = l->lost + 1;
   if (l->lose == 0 || l->lost % l->lose != 0) {
-    l->wire.send(p->ip, p->port, (uint8*)k, MAIL_BYTES);
+    alph_link_out(l, p, (uint8*)k, MAIL_BYTES);
   }
   p->gate.leave(was);
   return ALPH_OK;
@@ -199,11 +222,13 @@ fn alph_link_say(l: AlphLink*, p: AlphPeer*) {
   k.from_place = (uint32)l->cores->first;
   k.from_life = l->life;
   k.to_life = p->life;
+  // Sent inside the gate, as every datagram to a peer is: on a sealed link
+  // they must reach the wire in the order they were sealed.
   var was: int32 = p->gate.enter();
   k.ack = p->got;
   p->owed = 0;
+  alph_link_out(l, p, (uint8*)&k, BEAT_BYTES);
   p->gate.leave(was);
-  l->wire.send(p->ip, p->port, (uint8*)&k, BEAT_BYTES);
 }
 
 // Brings the watcher up to date: down for a machine it thinks is up that is
@@ -225,13 +250,25 @@ fn alph_link_tell(l: AlphLink*, p: AlphPeer*) {
   }
 }
 
-fn alph_link_heard(l: AlphLink*, k: AlphPacket*, got: int64) {
+// On a sealed link, born is when the sender's run began and count is which
+// datagram of that run this is.
+fn alph_link_heard(l: AlphLink*, k: AlphPacket*, got: int64, born: Word, count: Word) {
   if (got < BEAT_BYTES || k->magic != MAGIC) {
     return;
   }
   var p: AlphPeer* = alph_link_peer(l, (Word)(int64)k->from_place);
   if (p == 0 || p->first != (Word)(int64)k->from_place) {
     return;
+  }
+  if (l->open != 0) {
+    // Each datagram of a run is taken once, and no run before the latest
+    // one heard is taken at all: what was recorded cannot be played again.
+    if (p->heard != 0 && (born < p->newest || (born == p->newest && count <= p->heard))) {
+      l->refused = l->refused + 1;
+      return;
+    }
+    p->newest = born;
+    p->heard = count;
   }
   // A life is the time its machine started, so a later one is newer. Mail
   // still on its way from the run before must not bring that run back.
@@ -241,12 +278,16 @@ fn alph_link_heard(l: AlphLink*, k: AlphPacket*, got: int64) {
   if (p->life != k->from_life) {
     alph_link_fresh(p, k->from_life);
   }
+  if (k->to_life != l->life) {
+    // It has not heard this run of ours yet, or this was said to an earlier
+    // one. Its run is noted, so our next beat names it, but it does not
+    // count as alive until it answers this run: something recorded before
+    // we started cannot do that.
+    return;
+  }
   p->seen = alph_now();
   p->alive = 1;
   alph_link_tell(l, p);
-  if (k->to_life != l->life) {
-    return;  // it has not heard this run of ours yet, or means an earlier one
-  }
   var was: int32 = p->gate.enter();
   if ((int32)(k->ack - p->acked) > 0 && (int32)(p->sent - k->ack) >= 0) {
     p->acked = k->ack;
@@ -298,7 +339,7 @@ fn alph_link_chase(l: AlphLink*, p: AlphPeer*) {
       var k: AlphPacket* = &p->window[seq % WINDOW];
       k->ack = p->got;
       k->to_life = p->life;
-      l->wire.send(p->ip, p->port, (uint8*)k, MAIL_BYTES);
+      alph_link_out(l, p, (uint8*)k, MAIL_BYTES);
       l->resent = l->resent + 1;
       seq = seq + 1;
     }
@@ -327,16 +368,34 @@ fn alph_link_beat(l: AlphLink*) {
 fn alph_link_main(arg: cstring) -> uint32 {
   var l: AlphLink* = (AlphLink*)arg;
   var k: AlphPacket;
+  var raw: uint8[160];
   var ip: uint32 = 0;
   var port: int64 = 0;
   var beat: Word = alph_now() - alph_ms(BEAT_MS);
   var chase: Word = alph_now();
   while (l->stopping == 0) {
-    var got: int64 = l->wire.recv((uint8*)&k, MAIL_BYTES, &ip, &port);
-    if (got > 0 && l->deaf == 0) {
-      alph_link_heard(l, &k, got);
+    var got: int64 = 0;
+    var count: Word = 0;
+    var born: Word = 0;
+    if (l->open == 0) {
+      got = l->wire.recv((uint8*)&k, MAIL_BYTES, &ip, &port);
+    } else {
+      got = l->wire.recv(&raw[0], 160, &ip, &port);
+      if (got > 0) {
+        var place: uint32 = 0;
+        got = l->open(l->sealer, (uint8*)&k, &raw[0], got, &place, &born, &count);
+        // The sender named outside the seal must be the one named inside.
+        if (got < BEAT_BYTES || place != k.from_place || (uint32)(born & 4294967295) != k.from_life) {
+          l->refused = l->refused + 1;
+          got = 0;
+          count = -1;
+        }
+      }
     }
-    if (got == 0 || (Word)(alph_now() - chase) >= alph_ms(5)) {
+    if (got > 0 && l->deaf == 0) {
+      alph_link_heard(l, &k, got, born, count);
+    }
+    if ((got == 0 && count == 0) || (Word)(alph_now() - chase) >= alph_ms(5)) {
       chase = alph_now();
       for i in 0..l->count {
         alph_link_chase(l, &l->peers[i]);
@@ -358,6 +417,7 @@ export fn AlphLink_init__ptr(l: AlphLink*, cores: AlphCores*, first: Word, peers
   l->room = room;
   l->count = 0;
   l->life = 0;
+  l->born = 0;
   l->watcher = 0;
   l->thread = 0;
   l->stopping = 0;
@@ -366,6 +426,10 @@ export fn AlphLink_init__ptr(l: AlphLink*, cores: AlphCores*, first: Word, peers
   l->lose = 0;
   l->lost = 0;
   l->deaf = 0;
+  l->seal = 0;
+  l->open = 0;
+  l->sealer = 0;
+  l->refused = 0;
   cores->join(first, &alph_link_far, (rawptr)l);
 }
 
@@ -386,6 +450,8 @@ export fn AlphLink_peer__ptr(l: AlphLink*, first: Word, count: Word, ip: uint32,
   p->told_life = 0;
   p->seen = 0;
   p->gate.init();
+  p->heard = 0;
+  p->newest = 0;
   alph_link_fresh(p, 0);
   l->count = l->count + 1;
   return ALPH_OK;
@@ -411,10 +477,11 @@ export fn AlphLink_start__ptr(l: AlphLink*, port: int64) -> Word {
   // This run's life: the time now in milliseconds, so a later run has a
   // later life, and never 0.
   syscall(228, 0, (int64)&ts[0]);
-  l->life = (uint32)((ts[0] * 1000 + ts[1] / 1000000) & 4294967295);
-  if (l->life == 0) {
-    l->life = 1;
+  l->born = (Word)(ts[0] * 1000 + ts[1] / 1000000);
+  if ((Word)(l->born & 4294967295) == 0) {
+    l->born = l->born + 1;
   }
+  l->life = (uint32)(l->born & 4294967295);
   l->stopping = 0;
   l->thread = CreateThread(0, 0, &alph_link_main, (cstring)l, 0, 0);
   return ALPH_OK;

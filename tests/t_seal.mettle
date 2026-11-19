@@ -1,0 +1,240 @@
+// A sealed link (src/seal): two machines with the same key talk as before.
+// A datagram in the clear, one sealed with another key, one changed on the
+// way and one played a second time are all dropped, and beats recorded from
+// an earlier run of a machine do not make it look alive.
+
+import "std/io";
+import "std/thread";
+import "port/wire";
+import "alph/actor/actor";
+import "alph/cores/cores";
+import "alph/link/link";
+import "alph/seal/seal";
+
+const PING: Word = 1;
+const PONG: Word = 2;
+const NOTE: Word = 3;
+const END: Word = 4;
+const ROUNDS: Word = 500;
+
+var g_a: AlphCores;
+var g_a_core: AlphCore[2];
+var g_a_actors: AlphActor[4];
+var g_a_mail: AlphMsg[32];
+var g_a_link: AlphLink;
+var g_a_peers: AlphPeer[1];
+var g_a_seal: AlphSeal;
+
+var g_b: AlphCores;
+var g_b_core: AlphCore[2];
+var g_b_actors: AlphActor[4];
+var g_b_mail: AlphMsg[32];
+var g_b_link: AlphLink;
+var g_b_peers: AlphPeer[1];
+var g_b_seal: AlphSeal;
+var g_other_seal: AlphSeal;  // seals as B would, with another key,
+var g_other_link: AlphLink;  // through a link that only stands in for B's
+
+var g_old_seal: AlphSeal;    // seals with the right key, as a run of B long over
+var g_old_link: AlphLink;
+
+var g_ponger: Word = 0;
+var g_failures: int32 = 0;
+
+fn expect(ok: bool, what: string) {
+  if (!ok) {
+    println("FAIL {what}");
+    g_failures = g_failures + 1;
+  }
+}
+
+fn ponger(a: AlphActor*, m: AlphMsg*) -> Word {
+  a->reply(m, PONG, m->arg + 1);
+  return 0;
+}
+
+struct Driver {
+  want: Word;
+  rounds: Word;
+  ref: Word;
+  bad: Word;
+  notes: Word;
+}
+
+// Pings the ponger once B is up. Later counts NOTEs and stops at END.
+fn driver(a: AlphActor*, m: AlphMsg*) -> Word {
+  var d: Driver* = (Driver*)a->state;
+  if (m->tag == ALPH_UP) {
+    d->ref = a->ask(g_ponger, PING, 0);
+  } else if (m->tag == PONG) {
+    if (m->ref != d->ref || m->arg != d->rounds + 1) {
+      d->bad = d->bad + 1;
+    }
+    d->rounds = m->arg;
+    if (d->rounds >= d->want) {
+      a->cores()->stop();
+      return 0;
+    }
+    d->ref = a->ask(g_ponger, PING, d->rounds);
+  } else if (m->tag == NOTE) {
+    d->notes = d->notes + 1;
+  } else if (m->tag == END) {
+    a->cores()->stop();
+  }
+  return 0;
+}
+
+// The link's wire format, to make what another machine might send.
+struct Packet {
+  magic: uint32;
+  kind: uint32;
+  from_place: uint32;
+  from_life: uint32;
+  to_life: uint32;
+  ack: uint32;
+  seq: uint32;
+  to_place: uint32;
+  to_gen: uint32;
+  to_index: uint32;
+  src_place: uint32;
+  src_gen: uint32;
+  src_index: uint32;
+  unused: uint32;
+  tag: int64;
+  arg: int64;
+  ref: int64;
+}
+
+fn b_main(arg: cstring) -> uint32 {
+  g_b.run();
+  return 0;
+}
+
+fn main() -> int32 {
+  var port_a: int64 = 11000 + (syscall(39) % 300) * 3;
+  var port_b: int64 = port_a + 1;
+  var here: uint32 = alph_ip4(127, 0, 0, 1);
+  var key: uint8[32];
+  var other: uint8[32];
+  for i in 0..32 {
+    key[i] = (uint8)(i * 7 + 1);
+    other[i] = (uint8)(i * 7 + 2);
+  }
+  var d: Driver;
+  d.want = ROUNDS;
+  d.rounds = 0;
+  d.bad = 0;
+  d.notes = 0;
+
+  g_a.init(&g_a_core[0], 2, &g_a_actors[0], 2, &g_a_mail[0], 8);
+  g_a_link.init(&g_a, 0, &g_a_peers[0], 1);
+  g_a_link.peer(2, 2, here, port_b);
+  var driver_pid: Word = g_a.spawn_on(0, &driver, (rawptr)&d);
+  g_a_link.watch(driver_pid);
+  expect(g_a_seal.init(&g_a_link, &key[0]) == ALPH_OK, "A's link is sealed");
+
+  g_b.init(&g_b_core[0], 2, &g_b_actors[0], 2, &g_b_mail[0], 8);
+  g_b_link.init(&g_b, 2, &g_b_peers[0], 1);
+  g_b_link.peer(0, 2, here, port_a);
+  g_ponger = g_b.spawn_on(1, &ponger, 0);
+  expect(g_b_seal.init(&g_b_link, &key[0]) == ALPH_OK, "B's link is sealed with the same key");
+  expect(g_b_seal.init(&g_b_link, &key[0]) == ALPH_GONE, "a link is sealed once");
+
+  // Before B starts: beats recorded from a run of B that is long over are
+  // played to A. They are sealed with the right key, but they were said to
+  // an earlier run of A, so B does not count as alive.
+  expect(g_a_link.start(port_a) == ALPH_OK, "A listens");
+  var third: AlphWire;
+  var k: Packet;
+  var sealed: uint8[128];
+  var n: int64 = 0;
+  expect(third.open(port_a + 2, 10), "a third socket");
+  g_old_link.cores = &g_b;
+  g_old_link.sealer = 0;
+  g_old_link.born = g_a_link.born - 100000;
+  g_old_link.life = (uint32)(g_old_link.born & 4294967295);
+  g_old_seal.init(&g_old_link, &key[0]);
+  k.magic = 1095520328;
+  k.kind = 1;
+  k.from_place = 2;
+  k.from_life = g_old_link.life;
+  k.to_life = g_a_link.life - 5000;
+  k.ack = 0;
+  for i in 0..5 {
+    n = g_old_seal.make(&sealed[0], (uint8*)&k, 24);
+    third.send(here, port_a, &sealed[0], n);
+    thread_sleep_ms(20);
+  }
+  expect(g_a_peers[0].newest == g_old_link.born, "A heard the old run's beats");
+  expect(!g_a_link.reaches(2), "and does not take B for alive");
+
+  expect(g_b_link.start(port_b) == ALPH_OK, "B listens");
+  var b_thread: int64 = CreateThread(0, 0, &b_main, 0, 0, 0);
+  g_a.run();
+  expect(d.rounds == ROUNDS && d.bad == 0, "with the same key, requests and replies cross ({d.rounds} rounds, {d.bad} bad)");
+  expect(g_a_link.refused == 0 && g_b_link.refused == 0, "and nothing is refused ({g_a_link.refused} and {g_b_link.refused})");
+
+  // From the third socket: a note for the driver, made as B would make it.
+  g_other_link.cores = &g_b;
+  g_other_link.sealer = 0;
+  g_other_link.born = g_b_link.born;
+  g_other_link.life = g_b_link.life;
+  g_other_seal.init(&g_other_link, &other[0]);
+  k.magic = 1095520328;
+  k.kind = 2;
+  k.from_place = 2;
+  k.from_life = g_a_peers[0].life;
+  k.to_life = g_a_link.life;
+  k.ack = 0;
+  k.seq = g_a_peers[0].got + 1;
+  k.to_place = 0;
+  k.to_gen = (uint32)((driver_pid >> ALPH_INDEX_BITS) & 16777215);
+  k.to_index = (uint32)(driver_pid & 16777215);
+  k.src_place = 0;
+  k.src_gen = 0;
+  k.src_index = 0;
+  k.unused = 0;
+  k.tag = (int64)NOTE;
+  k.arg = 0;
+  k.ref = 0;
+
+  third.send(here, port_a, (uint8*)&k, 80);     // in the clear
+  n = g_other_seal.make(&sealed[0], (uint8*)&k, 80);
+  third.send(here, port_a, &sealed[0], n);      // sealed with another key
+  n = g_b_seal.make(&sealed[0], (uint8*)&k, 80);
+  sealed[40] = sealed[40] + 1;
+  third.send(here, port_a, &sealed[0], n);      // changed on the way
+  n = g_b_seal.make(&sealed[0], (uint8*)&k, 80);
+  third.send(here, port_a, &sealed[0], n);      // sound: arrives
+  third.send(here, port_a, &sealed[0], n);      // the same datagram again
+  k.seq = k.seq + 1;
+  k.tag = (int64)END;
+  n = g_b_seal.make(&sealed[0], (uint8*)&k, 80);
+  third.send(here, port_a, &sealed[0], n);
+  g_a.run();
+  expect(d.notes == 1, "of five notes only the one sealed with the key and not played before arrives ({d.notes})");
+  expect(g_a_link.refused == 4, "the other four are refused ({g_a_link.refused})");
+
+  // The old run's beat again, now that the real B is known: refused, since
+  // it is from before the latest run heard.
+  k.kind = 1;
+  k.from_life = g_old_link.life;
+  n = g_old_seal.make(&sealed[0], (uint8*)&k, 24);
+  third.send(here, port_a, &sealed[0], n);
+  thread_sleep_ms(50);
+  third.close();
+  expect(g_a_link.refused == 5, "a beat from a run before the latest is refused ({g_a_link.refused})");
+
+  g_b_link.stop();
+  g_b.stop();
+  thread_join_infinite(b_thread);
+  thread_close(b_thread);
+  g_b_link.close();
+  g_a_link.stop();
+  g_a_link.close();
+  if (g_failures != 0) {
+    return 1;
+  }
+  println("seal ok: {ROUNDS} requests on a sealed link, 5 false datagrams refused, a recorded run not taken for alive");
+  return 0;
+}

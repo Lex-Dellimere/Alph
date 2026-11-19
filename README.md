@@ -59,9 +59,10 @@ This is [examples/count.mettle](examples/count.mettle). The node owns no memory:
 | Lives | Watch an actor to be told when it ends and why. Keep one, and a crash restarts it in place with the same pid | [src/life](src/life/life.mettle) |
 | Links | Other machines over UDP. Messages arrive once and in order, and a lost machine is noticed in half a second | [src/link](src/link/link.mettle) |
 | Names and the door | Find an actor on another machine by name, and watch it | [src/name](src/name/name.mettle), [src/door](src/door/door.mettle) |
+| Seals | A link only the holders of one key can read or speak on | [src/seal](src/seal/seal.mettle) |
 | Ports | What differs per device: `mcu` (one hart, no OS) and `host` (x86-64 Linux) | [ports](ports) |
 
-[docs/design.md](docs/design.md) explains each of these, what was measured, and what is not built yet.
+[docs/start.md](docs/start.md) shows how to use each of these. [docs/design.md](docs/design.md) explains why they are built this way, what was measured, and what is not built yet.
 
 ## Try it
 
@@ -104,7 +105,7 @@ qemu-system-riscv32 -M virt -bios none -nographic -device loader,file=blink.bin,
 
 ## What it does not do yet
 
-- Nothing on the link is encrypted or signed: it is for a network you trust.
+- A sealed link has one key for the whole network: any holder can speak as any machine, and someone who gets the key later can read what they recorded before.
 - A job with data of its own cannot go to another machine, only a job of one word in and one word out.
 - Timers look at every timer slot: right for tens of timers, not thousands.
 - There is no socket or file IO on the new core.
@@ -137,10 +138,12 @@ src/life/life.mettle        lives: watching and keeping actors
 src/link/link.mettle        links: other machines, over UDP
 src/name/name.mettle        names: a number for a pid
 src/door/door.mettle        the door: find and watch actors on other machines
+src/seal/seal.mettle        seals: an encrypted and signed link (needs the cryptex package)
 ports/mcu, ports/host       what differs per device, picked with -I ports/<name>
 src/alph.mettle             the first runtime in one import
 src/core, src/heal, src/work, src/net, src/io, src/sched, src/sys
                             the first runtime
+docs/start.md               how to use the new alph, layer by layer
 docs/design.md              the design of the new alph, with what was measured
 docs/guide.md, docs/api.md  the first runtime's guide and reference
 examples/                   small programs, run by check.sh
