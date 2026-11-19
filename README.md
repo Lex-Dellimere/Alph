@@ -62,7 +62,7 @@ This is [examples/count.mettle](examples/count.mettle). The node owns no memory:
 | Names and the door | Find an actor on another machine by name, and watch it | [src/name](src/name/name.mettle), [src/door](src/door/door.mettle) |
 | Seals | A link only the holders of one key can read or speak on | [src/seal](src/seal/seal.mettle) |
 | Tether | A microcontroller tied to a bigger machine by its serial line: each side's actors reach the other's by pid. That machine can pass the board's mail on, so the whole network reaches it. The line can be made sure, so what is lost or damaged on it is sent again | [src/tether](src/tether/tether.mettle) |
-| Board | The short way for a microcontroller: it says which kinds of work it does, and the bigger machines send it jobs as they would to any other place. It asks for work too, so two boards share work with no computer between them. An interrupt can be made a message to an actor | [src/board](src/board/board.mettle) |
+| Board | The short way for a microcontroller: it says which kinds of work it does, and the bigger machines send it jobs as they would to any other place. It asks for work too, so two boards share work with no computer between them, and work that must never happen twice can be asked for and done at most once. An interrupt can be made a message to an actor | [src/board](src/board/board.mettle) |
 | Machine and batch | The short way: a machine set up in one call, and one kind of work handed out in pieces to cores, the GPU, other machines and boards | [src/machine](src/machine/machine.mettle), [src/batch](src/batch/batch.mettle) |
 | Ports | What differs per device: `mcu` (one hart, no OS), `harts` (several harts, no OS), `pico2` (a Raspberry Pi Pico 2), `host` (x86-64 Linux) and `arm64` (64-bit ARM Linux: a Raspberry Pi, a Jetson) | [ports](ports) |
 
@@ -189,7 +189,6 @@ mettle --release examples/mcu/two_b.mettle --target riscv32-none --board qemu-vi
 
 - Nothing here has run on real hardware other than an x86-64 computer. The boards run in QEMU and, for the Pico 2, on the compiler's model of its chip. The ARM Linux programs run under an emulator.
 - On ARM Linux a handler that crashes ends the process.
-- A board cannot ask another board for work done at most once: that needs a number that is new at every start, and a board has no clock or storage to make one.
 - A sealed link has one key for the whole network: any holder can speak as any machine, and someone who gets the key later can read what they recorded before.
 - A job for another machine carries at most 1,024 bytes, and gives back a word and at most 1,016 bytes.
 - Sockets are Linux only, and there is no file IO.
@@ -232,6 +231,7 @@ src/batch/batch.mettle      a batch: one kind of work handed out in pieces
 src/seal/seal.mettle        seals: an encrypted and signed link (needs the cryptex package)
 src/tether/tether.mettle    tether: a board and a bigger machine on a serial line
 src/board/board.mettle      a board: a microcontroller that takes work from bigger machines
+                            (once and asks: work done at most once; irq: interrupts as messages)
 ports/mcu, ports/harts, ports/pico2, ports/host, ports/arm64
                             what differs per device, picked with -I ports/<name>
 src/alph.mettle             the first runtime in one import

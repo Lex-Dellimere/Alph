@@ -315,6 +315,17 @@ build_board() {
       "$METTLE" --release tests/mcu/irq_board.mettle --target riscv32-none --board qemu-virt \
         --emit-flat "$OUT/irq_board.bin" -I ports/mcu > "$log" 2>&1 || status=1
       ;;
+    once)
+      # The asking board also as a Pico 2 image, for the board's own source
+      # of fresh numbers: built, not run.
+      log="$OUT/once.log"
+      "$METTLE" --release tests/mcu/once_asker.mettle --target riscv32-none --board qemu-virt \
+        --emit-flat "$OUT/once_asker.bin" -I ports/mcu > "$log" 2>&1 &&
+      "$METTLE" --release tests/mcu/once_worker.mettle --target riscv32-none --board qemu-virt \
+        --emit-flat "$OUT/once_worker.bin" -I ports/mcu >> "$log" 2>&1 &&
+      "$METTLE" --release tests/mcu/once_asker.mettle --target riscv32-none --board pico2 \
+        --emit-flat "$OUT/pico2_once_asker.bin" -I ports/pico2 -I ports/mcu >> "$log" 2>&1 || status=1
+      ;;
     two)
       log="$OUT/two.log"
       "$METTLE" --release examples/mcu/two_a.mettle --target riscv32-none --board qemu-virt \
@@ -347,7 +358,7 @@ built() { [ "$(cat "$OUT/$1.built" 2> /dev/null)" = "${2:-0}" ]; }
 board_steps=()
 if [ "$boards" -eq 1 ]; then
   board_steps=(pico2 arm64)
-  [ "$qemu" -eq 1 ] && board_steps+=(blink tether relay arm harts pair two sure irq)
+  [ "$qemu" -eq 1 ] && board_steps+=(blink tether relay arm harts pair two once sure irq)
   rm -f "$OUT"/*.built "$OUT/pico2.unbuilt" "$OUT/arm64.unbuilt"
 fi
 
@@ -635,6 +646,34 @@ step_two() {
   fi
 }
 
+# A board asks another for work done at most once, with answers lost and
+# both boards forgetting everything once: no job is done twice.
+step_once() {
+  local log="$OUT/once.log" port other asked worked
+  if ! built once; then
+    echo "FAIL  mcu/once build (see $log)"
+    fails=$((fails + 1))
+  else
+    port=$((16431 + $$ % 500))
+    timeout 40 qemu-system-riscv32 -M virt -bios none -display none -monitor none \
+      -serial "tcp:127.0.0.1:$port,server=on,wait=off" \
+      -device loader,file="$OUT/once_worker.bin",addr=0x80000000,force-raw=on >> "$log" 2>&1 &
+    other=$!
+    sleep 0.4
+    timeout 40 qemu-system-riscv32 -M virt -bios none -display none -monitor none \
+      -serial "tcp:127.0.0.1:$port" -device loader,file="$OUT/once_asker.bin",addr=0x80000000,force-raw=on >> "$log" 2>&1
+    asked=$?
+    wait "$other"
+    worked=$?
+    if [ "$asked" -eq 0 ] && [ "$worked" -eq 0 ]; then
+      echo "ok    mcu/once [a board of $(stat -c %s "$OUT/once_asker.bin") bytes asks another for 32 jobs done at most once: answers lost, both forget everything once, none done twice]"
+    else
+      echo "FAIL  mcu/once: asking board exit $asked, working board exit $worked (see $log)"
+      fails=$((fails + 1))
+    fi
+  fi
+}
+
 # An interrupt as a message: the QEMU board's clock raises five alarms, and
 # each reaches an actor as a message.
 step_irq() {
@@ -737,6 +776,7 @@ if [ "$boards" -eq 1 ]; then
   [ "$qemu" -eq 1 ] && step_harts
   [ "$qemu" -eq 1 ] && step_pair
   [ "$qemu" -eq 1 ] && step_two
+  [ "$qemu" -eq 1 ] && step_once
   [ "$qemu" -eq 1 ] && step_sure
   [ "$qemu" -eq 1 ] && step_irq
   step_arm64

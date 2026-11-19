@@ -797,6 +797,35 @@ g_board.share_once(MOVE, &move, &g_moves);
 - Without the short way: `g_places.once(kind)` on the asking side, and the worker uses `AlphOnce` from `alph/place/once`, as `src/board/once.mettle` does.
 - A board that shares no such kind pays nothing for this. With one, the arm example's image goes from 4,544 to 5,520 bytes.
 
+A board asks for such work too, of a computer or of another board. One `AlphBoardAsks` is one kind, asked by one actor:
+
+```mettle
+import "alph/board/asks";
+
+var g_moves: AlphBoardAsks;
+
+g_moves.init(&g_board, MOVE);
+
+fn mover(a: AlphActor*, m: AlphMsg*) -> Word {
+  if (m->tag == TICK) {
+    g_moves.tick(a);                    // sends again what has no answer yet
+    g_time.after(150, a->pid, TICK, 0);
+  }
+  var ended: Word = g_moves.took(a, m);  // every message goes through it
+  for e in 0..ended {
+    // g_moves.told_ref[e] ended as g_moves.told_status[e]:
+    // ALPH_OK with g_moves.told_out[e], or ALPH_LOST
+  }
+  var ref: Word = g_moves.ask(a, angle);  // ALPH_FULL: not yet, ask after the next tick or answer
+  return 0;
+}
+```
+
+- The line sends nothing again, so `tick` does: call it from a timer a few times a second, and no more often than four times what a job takes.
+- `took` returns how many jobs the message ended. A job ends as `ALPH_OK` with its out, or as `ALPH_LOST` when the worker was restarted: done or not, it cannot be told. A worker that refuses a job ends it with the refusal (`ALPH_FULL` or `ALPH_GONE`): it was not done.
+- A board that was restarted must not use a job number it used before. Its port gives it a fresh one (`alph_board_fresh`): the clock on QEMU's board, random bits from the chip on a Pico 2.
+- `lost()` is the program's own word that the worker is gone, if it has a way to know: every job out ends as lost.
+
 **Interrupts as messages.** A sensor that has a reading, a pin that changed, a counter that wrapped: on a board these arrive as interrupts. `alph/board/irq` turns each into a message, so the code that deals with it is an ordinary handler:
 
 ```mettle

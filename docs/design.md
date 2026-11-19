@@ -122,6 +122,8 @@ What makes this hard is everything else that can happen: a copy that arrives lat
 
 It holds as long as the way between the two never delivers a message twice, which the link and the tether do not. In the test an asker and a worker have a way between them that loses a fifth of the messages each way, the worker is restarted every 600 ms and the asker is told it ended when it did not: of 150 jobs about 124 were done once and answered, about 26 were told lost (some done, some not), 15 to 19 were answered from memory, and none was done twice, in 60 runs of 60.
 
+A board follows the same rule when it asks (`src/board/asks.mettle`), with one difference. A computer names a run by its clock. A board has no clock that outlives a restart, so its port gives the number: the emulator's clock in QEMU, 18 random bits from the chip's ring oscillator on a Pico 2. Random bits repeat once in 262,144 starts, and a repeat only matters if a copy of an old job is still on its way then. In the check one board asks another for 32 jobs while every third answer is thrown away, the worker forgets everything once and the asker forgets everything once: most are done and answered rightly, the rest are told lost or were out when the asker forgot, and none is done twice. With the resend changed to take a new number, which is what a plain retry does, the same check fails.
+
 ## Crossings
 
 A message to another core moves cache lines over the memory bus. A job for the GPU moves data over PCIe. A message to another machine is a datagram. These are one thing, a crossing, and data is what makes a crossing expensive: a message is four words, data is megabytes. Two rules follow.

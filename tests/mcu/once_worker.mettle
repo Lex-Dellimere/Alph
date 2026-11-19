@@ -1,0 +1,78 @@
+// The board that does the work in the check of a board asking for work
+// done at most once (once_asker.mettle is the other). It counts how often
+// each job was done, and in the middle forgets everything it remembered,
+// as a restart would make it. It passes when no job was done twice.
+
+import "port/port";
+import "port/board";
+import "alph/actor/actor";
+import "alph/time/time";
+import "alph/board/board";
+import "alph/board/once";
+
+const MOVE: Word = 0;
+const TICK: Word = 1;
+
+var g_board: AlphBoard;
+var g_moves: AlphBoardOnce;
+var g_time: AlphTime;
+var g_timers: AlphTimer[2];
+var g_runs: uint8[64];
+var g_twice: Word = 0;
+var g_served: Word = 0;
+var g_idle: Word = 0;
+var g_forgot: Word = 0;
+
+@interrupt fn mettle_trap() {
+  mettle_board_exit(99);
+}
+
+fn move(n: Word) -> Word {
+  if (n >= 0 && n < 64) {
+    g_runs[n] = g_runs[n] + 1;
+    if (g_runs[n] > 1) {
+      g_twice = g_twice + 1;
+    }
+  }
+  return n + 1000;
+}
+
+fn ticker(a: AlphActor*, m: AlphMsg*) -> Word {
+  if (m->tag != TICK) {
+    return 0;
+  }
+  g_idle = g_idle + 1;
+  if (g_board.served != g_served) {
+    g_served = g_board.served;
+    g_idle = 0;
+  }
+  if (g_forgot == 0 && g_served >= 14) {
+    g_forgot = 1;
+    g_moves.memory.init();  // what a restart leaves of it
+  }
+  if (g_served >= 10 && g_idle >= 20) {
+    a->node->stop();
+    return 0;
+  }
+  g_time.after(100, a->pid, TICK, 0);
+  return 0;
+}
+
+fn main() -> int32 {
+  alph_board_start();
+  g_board.init(1, 0, 1);
+  g_time.init(&g_board.node, &g_timers[0], 2);
+  g_board.share_once(MOVE, &move, &g_moves);
+  var me: Word = g_board.node.spawn(&ticker, 0);
+  mettle_irq_enable();
+  g_time.after(100, me, TICK, 0);
+  g_board.run();
+  g_time.stop();
+  if (g_twice != 0) {
+    return 1;
+  }
+  if (g_forgot == 0) {
+    return 2;
+  }
+  return 0;
+}

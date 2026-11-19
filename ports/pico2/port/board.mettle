@@ -13,3 +13,16 @@ export fn alph_board_start() {
   mettle_board_trap_install();
   pico2_console_raw(true);
 }
+
+// A number this board has most likely not given before, for work that must
+// be done at most once (alph/board/asks): 18 random bits from the chip's
+// ring oscillator (ROSC RANDOMBIT, 0x400e8020). The same number comes
+// twice in a row once in 262,144 starts.
+export fn alph_board_fresh() -> Word {
+  var bit: volatile uint32* = (volatile uint32*)1074692128;
+  var out: Word = 0;
+  for i in 0..18 {
+    out = (Word)((out << 1) | (Word)(*bit & 1));
+  }
+  return out;
+}

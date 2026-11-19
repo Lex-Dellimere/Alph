@@ -2973,3 +2973,14 @@ export fn alph_board_start()
 ```
 
 Does what this board needs before anything else. Call it first in main.
+
+### `alph_board_fresh`
+
+```mettle
+export fn alph_board_fresh() -> Word
+```
+
+A number this board has not given before, for work that must be done at
+most once (alph/board/asks). QEMU's virt board has a clock that goes on
+while the board is restarted: this is its time in steps of 134 ms, so a
+board that is back within one step has no fresh number yet.
