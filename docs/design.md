@@ -18,6 +18,18 @@ Everything else is something that sends messages. A timer interrupt sends a tick
 
 The node owns no memory. The caller hands it the actor slots and the mailboxes, so a board with 2 KB of RAM and a server with a million actors use the same code.
 
+## Lives
+
+A handler that returns non-zero ends its actor, and what it returned is the reason. A handler that crashes (a null pointer, a division by zero, an index past the end, a fault signal) ends its actor with the reason `ALPH_CRASHED` and the node goes on: the port's guard saves a place to resume before each handler, and Mettle's runtime comes back to it instead of ending the process. This is on Linux, in a program built with `-s`. On a microcontroller a crash is still the board's trap.
+
+`src/life` decides what an end means for others:
+
+- **Watching.** A watcher is sent `ALPH_ENDED` with the reason when the actor it watches ends. Watching one that is already gone says so at once. An actor is gone before anyone is told, so a watcher that hears of an end can no longer reach it.
+- **Keeping.** A kept actor that fails or crashes is not ended. Its state is set up again and it goes on with the same pid and the mail it had, so nothing that knows it has to learn a new pid. After its last allowed restart it ends like any other.
+- **Lost machines.** When a link reports a machine down, every actor watched on that machine ends for its watchers with the reason `ALPH_LOST`.
+
+Not built: watching an actor on another machine while that machine stays up (its end is not sent across), restart limits counted over time rather than in all, and groups that restart together.
+
 ## Time
 
 A timer is something that sends a message later, so it is a layer (`src/time`), not part of the core. `after` sends a message in so many milliseconds and returns a ref, `cancel` takes it back. The port's alarm rings when the soonest timer is due: the board's timer interrupt on `mcu`, one sleeping thread on `host`.
@@ -33,11 +45,11 @@ What differs between devices is in a port, a folder picked at build time with `-
 | `mcu` | one hart, no OS | 32 bits | 1,024 | 256 | `wfi` | interrupts off |
 | `host` | an x86-64 Linux process | 64 bits | 16 million | 32,768 | looks for mail for about 10 µs, then a futex | a spin lock |
 
-A port is two files, the gate and the alarm, of 30 to 100 lines each. A new device is a new port.
+A port is a few files of 30 to 130 lines each: the gate, the alarm, the guard that catches a crash, and the wire to other machines. A new device is a new port.
 
 ## Size
 
-`examples/mcu/blink.mettle` is two actors and a timer on 32-bit RISC-V. The whole image, board startup included, is 3,192 bytes: about 1.2 KB of core, 1.1 KB of timers and alarm, the rest the board and the program. `check.sh` builds it, runs it in QEMU and fails above 5 KB.
+`examples/mcu/blink.mettle` is two actors and a timer on 32-bit RISC-V. The whole image, board startup included, is 3,256 bytes: about 1.3 KB of core, 1.1 KB of timers and alarm, the rest the board and the program. `check.sh` builds it, runs it in QEMU and fails above 5 KB.
 
 ## Places
 

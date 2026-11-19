@@ -92,7 +92,7 @@ It checks that `docs/api.md` matches the source, then builds every test and exam
 
 ## The small core
 
-alph is being rebuilt on a core small enough for a microcontroller: actors, messages and a run loop in one file, [src/actor/actor.mettle](src/actor/actor.mettle). The same source runs on a bare 32-bit RISC-V board in a 3.2 KB image, timers included, and in a Linux process, where [src/cores/cores.mettle](src/cores/cores.mettle) runs one node per thread and an actor sends to another core the way it sends next door. [docs/design.md](docs/design.md) says where this is going: one runtime that puts work on a core, a GPU or another machine, whichever is cheapest.
+alph is being rebuilt on a core small enough for a microcontroller: actors, messages and a run loop in one file, [src/actor/actor.mettle](src/actor/actor.mettle). The same source runs on a bare 32-bit RISC-V board in a 3.3 KB image, timers included, and in a Linux process, where [src/cores/cores.mettle](src/cores/cores.mettle) runs one node per thread and an actor sends to another core the way it sends next door. [docs/design.md](docs/design.md) says where this is going: one runtime that puts work on a core, a GPU or another machine, whichever is cheapest.
 
 ```bash
 mettle --release examples/mcu/blink.mettle --target riscv32-none --board qemu-virt --emit-flat blink.bin -I ports/mcu
@@ -119,6 +119,7 @@ src/cores/cores.mettle      the small core on several threads, one node each
 src/time/time.mettle        timers for the small core: a message sent later
 src/place/place.mettle      places: a job goes to the core or the GPU, whichever should finish it first
 src/link/link.mettle        links: other machines as places, over UDP, a lost machine noticed in half a second
+src/life/life.mettle        lives: watch an actor to be told when it ends, keep one so a crash restarts it in place
 ports/mcu, ports/host       what differs per device, picked with -I ports/<name>
 src/alph.mettle             the first runtime in one import
 src/core/node.mettle        the node: actors, schedulers, messages, links, monitors, requests, timers,

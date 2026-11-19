@@ -12,10 +12,12 @@
 // build time with -I ports/<name>.
 
 import "port/port";
+import "port/guard";
 
 export const ALPH_OK: Word = 0;
 export const ALPH_FULL: Word = -1;  // the mailbox is full
 export const ALPH_GONE: Word = -2;  // no such actor
+export const ALPH_CRASHED: Word = -9;  // the reason an actor ends with when its handler crashes
 
 export struct AlphMsg {
   tag: Word;
@@ -52,6 +54,10 @@ export struct AlphNode {
   place: Word;
   far: fn(AlphNode*, Word, AlphMsg*) -> Word;
   world: rawptr;  // whoever set far
+  ended: fn(AlphNode*, AlphActor*, Word) -> Word;
+  life: rawptr;   // whoever set ended
+  guard: AlphGuard;
+  running: AlphActor*;  // the actor whose handler is running
 }
 
 // Puts a slot at the back of the free list, so its pids are reused last.
@@ -80,6 +86,8 @@ export fn AlphNode_init__ptr(n: AlphNode*, actors: AlphActor*, slots: Word, mail
   n->place = 0;
   n->far = 0;
   n->world = 0;
+  n->ended = 0;
+  n->life = 0;
   n->gate.init();
   for i in 0..slots {
     var a: AlphActor* = &actors[i];
@@ -102,6 +110,35 @@ export fn AlphNode_join__ptr(n: AlphNode*, place: Word, far: fn(AlphNode*, Word,
   for i in 0..n->slots {
     n->actors[i].pid = (Word)((n->actors[i].pid & low) | (place << ALPH_PLACE_SHIFT));
   }
+}
+
+// Has ended called whenever a handler returns non-zero, with the actor and
+// what the handler returned, before the actor is gone. If ended returns
+// non-zero the actor is not ended: it keeps its pid and its mail.
+export fn AlphNode_on_end__ptr(n: AlphNode*, ended: fn(AlphNode*, AlphActor*, Word) -> Word, life: rawptr) {
+  n->ended = ended;
+  n->life = life;
+}
+
+// For ended to call, on an actor it will let end: from here mail for it is
+// refused and it counts as gone, so whoever is told next that it ended
+// cannot still reach it.
+export fn AlphNode_bury__ptr(n: AlphNode*, a: AlphActor*) {
+  var was: int32 = n->gate.enter();
+  a->alive = 0;
+  n->gate.leave(was);
+}
+
+// Whether a pid names an actor here that is alive now.
+export fn AlphNode_alive__ptr(n: AlphNode*, pid: Word) -> bool {
+  var i: Word = (Word)(pid & (((Word)1 << ALPH_INDEX_BITS) - 1));
+  if (i >= n->slots) {
+    return false;
+  }
+  var was: int32 = n->gate.enter();
+  var out: bool = n->actors[i].alive != 0 && n->actors[i].pid == pid;
+  n->gate.leave(was);
+  return out;
 }
 
 // Returns the new actor's pid, or 0 when every slot is taken.
@@ -226,14 +263,19 @@ fn alph_next_pid(pid: Word) -> Word {
   return pid + step;
 }
 
-// Runs actors until stop. A handler that returns non-zero ends its actor.
-// With nothing to do the node sleeps until a message arrives.
-export fn AlphNode_run__ptr(n: AlphNode*) {
+// Runs messages until stop, or, when wait is 0, until none is waiting.
+// Returns how many it ran.
+fn alph_run(n: AlphNode*, wait: Word) -> Word {
   var m: AlphMsg;
+  var ran: Word = 0;
+  n->guard.open();
   var was: int32 = n->gate.enter();
   while (n->stopped == 0) {
     var a: AlphActor* = n->first;
     if (a == 0) {
+      if (wait == 0) {
+        break;
+      }
       n->gate.sleep(was);
       was = n->gate.enter();
       continue;
@@ -248,9 +290,25 @@ export fn AlphNode_run__ptr(n: AlphNode*) {
       a->head = 0;
     }
     a->count = a->count - 1;
+    n->running = a;
     n->gate.leave(was);
 
-    var end: Word = a->handle(a, &m);
+    // A crash in the handler comes back to the save, which then returns 1.
+    // What this function kept in registers may be stale there, so the
+    // actor is read back from the node.
+    var end: Word = 0;
+    n->guard.arm();
+    if (n->guard.save() == 0) {
+      end = a->handle(a, &m);
+    } else {
+      a = n->running;
+      end = ALPH_CRASHED;
+    }
+    n->guard.disarm();
+    if (end != 0 && n->ended != 0 && n->ended(n, a, end) != 0) {
+      end = 0;
+    }
+    ran = ran + 1;
 
     was = n->gate.enter();
     if (end != 0) {
@@ -264,6 +322,25 @@ export fn AlphNode_run__ptr(n: AlphNode*) {
       a->queued = 0;
     }
   }
-  n->stopped = 0;
+  if (wait != 0) {
+    n->stopped = 0;
+  }
   n->gate.leave(was);
+  n->guard.close();
+  return ran;
+}
+
+// Runs actors until stop. A handler that returns non-zero ends its actor,
+// and what it returned is the reason. A handler that crashes ends its actor
+// with ALPH_CRASHED and the node goes on (on Linux, in a program built with
+// -s). With nothing to do the node sleeps until a message arrives.
+export fn AlphNode_run__ptr(n: AlphNode*) {
+  alph_run(n, 1);
+}
+
+// Runs the messages that are waiting and returns how many that was: for a
+// program with a loop of its own, such as one that draws a frame each time
+// round. A stop ends the turn early and is left for the next run.
+export fn AlphNode_turn__ptr(n: AlphNode*) -> Word {
+  return alph_run(n, 0);
 }

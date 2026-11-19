@@ -86,6 +86,15 @@ export fn AlphCores_spawn__ptr(c: AlphCores*, handle: fn(AlphActor*, AlphMsg*) -
   return pid;
 }
 
+// Whether a pid names an actor on one of these cores that is alive now.
+export fn AlphCores_alive__ptr(c: AlphCores*, pid: Word) -> bool {
+  var core: Word = (Word)(pid >> ALPH_PLACE_SHIFT) - c->first;
+  if (core < 0 || core >= c->count) {
+    return false;
+  }
+  return c->cores[core].node.alive(pid);
+}
+
 // From outside an actor.
 export fn AlphCores_send__ptr(c: AlphCores*, to: Word, tag: Word, arg: Word) -> Word {
   return c->cores[0].node.send(to, tag, arg);

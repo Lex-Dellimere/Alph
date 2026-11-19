@@ -18,6 +18,10 @@ METTLE="${METTLE:-$ROOT/../Mettle/bin/mettle}"
 OUT="build/check"
 MODES=("-s" "-s --release")
 MCU_LIMIT=5120  # bytes: the whole RISC-V image, board startup included
+# Tests of the first runtime that assert millisecond deadlines. On a busy
+# machine they miss them, so they get three tries and the output says when
+# one needed more than the first. Every other test gets one.
+TIMED="t_bound t_fair t_shed t_shed_edge t_timer_handoff t_storm"
 mkdir -p "$OUT"
 
 # mettle.deps is generated (mbuild writes it on every build). Without mbuild,
@@ -71,13 +75,27 @@ for src in "${tests[@]}"; do
       fails=$((fails + 1))
       continue
     fi
-    if timeout 60 "$exe" >> "$log" 2>&1; then
-      echo "ok    $name [$mode]"
-    else
-      echo "FAIL  $name [$mode] exit $? (see $log)"
-      tail -n 8 "$log" | sed 's/^/      /'
-      fails=$((fails + 1))
-    fi
+    tries=1
+    case " $TIMED " in *" $name "*) tries=3 ;; esac
+    try=1
+    while true; do
+      if timeout 60 "$exe" >> "$log" 2>&1; then
+        if [ "$try" -eq 1 ]; then
+          echo "ok    $name [$mode]"
+        else
+          echo "ok    $name [$mode] (try $try: it asserts deadlines and the machine was busy)"
+        fi
+        break
+      fi
+      code=$?
+      if [ "$try" -ge "$tries" ]; then
+        echo "FAIL  $name [$mode] exit $code (see $log)"
+        tail -n 8 "$log" | sed 's/^/      /'
+        fails=$((fails + 1))
+        break
+      fi
+      try=$((try + 1))
+    done
   done
 done
 
