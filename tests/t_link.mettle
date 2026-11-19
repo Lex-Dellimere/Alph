@@ -1,0 +1,259 @@
+// Links (src/link): two machines in one process, each with its own cores,
+// talking over UDP on this computer. Requests and replies cross, a machine
+// not yet heard or not known is gone, one that goes quiet is noticed in
+// under a second, one that comes back is reachable again as a new one, and
+// mail that is malformed, misaddressed or from an earlier run is dropped.
+
+import "std/io";
+import "std/thread";
+import "alph/actor/actor";
+import "alph/cores/cores";
+import "port/wire";
+import "alph/link/link";
+
+const PING: Word = 1;
+const PONG: Word = 2;
+const ROUNDS: Word = 2000;
+
+// Machine A is places 0 and 1, machine B is places 2 and 3.
+var g_a: AlphCores;
+var g_a_core: AlphCore[2];
+var g_a_actors: AlphActor[4];
+var g_a_mail: AlphMsg[32];
+var g_a_link: AlphLink;
+var g_a_peers: AlphPeer[2];
+
+var g_b: AlphCores;
+var g_b_core: AlphCore[2];
+var g_b_actors: AlphActor[4];
+var g_b_mail: AlphMsg[32];
+var g_b_link: AlphLink;
+var g_b_peers: AlphPeer[2];
+var g_b_thread: int64 = 0;
+
+var g_ponger: Word = 0;
+var g_failures: int32 = 0;
+
+fn expect(ok: bool, what: string) {
+  if (!ok) {
+    println("FAIL {what}");
+    g_failures = g_failures + 1;
+  }
+}
+
+fn now_ms() -> Word {
+  var ts: int64[2];
+  syscall(228, 1, (int64)&ts[0]);
+  return (Word)(ts[0] * 1000 + ts[1] / 1000000);
+}
+
+fn ponger(a: AlphActor*, m: AlphMsg*) -> Word {
+  a->reply(m, PONG, m->arg + 1);
+  return 0;
+}
+
+// On machine A: pings the ponger once B is up, and notes when B is lost.
+struct Driver {
+  want: Word;    // rounds to run once B is up, 0 to wait for it to go down
+  rounds: Word;
+  ref: Word;
+  bad: Word;
+  ups: Word;
+  downs: Word;
+  down_at: Word;
+}
+
+fn driver(a: AlphActor*, m: AlphMsg*) -> Word {
+  var d: Driver* = (Driver*)a->state;
+  if (m->tag == ALPH_DOWN) {
+    d->downs = d->downs + 1;
+    d->down_at = now_ms();
+    if (d->want == 0) {
+      a->cores()->stop();
+    }
+    return 0;
+  }
+  if (m->tag == ALPH_UP) {
+    d->ups = d->ups + 1;
+    if (m->arg != 2) {
+      d->bad = d->bad + 1;
+    }
+    d->ref = a->ask(g_ponger, PING, 0);
+    return 0;
+  }
+  if (m->ref != d->ref || m->from != g_ponger || m->arg != d->rounds + 1) {
+    d->bad = d->bad + 1;
+  }
+  d->rounds = m->arg;
+  if (d->rounds >= d->want) {
+    a->cores()->stop();
+    return 0;
+  }
+  d->ref = a->ask(g_ponger, PING, d->rounds);
+  return 0;
+}
+
+// The wire format, written out here so the test can send what a faulty or
+// hostile machine might.
+struct Forged {
+  magic: uint32;
+  kind: uint32;
+  from_place: uint32;
+  from_life: uint32;
+  to_life: uint32;
+  to_place: uint32;
+  to_gen: uint32;
+  to_index: uint32;
+  src_place: uint32;
+  src_gen: uint32;
+  src_index: uint32;
+  unused: uint32;
+  tag: int64;
+  arg: int64;
+  ref: int64;
+}
+
+const NOTE: Word = 3;
+const END: Word = 4;
+
+// On machine A: counts NOTEs and stops the cores at END.
+fn sink(a: AlphActor*, m: AlphMsg*) -> Word {
+  var notes: Word* = (Word*)a->state;
+  if (m->tag == END) {
+    a->cores()->stop();
+    return 0;
+  }
+  *notes = *notes + 1;
+  return 0;
+}
+
+fn b_main(arg: cstring) -> uint32 {
+  g_b.run();
+  return 0;
+}
+
+fn start_b(port_a: int64, port_b: int64) {
+  g_b.init(&g_b_core[0], 2, &g_b_actors[0], 2, &g_b_mail[0], 8);
+  g_b_link.init(&g_b, 2, &g_b_peers[0], 2);
+  g_b_link.peer(0, 2, alph_ip4(127, 0, 0, 1), port_a);
+  g_ponger = g_b.spawn_on(1, &ponger, 0);
+  expect(g_b_link.start(port_b) == ALPH_OK, "machine B listens");
+  g_b_thread = CreateThread(0, 0, &b_main, 0, 0, 0);
+}
+
+fn stop_b() {
+  g_b_link.stop();
+  g_b.stop();
+  thread_join_infinite(g_b_thread);
+  thread_close(g_b_thread);
+  g_b_link.close();
+}
+
+fn main() -> int32 {
+  var port_a: int64 = 21000 + (syscall(39) % 20000) * 2;
+  var port_b: int64 = port_a + 1;
+  var d: Driver;
+  d.rounds = 0;
+  d.bad = 0;
+  d.ups = 0;
+  d.downs = 0;
+
+  g_a.init(&g_a_core[0], 2, &g_a_actors[0], 2, &g_a_mail[0], 8);
+  g_a_link.init(&g_a, 0, &g_a_peers[0], 2);
+  g_a_link.peer(2, 2, alph_ip4(127, 0, 0, 1), port_b);
+  g_a_link.watch(g_a.spawn_on(0, &driver, (rawptr)&d));
+  expect(g_a_link.start(port_a) == ALPH_OK, "machine A listens");
+
+  // B's ponger will be the first actor on B's second core.
+  var there: Word = (Word)(((Word)3 << ALPH_PLACE_SHIFT) | ((Word)1 << ALPH_INDEX_BITS));
+  expect(g_a.send(there, PING, 0) == ALPH_GONE, "a machine not yet heard is gone");
+  expect(g_a.send((Word)(((Word)9 << ALPH_PLACE_SHIFT) | ((Word)1 << ALPH_INDEX_BITS)), PING, 0) == ALPH_GONE,
+         "a place no machine has is gone");
+  expect(!g_a_link.reaches(2), "B is not reachable before it starts");
+
+  // B starts: A is told, and requests and replies cross.
+  start_b(port_a, port_b);
+  expect(g_ponger == there, "the ponger is where A expects it");
+  d.want = ROUNDS;
+  var began: Word = now_ms();
+  g_a.run();
+  var each_us: Word = (Word)((now_ms() - began) * 1000 / ROUNDS);
+  expect(d.ups == 1, "A is told once that B is up ({d.ups})");
+  expect(d.rounds == ROUNDS, "every round crossed and came back ({d.rounds})");
+  expect(d.bad == 0, "each reply came from the ponger with its request's ref ({d.bad} did not)");
+  expect(g_a_link.reaches(3), "B is reachable");
+  var first_life: uint32 = g_a_peers[0].life;
+
+  // B goes quiet: A notices in under a second.
+  d.want = 0;
+  var quiet: Word = now_ms();
+  stop_b();
+  g_a.run();
+  var took: Word = d.down_at - quiet;
+  expect(d.downs == 1, "A is told once that B is down ({d.downs})");
+  expect(took >= 300 && took < 1000, "within a second, and not at once ({took} ms)");
+  expect(g_a.send(g_ponger, PING, 0) == ALPH_GONE, "a machine that is down is gone");
+  expect(!g_a_link.reaches(2), "B is not reachable");
+
+  // B comes back as a new machine, and is reachable again.
+  d.rounds = 0;
+  d.want = 100;
+  start_b(port_a, port_b);
+  g_a.run();
+  expect(d.ups == 2, "A is told that B is up again ({d.ups})");
+  expect(d.rounds == 100 && d.bad == 0, "requests cross again ({d.rounds} rounds, {d.bad} bad)");
+  expect(g_a_peers[0].life != first_life, "the B that came back is a new one");
+
+  // What a faulty machine might send, from a third socket claiming to be B.
+  var notes: Word = 0;
+  var sink_pid: Word = g_a.spawn_on(1, &sink, (rawptr)&notes);
+  var third: AlphWire;
+  var here: uint32 = alph_ip4(127, 0, 0, 1);
+  var f: Forged;
+  expect(third.open(port_a + 2, 10), "a third socket");
+  var b_life: uint32 = g_a_peers[0].life;
+  f.magic = 1095520328;
+  f.kind = 2;
+  f.from_place = 2;
+  f.from_life = b_life;
+  f.to_life = g_a_link.life;
+  f.to_place = 1;
+  f.to_gen = (uint32)((sink_pid >> ALPH_INDEX_BITS) & 16777215);
+  f.to_index = (uint32)(sink_pid & 16777215);
+  f.src_place = 0;
+  f.src_gen = 0;
+  f.src_index = 0;
+  f.unused = 0;
+  f.tag = (int64)NOTE;
+  f.arg = 0;
+  f.ref = 0;
+  third.send(here, port_a, (uint8*)&f, 72);   // sound: arrives
+  f.to_life = g_a_link.life + 1;
+  third.send(here, port_a, (uint8*)&f, 72);   // meant for another run of A
+  f.to_life = g_a_link.life;
+  f.to_place = 0;
+  f.to_gen = f.to_gen + 16777216;             // spills into the place: names core 1 from core 0
+  third.send(here, port_a, (uint8*)&f, 72);
+  f.to_place = 1;
+  f.to_gen = f.to_gen - 16777216;
+  third.send(here, port_a, (uint8*)&f, 40);   // cut short
+  f.from_life = b_life - 5000;                // from a run of B before this one
+  third.send(here, port_a, (uint8*)&f, 72);
+  f.from_life = b_life;
+  f.tag = (int64)END;
+  third.send(here, port_a, (uint8*)&f, 72);
+  g_a.run();
+  third.close();
+  expect(notes == 1, "of five notes only the sound one arrives ({notes})");
+  expect(g_a_peers[0].life == b_life, "mail from an earlier run of B does not bring that run back");
+  expect(d.ups == 2 && d.downs == 1, "and the watcher is told nothing new ({d.ups} ups, {d.downs} downs)");
+
+  stop_b();
+  g_a_link.stop();
+  g_a_link.close();
+  if (g_failures != 0) {
+    return 1;
+  }
+  println("link ok: {ROUNDS} requests between two machines at {each_us} us each, a lost machine noticed in {took} ms");
+  return 0;
+}

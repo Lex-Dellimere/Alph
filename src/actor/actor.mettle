@@ -98,8 +98,9 @@ export fn AlphNode_join__ptr(n: AlphNode*, place: Word, far: fn(AlphNode*, Word,
   n->place = place;
   n->far = far;
   n->world = world;
+  var low: Word = (Word)(((Word)1 << ALPH_PLACE_SHIFT) - 1);
   for i in 0..n->slots {
-    n->actors[i].pid = (Word)(n->actors[i].pid | (place << ALPH_PLACE_SHIFT));
+    n->actors[i].pid = (Word)((n->actors[i].pid & low) | (place << ALPH_PLACE_SHIFT));
   }
 }
 

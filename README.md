@@ -118,6 +118,7 @@ src/actor/actor.mettle      the small core: actors, messages, the run loop
 src/cores/cores.mettle      the small core on several threads, one node each
 src/time/time.mettle        timers for the small core: a message sent later
 src/place/place.mettle      places: a job goes to the core or the GPU, whichever should finish it first
+src/link/link.mettle        links: other machines as places, over UDP, a lost machine noticed in half a second
 ports/mcu, ports/host       what differs per device, picked with -I ports/<name>
 src/alph.mettle             the first runtime in one import
 src/core/node.mettle        the node: actors, schedulers, messages, links, monitors, requests, timers,
