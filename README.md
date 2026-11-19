@@ -53,7 +53,7 @@ This is [examples/count.mettle](examples/count.mettle). The node owns no memory:
 | Layer | What it does | Where |
 |---|---|---|
 | Core | Actors, messages, the run loop. On Linux a handler that crashes ends only its actor | [src/actor](src/actor/actor.mettle) |
-| Cores | One node per core: a thread each on Linux, a hart each on a chip with several. An actor sends to another core the way it sends next door | [src/cores](src/cores/cores.mettle) |
+| Cores | One node per core: a thread each on Linux, a hart each on a chip with several. An actor sends to another core the way it sends next door. On Linux, lanes let cores that send each other a lot do it without a lock | [src/cores](src/cores/cores.mettle) |
 | Time | A message sent later. Small timers for a board, a timer wheel for thousands | [src/time](src/time/time.mettle), [wheel](src/time/wheel.mettle) |
 | Places | A job goes to a core, the GPU or another machine, whichever alph has timed as finishing it first. A job stays where its data is | [src/place](src/place/place.mettle) |
 | Polls | A socket sends a message when it is ready, so no handler waits. TCP calls that go with it, and other programs: start one and get a message when it ends | [src/poll](src/poll/poll.mettle) |
@@ -184,7 +184,7 @@ mettle --release examples/mcu/two_b.mettle --target riscv32-none --board qemu-vi
 - A sealed link has one key for the whole network: any holder can speak as any machine, and someone who gets the key later can read what they recorded before.
 - A job for another machine carries at most 1,024 bytes, and gives back a word and at most 1,016 bytes.
 - Sockets are Linux only, and there is no file IO.
-- A message between two cores costs 150 to 300 ns against about 20 ns inside a node.
+- A message between two cores costs 150 to 300 ns against about 20 ns inside a node. Lanes bring a stream of them down to about 70 ns, but a single request and its reply are no quicker.
 - A microcontroller joins through a serial line to one machine, and nothing lost on that line is sent again.
 - A board's jobs are one word in and one word out, one at a time. A board asks the machine at the other end of its line, not the best of several places.
 - A job whose answer is lost is placed again, so it can be done twice. Work that must not be, such as moving an arm, needs care until jobs done at most once are built.
@@ -209,6 +209,7 @@ Everything under `src/core`, `src/heal`, `src/work`, `src/net`, `src/io`, `src/s
 ```text
 src/actor/actor.mettle      the core: actors, messages, the run loop
 src/cores/cores.mettle      the core on several threads, one node each
+src/cores/lanes.mettle      lanes: a lock-free way between each pair of cores
 src/time/time.mettle        timers: a message sent later
 src/time/wheel.mettle       a timer wheel, for thousands of timers
 src/place/place.mettle      places: a job goes to a core, the GPU or another machine

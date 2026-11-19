@@ -554,6 +554,18 @@ Call it as `n->put(to, m)`, or `n.put(to, m)` on a value.
 
 Delivers a whole message. ALPH_FULL and ALPH_GONE are refusals.
 
+### `AlphNode_deliver__ptr`
+
+```mettle
+export fn AlphNode_deliver__ptr(n: AlphNode*, to: Word, m: AlphMsg*) -> Word
+```
+
+Call it as `n->deliver(to, m)`, or `n.deliver(to, m)` on a value.
+
+Put for an actor here, by code already inside the node's gate: what
+gathers mail that came another way. Returns ALPH_OK, ALPH_FULL or
+ALPH_GONE.
+
 ### `AlphNode_send__ptr`
 
 ```mettle
@@ -648,8 +660,11 @@ actor slots and the mailboxes, which it shares out evenly.
 export struct AlphCore {
   node: AlphNode;
   thread: int64;
+  self: int32;  // the thread running this core, 0 when none
 }
 ```
+
+One core: its node and the thread or hart that runs it.
 
 ### `AlphCores`
 
@@ -660,8 +675,15 @@ export struct AlphCores {
   first: Word;  // the first core's place: the cores are first, first + 1, ...
   far: fn(AlphCores*, Word, AlphMsg*) -> Word;
   world: rawptr;  // whoever set far
+  // Tried first for mail between the cores, only on the thread that runs
+  // the sending node (src/cores/lanes). A board has none: ALPH_GATHER is 0
+  // there, so the test folds away.
+  cross: fn(AlphCores*, AlphNode*, Word, AlphMsg*) -> Word;
+  ways: rawptr;  // whoever set cross
 }
 ```
+
+The cores of one machine, a node on each.
 
 ### `AlphCores_join__ptr`
 
@@ -758,6 +780,67 @@ export fn AlphCores_stop__ptr(c: AlphCores*)
 ```
 
 Call it as `c->stop()`, or `c.stop()` on a value.
+
+Stops every core, so run returns. Any actor or thread may call it.
+
+## alph/cores/lanes
+
+Lanes between cores, for src/cores on Linux. Putting into another core's
+node takes its gate, so both cores write the same lines. With lanes, a
+handler's message for another core goes instead into a ring for that
+pair of cores that only the sending core's thread writes and only the
+receiving core's thread reads, with no lock, and the receiver moves it
+into the mailbox when it runs.
+
+What a sender is told changes: ALPH_OK once the message is in the lane,
+ALPH_FULL when the lane is full, never ALPH_GONE. A message for an actor
+that is gone when it arrives is dropped, and one for a full mailbox waits
+at the head of its lane, with what is behind it, until the actor has
+room. Sends from any other thread take the gate as before.
+
+A board has none: an interrupt runs on the hart it stops, so a hart
+cannot tell a core's own sends from others.
+
+### `AlphLetter`
+
+```mettle
+export struct AlphLetter {
+  to: Word;
+  msg: AlphMsg;
+}
+```
+
+A message in a lane, with the pid it is for.
+
+### `AlphLane`
+
+```mettle
+export struct AlphLane {
+  tail: int32;  // where the sender puts the next message
+  head_seen: int32;
+  mail: AlphLetter*;
+  room: int32;
+  sender: int32[11];
+  head: int32;  // the next message the receiver takes
+  tail_seen: int32;
+  receiver: int64[7];
+}
+```
+
+The sender's half and the receiver's half sit on lines of their own. The
+lane from a core to itself carries nothing; its tail is that core's idle:
+set while it goes to sleep, when a sender must wake it.
+
+### `AlphCores_lanes__ptr`
+
+```mettle
+export fn AlphCores_lanes__ptr(c: AlphCores*, lanes: AlphLane*, mail: AlphLetter*, room: Word)
+```
+
+Call it as `c->lanes(lanes, mail, room)`, or `c.lanes(lanes, mail, room)` on a value.
+
+Turns lanes on. lanes holds count * count lanes, mail count * count *
+room letters, and a lane holds room - 1. Call it before run.
 
 ## alph/time/time
 

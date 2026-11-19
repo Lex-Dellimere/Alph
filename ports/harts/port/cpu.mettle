@@ -43,3 +43,9 @@ export fn alph_cpu_join(handle: int64) {
   while (mettle_atomic_compare_exchange_i32(&g_done[(int32)handle], 0, 0) == 0) {
   }
 }
+
+// 0: an interrupt runs on the hart it stops, so the hart is not enough to
+// tell a core's own sends from others, and lanes are not used.
+export fn alph_cpu_self() -> int32 {
+  return 0;
+}

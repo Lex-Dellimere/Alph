@@ -9,6 +9,7 @@
 export type Word = int32;
 export const ALPH_INDEX_BITS: Word = 10;   // 1,024 actors in a node
 export const ALPH_PLACE_SHIFT: Word = 23;  // 13 bits of generation, then 8 of place
+export const ALPH_GATHER: Word = 0;  // no mail comes but through put
 
 const SOFTWARE: uint64 = 8;       // the software interrupt's bit in mie
 const WAKE_BASE: int32 = 33554432;  // the CLINT: one word a hart, at 0x2000000
@@ -68,6 +69,9 @@ export fn AlphGate_wake__ptr(g: AlphGate*) {
     g->asleep = 0;
     alph_hart_poke(g->hart, 1);
   }
+}
+
+export fn AlphGate_gather__ptr(g: AlphGate*) {
 }
 
 // A wake that arrives while its hart is awake with interrupts on: nothing

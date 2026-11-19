@@ -3,6 +3,7 @@
 export type Word = int32;
 export const ALPH_INDEX_BITS: Word = 10;   // 1,024 actors in a node
 export const ALPH_PLACE_SHIFT: Word = 23;  // 13 bits of generation, then 8 of place
+export const ALPH_GATHER: Word = 0;  // no mail comes but through put
 
 export struct AlphGate {
   unused: int32;
@@ -26,4 +27,7 @@ export fn AlphGate_sleep__ptr(g: AlphGate*, was: int32) {
 }
 
 export fn AlphGate_wake__ptr(g: AlphGate*) {
+}
+
+export fn AlphGate_gather__ptr(g: AlphGate*) {
 }

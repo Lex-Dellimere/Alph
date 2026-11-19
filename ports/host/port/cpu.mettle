@@ -13,3 +13,9 @@ export fn alph_cpu_join(handle: int64) {
   thread_join_infinite(handle);
   thread_close(handle);
 }
+
+// The calling thread's id, never 0: a core knows by it that a send comes
+// from its own thread.
+export fn alph_cpu_self() -> int32 {
+  return (int32)GetCurrentThreadId();
+}

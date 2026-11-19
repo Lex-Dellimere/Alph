@@ -1,0 +1,350 @@
+// Lanes between cores (src/cores): a full lane refuses, a full mailbox holds
+// its lane, mail for a gone actor is dropped, a storm of random sends among
+// many actors loses, doubles and reorders nothing, sends from other threads
+// still arrive, and the cores stop and run again.
+
+import "std/io";
+import "std/thread";
+import "alph/actor/actor";
+import "alph/cores/cores";
+import "alph/cores/lanes";
+import "alph/time/time";
+
+const CORES: Word = 4;
+const SLOTS: Word = 24;
+const ROOM: Word = 8;
+const LANE: Word = 16;      // a lane holds LANE - 1
+const TALKERS: Word = 48;
+const PER: Word = 4000;     // messages each talker sends in a run
+const BURST: Word = 8;      // sends a turn before giving the core to others
+const OUTSIDE: Word = 20000;
+const TO_Y: Word = 10;
+
+const GO: Word = 1;
+const MORE: Word = 2;
+const NOTE: Word = 3;
+const DUE: Word = 4;
+const END: Word = 5;
+const DATA: Word = 100;  // DATA + the sender's number
+
+extern fn mettle_atomic_inc_i32(target: int32*) -> int32 with none = "mettle_atomic_inc_i32";
+
+var g_cores: AlphCores;
+var g_core: AlphCore[4];
+var g_actors: AlphActor[96];
+var g_mail: AlphMsg[768];
+var g_lanes: AlphLane[16];
+var g_letters: AlphLetter[256];
+var g_time: AlphTime;
+var g_timers: AlphTimer[4];
+var g_failures: int32 = 0;
+
+fn expect(ok: bool, what: string) {
+  if (!ok) {
+    println("FAIL {what}");
+    g_failures = g_failures + 1;
+  }
+}
+
+fn place_of(pid: Word) -> Word {
+  return (Word)(pid >> ALPH_PLACE_SHIFT);
+}
+
+// A hog keeps core 2 busy while the filler fills the lane from core 1 to
+// core 2, so nothing is taken out of the lane until the hog lets go.
+var g_release: volatile int32 = 0;
+
+struct Fill {
+  filler: Word;
+  gone: Word;
+  y: Word;
+  z: Word;
+  oks: Word;
+  gone_out: Word;
+  y_got: Word;
+  z_got: Word;
+  y_at_z: Word;  // what y had when z's first message came
+  bad: Word;
+}
+
+var g_fill: Fill;
+
+fn hog(a: AlphActor*, m: AlphMsg*) -> Word {
+  a->send(g_fill.filler, GO, 0);
+  while (g_release == 0) {
+  }
+  return 1;
+}
+
+fn filler(a: AlphActor*, m: AlphMsg*) -> Word {
+  var f: Fill* = &g_fill;
+  f->gone_out = a->send(f->gone, NOTE, 0);
+  if (f->gone_out == ALPH_OK) {
+    f->oks = 1;
+  }
+  var sent_y: Word = 0;
+  var sent_z: Word = 0;
+  while (true) {
+    var out: Word = 0;
+    if (sent_y < TO_Y) {
+      out = a->send(f->y, NOTE, sent_y);
+      if (out == ALPH_OK) {
+        sent_y = sent_y + 1;
+      }
+    } else {
+      out = a->send(f->z, NOTE, sent_z);
+      if (out == ALPH_OK) {
+        sent_z = sent_z + 1;
+      }
+    }
+    if (out != ALPH_OK) {
+      if (out != ALPH_FULL) {
+        f->bad = f->bad + 1;
+      }
+      break;
+    }
+    f->oks = f->oks + 1;
+  }
+  g_release = 1;
+  return 1;
+}
+
+fn catcher(a: AlphActor*, m: AlphMsg*) -> Word {
+  var f: Fill* = &g_fill;
+  if (a->pid == f->y) {
+    if (m->arg != f->y_got) {
+      f->bad = f->bad + 1;
+    }
+    f->y_got = f->y_got + 1;
+  } else {
+    if (f->z_got == 0) {
+      f->y_at_z = f->y_got;
+    }
+    if (m->arg != f->z_got) {
+      f->bad = f->bad + 1;
+    }
+    f->z_got = f->z_got + 1;
+  }
+  if (f->y_got + f->z_got == LANE - 2) {
+    a->cores()->stop();
+  }
+  return 0;
+}
+
+fn ender(a: AlphActor*, m: AlphMsg*) -> Word {
+  return 1;
+}
+
+// Talkers send numbered messages to random others; each checks that what
+// comes from each sender comes in order.
+struct Talker {
+  id: Word;
+  seed: Word;
+  left: Word;
+  full: Word;
+  bad: Word;
+  more: Word;  // a MORE is waiting in its own mailbox: one is enough
+  sent: Word[48];  // the next number for each other talker
+  next: Word[48];  // the next number expected from each
+}
+
+var g_talkers: Talker[48];
+var g_pids: Word[48];
+var g_got: int32 = 0;
+var g_total: int32 = 0;
+
+// A refused MORE is no loss: the mailbox is full, so the talker runs again.
+fn again(a: AlphActor*, t: Talker*) {
+  if (t->more == 0 && a->send(a->pid, MORE, 0) == ALPH_OK) {
+    t->more = 1;
+  }
+}
+
+fn talker(a: AlphActor*, m: AlphMsg*) -> Word {
+  var t: Talker* = (Talker*)a->state;
+  if (m->tag == MORE) {
+    t->more = 0;
+  }
+  if (m->tag >= DATA) {
+    var from: Word = m->tag - DATA;
+    if (m->arg != t->next[from]) {
+      t->bad = t->bad + 1;
+    }
+    t->next[from] = m->arg + 1;
+    if (mettle_atomic_inc_i32(&g_got) == g_total) {
+      a->cores()->stop();
+    }
+  }
+  var burst: Word = 0;
+  while (t->left > 0) {
+    if (burst == BURST) {
+      again(a, t);
+      return 0;
+    }
+    t->seed = (Word)((t->seed * 1103515245 + 12345) & 2147483647);
+    var to: Word = (Word)((t->seed >> 8) % (TALKERS - 1));
+    if (to >= t->id) {
+      to = to + 1;
+    }
+    var out: Word = a->send(g_pids[to], DATA + t->id, t->sent[to]);
+    if (out == ALPH_FULL) {
+      t->full = t->full + 1;
+      again(a, t);
+      return 0;
+    }
+    if (out != ALPH_OK) {
+      t->bad = t->bad + 1;
+    }
+    t->sent[to] = t->sent[to] + 1;
+    t->left = t->left - 1;
+    burst = burst + 1;
+  }
+  return 0;
+}
+
+// An actor fed from a thread that runs no core.
+struct Listener {
+  got: Word;
+  bad: Word;
+}
+
+var g_listener: Listener;
+var g_listener_pid: Word = 0;
+var g_outside_full: Word = 0;
+
+fn listener(a: AlphActor*, m: AlphMsg*) -> Word {
+  var l: Listener* = (Listener*)a->state;
+  if (m->arg != l->got) {
+    l->bad = l->bad + 1;
+  }
+  l->got = l->got + 1;
+  if (mettle_atomic_inc_i32(&g_got) == g_total) {
+    a->cores()->stop();
+  }
+  return 0;
+}
+
+fn outside(arg: cstring) -> uint32 {
+  var i: Word = 0;
+  while (i < OUTSIDE) {
+    var out: Word = g_cores.send(g_listener_pid, NOTE, i);
+    if (out == ALPH_OK) {
+      i = i + 1;
+    } else {
+      g_outside_full = g_outside_full + 1;
+      syscall(24);
+    }
+  }
+  return 0;
+}
+
+fn sleeper(a: AlphActor*, m: AlphMsg*) -> Word {
+  var woke: Word* = (Word*)a->state;
+  *woke = m->arg;
+  a->cores()->stop();
+  return 1;
+}
+
+fn storm(with_outside: bool) {
+  g_got = 0;
+  g_total = (int32)(TALKERS * PER);
+  if (with_outside) {
+    g_total = g_total + (int32)OUTSIDE;
+  }
+  for i in 0..TALKERS {
+    g_talkers[i].left = PER;
+    g_cores.send(g_pids[i], GO, 0);
+  }
+  var h: int64 = 0;
+  if (with_outside) {
+    h = CreateThread(0, 0, &outside, (cstring)0, 0, 0);
+  }
+  g_cores.run();
+  if (with_outside) {
+    thread_join_infinite(h);
+    thread_close(h);
+  }
+}
+
+fn check_storm(run: Word) {
+  var bad: Word = 0;
+  var lost: Word = 0;
+  var left: Word = 0;
+  for i in 0..TALKERS {
+    bad = bad + g_talkers[i].bad;
+    left = left + g_talkers[i].left;
+    for j in 0..TALKERS {
+      if (g_talkers[i].sent[j] != g_talkers[j].next[i]) {
+        lost = lost + 1;
+      }
+    }
+  }
+  expect(bad == 0, "run {run}: every message in order from each sender ({bad} were not)");
+  expect(left == 0, "run {run}: every talker sent all it had ({left} left)");
+  expect(lost == 0, "run {run}: every pair got exactly what was sent ({lost} pairs did not)");
+  expect(g_got == g_total, "run {run}: {g_got} of {g_total} arrived");
+}
+
+fn main() -> int32 {
+  g_cores.init(&g_core[0], CORES, &g_actors[0], SLOTS, &g_mail[0], ROOM);
+  g_cores.lanes(&g_lanes[0], &g_letters[0], LANE);
+
+  // A full lane, a full mailbox holding its lane, mail for the gone.
+  g_fill.filler = g_cores.spawn_on(1, &filler, 0);
+  g_fill.gone = g_cores.spawn_on(2, &ender, 0);
+  var hog_pid: Word = g_cores.spawn_on(2, &hog, 0);
+  g_fill.y = g_cores.spawn_on(2, &catcher, 0);
+  g_fill.z = g_cores.spawn_on(2, &catcher, 0);
+  g_cores.send(g_fill.gone, END, 0);
+  g_cores.send(hog_pid, GO, 0);
+  g_cores.run();
+  expect(g_fill.gone_out == ALPH_OK, "a send to a gone actor through a lane is taken ({g_fill.gone_out})");
+  expect(g_fill.oks == LANE - 1, "a lane takes {LANE - 1} messages, then is full ({g_fill.oks})");
+  expect(g_fill.y_got == TO_Y, "y got all {TO_Y} ({g_fill.y_got})");
+  expect(g_fill.z_got == LANE - 2 - TO_Y, "z got what was behind y ({g_fill.z_got})");
+  expect(g_fill.y_at_z >= ROOM, "z waited behind y's full mailbox (y had {g_fill.y_at_z} when z got its first)");
+  expect(g_fill.bad == 0, "the lane kept order and refused only with ALPH_FULL ({g_fill.bad})");
+
+  // A storm, then the same talkers again with a thread that runs no core
+  // sending to one more actor at the same time.
+  for i in 0..TALKERS {
+    var t: Talker* = &g_talkers[i];
+    t->id = (Word)i;
+    t->seed = (Word)(i * 7919 + 17);
+    t->full = 0;
+    t->bad = 0;
+    t->more = 0;
+    for j in 0..TALKERS {
+      t->sent[j] = 0;
+      t->next[j] = 0;
+    }
+    g_pids[i] = g_cores.spawn_on((Word)(i % CORES), &talker, (rawptr)t);
+  }
+  storm(false);
+  check_storm(1);
+  g_listener.got = 0;
+  g_listener.bad = 0;
+  g_listener_pid = g_cores.spawn_on(3, &listener, (rawptr)&g_listener);
+  storm(true);
+  check_storm(2);
+  expect(g_listener.got == OUTSIDE, "every message from the other thread arrived ({g_listener.got})");
+  expect(g_listener.bad == 0, "in order ({g_listener.bad} were not)");
+  var full: Word = 0;
+  for i in 0..TALKERS {
+    full = full + g_talkers[i].full;
+  }
+
+  // A timer's thread reaches an actor on another core.
+  var woke: Word = 0;
+  g_time.init(&g_core[0].node, &g_timers[0], 4);
+  g_time.after(3, g_cores.spawn_on(3, &sleeper, (rawptr)&woke), DUE, 7);
+  g_cores.run();
+  g_time.stop();
+  expect(woke == 7, "a timer reaches an actor on another core");
+
+  if (g_failures != 0) {
+    return 1;
+  }
+  println("cross ok: two storms of {TALKERS * PER} among {TALKERS} actors on {CORES} cores ({full} full lanes or mailboxes met), {OUTSIDE} from another thread, a full lane and a held one");
+  return 0;
+}

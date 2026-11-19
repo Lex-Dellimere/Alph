@@ -108,6 +108,10 @@ The render example first copied every tile back to the host as it finished. Meas
 
 Letting a node take eight messages in one visit to its lock, where it took one, made no difference: the 8-core storm, the two-core ping and the single-node ping all measured the same within noise, so it was taken out. The cost of a message between cores is the cache lines the sender and the receiver both touch, not how often the receiver takes its lock.
 
+So `src/cores/lanes.mettle` gives each pair of cores a lane: a ring that only the sending core's thread writes and only the receiving core's thread reads, with no lock. The receiver empties its lanes into its actors' mailboxes when its queue is empty and after every sixteen messages. A sender wakes the receiver only when it is about to sleep in the kernel. A core knows a send is its own by the thread's id, so sends from any other thread (a timer, a socket, the link) keep taking the lock.
+
+Measured in one program, lanes off and on in turn, on a machine at load 21 to 37: a stream from one core to another went from about 255 ns a message to 70, and a storm among 64 actors on 8 cores from 105 to 58. Two actors on two cores trading one message did not gain: 255 to 275 ns without, 290 to 300 with. Lanes are opt-in because they change what a sender is told. A message is in the lane, not yet in the mailbox, so a sender no longer hears that an actor is gone, and a full mailbox holds up its lane instead of refusing the sender. They are for Linux: on a board an interrupt runs on the hart it stops, so a hart cannot tell its own sends from an interrupt's. A board's image is the same to the byte with the lanes in the tree.
+
 ## Lives
 
 A handler that returns non-zero ends its actor, and what it returned is the reason. A handler that crashes (a null pointer, a division by zero, an index past the end, a fault signal) ends its actor with the reason `ALPH_CRASHED`, and the node goes on. The port's guard saves a place to resume before each handler, and Mettle's runtime comes back to it. This is on Linux, in a program built with `-s`.
@@ -159,7 +163,7 @@ The measurements that decide a choice are in the section for that choice: the re
 
 - Restart limits counted over time rather than in all, and groups that restart together.
 - Dropping a watch across machines.
-- A crossing that carries everything waiting, in the cores or the link, where every message still crosses alone. Cheaper messages between cores need a queue per pair of cores that the sender writes without touching anything the receiver owns, which changes what a full mailbox can tell a sender.
+- A crossing that carries everything waiting in the link, where every message is still a datagram of its own.
 - A sealed link has one key for all, so any holder can speak as any machine and there is no forward secrecy. Peers are listed by hand.
 - A board on the UDP link itself. A board joins through a serial line to one machine, and a line that sends again what was lost.
 - A board that sends its work to the best of several places. It asks the machine at the other end of its line.

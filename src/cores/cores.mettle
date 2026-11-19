@@ -9,23 +9,39 @@
 import "port/cpu";
 import "alph/actor/actor";
 
+extern fn mettle_atomic_exchange_i32(target: int32*, value: int32) -> int32 with none = "mettle_atomic_exchange_i32";
+
+// One core: its node and the thread or hart that runs it.
 export struct AlphCore {
   node: AlphNode;
   thread: int64;
+  self: int32;  // the thread running this core, 0 when none
 }
 
+// The cores of one machine, a node on each.
 export struct AlphCores {
   cores: AlphCore*;
   count: Word;
   first: Word;  // the first core's place: the cores are first, first + 1, ...
   far: fn(AlphCores*, Word, AlphMsg*) -> Word;
   world: rawptr;  // whoever set far
+  // Tried first for mail between the cores, only on the thread that runs
+  // the sending node (src/cores/lanes). A board has none: ALPH_GATHER is 0
+  // there, so the test folds away.
+  cross: fn(AlphCores*, AlphNode*, Word, AlphMsg*) -> Word;
+  ways: rawptr;  // whoever set cross
 }
 
 fn alph_cores_far(n: AlphNode*, to: Word, m: AlphMsg*) -> Word {
   var c: AlphCores* = (AlphCores*)n->world;
   var core: Word = (Word)(to >> ALPH_PLACE_SHIFT) - c->first;
   if (core >= 0 && core < c->count) {
+    if (ALPH_GATHER != 0 && c->cross != 0) {
+      var self: int32 = c->cores[n->place - c->first].self;
+      if (self != 0 && self == alph_cpu_self()) {
+        return c->cross(c, n, to, m);
+      }
+    }
     return c->cores[core].node.put(to, m);
   }
   if (c->far == 0) {
@@ -53,11 +69,17 @@ export fn AlphCores_init__ptr(c: AlphCores*, cores: AlphCore*, count: Word, acto
   c->first = 0;
   c->far = 0;
   c->world = 0;
+  if (ALPH_GATHER != 0) {
+    c->cross = 0;
+  }
   for i in 0..count {
     var n: AlphNode* = &cores[i].node;
     n->init(&actors[i * slots], slots, &mail[i * slots * room], room);
     n->join((Word)i, &alph_cores_far, (rawptr)c);
     cores[i].thread = 0;
+    if (ALPH_GATHER != 0) {
+      cores[i].self = 0;
+    }
   }
 }
 
@@ -106,9 +128,17 @@ export fn AlphActor_cores__ptr(a: AlphActor*) -> AlphCores* {
   return (AlphCores*)a->node->world;
 }
 
+// self is cleared with a full barrier before the thread can end, so a later
+// thread given the same id cannot take it for its own.
 fn alph_core_main(arg: cstring) -> uint32 {
-  var n: AlphNode* = (AlphNode*)arg;
-  n->run();
+  var core: AlphCore* = (AlphCore*)arg;
+  if (ALPH_GATHER != 0) {
+    core->self = alph_cpu_self();
+  }
+  core->node.run();
+  if (ALPH_GATHER != 0) {
+    mettle_atomic_exchange_i32(&core->self, 0);
+  }
   return 0;
 }
 
@@ -117,14 +147,15 @@ fn alph_core_main(arg: cstring) -> uint32 {
 // handler opened) does not last from one run to the next.
 export fn AlphCores_run__ptr(c: AlphCores*) {
   for i in 1..c->count {
-    c->cores[i].thread = alph_cpu_start(i, &alph_core_main, (cstring)&c->cores[i].node);
+    c->cores[i].thread = alph_cpu_start(i, &alph_core_main, (cstring)&c->cores[i]);
   }
-  c->cores[0].node.run();
+  alph_core_main((cstring)&c->cores[0]);
   for i in 1..c->count {
     alph_cpu_join(c->cores[i].thread);
   }
 }
 
+// Stops every core, so run returns. Any actor or thread may call it.
 export fn AlphCores_stop__ptr(c: AlphCores*) {
   for i in 0..c->count {
     c->cores[i].node.stop();

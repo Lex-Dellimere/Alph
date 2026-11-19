@@ -220,6 +220,21 @@ fn main() -> int32 {
 - `run()` runs the first core on this thread and the rest on threads of their own, until `stop()`. Every `run` starts new threads, so what belongs to a thread (a GPU a handler opened) does not last from one run to the next.
 - Inside a handler, `a->cores()` gives the `AlphCores` the actor runs among, and `a->cores()->stop()` stops them all.
 
+**Lanes.** A message to another core takes that core's lock, and both cores write the same memory. When cores send each other a lot, turn on lanes (Linux only, in `alph/cores/lanes`): a ring for each pair of cores that one core writes and the other reads, with no lock.
+
+```mettle
+import "alph/cores/lanes";
+
+var g_lanes: AlphLane[16];        // cores * cores
+var g_letters: AlphLetter[4096];  // cores * cores * room
+
+g_cores.lanes(&g_lanes[0], &g_letters[0], 256);  // after init, before run
+```
+
+- A stream of messages from one core to another cost about 70 ns each with lanes against about 260 without, and a storm among 64 actors on 8 cores about 58 against 105. One request and its reply are no quicker.
+- What a sender is told changes. A send from a handler to another core returns `ALPH_OK` once the message is in the lane and `ALPH_FULL` when the lane is full, never `ALPH_GONE`: a message for an actor that is gone is dropped when it arrives. A message for a full mailbox waits in its lane, and what is behind it waits too.
+- Sends from outside a handler (`g_cores.send`, timers, sockets, the link) go the old way. So do all sends on a board.
+
 An actor stays on the core it was spawned on. Work moves between cores when your program hands it out in pieces, as the boss in `spread.mettle` does: a worker that answers gets the next chunk. A send from one core to another can be refused with `ALPH_FULL`, as on one node. If you want alph to choose a place for each piece of work, use places below.
 
 ## Timers
@@ -748,7 +763,7 @@ These are not built yet.
 - A sealed link has one key for the whole network: any holder can speak as any machine, and someone who gets the key later can read what they recorded before.
 - A job for another machine carries at most 1,024 bytes, and gives back a word and at most 1,016 bytes.
 - Sockets are Linux only, and there is no file IO.
-- A message between two cores costs 150 to 300 ns against about 20 ns inside a node. Removing that needs a queue per pair of cores that the sender writes without touching anything the receiver owns, which changes what a full mailbox can tell a sender. Not built.
+- A message between two cores costs 150 to 300 ns against about 20 ns inside a node. Lanes bring a stream of them down to about 70 ns, but one request and its reply are no quicker, and lanes are for Linux only.
 - A microcontroller joins through a serial line to one machine, and nothing lost on that line is sent again.
 - A board's jobs are one word in and one word out, one at a time. A board asks the machine at the other end of its line, not the best of several places.
 - A job whose answer is lost is placed again, so it can be done twice. Jobs done at most once are not built.

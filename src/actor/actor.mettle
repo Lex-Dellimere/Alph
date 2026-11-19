@@ -217,6 +217,35 @@ export fn AlphNode_put__ptr(n: AlphNode*, to: Word, m: AlphMsg*) -> Word {
   return out;
 }
 
+// Put for an actor here, by code already inside the node's gate: what
+// gathers mail that came another way. Returns ALPH_OK, ALPH_FULL or
+// ALPH_GONE.
+export fn AlphNode_deliver__ptr(n: AlphNode*, to: Word, m: AlphMsg*) -> Word {
+  var i: Word = (Word)(to & (((Word)1 << ALPH_INDEX_BITS) - 1));
+  if (i >= n->slots) {
+    return ALPH_GONE;
+  }
+  var a: AlphActor* = &n->actors[i];
+  if (a->alive == 0 || a->pid != to) {
+    return ALPH_GONE;
+  }
+  if (a->count >= n->room) {
+    return ALPH_FULL;
+  }
+  var at: Word = a->head + a->count;
+  if (at >= n->room) {
+    at = at - n->room;
+  }
+  a->mail[at] = *m;
+  a->count = a->count + 1;
+  if (a->queued == 0) {
+    a->queued = 1;
+    alph_enqueue(n, a);
+    n->gate.wake();
+  }
+  return ALPH_OK;
+}
+
 // From outside an actor: another thread, an interrupt, main.
 export fn AlphNode_send__ptr(n: AlphNode*, to: Word, tag: Word, arg: Word) -> Word {
   var m: AlphMsg = { tag: tag, from: 0, arg: arg, ref: 0 };
@@ -277,9 +306,15 @@ fn alph_run(n: AlphNode*, wait: Word) -> Word {
   var m: AlphMsg;
   var ran: Word = 0;
   n->guard.open();
+  var since: Word = 0;
   var was: int32 = n->gate.enter();
   while (n->stopped == 0) {
     var a: AlphActor* = n->first;
+    if (ALPH_GATHER != 0 && (a == 0 || since >= ALPH_GATHER)) {
+      n->gate.gather();
+      since = 0;
+      a = n->first;
+    }
     if (a == 0) {
       if (wait == 0) {
         break;
@@ -299,6 +334,7 @@ fn alph_run(n: AlphNode*, wait: Word) -> Word {
     }
     a->count = a->count - 1;
     n->running = a;
+    since = since + 1;
     n->gate.leave(was);
 
     // A crash in the handler comes back to the save, which then returns 1.

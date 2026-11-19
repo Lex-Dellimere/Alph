@@ -3,6 +3,7 @@
 export type Word = int64;
 export const ALPH_INDEX_BITS: Word = 24;   // 16 million actors in a node
 export const ALPH_PLACE_SHIFT: Word = 48;  // 24 bits of generation, then 15 of place
+export const ALPH_GATHER: Word = 16;  // messages a node runs between gathers while it is busy
 
 const SYS_SCHED_YIELD: int64 = 24;
 const SYS_FUTEX: int64 = 202;
@@ -22,6 +23,9 @@ export struct AlphGate {
   wakes: int32;
   state: int32;
   owed: int32;  // a wake to make once the lock is free
+  collect: fn(rawptr) -> void;  // brings in mail that came another way (src/cores/lanes)
+  look: fn(rawptr, bool) -> bool;  // whether such mail is waiting; with true, before a sleep
+  near: rawptr;  // whoever set them
 }
 
 export fn AlphGate_init__ptr(g: AlphGate*) {
@@ -29,6 +33,16 @@ export fn AlphGate_init__ptr(g: AlphGate*) {
   g->wakes = 0;
   g->state = AWAKE;
   g->owed = 0;
+  g->collect = 0;
+  g->look = 0;
+  g->near = 0;
+}
+
+// Called inside the gate by the node that sleeps on it.
+export fn AlphGate_gather__ptr(g: AlphGate*) {
+  if (g->collect != 0) {
+    g->collect(g->near);
+  }
 }
 
 // A compare-and-swap, not an exchange: on every CPU it makes what was
@@ -61,7 +75,9 @@ export fn AlphGate_leave__ptr(g: AlphGate*, was: int32) {
 
 // Mail usually comes back within microseconds, so look for a while first:
 // a sleep and its wake cost two system calls. A wake between the leave and
-// the wait changes wakes, so the wait returns.
+// the wait changes wakes, so the wait returns. Mail that comes without a
+// wake (src/cores' lanes) is found by look, and look(true) tells its sender
+// to wake this from here on.
 export fn AlphGate_sleep__ptr(g: AlphGate*, was: int32) {
   var seen: int32 = g->wakes;
   g->state = LOOKING;
@@ -70,9 +86,12 @@ export fn AlphGate_sleep__ptr(g: AlphGate*, was: int32) {
     if (mettle_atomic_compare_exchange_i32(&g->wakes, seen, seen) != seen) {
       return;
     }
+    if (g->look != 0 && g->look(g->near, false)) {
+      return;
+    }
   }
   g->enter();
-  if (g->wakes != seen) {
+  if (g->wakes != seen || (g->look != 0 && g->look(g->near, true))) {
     g->leave(0);
     return;
   }

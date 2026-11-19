@@ -63,6 +63,7 @@ NEW_MODULES=(
   src/board/board.mettle
   src/actor/actor.mettle
   src/cores/cores.mettle
+  src/cores/lanes.mettle
   src/time/time.mettle
   src/time/wheel.mettle
   src/place/place.mettle
