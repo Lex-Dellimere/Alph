@@ -3,84 +3,113 @@
 <img width="3419" height="1389" alt="image" src="https://github.com/user-attachments/assets/f685df06-1016-4a6d-a726-b67c24c767b5" />
 
 
-Erlang-style actors, supervision and self-healing for [Mettle](https://github.com/The-Mettle-Project/Mettle), written in Mettle.
+alph runs work where it will finish first: on this core, another core, a GPU or another machine. It is written in [Mettle](https://github.com/The-Mettle-Project/Mettle), and the same source builds for a microcontroller with no OS and for several computers working together.
 
-An actor is a state block, a bounded mailbox and a handler that runs one message to completion. A crash inside a handler ends only that actor, and its links and monitors see it.
-
-Healing comes in two kinds:
-- **Passive:** supervisors restart failed actors the OTP way.
-- **Proactive:** a medic repairs a crashed actor in place, on the same pid, without anyone else seeing the crash.
-
-Around that: a heap per actor, bound actors that may block, non-blocking IO and TCP, names and groups, child processes, dynamic supervisors, a worker pool and a limiter, and an ordered shutdown that handles OS signals.
-
-Nodes can also connect: an actor on another node is reached through a proxy, with remote requests, links, monitors and exit signals, over a Noise-encrypted connection. This is opt-in (`alph/net/dist`) and not part of `alph/alph`.
-
-It runs on x86-64 Linux.
+The whole model is small. An actor is a state and a handler. A message is four words. A node runs one message at a time. Everything else (time, a GPU, other cores, other machines) is something that sends messages, added as a layer you can leave out.
 
 ## Example
 
 ```mettle
 import "std/io";
-import "alph/alph";
+import "alph/actor/actor";
 
-const TAG_ADD: int64 = ALPH_TAG_USER;
+const ADD: Word = 1;
 
 struct Counter {
-  total: int64;
+  total: Word;
 }
 
-fn counter(ctx: AlphCtx*, m: AlphMsg*) -> int64 {
-  var c: Counter* = (Counter*)ctx->state;
-  if (m->tag == TAG_ADD) {
-    c->total = c->total + m->arg;
-    if (c->total >= 6) {
-      println("total {c->total}");
-      alph_halt(ctx, 0);
-    }
+fn counter(a: AlphActor*, m: AlphMsg*) -> Word {
+  var c: Counter* = (Counter*)a->state;
+  c->total = c->total + m->arg;
+  if (c->total >= 6) {
+    println("total {c->total}");
+    a->node->stop();
   }
-  return ALPH_CONTINUE;
+  return 0;
 }
 
 var g_node: AlphNode;
+var g_actors: AlphActor[4];
+var g_mail: AlphMsg[32];
 
 fn main() -> int32 {
-  var cfg: AlphConfig;
-  alph_config(&cfg);
-  if (!alph_node_start(&g_node, &cfg)) {
-    return 1;
-  }
   var c: Counter;
   c.total = 0;
-  var pid: int64 = alph_node_spawn_value<Counter>(&g_node, 0, &c, &counter);
-  for i: int64 in 1..4 {
-    alph_node_send(&g_node, pid, TAG_ADD, i);
+  g_node.init(&g_actors[0], 4, &g_mail[0], 8);
+  var pid: Word = g_node.spawn(&counter, (rawptr)&c);
+  for i in 1..4 {
+    g_node.send(pid, ADD, (Word)i);
   }
-  return (int32)alph_node_wait(&g_node);
+  g_node.run();
+  return 0;
 }
 ```
 
-This is [examples/counter.mettle](examples/counter.mettle). The other examples show [requests](examples/request.mettle), [a supervisor](examples/supervised.mettle), [a medic](examples/medic.mettle), [a TCP echo server](examples/echo.mettle), [a limiter with child processes](examples/jobs.mettle) and [two nodes in one process](examples/cluster.mettle).
+This is [examples/count.mettle](examples/count.mettle). The node owns no memory: the program hands it the actor slots and the mailboxes, which is why the same code fits a microcontroller.
 
-## Use
+## What is here
 
-Map the runtime in your app's `mettle.deps`, then `import "alph/alph"`:
+| Layer | What it does | Where |
+|---|---|---|
+| Core | Actors, messages, the run loop. A handler that crashes ends only its actor | [src/actor](src/actor/actor.mettle) |
+| Cores | One node per thread. An actor sends to another core the way it sends next door | [src/cores](src/cores/cores.mettle) |
+| Time | A message sent later | [src/time](src/time/time.mettle) |
+| Places | A job goes to a core, the GPU or another machine, whichever alph has timed as finishing it first. A job stays where its data is | [src/place](src/place/place.mettle) |
+| Lives | Watch an actor to be told when it ends and why. Keep one, and a crash restarts it in place with the same pid | [src/life](src/life/life.mettle) |
+| Links | Other machines over UDP. Messages arrive once and in order, and a lost machine is noticed in half a second | [src/link](src/link/link.mettle) |
+| Names and the door | Find an actor on another machine by name, and watch it | [src/name](src/name/name.mettle), [src/door](src/door/door.mettle) |
+| Ports | What differs per device: `mcu` (one hart, no OS) and `host` (x86-64 Linux) | [ports](ports) |
+
+[docs/design.md](docs/design.md) explains each of these, what was measured, and what is not built yet.
+
+## Try it
+
+Map alph in your program's `mettle.deps`, then pick a port when you build:
 
 ```text
 alph=<path to alph>/src
 ```
 
-Build with the dev compiler from the Mettle repo, always with `-s`:
-
 ```bash
-../Mettle/bin/mettle --build -s --release app.mettle
+mettle --build -s --release examples/count.mettle -I ports/host -o count
 ```
 
-Without `-s`, the compiler turns failed checks (bounds, divide) into an inline exit that alph cannot catch.
+Build with `-s`: without it the compiler turns a failed check (a bad index, a division by zero) into an exit that alph cannot catch.
 
-To use distribution, also `import "alph/net/dist"` and map the cryptex package in `mettle.deps` (`cryptex=<path>/cryptex/src`).
+Work spread over four cores, [examples/spread.mettle](examples/spread.mettle):
 
-- [Guide](docs/guide.md): how to use the runtime, from starting a node to healing, IO, child processes, pools, shutdown and distribution.
-- [API reference](docs/api.md): every function, type and constant, with its inputs, outputs and which thread may call it.
+```bash
+mettle --build -s --release examples/spread.mettle -I ports/host -o spread
+```
+
+Tiles of a picture rendered on cores or on the GPU, whichever should finish each first, with the same pixels either way, [examples/render.mettle](examples/render.mettle). Without a GPU it runs on the cores:
+
+```bash
+mettle --build -s --release examples/render.mettle -I ports/host -o render
+```
+
+Work shared with another machine, [examples/far.mettle](examples/far.mettle). With no arguments both machines run in one process. On two computers, start `./far helper <the boss's address>` on one and `./far boss <the helper's address>` on the other. If the other machine is not there, or is lost on the way, the work is done here:
+
+```bash
+mettle --build -s --release examples/far.mettle -I ports/host -o far
+```
+
+Two actors and a timer on a bare 32-bit RISC-V board, in a 3.3 KB image, [examples/mcu/blink.mettle](examples/mcu/blink.mettle):
+
+```bash
+mettle --release examples/mcu/blink.mettle --target riscv32-none --board qemu-virt --emit-flat blink.bin -I ports/mcu
+qemu-system-riscv32 -M virt -bios none -nographic -device loader,file=blink.bin,addr=0x80000000,force-raw=on
+```
+
+## What it does not do yet
+
+- Nothing on the link is encrypted or signed: it is for a network you trust.
+- A job with data of its own cannot go to another machine, only a job of one word in and one word out.
+- Timers look at every timer slot: right for tens of timers, not thousands.
+- There is no socket or file IO on the new core.
+- A message between two cores costs 150 to 300 ns against about 20 ns inside a node.
+- The microcontroller port has no link to other machines.
 
 ## Test
 
@@ -88,68 +117,32 @@ To use distribution, also `import "alph/net/dist"` and map the cryptex package i
 ./check.sh
 ```
 
-It checks that `docs/api.md` matches the source, then builds every test and example in debug and release and runs it. After changing a doc comment, run `tools/apidoc.sh` to rebuild the reference.
+It builds every test and example in debug and release and runs it, builds the RISC-V example, runs it in QEMU and fails if the image is over 5 KB. It also checks that `docs/api.md` matches the first runtime's source.
 
-## The small core
+## The first runtime
 
-alph is being rebuilt on a core small enough for a microcontroller: actors, messages and a run loop in one file, [src/actor/actor.mettle](src/actor/actor.mettle). The same source runs on a bare 32-bit RISC-V board in a 3.3 KB image, timers included, and in a Linux process, where [src/cores/cores.mettle](src/cores/cores.mettle) runs one node per thread and an actor sends to another core the way it sends next door. [docs/design.md](docs/design.md) says where this is going: one runtime that puts work on a core, a GPU or another machine, whichever is cheapest.
+Everything under `src/core`, `src/heal`, `src/work`, `src/net`, `src/io`, `src/sched` and `src/sys` is the runtime alph started as: Erlang-style actors for x86-64 Linux with supervisors, medics, a heap per actor, non-blocking IO and TCP, child processes, a worker pool and Noise-encrypted distribution, in one import (`alph/alph`). It works and its tests run. It is the reference while its parts are rebuilt on the small core, and each part goes when its replacement does the same job.
 
-```bash
-mettle --release examples/mcu/blink.mettle --target riscv32-none --board qemu-virt --emit-flat blink.bin -I ports/mcu
-qemu-system-riscv32 -M virt -bios none -nographic -device loader,file=blink.bin,addr=0x80000000,force-raw=on
-```
-
-On Linux, [examples/spread.mettle](examples/spread.mettle) counts primes on four cores:
-
-```bash
-mettle --build --release examples/spread.mettle -I ports/host -o spread
-```
-
-[examples/far.mettle](examples/far.mettle) counts primes on two machines, sending each piece of the work to a core here or to the other machine, whichever should finish it first. With no arguments both machines run in one process; with `helper <address>` on one computer and `boss <address>` on another it is two computers. If the other machine is not there, or is lost on the way, the work is done here.
-
-```bash
-mettle --build --release examples/far.mettle -I ports/host -o far
-```
-
-[examples/render.mettle](examples/render.mettle) renders a picture in tiles that can each run on a core or on the GPU. Both ways call the same Mettle function, alph times them and sends each tile where it should finish first, and the pixels come out the same either way. Without a GPU it runs on the cores.
-
-```bash
-mettle --build --release examples/render.mettle -I ports/host -o render
-```
+- [Guide](docs/guide.md): how to use the first runtime.
+- [API reference](docs/api.md): every function, type and constant of the first runtime.
 
 ## Layout
 
 ```text
-src/actor/actor.mettle      the small core: actors, messages, the run loop
-src/cores/cores.mettle      the small core on several threads, one node each
-src/time/time.mettle        timers for the small core: a message sent later
-src/place/place.mettle      places: a job goes to a core, the GPU or another machine, whichever should finish it first
-src/link/link.mettle        links: other machines as places, over UDP, a lost machine noticed in half a second
-src/life/life.mettle        lives: watch an actor to be told when it ends, keep one so a crash restarts it in place
+src/actor/actor.mettle      the core: actors, messages, the run loop
+src/cores/cores.mettle      the core on several threads, one node each
+src/time/time.mettle        timers: a message sent later
+src/place/place.mettle      places: a job goes to a core, the GPU or another machine
+src/life/life.mettle        lives: watching and keeping actors
+src/link/link.mettle        links: other machines, over UDP
 src/name/name.mettle        names: a number for a pid
-src/door/door.mettle        the door: find an actor on another machine by name, and watch it
+src/door/door.mettle        the door: find and watch actors on other machines
 ports/mcu, ports/host       what differs per device, picked with -I ports/<name>
 src/alph.mettle             the first runtime in one import
-src/core/node.mettle        the node: actors, schedulers, messages, links, monitors, requests, timers,
-                            names and groups, IO and TCP, child processes, shutdown and signals
-src/core/mailbox.mettle     messages and the bounded mailbox
-src/core/queue.mettle       intrusive multi-producer queue
-src/core/heap.mettle        per-actor heaps and scratch memory
-src/heal/supervisor.mettle  supervisors: passive healing
-src/heal/medic.mettle       medics: proactive healing
-src/heal/dynamic.mettle     dynamic supervisors: children started at run time
-src/work/pool.mettle        worker pool: blocking jobs on bound threads
-src/work/limiter.mettle     limiter: a counting semaphore as an actor
-src/net/port.mettle         port waiter: tells you when a TCP port accepts connections
-src/net/dist.mettle         distribution (opt-in): proxies for remote actors, remote send, links and monitors
-src/net/noise.mettle        the Noise_XXpsk3 handshake and transport ciphers dist uses (opt-in)
-src/sys/linux.mettle        syscall numbers and flags
-src/sys/atomic.mettle       64-bit atomics
-src/sys/clock.mettle        monotonic time and futex
-src/sys/thread.mettle       threads with a guard page and their own signal stack; CPU count
-src/sys/recover.mettle      recovery points over the runtime's crash hook
-src/sys/fd.mettle           read, write, close, epoll, eventfd and socket wrappers
-docs/                       guide and API reference
+src/core, src/heal, src/work, src/net, src/io, src/sched, src/sys
+                            the first runtime
+docs/design.md              the design of the new alph, with what was measured
+docs/guide.md, docs/api.md  the first runtime's guide and reference
 examples/                   small programs, run by check.sh
 tests/                      self-checking test programs
 tools/                      apidoc.sh, which builds docs/api.md

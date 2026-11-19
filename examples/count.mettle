@@ -1,0 +1,38 @@
+// The smallest alph program: one actor that adds up what it is sent.
+//
+//   mettle --build -s --release examples/count.mettle -I ports/host -o count
+
+import "std/io";
+import "alph/actor/actor";
+
+const ADD: Word = 1;
+
+struct Counter {
+  total: Word;
+}
+
+fn counter(a: AlphActor*, m: AlphMsg*) -> Word {
+  var c: Counter* = (Counter*)a->state;
+  c->total = c->total + m->arg;
+  if (c->total >= 6) {
+    println("total {c->total}");
+    a->node->stop();
+  }
+  return 0;
+}
+
+var g_node: AlphNode;
+var g_actors: AlphActor[4];
+var g_mail: AlphMsg[32];
+
+fn main() -> int32 {
+  var c: Counter;
+  c.total = 0;
+  g_node.init(&g_actors[0], 4, &g_mail[0], 8);
+  var pid: Word = g_node.spawn(&counter, (rawptr)&c);
+  for i in 1..4 {
+    g_node.send(pid, ADD, (Word)i);
+  }
+  g_node.run();
+  return 0;
+}

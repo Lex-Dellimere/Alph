@@ -16,7 +16,7 @@ A pid names a place, a slot there and which actor the slot held. A slot gives ou
 
 Everything else is something that sends messages. A timer interrupt sends a tick. A socket sends "readable". A GPU sends "done". Another machine sends whatever its actors sent. The core does not know any of them.
 
-The node owns no memory. The caller hands it the actor slots and the mailboxes, so a board with 2 KB of RAM and a server with a million actors use the same code.
+The node owns no memory. The caller hands it the actor slots and the mailboxes, so a small board and a large server use the same code.
 
 ## Lives
 
