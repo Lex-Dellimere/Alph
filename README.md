@@ -56,7 +56,7 @@ This is [examples/count.mettle](examples/count.mettle). The node owns no memory:
 | Cores | One node per thread. An actor sends to another core the way it sends next door | [src/cores](src/cores/cores.mettle) |
 | Time | A message sent later | [src/time](src/time/time.mettle) |
 | Places | A job goes to a core, the GPU or another machine, whichever alph has timed as finishing it first. A job stays where its data is | [src/place](src/place/place.mettle) |
-| Polls | A socket sends a message when it is ready, so no handler waits. TCP calls that go with it | [src/poll](src/poll/poll.mettle) |
+| Polls | A socket sends a message when it is ready, so no handler waits. TCP calls that go with it, and other programs: start one and get a message when it ends | [src/poll](src/poll/poll.mettle) |
 | Lives | Watch an actor to be told when it ends and why. Keep one, and a crash restarts it in place with the same pid | [src/life](src/life/life.mettle) |
 | Links | Other machines over UDP. Messages arrive once and in order, and a lost machine is noticed in half a second | [src/link](src/link/link.mettle) |
 | Names and the door | Find an actor on another machine by name, and watch it | [src/name](src/name/name.mettle), [src/door](src/door/door.mettle) |

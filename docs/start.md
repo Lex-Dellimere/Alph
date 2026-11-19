@@ -230,6 +230,22 @@ fn echo(a: AlphActor*, m: AlphMsg*) -> Word {
 - `forget(fd)` stops asking. Do this before closing the descriptor.
 - `alph_tcp_listen(port)`, `alph_tcp_accept(listener)` and `alph_tcp_connect(ip, port)` give sockets. `alph_read` and `alph_write` return how many bytes moved, `ALPH_LATER` when nothing can be done yet, or `ALPH_BROKEN`. `alph_read` returns 0 when the other side has closed. A connection made with `alph_tcp_connect` is ready once it is ready for writing and `alph_tcp_failed(fd)` is false.
 
+**Other programs.** `port/proc` starts a program and gives a descriptor that is ready for reading once the program has ended, so with the poll its end is a message. This is from `tests/t_proc.mettle`:
+
+```mettle
+import "port/proc";
+
+r->fds[i] = alph_proc_start(r->commands[i]);
+g_poll.want(r->fds[i], ALPH_READ, a->pid, ENDED);
+
+// later, on ENDED, with the descriptor in m->arg:
+r->results[i] = alph_proc_result(r->fds[i]);
+g_poll.forget(r->fds[i]);
+alph_close(r->fds[i]);
+```
+
+`alph_proc_start(command)` runs the command with `/bin/sh -c` and returns the descriptor, or `ALPH_NO_PROGRAM`. `alph_proc_result(fd)` gives the exit status (0 to 255), 128 plus the signal that ended the program, or `ALPH_RUNNING` while it has not ended. A command that is not there gives 127, as the shell does. Programs get only a `PATH` unless you call `alph_proc_env(argv + argc + 1)` in `main` to hand on your own environment.
+
 ## Lives
 
 `AlphLife` lets an actor be told when another ends and why, and lets a failed actor go on with the same pid. It works with `AlphCores`, so it is for the host port. Set it up after the cores and before they run:

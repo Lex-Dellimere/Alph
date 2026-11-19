@@ -46,7 +46,7 @@ Every operation looks at every timer slot. That is the smallest code and right f
 
 ## Polls
 
-`src/poll` is how a socket, or any file descriptor, sends a message when it is ready. Handlers never wait: they read and write what can be done now, and ask to be told when there is more. One thread sleeps in the kernel until something is ready and sends the messages. Each asking is for one message, so a busy socket cannot flood a mailbox and an actor that is not ready for more is not told. The host port has the TCP calls that go with it, none of which waits. `examples/talk.mettle` is an echo server with an actor for each connection, and the test runs twenty clients against one at once. This is Linux only.
+`src/poll` is how a socket, or any file descriptor, sends a message when it is ready. Handlers never wait: they read and write what can be done now, and ask to be told when there is more. One thread sleeps in the kernel until something is ready and sends the messages. Each asking is for one message, so a busy socket cannot flood a mailbox and an actor that is not ready for more is not told. The host port has the TCP calls that go with it, none of which waits. `examples/talk.mettle` is an echo server with an actor for each connection, and the test runs twenty clients against one at once. Another program is the same thing: the host port starts one and gives back a descriptor that is ready when the program has ended, so its end is a message too. This is Linux only.
 
 ## Ports
 
