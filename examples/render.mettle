@@ -19,6 +19,7 @@ import "std/gpu";
 import "alph/actor/actor";
 import "alph/cores/cores";
 import "alph/place/place";
+import "port/sys";
 
 const WIDTH: int32 = 512;
 const PIXELS: int32 = 262144;
@@ -124,7 +125,7 @@ fn picture_here(job: AlphJob*) -> Word {
 
 fn now_ns() -> Word {
   var ts: int64[2];
-  syscall(228, 1, (int64)&ts[0]);
+  syscall(ALPH_NR_CLOCK_GETTIME, 1, (int64)&ts[0]);
   return (Word)(ts[0] * 1000000000 + ts[1]);
 }
 

@@ -22,6 +22,7 @@ import "alph/actor/actor";
 import "alph/machine/machine";
 import "alph/batch/batch";
 import "../../examples/mcu/arm_work";
+import "port/sys";
 
 const LATE: Word = 4;
 const TICK: Word = 5;
@@ -46,7 +47,7 @@ var g_on_board: Word = 0;
 
 fn now_ns() -> Word {
   var ts: int64[2];
-  syscall(228, 1, (int64)&ts[0]);
+  syscall(ALPH_NR_CLOCK_GETTIME, 1, (int64)&ts[0]);
   return (Word)(ts[0] * 1000000000 + ts[1]);
 }
 
@@ -57,7 +58,7 @@ fn primes_job(job: AlphJob*) -> Word {
   var rest: int64[2];
   rest[0] = (int64)2000000 / 1000000000;
   rest[1] = (int64)2000000 % 1000000000;
-  syscall(35, (int64)&rest[0], 0);
+  syscall(ALPH_NR_NANOSLEEP, (int64)&rest[0], 0);
   job->out = count_primes(job->in);
   return 0;
 }
@@ -175,7 +176,7 @@ fn main(argc: int32, argv: cstring*) -> int32 {
     println("no board called");
     return 1;
   }
-  syscall(72, line, 4, 0);
+  syscall(ALPH_NR_FCNTL, line, 4, 0);
   alph_line_open(line);
 
   // The machine with the board on its line: places 0 and 1.

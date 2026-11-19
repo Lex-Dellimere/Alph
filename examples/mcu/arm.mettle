@@ -1,8 +1,11 @@
 // A board that takes part in a bigger machine's work: the chip in a robot's
-// arm, say, on the serial line of the computer that plans. It shares two
-// kinds of work. Counting primes is work the computer can do too, so alph
-// sends the board some of it. Reading a joint's angle is work only this
-// board can do, so all of that comes here. arm_host.mettle is the computer.
+// arm, say, on the serial line of the computer that plans. It shares
+// three kinds of work. Counting primes is work the computer can do too, so
+// alph sends the board some of it. Reading a joint's angle is work only
+// this board can do, so all of that comes here. Moving the arm is work
+// that must never be done twice, whatever is lost on the line: the board
+// remembers what it did and answers a job sent again without moving again.
+// arm_host.mettle is the computer.
 //
 //   mettle --release examples/mcu/arm.mettle --target riscv32-none \
 //       --board qemu-virt --emit-flat arm.bin -I ports/mcu
@@ -10,9 +13,12 @@
 import "port/board";
 import "alph/actor/actor";
 import "alph/board/board";
+import "alph/board/once";
 import "arm_work";
 
 var g_board: AlphBoard;
+var g_moves: AlphBoardOnce;
+var g_at: Word = 0;  // where the arm is
 
 @interrupt fn mettle_trap() {
   mettle_board_exit(99);
@@ -21,6 +27,12 @@ var g_board: AlphBoard;
 // Stands for reading a sensor.
 fn angle(joint: Word) -> Word {
   return (Word)(joint * 3) + 1;
+}
+
+// Stands for driving a motor: turns the arm and says where it is now.
+fn move(by: Word) -> Word {
+  g_at = g_at + by;
+  return g_at;
 }
 
 fn quitter(a: AlphActor*, m: AlphMsg*) -> Word {
@@ -37,6 +49,7 @@ fn main() -> int32 {
   g_board.node.spawn(&quitter, 0);
   g_board.share(PRIMES, &count_primes);
   g_board.share(ANGLE, &angle);
+  g_board.share_once(MOVE, &move, &g_moves);
   mettle_irq_enable();
   g_board.run();
   return 0;

@@ -10,6 +10,7 @@ import "alph/actor/actor";
 import "alph/cores/cores";
 import "alph/link/link";
 import "alph/seal/seal";
+import "port/sys";
 
 const PING: Word = 1;
 const PONG: Word = 2;
@@ -129,7 +130,7 @@ fn b_main(arg: cstring) -> uint32 {
 }
 
 fn main() -> int32 {
-  var port_a: int64 = 11000 + (syscall(39) % 300) * 3;
+  var port_a: int64 = 11000 + (syscall(ALPH_NR_GETPID) % 300) * 3;
   var port_b: int64 = port_a + 1;
   var here: uint32 = alph_ip4(127, 0, 0, 1);
   var key: uint8[32];

@@ -739,6 +739,29 @@ From then on a batch of `ANGLE` jobs goes to the board, and each `PRIMES` job go
 - The board's own actors are spawned on `g_board.node`.
 - With a real board, open its serial device on the computer with `alph_serial_open("/dev/ttyACM0", 115200)` (from `port/serial`) and give the descriptor to `alph_line_open`.
 
+**Work that must not be done twice.** A job whose answer is lost on the way is normally placed again, so it can be done twice. For counting primes that wastes a little. For moving an arm it is wrong. Say that a kind is done at most once, on the computer and on the board:
+
+```mettle
+// the computer
+g_m.kind(MOVE, 0, 0);
+g_m.share(MOVE);
+g_m.once(MOVE);
+
+// the board
+import "alph/board/once";
+
+var g_moves: AlphBoardOnce;  // what the board remembers for this kind
+
+g_board.share_once(MOVE, &move, &g_moves);
+```
+
+- A job not answered is sent again to the same worker and never placed anywhere else. The worker remembers the last jobs it did for each asker, and answers one sent again without doing it again.
+- When the worker is lost or was restarted, the job comes back with `job->status == ALPH_LOST`: it may or may not have been done, and the program decides what that means. A batch counts such pieces in `b->lost` and does not hand them out again.
+- A job that was refused before it was ever sent a second time was not done, and is placed again as usual.
+- Such a job carries a word and gives a word back, no bytes. At most four are out to one worker at once.
+- Without the short way: `g_places.once(kind)` on the asking side, and the worker uses `AlphOnce` from `alph/place/once`, as `src/board/once.mettle` does.
+- A board that shares no such kind pays nothing for this. With one, the arm example's image goes from 4,544 to 5,520 bytes.
+
 **A board that asks.** A board asks for work as well: `g_board.ask(a, kind, in)` sends a job to whoever does that kind at the other end of the line, a computer or another board. The answer comes to actor `a` as `ALPH_WORKED`, with the job's out in `arg` and the ref `ask` returned:
 
 ```mettle
@@ -766,7 +789,7 @@ These are not built yet.
 - A message between two cores costs 150 to 300 ns against about 20 ns inside a node. Lanes bring a stream of them down to about 70 ns, but one request and its reply are no quicker, and lanes are for Linux only.
 - A microcontroller joins through a serial line to one machine, and nothing lost on that line is sent again.
 - A board's jobs are one word in and one word out, one at a time. A board asks the machine at the other end of its line, not the best of several places.
-- A job whose answer is lost is placed again, so it can be done twice. Jobs done at most once are not built.
+- A job of a kind done at most once carries a word and gives a word back. When its worker is lost the program is told `ALPH_LOST`: it cannot know whether the job was done.
 - A batch has 16 pieces out at once and a machine takes 16 jobs for others at once, which is less than a helper with many cores can do.
 - Peers are listed by hand.
 - A watch cannot be dropped across machines.

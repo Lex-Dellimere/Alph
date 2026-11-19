@@ -9,6 +9,7 @@ import "std/thread";
 import "alph/actor/actor";
 import "alph/machine/machine";
 import "alph/batch/batch";
+import "port/sys";
 
 const GO: Word = 1;
 const SQUARE: Word = 0;   // out is in times in, after a moment's work
@@ -28,7 +29,7 @@ fn expect(ok: bool, what: string) {
 
 fn now_ns() -> Word {
   var ts: int64[2];
-  syscall(228, 1, (int64)&ts[0]);
+  syscall(ALPH_NR_CLOCK_GETTIME, 1, (int64)&ts[0]);
   return (Word)(ts[0] * 1000000000 + ts[1]);
 }
 
@@ -37,7 +38,7 @@ fn square(job: AlphJob*) -> Word {
   var rest: int64[2];
   rest[0] = (int64)500000 / 1000000000;
   rest[1] = (int64)500000 % 1000000000;
-  syscall(35, (int64)&rest[0], 0);
+  syscall(ALPH_NR_NANOSLEEP, (int64)&rest[0], 0);
   job->out = (Word)(job->in * job->in);
   return 0;
 }
@@ -140,7 +141,7 @@ fn both(kind: Word, pid_a: Word, pid_b: Word) {
 }
 
 fn main() -> int32 {
-  var port_a: int64 = 14000 + (syscall(39) % 2000) * 2;
+  var port_a: int64 = 14000 + (syscall(ALPH_NR_GETPID) % 2000) * 2;
   var port_b: int64 = port_a + 1;
   machine(&g_a, 0, 3, port_b);
   machine(&g_b, 3, 0, port_a);

@@ -1,0 +1,300 @@
+// Jobs done at most once (src/place, alph/place/once). First the worker's
+// memory by itself. Then an asker and a worker with a bad way between
+// them: a fifth of the messages each way are lost, the worker is restarted
+// now and then and forgets everything, and the asker is told now and then
+// that the worker ended when it did not. Whatever happens, no job is done
+// twice, a job answered was done once and rightly, and every job is
+// answered or told lost.
+
+import "std/io";
+import "std/thread";
+import "port/sys";
+import "alph/actor/actor";
+import "alph/cores/cores";
+import "alph/time/time";
+import "alph/place/place";
+import "alph/place/once";
+
+const GO: Word = 1;
+const TICK: Word = 2;
+const MOVE: Word = 0;  // the kind: out is in * 2 + 1
+const JOBS: Word = 150;
+const OUT: Word = 4;
+
+var g_a: AlphCores;
+var g_a_core: AlphCore[1];
+var g_a_actors: AlphActor[4];
+var g_a_mail: AlphMsg[64];
+var g_b: AlphNode;
+var g_b_actors: AlphActor[2];
+var g_b_mail: AlphMsg[32];
+var g_time: AlphTime;
+var g_timers: AlphTimer[4];
+var g_places: AlphPlaces;
+var g_seats: AlphPlace[1];
+var g_kinds: AlphKind[1];
+var g_jobs: AlphJob[4];
+var g_memory: AlphOnce;
+var g_far_place: Word = 0;
+var g_worker: Word = 0;
+
+var g_runs: Word[150];   // times each job was done
+var g_state: Word[150];  // 0 not asked, 1 out, 2 answered, 3 told lost
+var g_wrong: Word = 0;
+var g_lost: Word = 0;
+var g_answered: Word = 0;
+var g_next: Word = 0;
+var g_reboot: int32 = 0;  // the worker forgets everything at its next message
+var g_reboots: Word = 0;
+var g_strangers: Word = 0;
+var g_again: Word = 0;    // jobs answered from memory
+var g_seed: uint32 = 12345;
+var g_failures: int32 = 0;
+
+fn expect(ok: bool, what: string) {
+  if (!ok) {
+    println("FAIL {what}");
+    g_failures = g_failures + 1;
+  }
+}
+
+// One message in five is lost on the way.
+fn lost_on_the_way() -> bool {
+  g_seed = g_seed * 1103515245 + 12345;
+  return ((g_seed >> 16) % 5) == 0;
+}
+
+fn to_worker(c: AlphCores*, to: Word, m: AlphMsg*) -> Word {
+  if (lost_on_the_way()) {
+    return ALPH_OK;
+  }
+  return g_b.put(to, m);
+}
+
+fn to_asker(n: AlphNode*, to: Word, m: AlphMsg*) -> Word {
+  if (lost_on_the_way()) {
+    return ALPH_OK;
+  }
+  return g_a.cores[0].node.put(to, m);
+}
+
+// The worker, as a board's or a machine's does it.
+fn worker(a: AlphActor*, m: AlphMsg*) -> Word {
+  if (g_reboot != 0) {
+    g_reboot = 0;
+    g_memory.init();
+    g_reboots = g_reboots + 1;
+  }
+  var answer: AlphMsg = { tag: ALPH_WORKED, from: a->pid, arg: 0, ref: m->ref };
+  if (m->tag == ALPH_HELLO) {
+    g_memory.hello(m->from, m->ref);
+    answer.tag = ALPH_HELLO;
+  } else if (m->tag == ALPH_WORK_ONCE) {
+    var seen: Word = g_memory.seen(m->from, m->ref, &answer.arg);
+    if (seen == ALPH_ONCE_STRANGER) {
+      answer.tag = ALPH_REFUSED;
+      answer.arg = ALPH_LOST;
+      g_strangers = g_strangers + 1;
+    } else if (seen == ALPH_ONCE_RUN) {
+      g_memory.begin(m->from, m->ref);
+      g_runs[m->arg] = g_runs[m->arg] + 1;
+      answer.arg = (Word)(m->arg * 2) + 1;
+      g_memory.done(m->from, m->ref, answer.arg);
+    } else if (seen == ALPH_ONCE_DONE) {
+      g_again = g_again + 1;
+    } else {
+      return 0;
+    }
+  } else {
+    return 0;
+  }
+  a->node->put(m->from, &answer);
+  return 0;
+}
+
+// Asks for every job once, a few at a time, and notes what comes of each.
+fn boss(a: AlphActor*, m: AlphMsg*) -> Word {
+  if (m->tag == ALPH_DONE) {
+    var job: AlphJob* = (AlphJob*)m->arg;
+    var id: Word = job->in;
+    if (job->status == ALPH_OK) {
+      if (g_state[id] != 1 || job->out != (Word)(id * 2) + 1) {
+        g_wrong = g_wrong + 1;
+      }
+      g_state[id] = 2;
+      g_answered = g_answered + 1;
+    } else if (job->status == ALPH_LOST) {
+      g_state[id] = 3;
+      g_lost = g_lost + 1;
+    } else {
+      g_state[id] = 0;  // not sent: asked for again below
+    }
+    job->kind = -1;
+  }
+  if (m->tag == TICK) {
+    g_time.after(1, a->pid, TICK, 0);
+  }
+  if (g_answered + g_lost == JOBS) {
+    a->cores()->stop();
+    return 0;
+  }
+  // Every job not yet out goes out when there is a job to carry it.
+  for i in 0..OUT {
+    var job: AlphJob* = &g_jobs[i];
+    if (job->kind != -1) {
+      continue;
+    }
+    var id: Word = -1;
+    for j in 0..JOBS {
+      if (g_state[j] == 0) {
+        id = (Word)j;
+        break;
+      }
+    }
+    if (id < 0) {
+      break;
+    }
+    job->kind = MOVE;
+    job->size = 1;
+    job->home = ALPH_NOWHERE;
+    job->stay = 0;
+    job->count = 0;
+    job->back = 0;
+    job->in = id;
+    g_state[id] = 1;
+    if (g_places.ask(a, job) < 0) {
+      g_state[id] = 0;  // no place, or not yet: at the next tick
+      job->kind = -1;
+      break;
+    }
+  }
+  return 0;
+}
+
+fn b_main(arg: cstring) -> uint32 {
+  g_b.run();
+  return 0;
+}
+
+fn main() -> int32 {
+  // The memory by itself.
+  var o: AlphOnce;
+  var out: Word = 0;
+  o.init();
+  expect(o.seen(7, 4097, &out) == ALPH_ONCE_STRANGER, "an asker that never said hello is a stranger");
+  o.hello(7, 4096);
+  expect(o.seen(7, 4097, &out) == ALPH_ONCE_RUN, "a new job is to be done");
+  o.begin(7, 4097);
+  expect(o.seen(7, 4097, &out) == ALPH_ONCE_BUSY, "a job being done is not done again");
+  o.done(7, 4097, 55);
+  expect(o.seen(7, 4097, &out) == ALPH_ONCE_DONE && out == 55, "a job done is answered from memory ({out})");
+  expect(o.seen(7, 4096, &out) == ALPH_ONCE_OLD, "a ref at the floor is an old copy");
+  expect(o.seen(7, 8193, &out) == ALPH_ONCE_STRANGER, "a job of another run is a stranger's");
+  o.begin(7, 4098);
+  o.undo(7, 4098);
+  expect(o.seen(7, 4098, &out) == ALPH_ONCE_RUN, "a job not done after all may be done when sent again");
+  for r in 4098..4102 {
+    o.begin(7, (Word)r);
+    o.done(7, (Word)r, (Word)r);
+  }
+  expect(o.seen(7, 4097, &out) == ALPH_ONCE_OLD, "the fifth job remembered pushes the first under the floor");
+  expect(o.seen(7, 4101, &out) == ALPH_ONCE_DONE && out == 4101, "and the last four are still remembered");
+  o.hello(7, 8192);
+  expect(o.seen(7, 4101, &out) == ALPH_ONCE_STRANGER, "after a new hello the old run is a stranger's");
+  expect(o.seen(7, 8193, &out) == ALPH_ONCE_RUN, "and the new run starts with nothing remembered");
+  o.hello(8, 4096);
+  o.hello(9, 4096);
+  o.hello(10, 4096);
+  expect(o.seen(7, 8193, &out) == ALPH_ONCE_RUN, "four askers are known at once");
+  o.hello(11, 4096);
+  expect(o.seen(8, 4097, &out) == ALPH_ONCE_STRANGER, "a fifth takes the place of the one heard from longest ago");
+  expect(o.seen(7, 8193, &out) == ALPH_ONCE_RUN && o.seen(11, 4097, &out) == ALPH_ONCE_RUN, "and the others stay");
+
+  // The asker is place 0, the worker place 4, and a bad way between them.
+  g_a.init(&g_a_core[0], 1, &g_a_actors[0], 4, &g_a_mail[0], 16);
+  g_a.join(0, &to_worker, 0);
+  g_b.init(&g_b_actors[0], 2, &g_b_mail[0], 16);
+  g_b.join(4, &to_asker, 0);
+  g_memory.init();
+  g_worker = g_b.spawn(&worker, 0);
+  g_time.init(&g_a_core[0].node, &g_timers[0], 4);
+  g_places.init(&g_seats[0], 1, &g_kinds[0], 1);
+  g_places.kind(MOVE, 0, 0);
+  g_places.once(MOVE);
+  g_places.clock(&g_time);
+  g_far_place = g_places.on_core(&g_a, 0, ALPH_FAR);
+  g_places.far(MOVE, g_worker);
+  for i in 0..OUT {
+    g_jobs[i].kind = -1;
+  }
+  var boss_pid: Word = g_a.spawn_on(0, &boss, 0);
+  var b_thread: int64 = CreateThread(0, 0, &b_main, 0, 0, 0);
+  g_time.after(1, boss_pid, TICK, 0);
+  g_time.after(60000, boss_pid, GO, 0);
+
+  // Trouble from outside while the jobs run.
+  var began: int64 = syscall(ALPH_NR_GETPID);
+  g_seed = (uint32)began;
+  var trouble: int64 = CreateThread(0, 0, &trouble_main, 0, 0, 0);
+  g_a.run();
+  g_trouble_over = 1;
+  thread_join_infinite(trouble);
+  thread_close(trouble);
+  g_time.stop();
+  g_b.stop();
+  thread_join_infinite(b_thread);
+  thread_close(b_thread);
+
+  var twice: Word = 0;
+  var unsaid: Word = 0;
+  var not_done: Word = 0;
+  var lost_done: Word = 0;
+  for i in 0..JOBS {
+    if (g_runs[i] > 1) {
+      twice = twice + 1;
+    }
+    if (g_state[i] != 2 && g_state[i] != 3) {
+      unsaid = unsaid + 1;
+    }
+    if (g_state[i] == 2 && g_runs[i] != 1) {
+      not_done = not_done + 1;
+    }
+    if (g_state[i] == 3 && g_runs[i] == 1) {
+      lost_done = lost_done + 1;
+    }
+  }
+  expect(twice == 0, "no job is done twice ({twice} were)");
+  expect(unsaid == 0, "every job is answered or told lost ({unsaid} were not)");
+  expect(not_done == 0 && g_wrong == 0, "a job answered was done once, and rightly ({not_done} not done, {g_wrong} wrong)");
+  expect(g_reboots > 0 && g_ended > 0, "the worker was restarted and the asker told it ended ({g_reboots} and {g_ended} times)");
+  expect(g_again > 0, "jobs sent again were answered from memory ({g_again})");
+  if (g_failures != 0) {
+    return 1;
+  }
+  println("once ok: {JOBS} jobs over a way that loses a fifth, {g_reboots} restarts of the worker and {g_ended} false ends: {g_answered} done once and answered, {g_lost} told lost ({lost_done} of them done), {g_again} answered from memory, none done twice");
+  return 0;
+}
+
+var g_trouble_over: int32 = 0;
+var g_ended: Word = 0;
+
+// Every 300 ms the worker is restarted, or the asker's place is told it
+// ended and is then given it again.
+fn trouble_main(arg: cstring) -> uint32 {
+  var turn: Word = 0;
+  while (g_trouble_over == 0) {
+    Sleep(300);
+    turn = turn + 1;
+    if (turn % 2 == 0) {
+      g_reboot = 1;
+    } else {
+      var ended: AlphMsg = { tag: ALPH_ENDED, from: g_worker, arg: ALPH_LOST, ref: 0 };
+      if (g_a.cores[0].node.put(g_far_place, &ended) == ALPH_OK) {
+        g_ended = g_ended + 1;
+      }
+      Sleep(5);
+      g_places.far(MOVE, g_worker);
+    }
+  }
+  return 0;
+}

@@ -15,6 +15,7 @@ import "port/line";
 import "alph/actor/actor";
 import "alph/time/time";
 import "alph/tether/tether";
+import "port/sys";
 
 const GO: Word = 1;
 const PONG: Word = 2;
@@ -87,7 +88,7 @@ fn main(argc: int32, argv: cstring*) -> int32 {
     println("no board called");
     return 1;
   }
-  syscall(72, line, 4, 0);  // the line's thread reads it and waits
+  syscall(ALPH_NR_FCNTL, line, 4, 0);  // the line's thread reads it and waits
   alph_line_open(line);
 
   // This machine is place 0. The board is place 1, and its one actor is the

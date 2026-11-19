@@ -11,6 +11,7 @@ import "alph/actor/actor";
 import "alph/cores/cores";
 import "port/wire";
 import "alph/link/link";
+import "port/sys";
 
 const PING: Word = 1;
 const PONG: Word = 2;
@@ -44,13 +45,13 @@ fn expect(ok: bool, what: string) {
 
 fn now_ms() -> Word {
   var ts: int64[2];
-  syscall(228, 1, (int64)&ts[0]);
+  syscall(ALPH_NR_CLOCK_GETTIME, 1, (int64)&ts[0]);
   return (Word)(ts[0] * 1000 + ts[1] / 1000000);
 }
 
 fn now_us() -> Word {
   var ts: int64[2];
-  syscall(228, 1, (int64)&ts[0]);
+  syscall(ALPH_NR_CLOCK_GETTIME, 1, (int64)&ts[0]);
   return (Word)(ts[0] * 1000000 + ts[1] / 1000);
 }
 
@@ -181,7 +182,7 @@ fn stop_b() {
 }
 
 fn main() -> int32 {
-  var port_a: int64 = 12000 + (syscall(39) % 5000) * 4;  // below the ports the system hands out itself
+  var port_a: int64 = 12000 + (syscall(ALPH_NR_GETPID) % 5000) * 4;  // below the ports the system hands out itself
   var port_b: int64 = port_a + 1;
   var d: Driver;
   d.rounds = 0;

@@ -23,9 +23,10 @@
 // it will finish first, and to the one of several that is least busy.
 //
 // The program writes the two ways. alph only times them, so nothing here
-// knows what a GPU is. x86-64 Linux, like the cores.
+// knows what a GPU is. Linux, like the cores.
 
 import "port/port";
+import "port/sys";
 import "alph/actor/actor";
 import "alph/cores/cores";
 import "alph/life/life";
@@ -48,6 +49,12 @@ const LONG: Word = 8;                  // a far job is out too long at this many
 const LONG_NS: Word = 1000000000;      // and never before a second
 export const ALPH_BACK_BYTES: Word = 1016;  // the most bytes a job on another machine gives back
 const FAR_REFS: Word = 1073741824;
+// A ref of a job done at most once: this bit, a run of 18 bits, a number of 12.
+const ONCE: Word = 1073741824;
+const ONCE_LAST: Word = 4095;
+const ONCE_OUT: Word = 4;            // such jobs out to one worker at once: what it remembers
+const HELLO_NS: Word = 100000000;    // a hello not answered in this long is said again
+const ONCE_AGAIN_NS: Word = 100000000;  // such a job not answered in this long, or four times its usual time, is sent again
 const WAYS: Word = 3;
 const SIZES: Word = 32;              // sizes are told apart by their power of two
 const FRESH: Word = 16;
@@ -80,6 +87,8 @@ export struct AlphJob {
   far_ref: Word; // the ref its request to another machine carries,
   far_to: Word;  // the worker it went to,
   far_seen: Word; // how many answers its place had had by then,
+  far_resent: Word; // a job done at most once: it was sent a second time,
+  far_asked: Word;  // and when it was last sent,
   began: Word;   // and when
   to: AlphPlace*;
   next: AlphJob*;
@@ -90,6 +99,7 @@ export struct AlphKind {
   cpu: fn(AlphJob*) -> Word;
   gpu: fn(AlphJob*) -> Word;
   bring: fn(AlphJob*) -> Word;
+  once: Word;      // a job of this kind is never done twice
   far: Word;       // an actor on another machine that does this kind's work, 0 when no machine does
   off: Word[3];    // this way cannot run the kind
   warm: Word[3];   // its first run is over: that one pays for starting up
@@ -142,6 +152,11 @@ export struct AlphPlace {
   gave_began: Word[4];  // when,
   gave_at: Word[4];   // and its kind times 192 plus which of the kind's times it is
   gave_next: Word;
+  once_known: Word[16];  // by kind, for jobs done at most once: 0 the worker must be said hello to, 1 hello sent, 2 it answered
+  once_ref: Word[16];    // the last ref given out in this run of refs
+  once_hello: Word[16];  // the ref of the hello sent
+  once_at: Word[16];     // when it was sent
+  once_run: Word[16];    // the run it started
   pace: Word[16];     // a far place, by kind: ns from one answer to the next while it has work, 0 when not known
   busy: Word;         // it still had work when its last answer came
   own: AlphTimes*;    // a far place's own times, one for each of its first own_kinds kinds, 0 for none
@@ -163,7 +178,7 @@ export struct AlphPlaces {
 
 fn alph_place_ns() -> Word {
   var ts: int64[2];
-  syscall(228, 1, (int64)&ts[0]);
+  syscall(ALPH_NR_CLOCK_GETTIME, 1, (int64)&ts[0]);
   return (Word)(ts[0] * 1000000000 + ts[1]);
 }
 
@@ -239,6 +254,7 @@ export fn AlphPlaces_kind__ptr(p: AlphPlaces*, kind: Word, cpu: fn(AlphJob*) -> 
   k->cpu = cpu;
   k->gpu = gpu;
   k->bring = 0;
+  k->once = 0;
   k->off[ALPH_CPU] = 0;
   k->far = 0;
   k->off[ALPH_GPU] = 0;
@@ -264,6 +280,20 @@ export fn AlphPlaces_kind__ptr(p: AlphPlaces*, kind: Word, cpu: fn(AlphJob*) -> 
       alph_place_clear(&x->own[kind]);
     }
   }
+}
+
+// Says that a job of this kind is never done twice, whatever is lost on
+// the way: for work that changes something, such as moving an arm. On
+// this machine a job runs once anyway. Sent to another machine it goes as
+// ALPH_WORK_ONCE, to a worker that remembers what it has done (a board or
+// a machine does, see alph/place/once). A job not answered is sent again
+// to the same worker and never placed anywhere else. If the worker or its
+// machine is lost, or was restarted, the job comes back with the status
+// ALPH_LOST: it may or may not have been done, and the program decides.
+// Such a job carries a word, not bytes, and gives a word back. Call it
+// after kind.
+export fn AlphPlaces_once__ptr(p: AlphPlaces*, kind: Word) {
+  p->kinds[kind].once = 1;
 }
 
 // Says how a kind's data on the GPU is brought to the host. It runs on the
@@ -417,6 +447,8 @@ export fn AlphPlaces_add__ptr(p: AlphPlaces*, way: Word) -> AlphPlace* {
     x->busy = 0;
     for k in 0..16 {
       x->pace[k] = 0;
+      x->once_known[k] = 0;
+      x->once_run[k] = -1;
     }
     x->own = 0;
     x->own_kinds = 0;
@@ -532,8 +564,8 @@ fn alph_place_pick(p: AlphPlaces*, job: AlphJob*) -> AlphPlace* {
       held = true;
       continue;
     }
-    if (x->way == ALPH_FAR && x->limit != 0 && job->count > 0) {
-      continue;  // a small machine takes no bytes
+    if (x->way == ALPH_FAR && (x->limit != 0 || k->once != 0) && job->count > 0) {
+      continue;  // a small machine takes no bytes, and a job done at most once carries none
     }
     var row: Word = alph_place_row(job, x->way);
     var at: Word = row + size;
@@ -757,6 +789,86 @@ fn alph_place_elsewhere(a: AlphActor*, p: AlphPlaces*, x: AlphPlace*, job: AlphJ
   x->unsent = job;
 }
 
+// A job whose worker cannot say whether it was done: its asker is told so.
+fn alph_place_lose(p: AlphPlaces*, x: AlphPlace*, job: AlphJob*) {
+  alph_place_forget(p, x, job);
+  job->status = ALPH_LOST;
+  job->way = ALPH_FAR;
+  job->next = x->unsent;
+  x->unsent = job;
+}
+
+// The same for every job done at most once that is out to a worker.
+fn alph_place_lose_all(p: AlphPlaces*, x: AlphPlace*, worker: Word) {
+  var job: AlphJob* = x->open;
+  x->open = 0;
+  while (job != 0) {
+    var after: AlphJob* = job->next;
+    if (job->far_to == worker && job->far_ref >= ONCE) {
+      alph_place_lose(p, x, job);
+    } else {
+      job->next = x->open;
+      x->open = job;
+    }
+    job = after;
+  }
+}
+
+// Says hello to a kind's worker: a new run of refs, named by the time in
+// eighths of a second, so that a run is never used twice, by this program
+// or by one started after it. No hello is said twice in one eighth.
+fn alph_place_greet(a: AlphActor*, x: AlphPlace*, kind: Word) {
+  var ts: int64[2];
+  syscall(ALPH_NR_CLOCK_GETTIME, 0, (int64)&ts[0]);
+  var run: Word = (Word)((ts[0] * 8 + ts[1] / 125000000) & 262143);
+  if (run == x->once_run[kind]) {
+    return;
+  }
+  var h: Word = (Word)(ONCE | (run << 12));
+  var hello: AlphMsg = { tag: ALPH_HELLO, from: a->pid, arg: 0, ref: h };
+  x->once_run[kind] = run;
+  x->once_ref[kind] = h;
+  x->once_hello[kind] = h;
+  x->once_known[kind] = 1;
+  x->once_at[kind] = alph_place_ns();
+  a->node->put(x->workers[kind], &hello);
+}
+
+// The ref for a job done at most once, or 0 when it cannot go out yet: the
+// worker has not answered a hello, or as many are out to it as it
+// remembers, or this run's numbers are used up and a new run must start.
+fn alph_place_once_ref(a: AlphActor*, x: AlphPlace*, job: AlphJob*) -> Word {
+  var kind: Word = job->kind;
+  var least: Word = 0;
+  var open: AlphJob* = x->open;
+  while (open != 0) {
+    if (open->kind == kind && open->far_ref >= ONCE && (least == 0 || open->far_ref < least)) {
+      least = open->far_ref;
+    }
+    open = open->next;
+  }
+  if (x->once_known[kind] != 2) {
+    if (x->once_known[kind] == 0 || (Word)(alph_place_ns() - x->once_at[kind]) > HELLO_NS) {
+      if (least == 0) {
+        alph_place_greet(a, x, kind);
+      }
+    }
+    return 0;
+  }
+  var next: Word = x->once_ref[kind] + 1;
+  if ((Word)(next & ONCE_LAST) == ONCE_LAST) {
+    if (least == 0) {
+      alph_place_greet(a, x, kind);
+    }
+    return 0;
+  }
+  if (least != 0 && next - least >= ONCE_OUT) {
+    return 0;
+  }
+  x->once_ref[kind] = next;
+  return next;
+}
+
 // A far place's machine no longer does a kind.
 fn alph_place_shut_far(p: AlphPlaces*, x: AlphPlace*, kind: Word) {
   if (kind < 0 || kind >= 16) {
@@ -764,6 +876,7 @@ fn alph_place_shut_far(p: AlphPlaces*, x: AlphPlace*, kind: Word) {
   }
   var was: int32 = p->gate.enter();
   x->workers[kind] = 0;
+  x->once_known[kind] = 0;
   x->pace[kind] = 0;
   alph_place_far_open(p, kind);
   p->gate.leave(was);
@@ -839,9 +952,14 @@ export fn alph_place_run(a: AlphActor*, m: AlphMsg*) -> Word {
     x->answered = x->answered + gap;
     var job: AlphJob* = x->open;
     var before: AlphJob* = 0;
-    while (job != 0 && job->far_ref != m->ref) {
+    while (job != 0 && (job->far_ref != m->ref || (m->ref >= ONCE && job->far_to != m->from))) {
       before = job;
       job = job->next;
+    }
+    if (job != 0 && job->far_ref >= ONCE && m->tag == ALPH_REFUSED && m->arg != ALPH_LOST && job->far_resent != 0) {
+      // Refused, but this job was sent more than once and another copy
+      // may have been taken: only an answer settles it.
+      job = 0;
     }
     if (job == 0 && m->tag != ALPH_REFUSED) {
       // The answer to a job given up on: the work was not lost, it took
@@ -915,6 +1033,16 @@ export fn alph_place_run(a: AlphActor*, m: AlphMsg*) -> Word {
         // work stops going there until it is tried again. Either way the
         // job goes to whichever place is best now.
         var k: AlphKind* = &p->kinds[job->kind];
+        if (m->arg == ALPH_LOST) {
+          // The worker does not know this run of refs: it was restarted, or
+          // gave this machine up. Nothing out to it can be told done or not.
+          var kind: Word = job->kind;
+          alph_place_lose(p, x, job);
+          alph_place_lose_all(p, x, m->from);
+          x->once_known[kind] = 0;
+          alph_place_answer(a, x);
+          return 0;
+        }
         if (m->arg == ALPH_GONE) {
           alph_place_shut_far(p, x, job->kind);
         }
@@ -951,13 +1079,22 @@ export fn alph_place_run(a: AlphActor*, m: AlphMsg*) -> Word {
     x->open = 0;
     while (job != 0) {
       var after: AlphJob* = job->next;
-      if (job->far_to == m->from) {
+      if (job->far_to == m->from && job->far_ref >= ONCE) {
+        alph_place_lose(p, x, job);  // done or not, no one can say
+      } else if (job->far_to == m->from) {
         alph_place_elsewhere(a, p, x, job);
       } else {
         job->next = x->open;
         x->open = job;
       }
       job = after;
+    }
+  }
+  if (m->tag == ALPH_HELLO) {
+    for i in 0..16 {
+      if (x->workers[i] == m->from && x->once_known[i] == 1 && x->once_hello[i] == m->ref) {
+        x->once_known[i] = 2;
+      }
     }
   }
   if (m->tag == ALPH_LOOK) {
@@ -984,6 +1121,24 @@ export fn alph_place_run(a: AlphActor*, m: AlphMsg*) -> Word {
       }
       var since: Word = job->began;
       var lost: bool = false;
+      if (job->far_ref >= ONCE) {
+        // Never given up on: sent again to the same worker under the same
+        // ref, which answers from what it remembers if it did the job.
+        var wait: Word = (Word)(t.last[0] * 4);
+        if (wait < ONCE_AGAIN_NS) {
+          wait = ONCE_AGAIN_NS;
+        }
+        if ((Word)(now - job->far_asked) > wait) {
+          var again: AlphMsg = { tag: ALPH_WORK_ONCE, from: a->pid, arg: job->in, ref: job->far_ref };
+          a->node->put(job->far_to, &again);
+          job->far_resent = 1;
+          job->far_asked = now;
+        }
+        job->next = x->open;
+        x->open = job;
+        job = after;
+        continue;
+      }
       if (x->limit != 0) {
         // This machine does its jobs one after another, so an answer to
         // any of them says it is still working through them. A job is
@@ -1035,9 +1190,21 @@ export fn alph_place_run(a: AlphActor*, m: AlphMsg*) -> Word {
     }
     job->began = alph_place_ns();
     job->far_seen = x->answers;
+    job->far_asked = job->began;
+    job->far_resent = 0;
     var ask: AlphMsg = { tag: ALPH_WORK, from: a->pid, arg: job->in, ref: job->far_ref };
     var out: Word = ALPH_GONE;
-    if (job->far_to != 0) {
+    if (job->far_to != 0 && k->once != 0) {
+      // Done at most once: the worker is said hello to first, and no more
+      // are out to it than it remembers. Until then the asker asks again.
+      job->far_ref = alph_place_once_ref(a, x, job);
+      ask.tag = ALPH_WORK_ONCE;
+      ask.ref = job->far_ref;
+      out = ALPH_FULL;
+      if (job->far_ref != 0) {
+        out = a->node->put(job->far_to, &ask);
+      }
+    } else if (job->far_to != 0) {
       if (job->count > 0 && p->link != 0) {
         out = p->link->send_bytes(a->pid, job->far_to, ALPH_WORK_BYTES, job->far_ref, job->bytes, job->count);
       } else {

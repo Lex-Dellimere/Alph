@@ -4,6 +4,7 @@
 // still arrive, and the cores stop and run again.
 
 import "std/io";
+import "port/sys";
 import "std/thread";
 import "alph/actor/actor";
 import "alph/cores/cores";
@@ -232,7 +233,7 @@ fn outside(arg: cstring) -> uint32 {
       i = i + 1;
     } else {
       g_outside_full = g_outside_full + 1;
-      syscall(24);
+      syscall(ALPH_NR_SCHED_YIELD);
     }
   }
   return 0;

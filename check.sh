@@ -349,6 +349,31 @@ if [ "$#" -eq 0 ] && command -v qemu-system-riscv32 > /dev/null 2>&1; then
   fi
 fi
 
+# The same layers for 64-bit ARM Linux (a Raspberry Pi, a Jetson): every
+# test and example of the new layers is built for it. They are not run
+# here: linking needs an ARM machine.
+if [ "$#" -eq 0 ]; then
+  arm_fails=0
+  for src in tests/t_actor tests/t_cores tests/t_cross tests/t_time tests/t_wheel tests/t_places \
+      tests/t_life tests/t_link tests/t_seal tests/t_door tests/t_far tests/t_parcel tests/t_poll \
+      tests/t_proc tests/t_tether tests/t_batch tests/t_machine tests/t_three tests/t_own \
+      tests/t_serial tests/t_back tests/t_once examples/tiles examples/render examples/share examples/picture \
+      examples/run examples/count examples/spread examples/far examples/talk \
+      examples/mcu/arm_host examples/mcu/tether_host examples/mcu/relay_host tests/mcu/arm_test; do
+    name=$(basename "$src")
+    log="$OUT/arm64_$name.log"
+    if ! "$METTLE" -s --release --target aarch64-linux "$src.mettle" -I ports/arm64 -I ports/host \
+        -o "$OUT/arm64_$name.o" > "$log" 2>&1; then
+      echo "FAIL  arm64/$name build (see $log)"
+      arm_fails=$((arm_fails + 1))
+    fi
+  done
+  if [ "$arm_fails" -eq 0 ]; then
+    echo "ok    arm64 [the new layers' tests and examples build for ARM Linux; not run here]"
+  fi
+  fails=$((fails + arm_fails))
+fi
+
 if [ "$fails" -eq 0 ]; then
   echo "PASS"
 else

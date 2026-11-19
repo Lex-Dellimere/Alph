@@ -61,6 +61,7 @@ NEW_MODULES=(
   src/machine/machine.mettle
   src/batch/batch.mettle
   src/board/board.mettle
+  src/board/once.mettle
   src/actor/actor.mettle
   src/cores/cores.mettle
   src/cores/lanes.mettle
@@ -68,6 +69,7 @@ NEW_MODULES=(
   src/time/wheel.mettle
   src/place/place.mettle
   src/place/words.mettle
+  src/place/once.mettle
   src/life/life.mettle
   src/name/name.mettle
   src/door/door.mettle

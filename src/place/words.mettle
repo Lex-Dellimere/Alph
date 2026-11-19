@@ -9,4 +9,6 @@ export const ALPH_WORKED: Word = -14;      // its answer: arg is the job's out, 
 export const ALPH_WORK_BYTES: Word = -17;  // as ALPH_WORK, for a job with bytes: arg is a parcel
 export const ALPH_WORKED_BYTES: Word = -20; // as ALPH_WORKED, for a job that gives bytes back: arg is a parcel, its first 8 bytes the job's out
 export const ALPH_REFUSED: Word = -18;     // a worker's answer when it cannot take the job: arg is ALPH_FULL for now, ALPH_GONE for never
+export const ALPH_WORK_ONCE: Word = -21;   // as ALPH_WORK, for a job that must not be done twice (see alph/place/once)
+export const ALPH_HELLO: Word = -22;       // to a worker before the first ALPH_WORK_ONCE: a new run of refs starts at ref. It answers the same back
 export const ALPH_SHARED: Word = 1073741824;  // the name of the worker for a shared kind is this plus the kind

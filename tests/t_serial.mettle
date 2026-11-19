@@ -4,6 +4,7 @@
 
 import "std/io";
 import "port/serial";
+import "port/sys";
 
 const TIOCSPTLCK: int64 = 1074025521;
 const TIOCGPTN: int64 = 2147767344;
@@ -38,15 +39,15 @@ fn digits(out: uint8*, n: int32) -> int32 {
 }
 
 fn main() -> int32 {
-  var master: int64 = syscall(2, (int64)"/dev/ptmx", 2 | 256, 0);
+  var master: int64 = alph_sys_open("/dev/ptmx", 2 | 256, 0);
   expect(master >= 0, "a pseudo-terminal can be made");
   if (master < 0) {
     return 1;
   }
   var unlock: int32 = 0;
   var number: int32 = -1;
-  syscall(16, master, TIOCSPTLCK, (int64)&unlock);
-  syscall(16, master, TIOCGPTN, (int64)&number);
+  syscall(ALPH_NR_IOCTL, master, TIOCSPTLCK, (int64)&unlock);
+  syscall(ALPH_NR_IOCTL, master, TIOCGPTN, (int64)&number);
   var path: uint8[32];
   var prefix: cstring = "/dev/pts/";
   var at: int32 = 0;
@@ -72,10 +73,10 @@ fn main() -> int32 {
   sent[6] = 192;  // the tether's end mark
   sent[7] = 255;
   var got: uint8[16];
-  expect(syscall(1, master, (int64)&sent[0], 8) == 8, "eight bytes go in at the far end");
+  expect(syscall(ALPH_NR_WRITE, master, (int64)&sent[0], 8) == 8, "eight bytes go in at the far end");
   var have: int64 = 0;
   while (have < 8) {
-    var n: int64 = syscall(0, line, (int64)&got[have], 16 - have);
+    var n: int64 = syscall(ALPH_NR_READ, line, (int64)&got[have], 16 - have);
     if (n <= 0) {
       break;
     }
@@ -89,10 +90,10 @@ fn main() -> int32 {
   }
   expect(same, "and come out of the line as they were ({have} bytes)");
 
-  expect(syscall(1, line, (int64)&sent[0], 8) == 8, "eight bytes go into the line");
+  expect(syscall(ALPH_NR_WRITE, line, (int64)&sent[0], 8) == 8, "eight bytes go into the line");
   have = 0;
   while (have < 8) {
-    var n: int64 = syscall(0, master, (int64)&got[have], 16 - have);
+    var n: int64 = syscall(ALPH_NR_READ, master, (int64)&got[have], 16 - have);
     if (n <= 0) {
       break;
     }
@@ -106,8 +107,8 @@ fn main() -> int32 {
   }
   expect(same, "and come out at the far end as they were ({have} bytes)");
 
-  syscall(3, line);
-  syscall(3, master);
+  syscall(ALPH_NR_CLOSE, line);
+  syscall(ALPH_NR_CLOSE, master);
   if (g_failures != 0) {
     return 1;
   }

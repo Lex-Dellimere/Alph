@@ -2,9 +2,8 @@
 
 import "std/thread";
 import "port/port";
+import "port/sys";
 
-const SYS_FUTEX: int64 = 202;
-const SYS_CLOCK_GETTIME: int64 = 228;
 const CLOCK_MONOTONIC: int64 = 1;
 const FUTEX_WAIT: int64 = 128;  // private
 const FUTEX_WAKE: int64 = 129;
@@ -25,7 +24,7 @@ export struct AlphAlarm {
 // Time in ticks: here a tick is a millisecond on the monotonic clock.
 export fn alph_now() -> Word {
   var ts: int64[2];
-  syscall(SYS_CLOCK_GETTIME, CLOCK_MONOTONIC, (int64)&ts[0]);
+  syscall(ALPH_NR_CLOCK_GETTIME, CLOCK_MONOTONIC, (int64)&ts[0]);
   return (Word)(ts[0] * 1000 + ts[1] / 1000000);
 }
 
@@ -45,7 +44,7 @@ fn alph_alarm_main(arg: cstring) -> uint32 {
       return 0;
     }
     if (al->armed == 0) {
-      syscall(SYS_FUTEX, (int64)&al->changes, FUTEX_WAIT, (int64)seen, 0);
+      syscall(ALPH_NR_FUTEX, (int64)&al->changes, FUTEX_WAIT, (int64)seen, 0);
       continue;
     }
     var wait: Word = al->at - alph_now();
@@ -56,14 +55,14 @@ fn alph_alarm_main(arg: cstring) -> uint32 {
     }
     ts[0] = (int64)(wait / 1000);
     ts[1] = (int64)(wait % 1000) * 1000000;
-    syscall(SYS_FUTEX, (int64)&al->changes, FUTEX_WAIT, (int64)seen, (int64)&ts[0]);
+    syscall(ALPH_NR_FUTEX, (int64)&al->changes, FUTEX_WAIT, (int64)seen, (int64)&ts[0]);
   }
   return 0;
 }
 
 fn alph_alarm_changed(al: AlphAlarm*) {
   mettle_atomic_inc_i32(&al->changes);
-  syscall(SYS_FUTEX, (int64)&al->changes, FUTEX_WAKE, 1);
+  syscall(ALPH_NR_FUTEX, (int64)&al->changes, FUTEX_WAKE, 1);
 }
 
 export fn AlphAlarm_start__ptr(al: AlphAlarm*, ring: fn(rawptr) -> void, ctx: rawptr) {

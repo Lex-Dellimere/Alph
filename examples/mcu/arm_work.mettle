@@ -5,6 +5,7 @@ import "port/port";
 
 export const PRIMES: Word = 0;  // in is a chunk's number, out the primes in that chunk
 export const ANGLE: Word = 1;   // in is a joint, out its angle: only the board can tell
+export const MOVE: Word = 2;    // in is how far to turn the arm, out where it is then: never done twice
 export const QUIT: Word = 3;
 export const CHUNK: Word = 500;
 

@@ -55,7 +55,7 @@ This is [examples/count.mettle](examples/count.mettle). The node owns no memory:
 | Core | Actors, messages, the run loop. On Linux a handler that crashes ends only its actor | [src/actor](src/actor/actor.mettle) |
 | Cores | One node per core: a thread each on Linux, a hart each on a chip with several. An actor sends to another core the way it sends next door. On Linux, lanes let cores that send each other a lot do it without a lock | [src/cores](src/cores/cores.mettle) |
 | Time | A message sent later. Small timers for a board, a timer wheel for thousands | [src/time](src/time/time.mettle), [wheel](src/time/wheel.mettle) |
-| Places | A job goes to a core, the GPU or another machine, whichever alph has timed as finishing it first. A job stays where its data is | [src/place](src/place/place.mettle) |
+| Places | A job goes to a core, the GPU or another machine, whichever alph has timed as finishing it first. A job stays where its data is. A kind can be done at most once, for work that must never happen twice | [src/place](src/place/place.mettle) |
 | Polls | A socket sends a message when it is ready, so no handler waits. TCP calls that go with it, and other programs: start one and get a message when it ends | [src/poll](src/poll/poll.mettle) |
 | Lives | Watch an actor to be told when it ends and why. Keep one, and a crash restarts it in place with the same pid | [src/life](src/life/life.mettle) |
 | Links | Other machines over UDP. Messages arrive once and in order, can carry up to 1,024 bytes, and a lost machine is noticed in half a second | [src/link](src/link/link.mettle) |
@@ -64,7 +64,7 @@ This is [examples/count.mettle](examples/count.mettle). The node owns no memory:
 | Tether | A microcontroller tied to a bigger machine by its serial line: each side's actors reach the other's by pid. That machine can pass the board's mail on, so the whole network reaches it | [src/tether](src/tether/tether.mettle) |
 | Board | The short way for a microcontroller: it says which kinds of work it does, and the bigger machines send it jobs as they would to any other place. It asks for work too, so two boards share work with no computer between them | [src/board](src/board/board.mettle) |
 | Machine and batch | The short way: a machine set up in one call, and one kind of work handed out in pieces to cores, the GPU, other machines and boards | [src/machine](src/machine/machine.mettle), [src/batch](src/batch/batch.mettle) |
-| Ports | What differs per device: `mcu` (one hart, no OS), `harts` (several harts, no OS), `pico2` (a Raspberry Pi Pico 2) and `host` (x86-64 Linux) | [ports](ports) |
+| Ports | What differs per device: `mcu` (one hart, no OS), `harts` (several harts, no OS), `pico2` (a Raspberry Pi Pico 2), `host` (x86-64 Linux) and `arm64` (64-bit ARM Linux: a Raspberry Pi, a Jetson) | [ports](ports) |
 
 [docs/start.md](docs/start.md) shows how to use each of these. [docs/design.md](docs/design.md) explains why they are built this way, what was measured, and what is not built yet. Every struct, constant and function of these layers is listed in [docs/reference.md](docs/reference.md).
 
@@ -130,6 +130,12 @@ An echo server and a client over TCP, with an actor for each connection, [exampl
 mettle --build -s --release examples/talk.mettle -I ports/host -o talk
 ```
 
+For 64-bit ARM Linux, such as a Raspberry Pi or a Jetson, build on that machine with the ARM port in front of the Linux one:
+
+```bash
+mettle --build -s --release examples/share.mettle --target aarch64-linux -I ports/arm64 -I ports/host -o share
+```
+
 Two actors and a timer on a bare 32-bit RISC-V board, in a 3.3 KB image, [examples/mcu/blink.mettle](examples/mcu/blink.mettle):
 
 ```bash
@@ -161,7 +167,7 @@ qemu-system-riscv32 -M virt -smp 2 -bios none -nographic -device loader,file=har
 
 Two boards on one serial line, with no other machine: [examples/mcu/asker.mettle](examples/mcu/asker.mettle) asks the board above for numbers. Each board's actor reaches the other's by its pid, so a device with several chips is one program. `check.sh` runs the pair in two QEMUs.
 
-A computer and a board working as one machine, [examples/mcu/arm.mettle](examples/mcu/arm.mettle) and [examples/mcu/arm_host.mettle](examples/mcu/arm_host.mettle): the chip in a robot's arm, say, on the serial line of the computer that plans. The computer asks for joint angles, which only the board can read, and for primes, which both can count. It never says where either is done. Every angle comes from the board, and the board counts some of the primes. The function that counts is one file built into both programs. The board's image is 4.5 KB:
+A computer and a board working as one machine, [examples/mcu/arm.mettle](examples/mcu/arm.mettle) and [examples/mcu/arm_host.mettle](examples/mcu/arm_host.mettle): the chip in a robot's arm, say, on the serial line of the computer that plans. The computer asks for joint angles, which only the board can read, and for primes, which both can count. It never says where either is done. Every angle comes from the board, and the board counts some of the primes. It also asks for five moves of the arm, a kind that is done at most once: the board remembers what it did, so a move sent again because its answer was lost is answered and not made again. The function that counts is one file built into both programs. The board's image is 5.5 KB:
 
 With a real board in place of QEMU, the computer opens the board's serial device with `alph_serial_open("/dev/ttyACM0", 115200)` and gives it to `alph_line_open`.
 
@@ -181,13 +187,15 @@ mettle --release examples/mcu/two_b.mettle --target riscv32-none --board qemu-vi
 
 ## What it does not do yet
 
+- On ARM Linux a handler that crashes ends the process, and the programs have run under an emulator, not on an ARM machine.
+
 - A sealed link has one key for the whole network: any holder can speak as any machine, and someone who gets the key later can read what they recorded before.
 - A job for another machine carries at most 1,024 bytes, and gives back a word and at most 1,016 bytes.
 - Sockets are Linux only, and there is no file IO.
 - A message between two cores costs 150 to 300 ns against about 20 ns inside a node. Lanes bring a stream of them down to about 70 ns, but a single request and its reply are no quicker.
 - A microcontroller joins through a serial line to one machine, and nothing lost on that line is sent again.
 - A board's jobs are one word in and one word out, one at a time. A board asks the machine at the other end of its line, not the best of several places.
-- A job whose answer is lost is placed again, so it can be done twice. Work that must not be, such as moving an arm, needs care until jobs done at most once are built.
+- A job of a kind done at most once carries a word and gives a word back, and when its worker is lost the program is told it cannot know, not what happened.
 
 ## Test
 
@@ -223,7 +231,7 @@ src/batch/batch.mettle      a batch: one kind of work handed out in pieces
 src/seal/seal.mettle        seals: an encrypted and signed link (needs the cryptex package)
 src/tether/tether.mettle    tether: a board and a bigger machine on a serial line
 src/board/board.mettle      a board: a microcontroller that takes work from bigger machines
-ports/mcu, ports/harts, ports/pico2, ports/host
+ports/mcu, ports/harts, ports/pico2, ports/host, ports/arm64
                             what differs per device, picked with -I ports/<name>
 src/alph.mettle             the first runtime in one import
 src/core, src/heal, src/work, src/net, src/io, src/sched, src/sys

@@ -72,8 +72,8 @@ fn alph_board_serve(a: AlphActor*, m: AlphMsg*) -> Word {
   }
   var run: fn(Word) -> Word = k->run;
   var answer: AlphMsg = { tag: ALPH_WORKED, from: a->pid, arg: run(m->arg), ref: m->ref };
-  a->node->put(m->from, &answer);
   k->board->served = k->board->served + 1;
+  a->node->put(m->from, &answer);
   return 0;
 }
 

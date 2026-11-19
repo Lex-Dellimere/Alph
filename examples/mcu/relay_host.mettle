@@ -21,6 +21,7 @@ import "alph/time/time";
 import "alph/link/link";
 import "alph/tether/tether";
 import "alph/tether/relay";
+import "port/sys";
 
 const PING: Word = 1;
 const PONG: Word = 2;
@@ -112,7 +113,7 @@ fn main(argc: int32, argv: cstring*) -> int32 {
     println("no board called");
     return 1;
   }
-  syscall(72, line, 4, 0);  // the line's thread reads it and waits
+  syscall(ALPH_NR_FCNTL, line, 4, 0);  // the line's thread reads it and waits
   alph_line_open(line);
 
   // The middle machine: on the link, with the board behind it.

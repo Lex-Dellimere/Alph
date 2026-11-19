@@ -27,6 +27,8 @@ What differs between devices is in a port, a folder picked at build time with `-
 | `pico2` | a Raspberry Pi Pico 2, one of its RISC-V cores | as `mcu` | as `mcu` | as `mcu` | as `mcu` | as `mcu` |
 | `host` | an x86-64 Linux process | 64 bits | 16 million | 32,768 | looks for mail for about 10 µs, then a futex | a spin lock |
 
+`arm64` is 64-bit ARM Linux, such as a Raspberry Pi or a Jetson, built with `-I ports/arm64 -I ports/host`. It holds only what differs from `host`: the system call numbers (`port/sys`, which every other file names them through) and the guard. On ARM a handler that crashes ends the process, because the guard needs inline assembly that Mettle does not emit for ARM yet. Every test and example of these layers builds for it. Linked by hand and run under an ARM emulator on an x86-64 machine, 18 of the 19 tests passed (the one that crashes handlers on purpose cannot), and so did the Linux side of every board example with a RISC-V board in QEMU. Nothing has run on an ARM machine, and an emulator on x86-64 keeps memory in a stricter order than a real ARM chip, so a fault of ordering would not show.
+
 A port is a few files of 30 to 130 lines each: the gate, the alarm, the crash guard, how a core is started, and the wire or line to other machines. A new device is a new port. Ports stack: `harts` and `pico2` have only what differs from `mcu`, and are built with `-I ports/harts -I ports/mcu` or `-I ports/pico2 -I ports/mcu`.
 
 A board program calls `alph_board_start()` first, which is the port's, so the examples in `examples/mcu` are the same source on a QEMU board and on a Pico 2. On the Pico 2 they have run on the compiler's model of the chip, not yet on a real board: the blink prints its five counts from five timer interrupts, and the tether answers every question whole.
@@ -96,6 +98,20 @@ A board asks for work too. It asks the door at the other end of its line who doe
 
 The board runs one job at a time, so a machine sends it at most four and a place has a limit for that. Nothing on the line is sent again: a job or an answer lost there is given up on after a second and placed again.
 
+### Done at most once
+
+A job whose answer is lost is placed again, so it can be done twice. For work that changes something that is wrong, so a kind can be marked as done at most once. The rule the asker then follows: a job not answered is sent again to the same worker under the same ref, and never placed anywhere else. The worker remembers, for each of four askers, the last four jobs it did and what each gave, and answers a job sent again from that memory.
+
+What makes this hard is everything else that can happen: a copy that arrives late, a worker that was restarted and remembers nothing, an asker that was restarted and numbers its jobs from the start again, a worker wrongly taken for lost. The first design was explored by a program that tries every order of those events for small sizes. It found seven ways to do a job twice or to answer one job with another's result, the shortest in eight steps. The design that came through millions of states with none is this:
+
+- A ref is a run and a number in it. An asker says hello before its first job, and each hello starts a run never used before (it is named by the clock). The hello wipes what the worker remembered of that asker.
+- A job of any other run, or from an asker the worker does not know, is refused as lost. The asker then tells the program that every job it had out is lost: done or not, it cannot say. It never guesses.
+- A ref at or under the worker's floor is an old copy and is dropped.
+- A refusal counts as "not done" only for a job that was sent once. After a second sending only an answer settles it.
+- No more jobs are out to a worker than it remembers.
+
+It holds as long as the way between the two never delivers a message twice, which the link and the tether do not. In the test an asker and a worker have a way between them that loses a fifth of the messages each way, the worker is restarted every 600 ms and the asker is told it ended when it did not: of 150 jobs about 124 were done once and answered, about 26 were told lost (some done, some not), 15 to 19 were answered from memory, and none was done twice, in 60 runs of 60.
+
 ## Crossings
 
 A message to another core moves cache lines over the memory bus. A job for the GPU moves data over PCIe. A message to another machine is a datagram. These are one thing, a crossing, and data is what makes a crossing expensive: a message is four words, data is megabytes. Two rules follow.
@@ -156,7 +172,7 @@ The measurements that decide a choice are in the section for that choice: the re
 - Door: a lost machine's actors ended in about 540 ms.
 - Work: `examples/far.mettle` with two cores here and one worker there sent about a third of the chunks across.
 - Tether: a board in QEMU with a process on its line did 200 requests and replies.
-- Board: the `examples/mcu/arm.mettle` image is 4,544 bytes, and each of the two boards of `examples/mcu/two.mettle`, with timers, is 6,504. All 6 jobs only the board could do went to it. Of 200 chunks of primes that both could count, the computer did 196 and the board in QEMU 4. With the computer's chunks slowed to two milliseconds each and the board on another machine's line, the board did 7 of 400 and the machine on its line 191: the asking machine had timed each and sent the board little. When the board was stopped in the middle of a batch, all 400 pieces were still answered.
+- Board: the `examples/mcu/arm.mettle` image is 5,520 bytes with its kind done at most once and 4,544 without, and each of the two boards of `examples/mcu/two.mettle`, with timers, is 6,504. All 6 jobs only the board could do went to it. Of 200 chunks of primes that both could count, the computer did 196 and the board in QEMU 4. With the computer's chunks slowed to two milliseconds each and the board on another machine's line, the board did 7 of 400 and the machine on its line 191: the asking machine had timed each and sent the board little. When the board was stopped in the middle of a batch, all 400 pieces were still answered.
 - Share: two machines each handed out 200 pieces at once and each answered all of its own rightly. With three machines and 300 pieces, the one that handed out did 110 and the other two 92 and 98. When one of the three was lost in the middle of a second batch, every piece was still answered.
 
 ## What is not built
@@ -167,7 +183,6 @@ The measurements that decide a choice are in the section for that choice: the re
 - A sealed link has one key for all, so any holder can speak as any machine and there is no forward secrecy. Peers are listed by hand.
 - A board on the UDP link itself. A board joins through a serial line to one machine, and a line that sends again what was lost.
 - A board that sends its work to the best of several places. It asks the machine at the other end of its line.
-- Jobs done at most once. A job whose answer is lost is placed again, so it can run twice.
 - A job for another machine with more than 1,024 bytes in or 1,016 back, or with its data on a GPU.
 - A job's time predicted from more than its size. A Mandelbrot tile's time depends on where in the picture it is, so such work is placed less well.
 - Sizes for `src/machine` other than the fixed ones.

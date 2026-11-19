@@ -20,7 +20,8 @@ export struct AlphBatch {
   total: Word;
   next: Word;        // the next piece not yet handed out
   back: Word;        // pieces answered
-  gone: Word;        // of those, pieces no place could run
+  gone: Word;        // of those, pieces no place could run,
+  lost: Word;        // and pieces done at most once whose worker was lost: done or not, no one can say
   out: Word;         // pieces handed out and not yet answered
   by_way: Word[3];   // how many each way did: ALPH_CPU, ALPH_GPU, ALPH_FAR
   fill: fn(AlphBatch*, AlphJob*, Word) -> void;
@@ -113,8 +114,9 @@ fn alph_batch_more(b: AlphBatch*, a: AlphActor*) {
 // piece before it goes out, with the job and the piece's number (0 to
 // total - 1): it sets what the job needs (size, in, data, bytes, back,
 // home; the job starts with size 1, in the piece's number and no home). took is
-// called with each piece's finished job: its status is ALPH_OK, or
-// ALPH_GONE for a piece no place could run. ctx is the program's own, in
+// called with each piece's finished job: its status is ALPH_OK, ALPH_GONE
+// for a piece no place could run, or ALPH_LOST for a piece of a kind done
+// at most once whose worker was lost. ctx is the program's own, in
 // b->ctx. Call it from the actor that will get the answers. Returns
 // ALPH_OK, or ALPH_FULL when pieces of the batch before are still out: a
 // batch is begun again only once it is over.
@@ -130,6 +132,7 @@ export fn AlphBatch_begin__ptr(b: AlphBatch*, a: AlphActor*, kind: Word, total: 
   b->next = 0;
   b->back = 0;
   b->gone = 0;
+  b->lost = 0;
   b->out = 0;
   b->fill = fill;
   b->each = took;
@@ -178,6 +181,12 @@ export fn AlphBatch_took__ptr(b: AlphBatch*, a: AlphActor*, m: AlphMsg*) -> bool
   if (job->status == ALPH_OK) {
     b->back = b->back + 1;
     b->by_way[job->way] = b->by_way[job->way] + 1;
+    b->each(b, job, b->piece[slot]);
+  } else if (job->status == ALPH_LOST) {
+    // It may have been done: it is not handed out again. The program is
+    // told, and decides.
+    b->back = b->back + 1;
+    b->lost = b->lost + 1;
     b->each(b, job, b->piece[slot]);
   } else {
     b->again[b->again_count] = b->piece[slot];  // not done: it goes out again

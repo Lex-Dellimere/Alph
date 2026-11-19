@@ -3,10 +3,8 @@
 // and hands each byte that arrives to take. A process has one line.
 
 import "std/thread";
+import "port/sys";
 
-const SYS_READ: int64 = 0;
-const SYS_WRITE: int64 = 1;
-const SYS_SENDTO: int64 = 44;
 const MSG_NOSIGNAL: int64 = 16384;
 const EINTR: int64 = -4;
 const ENOTSOCK: int64 = -88;
@@ -31,7 +29,7 @@ export fn alph_line_open(fd: int64) {
 fn alph_line_main(arg: cstring) -> uint32 {
   var bytes: uint8[256];
   while (true) {
-    var got: int64 = syscall(SYS_READ, g_fd, (int64)&bytes[0], 256);
+    var got: int64 = syscall(ALPH_NR_READ, g_fd, (int64)&bytes[0], 256);
     if (got <= 0) {
       return 0;  // the other end is gone
     }
@@ -62,9 +60,9 @@ export fn alph_line_flush() {
   while (sent < g_have) {
     // As a send that raises no signal: a plain write to a connection whose
     // other end is gone would end the process with SIGPIPE.
-    var put: int64 = syscall(SYS_SENDTO, g_fd, (int64)&g_out[sent], g_have - sent, MSG_NOSIGNAL, 0, 0);
+    var put: int64 = syscall(ALPH_NR_SENDTO, g_fd, (int64)&g_out[sent], g_have - sent, MSG_NOSIGNAL, 0, 0);
     if (put == ENOTSOCK) {
-      put = syscall(SYS_WRITE, g_fd, (int64)&g_out[sent], g_have - sent);
+      put = syscall(ALPH_NR_WRITE, g_fd, (int64)&g_out[sent], g_have - sent);
     }
     if (put == EINTR) {
       continue;

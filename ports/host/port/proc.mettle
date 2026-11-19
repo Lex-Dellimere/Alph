@@ -2,12 +2,8 @@
 // reading when it has ended. With src/poll that is a message, like any
 // other descriptor.
 
-const SYS_CLOSE: int64 = 3;
-const SYS_FORK: int64 = 57;
-const SYS_EXECVE: int64 = 59;
-const SYS_EXIT_GROUP: int64 = 231;
-const SYS_WAITID: int64 = 247;
-const SYS_PIDFD_OPEN: int64 = 434;
+import "port/sys";
+
 const P_PIDFD: int64 = 3;
 const WNOHANG: int64 = 1;
 const WEXITED: int64 = 4;
@@ -40,16 +36,16 @@ export fn alph_proc_start(command: cstring) -> int64 {
   if (env == 0) {
     env = &envp[0];
   }
-  var pid: int64 = syscall(SYS_FORK);
+  var pid: int64 = alph_sys_fork();
   if (pid == 0) {
     // The new process: nothing but becoming the program.
-    syscall(SYS_EXECVE, (int64)"/bin/sh", (int64)&argv[0], (int64)env);
-    syscall(SYS_EXIT_GROUP, 127);
+    syscall(ALPH_NR_EXECVE, (int64)"/bin/sh", (int64)&argv[0], (int64)env);
+    syscall(ALPH_NR_EXIT_GROUP, 127);
   }
   if (pid < 0) {
     return ALPH_NO_PROGRAM;
   }
-  var fd: int64 = syscall(SYS_PIDFD_OPEN, pid, 0);
+  var fd: int64 = syscall(ALPH_NR_PIDFD_OPEN, pid, 0);
   if (fd < 0) {
     return ALPH_NO_PROGRAM;
   }
@@ -61,7 +57,7 @@ fn alph_proc_ended(fd: int64, options: int64) -> int64 {
   for i in 0..32 {
     info[i] = 0;
   }
-  if (syscall(SYS_WAITID, P_PIDFD, fd, (int64)&info[0], options, 0) < 0) {
+  if (syscall(ALPH_NR_WAITID, P_PIDFD, fd, (int64)&info[0], options, 0) < 0) {
     return ALPH_NO_PROGRAM;
   }
   if (info[4] == 0) {

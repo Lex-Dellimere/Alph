@@ -11,16 +11,13 @@
 
 import "std/thread";
 import "port/port";
+import "port/sys";
 import "alph/actor/actor";
 
 export const ALPH_READ: Word = 1;    // ready for reading, or the other side closed
 export const ALPH_WRITE: Word = 2;   // ready for writing
 export const ALPH_ERROR: Word = 4;   // the descriptor failed
 
-const SYS_CLOSE: int64 = 3;
-const SYS_EPOLL_WAIT: int64 = 232;
-const SYS_EPOLL_CTL: int64 = 233;
-const SYS_EPOLL_CREATE1: int64 = 291;
 const EPOLL_ADD: int64 = 1;
 const EPOLL_DEL: int64 = 2;
 const EPOLL_MOD: int64 = 3;
@@ -53,20 +50,11 @@ export struct AlphPoll {
   stopping: int32;
 }
 
-// The kernel's event record: 12 bytes, the events, then what we gave it to
-// hand back: the slot and the slot's turn, so that word about a descriptor
-// the slot no longer holds is dropped.
-struct AlphEvent {
-  events: uint32;
-  slot: uint32;
-  turn: uint32;
-}
-
 fn alph_poll_main(arg: cstring) -> uint32 {
   var p: AlphPoll* = (AlphPoll*)arg;
-  var events: AlphEvent[32];
+  var events: AlphEpollEvent[32];
   while (p->stopping == 0) {
-    var n: int64 = syscall(SYS_EPOLL_WAIT, p->epoll, (int64)&events[0], 32, 10);
+    var n: int64 = alph_sys_epoll_wait(p->epoll, &events[0], 32, 10);
     var was: int32 = p->gate.enter();
     for i in 0..n {
       var e: AlphEar* = &p->ears[(int64)events[i].slot];
@@ -94,7 +82,7 @@ fn alph_poll_main(arg: cstring) -> uint32 {
           e->owed = 0;
         } else if (out == ALPH_GONE) {
           // Its actor ended without forgetting it.
-          syscall(SYS_EPOLL_CTL, p->epoll, EPOLL_DEL, e->fd, 0);
+          syscall(ALPH_NR_EPOLL_CTL, p->epoll, EPOLL_DEL, e->fd, 0);
           e->fd = -1;
           e->owed = 0;
           e->turn = e->turn + 1;
@@ -121,7 +109,7 @@ export fn AlphPoll_init__ptr(p: AlphPoll*, node: AlphNode*, ears: AlphEar*, room
     ears[i].owed = 0;
     ears[i].turn = 0;
   }
-  p->epoll = syscall(SYS_EPOLL_CREATE1, 0);
+  p->epoll = syscall(ALPH_NR_EPOLL_CREATE1, 0);
   if (p->epoll < 0) {
     p->epoll = -1;
     return ALPH_GONE;
@@ -136,7 +124,7 @@ export fn AlphPoll_init__ptr(p: AlphPoll*, node: AlphNode*, ears: AlphEar*, room
 // if it failed. Ask again for the next. Returns ALPH_FULL when every ear is
 // in use, ALPH_GONE when the kernel refuses the descriptor.
 export fn AlphPoll_want__ptr(p: AlphPoll*, fd: int64, what: Word, to: Word, tag: Word) -> Word {
-  var event: AlphEvent;
+  var event: AlphEpollEvent;
   var mine: Word = -1;
   var out: Word = ALPH_OK;
   var was: int32 = p->gate.enter();
@@ -174,11 +162,13 @@ export fn AlphPoll_want__ptr(p: AlphPoll*, fd: int64, what: Word, to: Word, tag:
   if ((Word)(what & ALPH_WRITE) != 0) {
     event.events = event.events | EPOLLOUT;
   }
+  // Handed back with each event: the slot and its turn, so that word about
+  // a descriptor the slot no longer holds is dropped.
   event.slot = (uint32)mine;
   event.turn = e->turn;
-  var done: int64 = syscall(SYS_EPOLL_CTL, p->epoll, EPOLL_MOD, fd, (int64)&event);
+  var done: int64 = syscall(ALPH_NR_EPOLL_CTL, p->epoll, EPOLL_MOD, fd, (int64)&event);
   if (done == ENOENT) {
-    done = syscall(SYS_EPOLL_CTL, p->epoll, EPOLL_ADD, fd, (int64)&event);
+    done = syscall(ALPH_NR_EPOLL_CTL, p->epoll, EPOLL_ADD, fd, (int64)&event);
   }
   if (done < 0) {
     e->fd = -1;
@@ -196,7 +186,7 @@ export fn AlphPoll_forget__ptr(p: AlphPoll*, fd: int64) {
   for i in 0..p->room {
     if (p->ears[i].fd == fd) {
       if (p->epoll >= 0) {
-        syscall(SYS_EPOLL_CTL, p->epoll, EPOLL_DEL, fd, 0);
+        syscall(ALPH_NR_EPOLL_CTL, p->epoll, EPOLL_DEL, fd, 0);
       }
       p->ears[i].fd = -1;
       p->ears[i].owed = 0;
@@ -215,7 +205,7 @@ export fn AlphPoll_stop__ptr(p: AlphPoll*) {
   thread_join_infinite(p->thread);
   thread_close(p->thread);
   var was: int32 = p->gate.enter();
-  syscall(SYS_CLOSE, p->epoll);
+  syscall(ALPH_NR_CLOSE, p->epoll);
   p->epoll = -1;
   p->gate.leave(was);
 }

@@ -10,6 +10,7 @@ import "port/wire";
 import "alph/actor/actor";
 import "alph/cores/cores";
 import "alph/poll/poll";
+import "port/sys";
 
 const GO: Word = 1;
 const READY: Word = 2;
@@ -173,7 +174,7 @@ fn client(a: AlphActor*, m: AlphMsg*) -> Word {
 
 fn main() -> int32 {
   var listening: int64 = -1;
-  g_port = 9000 + syscall(39) % 900;
+  g_port = 9000 + syscall(ALPH_NR_GETPID) % 900;
   g_cores.init(&g_core[0], 2, &g_actors[0], 32, &g_mail[0], 8);
   expect(g_poll.init(&g_core[0].node, &g_ears[0], 48) == ALPH_OK, "the poll starts");
 
@@ -246,7 +247,7 @@ fn main() -> int32 {
   var extra: int64[94];
   var taken: Word = 0;
   for i in 0..47 {
-    syscall(293, (int64)&pipes[0], 0);
+    syscall(ALPH_NR_PIPE2, (int64)&pipes[0], 0);
     extra[i * 2] = pipes[0];
     extra[i * 2 + 1] = pipes[1];
     if (g_poll.want(pipes[0], ALPH_READ, 1, READY) == ALPH_OK) {
@@ -254,7 +255,7 @@ fn main() -> int32 {
     }
   }
   expect(taken == 47, "the ears fill up ({taken} more)");
-  syscall(293, (int64)&pipes[0], 0);
+  syscall(ALPH_NR_PIPE2, (int64)&pipes[0], 0);
   expect(g_poll.want(pipes[0], ALPH_READ, 1, READY) == ALPH_FULL, "one more is refused");
   g_poll.forget(extra[0]);
   expect(g_poll.want(pipes[0], ALPH_READ, 1, READY) == ALPH_OK, "until one is forgotten");

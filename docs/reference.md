@@ -46,6 +46,7 @@ export struct AlphMachine {
   asked: Word[64];   // by other machine and kind: the ref of the question to its door
   serving: AlphServing[8];
   taken: AlphTaken[16];
+  done: AlphOnce[8];      // by kind: what is remembered of jobs that must not be done twice
   tether: AlphTether;     // the line to a board, when there is one
   boards: AlphOnLine[4];  // the boards work is shared with
   board_count: Word;
@@ -148,6 +149,19 @@ home (a word in, or bytes) leave a machine. Returns ALPH_FULL when the
 first core has no room for one more actor, ALPH_GONE for a kind that is
 not 0 to 7.
 
+### `AlphMachine_once__ptr`
+
+```mettle
+export fn AlphMachine_once__ptr(m: AlphMachine*, kind: Word)
+```
+
+Call it as `m->once(kind)`, or `m.once(kind)` on a value.
+
+Says that a job of this kind (0 to 7) is never done twice, whatever is
+lost on the way: see AlphPlaces_once. Call it after kind, on every
+machine. A piece whose worker was lost comes back with the status
+ALPH_LOST.
+
 ### `AlphMachine_tell__ptr`
 
 ```mettle
@@ -220,7 +234,8 @@ export struct AlphBatch {
   total: Word;
   next: Word;        // the next piece not yet handed out
   back: Word;        // pieces answered
-  gone: Word;        // of those, pieces no place could run
+  gone: Word;        // of those, pieces no place could run,
+  lost: Word;        // and pieces done at most once whose worker was lost: done or not, no one can say
   out: Word;         // pieces handed out and not yet answered
   by_way: Word[3];   // how many each way did: ALPH_CPU, ALPH_GPU, ALPH_FAR
   fill: fn(AlphBatch*, AlphJob*, Word) -> void;
@@ -263,8 +278,9 @@ Starts handing out `total` pieces of a kind. fill is called for each
 piece before it goes out, with the job and the piece's number (0 to
 total - 1): it sets what the job needs (size, in, data, bytes, back,
 home; the job starts with size 1, in the piece's number and no home). took is
-called with each piece's finished job: its status is ALPH_OK, or
-ALPH_GONE for a piece no place could run. ctx is the program's own, in
+called with each piece's finished job: its status is ALPH_OK, ALPH_GONE
+for a piece no place could run, or ALPH_LOST for a piece of a kind done
+at most once whose worker was lost. ctx is the program's own, in
 b->ctx. Call it from the actor that will get the answers. Returns
 ALPH_OK, or ALPH_FULL when pieces of the batch before are still out: a
 batch is begun again only once it is over.
@@ -392,6 +408,46 @@ Call it as `b->stop()`, or `b.stop()` on a value.
 
 Stops the board, so run returns.
 
+## alph/board/once
+
+A kind of work a board does at most once, whatever is lost on the way:
+work that changes something, such as moving an arm. It is apart from
+alph/board/board so that a board with no such kind pays nothing for it.
+
+The board remembers the last jobs it did for each asker (alph/place/once
+says how). A job sent again is answered from that memory and not done
+again. A job from an asker the board does not know, because the board
+was restarted since, is refused as lost: that asker then knows it cannot
+tell whether the job was done.
+
+### `AlphBoardOnce`
+
+```mettle
+export struct AlphBoardOnce {
+  board: AlphBoard*;
+  run: fn(Word) -> Word;
+  memory: AlphOnce;
+}
+```
+
+One such kind: how it is done and what is remembered. The program hands
+it in.
+
+### `AlphBoard_share_once__ptr`
+
+```mettle
+export fn AlphBoard_share_once__ptr(b: AlphBoard*, kind: Word, run: fn(Word) -> Word, once: AlphBoardOnce*) -> Word
+```
+
+Call it as `b->share_once(kind, run, once)`, or `b.share_once(kind, run, once)` on a value.
+
+Does a kind of work (0 to 7) for the other machines, each job at most
+once: run is given a job's in and returns its out, and `once` is the
+memory for it. The machines must ask for the kind the same way
+(AlphMachine_once). Returns ALPH_OK, ALPH_FULL when there is no actor
+left for it, ALPH_GONE for a kind that is not 0 to 7 or is shared
+already.
+
 ## alph/actor/actor
 
 alph's core: actors, messages and the loop that runs them.
@@ -415,6 +471,7 @@ export const ALPH_FULL: Word = -1;  // the mailbox is full
 export const ALPH_GONE: Word = -2;  // no such actor
 export const ALPH_END: Word = 1;       // a handler returns this when its actor is finished
 export const ALPH_CRASHED: Word = -9;  // the reason an actor ends with when its handler crashes
+export const ALPH_LOST: Word = -8;     // the reason when an actor's machine was lost, and what a job is when no one can say whether it was done
 ```
 
 ### `AlphMsg`
@@ -1058,7 +1115,7 @@ its own work waiting, so work goes to another machine when that is where
 it will finish first, and to the one of several that is least busy.
 
 The program writes the two ways. alph only times them, so nothing here
-knows what a GPU is. x86-64 Linux, like the cores.
+knows what a GPU is. Linux, like the cores.
 
 The ways a job can be run, and where its data can be.
 
@@ -1103,6 +1160,8 @@ export struct AlphJob {
   far_ref: Word; // the ref its request to another machine carries,
   far_to: Word;  // the worker it went to,
   far_seen: Word; // how many answers its place had had by then,
+  far_resent: Word; // a job done at most once: it was sent a second time,
+  far_asked: Word;  // and when it was last sent,
   began: Word;   // and when
   to: AlphPlace*;
   next: AlphJob*;
@@ -1119,6 +1178,7 @@ export struct AlphKind {
   cpu: fn(AlphJob*) -> Word;
   gpu: fn(AlphJob*) -> Word;
   bring: fn(AlphJob*) -> Word;
+  once: Word;      // a job of this kind is never done twice
   far: Word;       // an actor on another machine that does this kind's work, 0 when no machine does
   off: Word[3];    // this way cannot run the kind
   warm: Word[3];   // its first run is over: that one pays for starting up
@@ -1171,6 +1231,11 @@ export struct AlphPlace {
   gave_began: Word[4];  // when,
   gave_at: Word[4];   // and its kind times 192 plus which of the kind's times it is
   gave_next: Word;
+  once_known: Word[16];  // by kind, for jobs done at most once: 0 the worker must be said hello to, 1 hello sent, 2 it answered
+  once_ref: Word[16];    // the last ref given out in this run of refs
+  once_hello: Word[16];  // the ref of the hello sent
+  once_at: Word[16];     // when it was sent
+  once_run: Word[16];    // the run it started
   pace: Word[16];     // a far place, by kind: ns from one answer to the next while it has work, 0 when not known
   busy: Word;         // it still had work when its last answer came
   own: AlphTimes*;    // a far place's own times, one for each of its first own_kinds kinds, 0 for none
@@ -1220,6 +1285,25 @@ Call it as `p->kind(kind, cpu, gpu)`, or `p.kind(kind, cpu, gpu)` on a value.
 Says how a kind is run each way. A way the kind does not have is 0. Each
 returns 0, or non-zero when it cannot run here (no GPU, say): the job then
 goes another way and that way is not tried again.
+
+### `AlphPlaces_once__ptr`
+
+```mettle
+export fn AlphPlaces_once__ptr(p: AlphPlaces*, kind: Word)
+```
+
+Call it as `p->once(kind)`, or `p.once(kind)` on a value.
+
+Says that a job of this kind is never done twice, whatever is lost on
+the way: for work that changes something, such as moving an arm. On
+this machine a job runs once anyway. Sent to another machine it goes as
+ALPH_WORK_ONCE, to a worker that remembers what it has done (a board or
+a machine does, see alph/place/once). A job not answered is sent again
+to the same worker and never placed anywhere else. If the worker or its
+machine is lost, or was restarted, the job comes back with the status
+ALPH_LOST: it may or may not have been done, and the program decides.
+Such a job carries a word, not bytes, and gives a word back. Call it
+after kind.
 
 ### `AlphPlaces_bring__ptr`
 
@@ -1388,8 +1472,119 @@ export const ALPH_WORKED: Word = -14;      // its answer: arg is the job's out, 
 export const ALPH_WORK_BYTES: Word = -17;  // as ALPH_WORK, for a job with bytes: arg is a parcel
 export const ALPH_WORKED_BYTES: Word = -20; // as ALPH_WORKED, for a job that gives bytes back: arg is a parcel, its first 8 bytes the job's out
 export const ALPH_REFUSED: Word = -18;     // a worker's answer when it cannot take the job: arg is ALPH_FULL for now, ALPH_GONE for never
+export const ALPH_WORK_ONCE: Word = -21;   // as ALPH_WORK, for a job that must not be done twice (see alph/place/once)
+export const ALPH_HELLO: Word = -22;       // to a worker before the first ALPH_WORK_ONCE: a new run of refs starts at ref. It answers the same back
 export const ALPH_SHARED: Word = 1073741824;  // the name of the worker for a shared kind is this plus the kind
 ```
+
+## alph/place/once
+
+What a worker remembers so that a job is never done twice. An asker
+that wants that sends its jobs as ALPH_WORK_ONCE and says ALPH_HELLO
+first. The worker keeps, for each of four askers, the last four jobs it
+did for it and what each gave. A job sent again is answered from that
+memory and not done again.
+
+A ref is a run of jobs and a number in it: the run in the high bits, the
+number in the low twelve. A hello starts a new run and wipes what was
+remembered of that asker. A job of any other run is a stranger's: the
+worker says it does not know it, and the asker then counts the job as
+lost (done or not, it cannot tell) and says hello again. A ref at or
+under the floor is an old copy and is dropped.
+
+Checked by exploring every order of loss, delay, restart and reboot for
+small sizes. It holds as long as the way between the two delivers no
+message twice, which the link and the tether do not.
+
+```mettle
+export const ALPH_ONCE_RUN: Word = 0;       // new: do it, then call done or undo
+export const ALPH_ONCE_DONE: Word = 1;      // done before: answer again with what it gave
+export const ALPH_ONCE_BUSY: Word = 2;      // being done now: say nothing, the answer is coming
+export const ALPH_ONCE_OLD: Word = 3;       // an old copy: say nothing
+export const ALPH_ONCE_STRANGER: Word = 4;  // not of this asker's run: refuse with ALPH_LOST
+```
+
+### `AlphOnce`
+
+```mettle
+export struct AlphOnce {
+  asker: Word[4];   // who, 0 for a free row
+  floor: Word[4];   // refs at or under it are old
+  last: Word[4];    // when the row was last used: the least is given up for a fifth asker
+  ref: Word[16];    // four for each asker, 0 for none
+  out: Word[16];
+  busy: Word[16];
+  clock: Word;
+}
+```
+
+What one worker remembers: four askers, and four jobs for each.
+
+### `AlphOnce_init__ptr`
+
+```mettle
+export fn AlphOnce_init__ptr(o: AlphOnce*)
+```
+
+Call it as `o->init()`, or `o.init()` on a value.
+
+Forgets everything: no asker is known.
+
+### `AlphOnce_hello__ptr`
+
+```mettle
+export fn AlphOnce_hello__ptr(o: AlphOnce*, from: Word, h: Word)
+```
+
+Call it as `o->hello(from, h)`, or `o.hello(from, h)` on a value.
+
+An asker's hello: a new run of refs starts at h, and what was remembered
+of that asker is forgotten. With four askers known already, the one
+heard from longest ago is given up.
+
+### `AlphOnce_seen__ptr`
+
+```mettle
+export fn AlphOnce_seen__ptr(o: AlphOnce*, from: Word, ref: Word, out: Word*) -> Word
+```
+
+Call it as `o->seen(from, ref, out)`, or `o.seen(from, ref, out)` on a value.
+
+What to do with a job: one of the ALPH_ONCE values. For ALPH_ONCE_DONE
+*out is what the job gave when it was done.
+
+### `AlphOnce_begin__ptr`
+
+```mettle
+export fn AlphOnce_begin__ptr(o: AlphOnce*, from: Word, ref: Word)
+```
+
+Call it as `o->begin(from, ref)`, or `o.begin(from, ref)` on a value.
+
+Remembers a job as being done. If that makes five for its asker, the
+oldest is forgotten and the floor moves up to it. Call it only after
+seen said ALPH_ONCE_RUN.
+
+### `AlphOnce_done__ptr`
+
+```mettle
+export fn AlphOnce_done__ptr(o: AlphOnce*, from: Word, ref: Word, out: Word)
+```
+
+Call it as `o->done(from, ref, out)`, or `o.done(from, ref, out)` on a value.
+
+The job is done and gave out.
+
+### `AlphOnce_undo__ptr`
+
+```mettle
+export fn AlphOnce_undo__ptr(o: AlphOnce*, from: Word, ref: Word)
+```
+
+Call it as `o->undo(from, ref)`, or `o.undo(from, ref)` on a value.
+
+The job was not done after all (no room for it): it is forgotten, so a
+copy sent again may be done.
 
 ## alph/life/life
 
@@ -1411,7 +1606,6 @@ The memory is the caller's, as everywhere: an array of watches and an
 array of keeps.
 
 ```mettle
-export const ALPH_LOST: Word = -8;   // the reason when an actor's machine was lost
 export const ALPH_ENDED: Word = -7;  // to a watcher: from is the actor, arg the reason, ref the watch
 ```
 

@@ -16,12 +16,12 @@
 
 import "std/thread";
 import "port/port";
+import "port/sys";
 import "alph/actor/actor";
 import "alph/cores/cores";
 import "alph/link/link";
 import "alph/tether/tether";
 
-const SYS_FUTEX: int64 = 202;
 const FUTEX_WAIT: int64 = 128;  // private
 const FUTEX_WAKE: int64 = 129;
 const ROOM: int32 = 64;
@@ -60,7 +60,7 @@ fn alph_relay_main(arg: cstring) -> uint32 {
     if (have) {
       g_tether->send(next.to, &next.m);
     } else {
-      syscall(SYS_FUTEX, (int64)&g_news, FUTEX_WAIT, (int64)seen, 0);
+      syscall(ALPH_NR_FUTEX, (int64)&g_news, FUTEX_WAIT, (int64)seen, 0);
     }
   }
   return 0;
@@ -87,7 +87,7 @@ fn alph_relay_beyond(l: AlphLink*, to: Word, m: AlphMsg*) -> Word {
   mettle_atomic_compare_exchange_i32(&g_lock, 0, 1);
   if (out == ALPH_OK) {
     mettle_atomic_inc_i32(&g_news);
-    syscall(SYS_FUTEX, (int64)&g_news, FUTEX_WAKE, 1);
+    syscall(ALPH_NR_FUTEX, (int64)&g_news, FUTEX_WAKE, 1);
   }
   return out;
 }

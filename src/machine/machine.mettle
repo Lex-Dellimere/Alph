@@ -28,6 +28,7 @@ import "alph/name/name";
 import "alph/life/life";
 import "alph/door/door";
 import "alph/place/place";
+import "alph/place/once";
 import "alph/tether/tether";
 import "alph/tether/relay";
 import "port/alarm";
@@ -57,6 +58,7 @@ struct AlphTaken {
   from: Word;
   ref: Word;
   busy: Word;
+  once: Word;   // it must not be done twice: its end is remembered
   bytes: uint8[1024];
   back: uint8[1024];  // the job's out in the first 8, then the bytes it gives back
 }
@@ -86,6 +88,7 @@ export struct AlphMachine {
   asked: Word[64];   // by other machine and kind: the ref of the question to its door
   serving: AlphServing[8];
   taken: AlphTaken[16];
+  done: AlphOnce[8];      // by kind: what is remembered of jobs that must not be done twice
   tether: AlphTether;     // the line to a board, when there is one
   boards: AlphOnLine[4];  // the boards work is shared with
   board_count: Word;
@@ -286,11 +289,16 @@ fn alph_machine_serve(a: AlphActor*, msg: AlphMsg*) -> Word {
     var t: AlphTaken* = (AlphTaken*)msg->arg;  // the job is the first thing in it
     var answer: AlphMsg = { tag: ALPH_WORKED, from: a->pid, arg: t->job.out, ref: t->ref };
     var sent: Word = ALPH_OK;
+    if (t->once != 0 && t->job.status == ALPH_OK) {
+      m->done[s->kind].done(t->from, t->ref, t->job.out);
+    } else if (t->once != 0) {
+      m->done[s->kind].undo(t->from, t->ref);  // not done: a copy sent again may be
+    }
     if (t->job.status != ALPH_OK) {
       answer.tag = ALPH_REFUSED;
       answer.arg = t->job.status;  // full for now, or gone: no place here can run it
       sent = a->node->put(t->from, &answer);
-    } else if (t->job.back_count > 0) {
+    } else if (t->job.back_count > 0 && t->once == 0) {
       for i in 0..8 {
         t->back[i] = (uint8)(((int64)t->job.out >> ((int64)i * 8)) & 255);
       }
@@ -304,7 +312,31 @@ fn alph_machine_serve(a: AlphActor*, msg: AlphMsg*) -> Word {
     t->busy = 0;
     return 0;
   }
-  if (msg->tag != ALPH_WORK && msg->tag != ALPH_WORK_BYTES) {
+  if (msg->tag == ALPH_HELLO) {
+    m->done[s->kind].hello(msg->from, msg->ref);
+    var hello: AlphMsg = { tag: ALPH_HELLO, from: a->pid, arg: 0, ref: msg->ref };
+    a->node->put(msg->from, &hello);
+    return 0;
+  }
+  var once: Word = 0;
+  if (msg->tag == ALPH_WORK_ONCE) {
+    // A job that must not be done twice: one sent again is answered from
+    // what is remembered, and one from an asker not known here is refused
+    // as lost, so that asker knows it cannot tell.
+    var answer: AlphMsg = { tag: ALPH_WORKED, from: a->pid, arg: 0, ref: msg->ref };
+    var seen: Word = m->done[s->kind].seen(msg->from, msg->ref, &answer.arg);
+    if (seen == ALPH_ONCE_STRANGER) {
+      answer.tag = ALPH_REFUSED;
+      answer.arg = ALPH_LOST;
+    }
+    if (seen == ALPH_ONCE_STRANGER || seen == ALPH_ONCE_DONE) {
+      a->node->put(msg->from, &answer);
+    }
+    if (seen != ALPH_ONCE_RUN) {
+      return 0;
+    }
+    once = 1;
+  } else if (msg->tag != ALPH_WORK && msg->tag != ALPH_WORK_BYTES) {
     return 0;
   }
   var parcel: AlphParcel* = 0;
@@ -338,8 +370,12 @@ fn alph_machine_serve(a: AlphActor*, msg: AlphMsg*) -> Word {
       }
       t->from = msg->from;
       t->ref = msg->ref;
+      t->once = once;
       why = m->places.ask(a, &t->job);
       if (why > 0) {
+        if (once != 0) {
+          m->done[s->kind].begin(msg->from, msg->ref);
+        }
         t->busy = 1;
         taken = true;
         m->served = m->served + 1;
@@ -505,12 +541,23 @@ export fn AlphMachine_share__ptr(m: AlphMachine*, kind: Word) -> Word {
   }
   m->serving[kind].machine = m;
   m->serving[kind].kind = kind;
+  m->done[kind].init();
   var pid: Word = m->cores.spawn_on(0, &alph_machine_serve, (rawptr)&m->serving[kind]);
   if (pid == 0) {
     return ALPH_FULL;
   }
   m->shared[kind] = 1;
   return m->names.set(ALPH_SHARED + kind, pid);
+}
+
+// Says that a job of this kind (0 to 7) is never done twice, whatever is
+// lost on the way: see AlphPlaces_once. Call it after kind, on every
+// machine. A piece whose worker was lost comes back with the status
+// ALPH_LOST.
+export fn AlphMachine_once__ptr(m: AlphMachine*, kind: Word) {
+  if (kind >= 0 && kind < 8) {
+    m->places.once(kind);
+  }
 }
 
 // The program's actor that is told ALPH_UP and ALPH_DOWN as other machines

@@ -1,11 +1,7 @@
 // Datagrams between machines: UDP over IPv4.
 
-const SYS_CLOSE: int64 = 3;
-const SYS_SOCKET: int64 = 41;
-const SYS_SENDTO: int64 = 44;
-const SYS_RECVFROM: int64 = 45;
-const SYS_BIND: int64 = 49;
-const SYS_SETSOCKOPT: int64 = 54;
+import "port/sys";
+
 const AF_INET: int64 = 2;
 const SOCK_DGRAM: int64 = 2;
 const SOL_SOCKET: int64 = 1;
@@ -39,16 +35,16 @@ fn alph_wire_address(out: uint8*, ip: uint32, port: int64) {
 export fn AlphWire_open__ptr(w: AlphWire*, port: int64, wait_ms: int64) -> bool {
   var address: uint8[16];
   var wait: int64[2];
-  w->fd = syscall(SYS_SOCKET, AF_INET, SOCK_DGRAM, 0);
+  w->fd = syscall(ALPH_NR_SOCKET, AF_INET, SOCK_DGRAM, 0);
   if (w->fd < 0) {
     return false;
   }
   wait[0] = wait_ms / 1000;
   wait[1] = (wait_ms % 1000) * 1000;
-  syscall(SYS_SETSOCKOPT, w->fd, SOL_SOCKET, SO_RCVTIMEO, (int64)&wait[0], 16);
+  syscall(ALPH_NR_SETSOCKOPT, w->fd, SOL_SOCKET, SO_RCVTIMEO, (int64)&wait[0], 16);
   alph_wire_address(&address[0], 0, port);
-  if (syscall(SYS_BIND, w->fd, (int64)&address[0], 16) < 0) {
-    syscall(SYS_CLOSE, w->fd);
+  if (syscall(ALPH_NR_BIND, w->fd, (int64)&address[0], 16) < 0) {
+    syscall(ALPH_NR_CLOSE, w->fd);
     w->fd = -1;
     return false;
   }
@@ -59,7 +55,7 @@ export fn AlphWire_open__ptr(w: AlphWire*, port: int64, wait_ms: int64) -> bool 
 export fn AlphWire_send__ptr(w: AlphWire*, ip: uint32, port: int64, bytes: uint8*, count: int64) -> bool {
   var address: uint8[16];
   alph_wire_address(&address[0], ip, port);
-  return syscall(SYS_SENDTO, w->fd, (int64)bytes, count, 0, (int64)&address[0], 16) == count;
+  return syscall(ALPH_NR_SENDTO, w->fd, (int64)bytes, count, 0, (int64)&address[0], 16) == count;
 }
 
 // The next datagram, and who sent it. Returns its length, or 0 when none
@@ -67,7 +63,7 @@ export fn AlphWire_send__ptr(w: AlphWire*, ip: uint32, port: int64, bytes: uint8
 export fn AlphWire_recv__ptr(w: AlphWire*, bytes: uint8*, room: int64, ip: uint32*, port: int64*) -> int64 {
   var address: uint8[16];
   var size: int32 = 16;
-  var got: int64 = syscall(SYS_RECVFROM, w->fd, (int64)bytes, room, 0, (int64)&address[0], (int64)&size);
+  var got: int64 = syscall(ALPH_NR_RECVFROM, w->fd, (int64)bytes, room, 0, (int64)&address[0], (int64)&size);
   if (got <= 0) {
     return 0;
   }
@@ -78,6 +74,6 @@ export fn AlphWire_recv__ptr(w: AlphWire*, bytes: uint8*, room: int64, ip: uint3
 
 // Closes the socket.
 export fn AlphWire_close__ptr(w: AlphWire*) {
-  syscall(SYS_CLOSE, w->fd);
+  syscall(ALPH_NR_CLOSE, w->fd);
   w->fd = -1;
 }

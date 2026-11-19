@@ -1,16 +1,7 @@
 // TCP over IPv4 without waiting: every call returns at once.
 
-const SYS_READ: int64 = 0;
-const SYS_WRITE: int64 = 1;
-const SYS_CLOSE: int64 = 3;
-const SYS_SOCKET: int64 = 41;
-const SYS_SENDTO: int64 = 44;
-const SYS_CONNECT: int64 = 42;
-const SYS_BIND: int64 = 49;
-const SYS_LISTEN: int64 = 50;
-const SYS_SETSOCKOPT: int64 = 54;
-const SYS_GETSOCKOPT: int64 = 55;
-const SYS_ACCEPT4: int64 = 288;
+import "port/sys";
+
 const AF_INET: int64 = 2;
 const SOCK_STREAM: int64 = 1;
 const SOCK_NONBLOCK: int64 = 2048;
@@ -46,14 +37,14 @@ fn alph_net_address(out: uint8*, ip: uint32, port: int64) {
 export fn alph_tcp_listen(port: int64) -> int64 {
   var address: uint8[16];
   var one: int32 = 1;
-  var fd: int64 = syscall(SYS_SOCKET, AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0);
+  var fd: int64 = syscall(ALPH_NR_SOCKET, AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0);
   if (fd < 0) {
     return ALPH_BROKEN;
   }
-  syscall(SYS_SETSOCKOPT, fd, SOL_SOCKET, SO_REUSEADDR, (int64)&one, 4);
+  syscall(ALPH_NR_SETSOCKOPT, fd, SOL_SOCKET, SO_REUSEADDR, (int64)&one, 4);
   alph_net_address(&address[0], 0, port);
-  if (syscall(SYS_BIND, fd, (int64)&address[0], 16) < 0 || syscall(SYS_LISTEN, fd, 128) < 0) {
-    syscall(SYS_CLOSE, fd);
+  if (syscall(ALPH_NR_BIND, fd, (int64)&address[0], 16) < 0 || syscall(ALPH_NR_LISTEN, fd, 128) < 0) {
+    syscall(ALPH_NR_CLOSE, fd);
     return ALPH_BROKEN;
   }
   return fd;
@@ -63,14 +54,14 @@ export fn alph_tcp_listen(port: int64) -> int64 {
 // when none is waiting, or ALPH_BROKEN.
 export fn alph_tcp_accept(listener: int64) -> int64 {
   var one: int32 = 1;
-  var fd: int64 = syscall(SYS_ACCEPT4, listener, 0, 0, SOCK_NONBLOCK);
+  var fd: int64 = syscall(ALPH_NR_ACCEPT4, listener, 0, 0, SOCK_NONBLOCK);
   if (fd == EAGAIN || fd == EINTR) {
     return ALPH_LATER;
   }
   if (fd < 0) {
     return ALPH_BROKEN;
   }
-  syscall(SYS_SETSOCKOPT, fd, IPPROTO_TCP, TCP_NODELAY, (int64)&one, 4);
+  syscall(ALPH_NR_SETSOCKOPT, fd, IPPROTO_TCP, TCP_NODELAY, (int64)&one, 4);
   return fd;
 }
 
@@ -80,15 +71,15 @@ export fn alph_tcp_accept(listener: int64) -> int64 {
 export fn alph_tcp_connect(ip: uint32, port: int64) -> int64 {
   var address: uint8[16];
   var one: int32 = 1;
-  var fd: int64 = syscall(SYS_SOCKET, AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0);
+  var fd: int64 = syscall(ALPH_NR_SOCKET, AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0);
   if (fd < 0) {
     return ALPH_BROKEN;
   }
-  syscall(SYS_SETSOCKOPT, fd, IPPROTO_TCP, TCP_NODELAY, (int64)&one, 4);
+  syscall(ALPH_NR_SETSOCKOPT, fd, IPPROTO_TCP, TCP_NODELAY, (int64)&one, 4);
   alph_net_address(&address[0], ip, port);
-  var out: int64 = syscall(SYS_CONNECT, fd, (int64)&address[0], 16);
+  var out: int64 = syscall(ALPH_NR_CONNECT, fd, (int64)&address[0], 16);
   if (out < 0 && out != EINPROGRESS) {
-    syscall(SYS_CLOSE, fd);
+    syscall(ALPH_NR_CLOSE, fd);
     return ALPH_BROKEN;
   }
   return fd;
@@ -98,7 +89,7 @@ export fn alph_tcp_connect(ip: uint32, port: int64) -> int64 {
 export fn alph_tcp_failed(fd: int64) -> bool {
   var error: int32 = 0;
   var size: int32 = 4;
-  if (syscall(SYS_GETSOCKOPT, fd, SOL_SOCKET, SO_ERROR, (int64)&error, (int64)&size) < 0) {
+  if (syscall(ALPH_NR_GETSOCKOPT, fd, SOL_SOCKET, SO_ERROR, (int64)&error, (int64)&size) < 0) {
     return true;
   }
   return error != 0;
@@ -107,7 +98,7 @@ export fn alph_tcp_failed(fd: int64) -> bool {
 // Reads what is there, up to room bytes. Returns how many, 0 when the other
 // side has closed, ALPH_LATER when nothing is there yet, or ALPH_BROKEN.
 export fn alph_read(fd: int64, bytes: uint8*, room: int64) -> int64 {
-  var got: int64 = syscall(SYS_READ, fd, (int64)bytes, room);
+  var got: int64 = syscall(ALPH_NR_READ, fd, (int64)bytes, room);
   if (got == EAGAIN || got == EINTR) {
     return ALPH_LATER;
   }
@@ -122,9 +113,9 @@ export fn alph_read(fd: int64, bytes: uint8*, room: int64) -> int64 {
 export fn alph_write(fd: int64, bytes: uint8*, count: int64) -> int64 {
   // As a send that raises no signal: a plain write to a socket whose other
   // side is gone would end the process with SIGPIPE.
-  var put: int64 = syscall(SYS_SENDTO, fd, (int64)bytes, count, MSG_NOSIGNAL, 0, 0);
+  var put: int64 = syscall(ALPH_NR_SENDTO, fd, (int64)bytes, count, MSG_NOSIGNAL, 0, 0);
   if (put == ENOTSOCK) {
-    put = syscall(SYS_WRITE, fd, (int64)bytes, count);
+    put = syscall(ALPH_NR_WRITE, fd, (int64)bytes, count);
   }
   if (put == EAGAIN || put == EINTR) {
     return ALPH_LATER;
@@ -137,5 +128,5 @@ export fn alph_write(fd: int64, bytes: uint8*, count: int64) -> int64 {
 
 // Closes a descriptor.
 export fn alph_close(fd: int64) {
-  syscall(SYS_CLOSE, fd);
+  syscall(ALPH_NR_CLOSE, fd);
 }

@@ -20,6 +20,7 @@ export const ALPH_FULL: Word = -1;  // the mailbox is full
 export const ALPH_GONE: Word = -2;  // no such actor
 export const ALPH_END: Word = 1;       // a handler returns this when its actor is finished
 export const ALPH_CRASHED: Word = -9;  // the reason an actor ends with when its handler crashes
+export const ALPH_LOST: Word = -8;     // the reason when an actor's machine was lost, and what a job is when no one can say whether it was done
 
 // A message: four words.
 export struct AlphMsg {

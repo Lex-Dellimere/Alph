@@ -10,6 +10,7 @@ import "std/io";
 import "alph/actor/actor";
 import "alph/cores/cores";
 import "alph/place/place";
+import "port/sys";
 
 const GO: Word = 1;
 const SMALL: Word = 16;
@@ -45,7 +46,7 @@ fn expect(ok: bool, what: string) {
 
 fn now_ns() -> Word {
   var ts: int64[2];
-  syscall(228, 1, (int64)&ts[0]);
+  syscall(ALPH_NR_CLOCK_GETTIME, 1, (int64)&ts[0]);
   return (Word)(ts[0] * 1000000000 + ts[1]);
 }
 

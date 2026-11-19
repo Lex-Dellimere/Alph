@@ -1,9 +1,11 @@
 // Jobs that give bytes back from another machine (src/machine, src/place):
 // the machine that asks has no way of its own to do the kind, so every job
 // goes to the other, and its bytes come back whole: none, one, some, and
-// as many as fit.
+// as many as fit. Then a kind done at most once, on a machine: every piece
+// is done exactly once there.
 
 import "std/io";
+import "port/sys";
 import "std/thread";
 import "alph/actor/actor";
 import "alph/machine/machine";
@@ -12,6 +14,8 @@ import "alph/batch/batch";
 const GO: Word = 1;
 const FILL: Word = 0;  // in is how many bytes to give back: byte i is (i * 7 + in) & 255, out is in * 3
 const PIECES: Word = 40;
+const STEP: Word = 1;  // done at most once: out is in + 7
+const STEPS: Word = 60;
 
 var g_m: AlphMachine[2];
 var g_batch: AlphBatch;
@@ -19,6 +23,8 @@ var g_back: uint8[40640];  // 1,016 bytes a piece
 var g_wrong: Word = 0;
 var g_bytes: Word = 0;
 var g_failures: int32 = 0;
+var g_stepped: Word[60];  // times each step was done
+var g_steps_right: Word = 0;
 
 fn expect(ok: bool, what: string) {
   if (!ok) {
@@ -54,13 +60,28 @@ fn fill_job(job: AlphJob*) -> Word {
   return 0;
 }
 
+fn step_job(job: AlphJob*) -> Word {
+  g_stepped[job->in] = g_stepped[job->in] + 1;
+  job->out = job->in + 7;
+  return 0;
+}
+
 fn each(b: AlphBatch*, job: AlphJob*, piece: Word) {
+  if (b->kind == STEP) {
+    return;
+  }
   job->in = wanted(piece);
   job->back = &g_back[piece * ALPH_BACK_BYTES];
   job->back_room = ALPH_BACK_BYTES;
 }
 
 fn answered(b: AlphBatch*, job: AlphJob*, piece: Word) {
+  if (b->kind == STEP) {
+    if (job->status == ALPH_OK && job->way == ALPH_FAR && job->out == piece + 7) {
+      g_steps_right = g_steps_right + 1;
+    }
+    return;
+  }
   var n: Word = wanted(piece);
   var ok: bool = job->status == ALPH_OK && job->way == ALPH_FAR && job->out == (Word)(n * 3) && job->back_count == n;
   for i in 0..n {
@@ -78,7 +99,11 @@ fn boss(a: AlphActor*, m: AlphMsg*) -> Word {
   if (m->tag == GO) {
     g_batch.begin(a, FILL, PIECES, &each, &answered, 0);
   } else if (g_batch.took(a, m) && g_batch.over()) {
-    a->cores()->stop();
+    if (g_batch.kind == FILL) {
+      g_batch.begin(a, STEP, STEPS, &each, &answered, 0);
+    } else {
+      a->cores()->stop();
+    }
   }
   return 0;
 }
@@ -89,7 +114,7 @@ fn helper_main(arg: cstring) -> uint32 {
 }
 
 fn main() -> int32 {
-  var port: int64 = 23000 + (syscall(39) % 2000) * 2;
+  var port: int64 = 23000 + (syscall(ALPH_NR_GETPID) % 2000) * 2;
   var here: uint32 = alph_ip4(127, 0, 0, 1);
   g_m[0].init(2, 0, false);
   g_m[0].peer(2, 2, here, port + 1);
@@ -97,7 +122,11 @@ fn main() -> int32 {
   g_m[1].init(2, 2, false);
   g_m[1].peer(0, 2, here, port);
   g_m[1].kind(FILL, &fill_job, 0);
+  g_m[0].kind(STEP, 0, 0);
+  g_m[1].kind(STEP, &step_job, 0);
   for i in 0..2 {
+    g_m[i].once(STEP);
+    expect(g_m[i].share(STEP) == ALPH_OK, "the machine shares the kind done at most once");
     expect(g_m[i].share(FILL) == ALPH_OK, "the machine shares the kind");
     expect(g_m[i].start(port + (int64)i) == ALPH_OK, "the machine listens");
   }
@@ -105,7 +134,7 @@ fn main() -> int32 {
   var pid: Word = g_m[0].cores.spawn_on(0, &boss, 0);
   var helper: int64 = CreateThread(0, 0, &helper_main, 0, 0, 0);
   var waited: int32 = 0;
-  while (g_m[0].seats[1].workers[FILL] == 0 && waited < 3000) {
+  while ((g_m[0].seats[1].workers[FILL] == 0 || g_m[0].seats[1].workers[STEP] == 0) && waited < 3000) {
     g_m[0].core[0].node.turn();
     Sleep(1);
     waited = waited + 1;
@@ -114,7 +143,14 @@ fn main() -> int32 {
 
   g_m[0].cores.send(pid, GO, 0);
   g_m[0].run();
-  expect(g_batch.over() && g_batch.by_way[ALPH_FAR] == PIECES, "every piece is done on the other machine ({g_batch.by_way[ALPH_FAR]} of {PIECES})");
+  var once_only: Word = 0;
+  for i in 0..STEPS {
+    if (g_stepped[i] == 1) {
+      once_only = once_only + 1;
+    }
+  }
+  expect(g_batch.over() && g_steps_right == STEPS && g_batch.lost == 0, "every step is answered rightly by the other machine ({g_steps_right} of {STEPS})");
+  expect(once_only == STEPS, "and was done exactly once ({once_only} of {STEPS})");
   expect(g_wrong == 0, "every piece's bytes come back whole ({g_wrong} wrong)");
 
   g_m[1].stop();
@@ -126,6 +162,6 @@ fn main() -> int32 {
   if (g_failures != 0) {
     return 1;
   }
-  println("back ok: {PIECES} jobs on another machine gave back {g_bytes} bytes, each whole");
+  println("back ok: {PIECES} jobs on another machine gave back {g_bytes} bytes, each whole, and {STEPS} steps were done once each");
   return 0;
 }

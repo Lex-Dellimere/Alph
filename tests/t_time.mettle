@@ -5,6 +5,7 @@
 import "std/io";
 import "alph/actor/actor";
 import "alph/time/time";
+import "port/sys";
 
 const DUE: Word = 1;
 const NOTE: Word = 2;
@@ -19,7 +20,7 @@ var g_failures: int32 = 0;
 
 fn now_us() -> Word {
   var ts: int64[2];
-  syscall(228, 1, (int64)&ts[0]);
+  syscall(ALPH_NR_CLOCK_GETTIME, 1, (int64)&ts[0]);
   return (Word)(ts[0] * 1000000 + ts[1] / 1000);
 }
 

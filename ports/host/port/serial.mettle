@@ -3,8 +3,8 @@
 // bits, no parity, one stop bit, nothing translated, no flow control) at
 // the speed asked for. Give the descriptor to alph_line_open.
 
-const SYS_OPEN: int64 = 2;
-const SYS_IOCTL: int64 = 16;
+import "port/sys";
+
 const O_RDWR: int64 = 2;
 const O_NOCTTY: int64 = 256;
 const TCGETS2: int64 = 2150388778;
@@ -31,12 +31,12 @@ struct Termios {
 // Opens a serial device at `baud` bits a second. Returns its descriptor, or
 // a negative number when it cannot be opened or set.
 export fn alph_serial_open(path: cstring, baud: int64) -> int64 {
-  var fd: int64 = syscall(SYS_OPEN, (int64)path, O_RDWR | O_NOCTTY, 0);
+  var fd: int64 = alph_sys_open(path, O_RDWR | O_NOCTTY, 0);
   if (fd < 0) {
     return fd;
   }
   var t: Termios;
-  var out: int64 = syscall(SYS_IOCTL, fd, TCGETS2, (int64)&t);
+  var out: int64 = syscall(ALPH_NR_IOCTL, fd, TCGETS2, (int64)&t);
   if (out >= 0) {
     t.iflag = 0;
     t.oflag = 0;
@@ -46,10 +46,10 @@ export fn alph_serial_open(path: cstring, baud: int64) -> int64 {
     t.ospeed = (uint32)baud;
     t.cc[VMIN] = 1;   // a read waits for one byte,
     t.cc[VTIME] = 0;  // however long that takes
-    out = syscall(SYS_IOCTL, fd, TCSETS2, (int64)&t);
+    out = syscall(ALPH_NR_IOCTL, fd, TCSETS2, (int64)&t);
   }
   if (out < 0) {
-    syscall(3, fd);
+    syscall(ALPH_NR_CLOSE, fd);
     return out;
   }
   return fd;

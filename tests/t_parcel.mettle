@@ -10,6 +10,7 @@ import "std/thread";
 import "alph/actor/actor";
 import "alph/cores/cores";
 import "alph/link/link";
+import "port/sys";
 
 const GO: Word = 1;
 const DATA: Word = 2;   // with a parcel: ref is its number
@@ -153,7 +154,7 @@ fn b_main(arg: cstring) -> uint32 {
 }
 
 fn main() -> int32 {
-  var port_a: int64 = 13000 + (syscall(39) % 2000) * 2;
+  var port_a: int64 = 13000 + (syscall(ALPH_NR_GETPID) % 2000) * 2;
   var port_b: int64 = port_a + 1;
   var here: uint32 = alph_ip4(127, 0, 0, 1);
   var s: Sender;

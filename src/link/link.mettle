@@ -25,6 +25,7 @@
 
 import "std/thread";
 import "port/port";
+import "port/sys";
 import "port/alarm";
 import "port/wire";
 import "alph/actor/actor";
@@ -752,7 +753,7 @@ export fn AlphLink_start__ptr(l: AlphLink*, port: int64) -> Word {
   }
   // This run's life: the time now in milliseconds, so a later run has a
   // later life, and never 0.
-  syscall(228, 0, (int64)&ts[0]);
+  syscall(ALPH_NR_CLOCK_GETTIME, 0, (int64)&ts[0]);
   l->born = (Word)(ts[0] * 1000 + ts[1] / 1000000);
   if ((Word)(l->born & 4294967295) == 0) {
     l->born = l->born + 1;

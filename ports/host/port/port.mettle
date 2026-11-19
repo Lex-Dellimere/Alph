@@ -1,12 +1,12 @@
-// An x86-64 Linux process: any thread may send, one thread runs the actors.
+// A 64-bit Linux process: any thread may send, one thread runs the actors.
+
+import "port/sys";
 
 export type Word = int64;
 export const ALPH_INDEX_BITS: Word = 24;   // 16 million actors in a node
 export const ALPH_PLACE_SHIFT: Word = 48;  // 24 bits of generation, then 15 of place
 export const ALPH_GATHER: Word = 16;  // messages a node runs between gathers while it is busy
 
-const SYS_SCHED_YIELD: int64 = 24;
-const SYS_FUTEX: int64 = 202;
 const FUTEX_WAIT: int64 = 128;  // private
 const FUTEX_WAKE: int64 = 129;
 const SPINS: int32 = 100;      // tries at the lock before giving up the CPU
@@ -58,7 +58,7 @@ export fn AlphGate_enter__ptr(g: AlphGate*) -> int32 {
     tries = tries + 1;
     if (tries == SPINS) {
       tries = 0;
-      syscall(SYS_SCHED_YIELD);
+      syscall(ALPH_NR_SCHED_YIELD);
     }
   }
   return 0;
@@ -69,7 +69,7 @@ export fn AlphGate_leave__ptr(g: AlphGate*, was: int32) {
   g->owed = 0;
   alph_unlock(g);
   if (owed != 0) {
-    syscall(SYS_FUTEX, (int64)&g->wakes, FUTEX_WAKE, 1);
+    syscall(ALPH_NR_FUTEX, (int64)&g->wakes, FUTEX_WAKE, 1);
   }
 }
 
@@ -97,7 +97,7 @@ export fn AlphGate_sleep__ptr(g: AlphGate*, was: int32) {
   }
   g->state = ASLEEP;
   alph_unlock(g);
-  syscall(SYS_FUTEX, (int64)&g->wakes, FUTEX_WAIT, (int64)seen, 0);
+  syscall(ALPH_NR_FUTEX, (int64)&g->wakes, FUTEX_WAIT, (int64)seen, 0);
 }
 
 // Called inside the gate. Costs nothing while the node is running.
