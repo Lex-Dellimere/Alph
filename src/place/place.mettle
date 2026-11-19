@@ -976,6 +976,14 @@ export fn alph_place_run(a: AlphActor*, m: AlphMsg*) -> Word {
           var was: int32 = p->gate.enter();
           alph_place_at(&p->kinds[slow], x, slow, (Word)(x->gave_at[g] % 192), &t);
           t.last[0] = x->answered - x->gave_began[g];
+          if (t.warm[0] == 0) {
+            // It was the first job there, and a first job pays for
+            // starting up (a GPU being opened, say): it was not lost and
+            // says little about the next. The way is tried again.
+            t.warm[0] = 1;
+            t.est[0] = 0;
+            t.low[0] = 0;
+          }
           p->gate.leave(was);
           x->gave_ref[g] = 0;
         }

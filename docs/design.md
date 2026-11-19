@@ -79,6 +79,8 @@ For the smallest tiles alph beats both, because it uses both. For the rest it ma
 - If the worker ends or its machine is lost, the jobs it had not answered are done here and nothing more is sent to it.
 - Given a clock, a job not answered in eight times its usual time, and at least a second, is given up on and placed again.
 
+The other machine places the job again among its own cores and GPU, so a machine with no GPU uses another machine's by asking for the same kind of work. In `examples/picture.mettle` a boss with two working cores and no GPU draws 1,200 rows of 1,000 pixels with a helper that has one working core and an RTX 4070: the boss drew 296 to 402 rows itself and sent 798 to 904, of which the helper drew 742 to 810 on its GPU, in five runs, and every pixel matched the picture drawn on one core. With the helper's GPU hidden, 389 rows went to it and 811 stayed. The first job on a GPU pays for opening it, most of a second, so the helper opens its GPU before work arrives. A first job to another machine that takes that long is given up on and done here, and when its answer comes after all it is counted as that machine's warm-up, not as its speed.
+
 `examples/far.mettle` counts the primes below two million on two machines. `examples/run.mettle` runs twelve commands, as a build would: each command's text is the bytes of a job, and its exit status comes back. The other machine runs it on its own cores through its own places, so the choice is made twice: which machine, then which core.
 
 ### Boards

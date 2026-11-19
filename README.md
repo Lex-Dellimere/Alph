@@ -106,7 +106,7 @@ The same program on every machine, [examples/share.mettle](examples/share.mettle
 mettle --build -s --release examples/share.mettle -I ports/host -o share
 ```
 
-A picture drawn by several machines, [examples/picture.mettle](examples/picture.mettle): each row is a job, its number goes out and its pixels come back as bytes. It takes the same arguments as `share`:
+A picture drawn by several machines, [examples/picture.mettle](examples/picture.mettle): each row is a job, its number goes out and its pixels come back as bytes. The helper has a GPU way for the same work, so a machine with no GPU uses another machine's: of 1,200 rows the boss draws about 320 on its own cores and sends about 860 to the helper, which draws about 800 of them on its GPU, and every pixel is the same as when one core draws it all. It takes the same arguments as `share`:
 
 ```bash
 mettle --build -s --release examples/picture.mettle -I ports/host -o picture
