@@ -1,0 +1,165 @@
+// A picture rendered in tiles on the cores and the GPU of one machine, the
+// short way. One function, escape(), is the work. A tile is a job that can
+// run on a core or on the GPU, both calling escape(), so the pixels are the
+// same either way. alph times the two and sends each tile where it should
+// finish first. Tiles rendered on the GPU stay there until the picture is
+// asked for, and then cross to the host once. Without a GPU it all runs on
+// the cores.
+//
+//   mettle --build -s --release examples/tiles.mettle -I ports/host -o tiles
+
+import "std/io";
+import "std/gpu";
+import "alph/actor/actor";
+import "alph/machine/machine";
+import "alph/batch/batch";
+
+const WIDTH: int32 = 512;
+const PIXELS: int32 = 262144;
+const TILE: int32 = 4096;
+const TILES: Word = 64;       // in a picture
+const PICTURES: Word = 16;    // the picture is rendered this many times over
+const DEPTH: int32 = 256;
+
+const RENDER: Word = 0;  // a tile: in is which one of the picture's
+const FETCH: Word = 1;   // only a core can run it, on data that is on the GPU: alph brings it
+const GO: Word = 1;
+
+var g_m: AlphMachine;
+var g_batch: AlphBatch;
+var g_fetch: AlphJob;
+var g_image: int32[262144];
+var g_fetched: int32[262144];
+var g_on_gpu: uint8[64];
+var g_device: int64 = 0;
+var g_gpu_state: int32 = 0;  // 0 not tried, 1 ready, 2 none
+
+// How many steps the point of pixel i takes to leave the Mandelbrot set.
+fn escape(i: int32) -> int32 {
+  var cr: float32 = (float32)(i % WIDTH) * (float32)3 / (float32)WIDTH - (float32)2;
+  var ci: float32 = (float32)(i / WIDTH) * (float32)3 / (float32)WIDTH - (float32)3 / (float32)2;
+  var zr: float32 = (float32)0;
+  var zi: float32 = (float32)0;
+  var n: int32 = 0;
+  while (n < DEPTH && zr * zr + zi * zi < (float32)4) {
+    var t: float32 = zr * zr - zi * zi + cr;
+    zi = (float32)2 * zr * zi + ci;
+    zr = t;
+    n = n + 1;
+  }
+  return n;
+}
+
+kernel(block = 256) tile_kernel(picture: int32*, first: int32, count: int32) {
+  var i: int32 = block.x * block_dim.x + thread.x;
+  if (i < count) {
+    picture[first + i] = escape(first + i);
+  }
+}
+
+fn tile_on_core(job: AlphJob*) -> Word {
+  var first: int32 = (int32)job->in * TILE;
+  for i in first..(first + TILE) {
+    g_image[i] = escape(i);
+  }
+  return 0;
+}
+
+// Runs on the GPU's own core, which is the thread that opens the GPU.
+fn tile_on_gpu(job: AlphJob*) -> Word {
+  if (g_gpu_state == 0) {
+    g_gpu_state = 2;
+    if (gpu_init() != 0) {
+      g_device = gpu_malloc((int64)PIXELS * 4);
+      if (g_device != 0) {
+        g_gpu_state = 1;
+      }
+    }
+  }
+  if (g_gpu_state != 1) {
+    return 1;  // no GPU: alph sends the tile to a core and does not try this again
+  }
+  dispatch tile_kernel[work: TILE](g_device, (int32)job->in * TILE, TILE);
+  if (gpu_sync() != 0) {
+    return 1;
+  }
+  return 0;
+}
+
+fn bring_picture(job: AlphJob*) -> Word {
+  if (g_gpu_state != 1 || gpu_to_host((uint8*)&g_fetched[0], g_device, (int64)PIXELS * 4) != 0) {
+    return 1;
+  }
+  return 0;
+}
+
+fn picture_here(job: AlphJob*) -> Word {
+  return 0;
+}
+
+fn each_tile(b: AlphBatch*, job: AlphJob*, piece: Word) {
+  job->in = (Word)(piece % TILES);
+  job->size = (Word)TILE;
+}
+
+// Where a tile's pixels are now: where it was rendered last.
+fn rendered(b: AlphBatch*, job: AlphJob*, piece: Word) {
+  g_on_gpu[job->in] = 0;
+  if (job->way == ALPH_GPU) {
+    g_on_gpu[job->in] = 1;
+  }
+}
+
+fn boss(a: AlphActor*, m: AlphMsg*) -> Word {
+  if (m->tag == GO) {
+    g_batch.begin(a, RENDER, (Word)(TILES * PICTURES), &each_tile, &rendered, 0);
+    return 0;
+  }
+  if (g_batch.took(a, m)) {
+    if (g_batch.over()) {
+      if (g_batch.by_way[ALPH_GPU] == 0) {
+        a->cores()->stop();
+        return 0;
+      }
+      // The picture is asked for on the host: alph has the GPU bring it.
+      g_fetch.kind = FETCH;
+      g_fetch.size = (Word)PIXELS;
+      g_fetch.home = ALPH_GPU;
+      g_m.places.ask(a, &g_fetch);
+    }
+    return 0;
+  }
+  if (m->tag == ALPH_DONE) {
+    for tile in 0..TILES {
+      if (g_on_gpu[tile] != 0) {
+        for i in (tile * TILE)..((tile + 1) * TILE) {
+          g_image[i] = g_fetched[i];
+        }
+      }
+    }
+    a->cores()->stop();
+  }
+  return 0;
+}
+
+fn main() -> int32 {
+  g_m.init(4, 0, true);
+  g_m.kind(RENDER, &tile_on_core, &tile_on_gpu);
+  g_m.kind(FETCH, &picture_here, 0);
+  g_m.places.bring(FETCH, &bring_picture);
+  g_batch.init(&g_m.places);
+  g_m.cores.send(g_m.cores.spawn_on(0, &boss, 0), GO, 0);
+  g_m.run();
+  g_m.shut();
+  var wrong: int32 = 0;
+  for i in 0..PIXELS {
+    if (g_image[i] != escape(i)) {
+      wrong = wrong + 1;
+    }
+  }
+  println("{TILES * PICTURES} tiles: {g_batch.by_way[ALPH_CPU]} rendered on the cores, {g_batch.by_way[ALPH_GPU]} on the GPU, {wrong} pixels wrong");
+  if (wrong != 0) {
+    return 1;
+  }
+  return 0;
+}

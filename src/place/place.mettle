@@ -42,6 +42,8 @@ const ALPH_NUDGE: Word = -3;
 const ALPH_BRING: Word = -6;         // to the GPU's place: bring the job's data to the host, then pass it on
 export const ALPH_WORK: Word = -13;    // to a worker on another machine: arg is the job's in
 export const ALPH_WORKED: Word = -14;  // its answer: arg is the job's out, with the same ref
+export const ALPH_WORK_BYTES: Word = -17;  // as ALPH_WORK, for a job with bytes: arg is a parcel
+export const ALPH_REFUSED: Word = -18;     // a worker's answer when it cannot take the job: arg is ALPH_FULL for now, ALPH_GONE for never
 const ALPH_LOOK: Word = -15;           // to a far place from its own timer: look for jobs out too long
 const LOOK_MS: Word = 100;
 const LONG: Word = 8;                  // a far job is out too long at this many times its usual time,
@@ -59,6 +61,7 @@ export struct AlphJob {
   out: Word;     // and what it gives back
   bytes: uint8*; // bytes that go with it to another machine, up to ALPH_PARCEL_BYTES,
   count: Word;   // and how many: 0 for none
+  stay: Word;    // not 0: it must be done on this machine
   home: Word;    // where its data is: ALPH_CPU, ALPH_GPU or ALPH_NOWHERE. alph sets it to where the job ran
   status: Word;  // ALPH_OK, ALPH_GONE when no place can run it, ALPH_FULL to ask again
   way: Word;     // how it was run
@@ -143,8 +146,8 @@ fn alph_place_can(k: AlphKind*, job: AlphJob*, way: Word) -> bool {
   if (way == ALPH_CPU && job->home == ALPH_GPU && k->bring == 0) {
     return false;  // its data is on the GPU and cannot be brought
   }
-  if (way == ALPH_FAR && job->home != ALPH_NOWHERE) {
-    return false;  // only a job with no data of its own can leave the machine
+  if (way == ALPH_FAR && (job->home != ALPH_NOWHERE || job->stay != 0)) {
+    return false;  // only a job with no data of its own can leave the machine, and not one told to stay
   }
   return true;
 }
@@ -216,7 +219,8 @@ export fn AlphPlaces_bring__ptr(p: AlphPlaces*, kind: Word, bring: fn(AlphJob*) 
 
 // Says which actor on another machine does a kind's work. It is sent
 // ALPH_WORK with the job's in as arg, and answers ALPH_WORKED with the
-// job's out and the same ref. Call it after kind. For the machine's loss to
+// job's out and the same ref, or ALPH_REFUSED with arg ALPH_FULL when it
+// cannot take the job now and ALPH_GONE when it never can. Call it after kind. For the machine's loss to
 // be noticed, have this machine's far place watch the worker: it treats
 // ALPH_ENDED from a worker as the end of that way.
 export fn AlphPlaces_far__ptr(p: AlphPlaces*, kind: Word, worker: Word) {
@@ -236,9 +240,9 @@ export fn AlphPlaces_clock__ptr(p: AlphPlaces*, time: AlphTime*) {
 }
 
 // Gives the places the link, so a job for another machine can carry bytes
-// (job->bytes and job->count). Its worker then gets ALPH_WORK with a parcel
-// in arg, which it gives back to its own link when it has read it, and the
-// job's in is not sent. Give the link its parcels first.
+// (job->bytes and job->count). Its worker then gets ALPH_WORK_BYTES with a
+// parcel in arg, which it gives back to its own link when it has read it,
+// and the job's in is not sent. Give the link its parcels first.
 export fn AlphPlaces_net__ptr(p: AlphPlaces*, link: AlphLink*) {
   p->link = link;
 }
@@ -588,8 +592,9 @@ export fn alph_place_run(a: AlphActor*, m: AlphMsg*) -> Word {
     job->next = x->unsent;
     x->unsent = job;
   }
-  if (m->tag == ALPH_WORKED) {
-    // The answer from another machine: the job with this ref is done.
+  if (m->tag == ALPH_WORKED || m->tag == ALPH_REFUSED) {
+    // The answer from another machine: the job with this ref is done, or
+    // the worker could not take it now and the asker is told to ask again.
     var job: AlphJob* = x->open;
     var before: AlphJob* = 0;
     while (job != 0 && job->far_ref != m->ref) {
@@ -602,13 +607,36 @@ export fn alph_place_run(a: AlphActor*, m: AlphMsg*) -> Word {
       } else {
         before->next = job->next;
       }
-      job->out = m->arg;
-      job->ns = alph_place_ns() - job->began;
-      job->status = ALPH_OK;
       job->way = ALPH_FAR;
-      alph_place_ran(p, x, job, job->ns, 0);
-      job->next = x->unsent;
-      x->unsent = job;
+      if (m->tag == ALPH_WORKED) {
+        job->out = m->arg;
+        job->ns = alph_place_ns() - job->began;
+        job->status = ALPH_OK;
+        alph_place_ran(p, x, job, job->ns, 0);
+        job->next = x->unsent;
+        x->unsent = job;
+      } else {
+        // Refused. A worker that can never run the kind shuts the way. One
+        // that is only full makes the way look twice as slow each time, so
+        // work stops going there until it is tried again. Either way the
+        // job goes to whichever place is best now.
+        var k: AlphKind* = &p->kinds[job->kind];
+        var was: int32 = p->gate.enter();
+        if (m->arg == ALPH_GONE) {
+          k->off[ALPH_FAR] = 1;
+        } else {
+          var slow: Word = (Word)(k->est[job->at] * 2);
+          var took: Word = alph_place_ns() - job->began;
+          if (slow < took) {
+            slow = took;
+          }
+          k->est[job->at] = slow;
+          k->low[job->at] = slow;
+          k->since[job->at] = 0;
+        }
+        p->gate.leave(was);
+        alph_place_elsewhere(a, p, x, job);
+      }
     }
   }
   if (m->tag == ALPH_ENDED) {
@@ -642,11 +670,21 @@ export fn alph_place_run(a: AlphActor*, m: AlphMsg*) -> Word {
     x->open = 0;
     while (job != 0) {
       var after: AlphJob* = job->next;
-      var limit: Word = (Word)(p->kinds[job->kind].est[job->at] * LONG);
+      // The limit comes from the last time an answer really took, not from
+      // the estimate, which a job given up on makes longer below.
+      var limit: Word = (Word)(p->kinds[job->kind].last[job->at] * LONG);
       if (limit < LONG_NS) {
         limit = LONG_NS;
       }
       if ((Word)(now - job->began) > limit) {
+        // The time it was given up after is now what that way is taken to
+        // cost, so the next jobs go another way until it is tried again.
+        var k: AlphKind* = &p->kinds[job->kind];
+        var was: int32 = p->gate.enter();
+        k->est[job->at] = now - job->began;
+        k->low[job->at] = now - job->began;
+        k->since[job->at] = 0;
+        p->gate.leave(was);
         p->late = p->late + 1;
         alph_place_elsewhere(a, p, x, job);
       } else {
@@ -675,7 +713,7 @@ export fn alph_place_run(a: AlphActor*, m: AlphMsg*) -> Word {
     var out: Word = ALPH_GONE;
     if (job->far_to != 0 && k->off[ALPH_FAR] == 0) {
       if (job->count > 0 && p->link != 0) {
-        out = p->link->send_bytes(a->pid, job->far_to, ALPH_WORK, job->far_ref, job->bytes, job->count);
+        out = p->link->send_bytes(a->pid, job->far_to, ALPH_WORK_BYTES, job->far_ref, job->bytes, job->count);
       } else {
         out = a->node->put(job->far_to, &ask);
       }

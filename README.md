@@ -62,6 +62,7 @@ This is [examples/count.mettle](examples/count.mettle). The node owns no memory:
 | Names and the door | Find an actor on another machine by name, and watch it | [src/name](src/name/name.mettle), [src/door](src/door/door.mettle) |
 | Seals | A link only the holders of one key can read or speak on | [src/seal](src/seal/seal.mettle) |
 | Tether | A microcontroller tied to a bigger machine by its serial line: each side's actors reach the other's by pid. That machine can pass the board's mail on, so the whole network reaches it | [src/tether](src/tether/tether.mettle) |
+| Machine and batch | The short way: a machine set up in one call, and one kind of work handed out in pieces to cores, the GPU and other machines | [src/machine](src/machine/machine.mettle), [src/batch](src/batch/batch.mettle) |
 | Ports | What differs per device: `mcu` (one hart, no OS), `harts` (several harts, no OS), `pico2` (a Raspberry Pi Pico 2) and `host` (x86-64 Linux) | [ports](ports) |
 
 [docs/start.md](docs/start.md) shows how to use each of these. [docs/design.md](docs/design.md) explains why they are built this way, what was measured, and what is not built yet.
@@ -98,7 +99,19 @@ Tiles of a picture rendered on cores or on the GPU, whichever should finish each
 mettle --build -s --release examples/render.mettle -I ports/host -o render
 ```
 
-Work shared with another machine, [examples/far.mettle](examples/far.mettle). With no arguments both machines run in one process. On two computers, start `./far helper <the boss's address>` on one and `./far boss <the helper's address>` on the other. If the other machine is not there, or is lost on the way, the work is done here:
+The same program on every machine, [examples/share.mettle](examples/share.mettle): each knows how to do the work and shares it, and the one started as the boss hands it out. This is the short way to use alph, and [docs/start.md](docs/start.md) begins with it. With no arguments two machines run in one process:
+
+```bash
+mettle --build -s --release examples/share.mettle -I ports/host -o share
+```
+
+A picture rendered on the cores and the GPU of one machine, the short way too, [examples/tiles.mettle](examples/tiles.mettle). One function is the work, a core and the GPU both call it, and the pixels are the same either way. Without a GPU it runs on the cores:
+
+```bash
+mettle --build -s --release examples/tiles.mettle -I ports/host -o tiles
+```
+
+The layers under it, used directly: work shared with another machine, [examples/far.mettle](examples/far.mettle). With no arguments both machines run in one process. On two computers, start `./far helper <the boss's address>` on one and `./far boss <the helper's address>` on the other. If the other machine is not there, or is lost on the way, the work is done here:
 
 ```bash
 mettle --build -s --release examples/far.mettle -I ports/host -o far
@@ -177,6 +190,8 @@ src/life/life.mettle        lives: watching and keeping actors
 src/link/link.mettle        links: other machines, over UDP
 src/name/name.mettle        names: a number for a pid
 src/door/door.mettle        the door: find and watch actors on other machines
+src/machine/machine.mettle  a machine: every layer set up in one call, and work shared between machines
+src/batch/batch.mettle      a batch: one kind of work handed out in pieces
 src/seal/seal.mettle        seals: an encrypted and signed link (needs the cryptex package)
 src/tether/tether.mettle    tether: a board and a bigger machine on a serial line
 ports/mcu, ports/harts, ports/pico2, ports/host

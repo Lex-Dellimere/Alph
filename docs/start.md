@@ -8,7 +8,7 @@ An actor is a state and a handler, and the handler runs once for each message th
 
 ## Building
 
-Each layer is one import: `alph/actor/actor` (the core), `alph/cores/cores`, `alph/time/time`, `alph/place/place`, `alph/poll/poll`, `alph/life/life`, `alph/link/link`, `alph/name/name`, `alph/door/door` and `alph/seal/seal`. Map alph in your program's `mettle.deps`:
+Each layer is one import: `alph/machine/machine` and `alph/batch/batch` (the short way), `alph/actor/actor` (the core), `alph/cores/cores`, `alph/time/time`, `alph/place/place`, `alph/poll/poll`, `alph/life/life`, `alph/link/link`, `alph/name/name`, `alph/door/door` and `alph/seal/seal`. Map alph in your program's `mettle.deps`:
 
 ```text
 alph=<path to alph>/src
@@ -21,6 +21,79 @@ mettle --build -s --release examples/count.mettle -I ports/host -o count
 ```
 
 Build with `-s`. Without it the compiler turns a failed check (a bad index, a division by zero) into an exit that alph cannot catch.
+
+## The short way
+
+Most programs on Linux want the same thing: some work, done on whatever cores, GPU and other machines there are. Two layers give that in a few lines. `AlphMachine` is all the layers below set up in one call. `AlphBatch` hands out one kind of work in pieces and gathers the answers. This is [examples/share.mettle](../examples/share.mettle) without its `main`:
+
+```mettle
+import "alph/actor/actor";
+import "alph/machine/machine";
+import "alph/batch/batch";
+
+const PRIMES: Word = 0;  // the kind of job: in is a chunk, out the primes in it
+
+var g_boss: AlphMachine;
+var g_batch: AlphBatch;
+var g_primes: Word = 0;
+
+// The work: a function that takes a job and fills in its out.
+fn count_primes(job: AlphJob*) -> Word {
+  ...
+  job->out = found;
+  return 0;
+}
+
+// What every machine does: three cores, the one kind of work, shared.
+fn machine(m: AlphMachine*, first: Word, other: Word, ip: uint32, port: int64) {
+  m->init(3, first, false);
+  m->peer(other, 3, ip, port);
+  m->kind(PRIMES, &count_primes, 0);
+  m->share(PRIMES);
+}
+
+fn each_chunk(b: AlphBatch*, job: AlphJob*, chunk: Word) {
+  job->in = CHUNKS - 1 - chunk;
+}
+
+fn counted(b: AlphBatch*, job: AlphJob*, chunk: Word) {
+  g_primes = g_primes + job->out;
+}
+
+fn boss(a: AlphActor*, m: AlphMsg*) -> Word {
+  if (m->tag == GO) {
+    g_batch.begin(a, PRIMES, CHUNKS, &each_chunk, &counted, 0);
+  } else if (g_batch.took(a, m) && g_batch.over()) {
+    a->cores()->stop();
+  }
+  return 0;
+}
+```
+
+Every machine runs the same program. Each says how a kind of job is done (`kind`) and that it is shared (`share`). The machine whose actor begins a batch is the one that hands the work out, and each piece goes to one of its own cores or to another machine, wherever it should be done first. A machine with nobody to share with does the work itself.
+
+**The machine.**
+
+- `init(cores, first, gpu)` sets up `cores` cores (1 to 16) whose places start at `first`. The first core has the door and the program's own actors, and the others take work. With `gpu` true the last core is the GPU's.
+- `peer(first, count, ip, port)` adds another machine, up to eight. `start(port)` joins them. A machine on its own needs neither.
+- `kind(kind, cpu, gpu)` says how a kind of job (0 to 7) is done: a function for a core and one for the GPU, 0 for a way it does not have.
+- `share(kind)` shares a kind with the other machines, both ways. Only a job with no home leaves a machine: one word in, or bytes.
+- `tell(pid)` names your actor that hears `ALPH_UP` and `ALPH_DOWN`.
+- `run()` runs the cores until `stop()`, and `shut()` ends the timers and the link afterwards.
+- The layers are fields of the machine, for when you want them: `m.cores`, `m.link`, `m.names`, `m.life`, `m.door`, `m.time`, `m.places`.
+
+The sizes are fixed: 32 actors a core, 16 messages a mailbox, 8 kinds. A program that needs others puts the layers together itself, as the sections below show and as `src/machine/machine.mettle` does.
+
+**The batch.**
+
+- `init(places)` ties a batch to a machine's places (`&m.places`).
+- `begin(a, kind, total, fill, took, ctx)` starts handing out `total` pieces, from the actor that will get the answers. `fill(b, job, piece)` is called before each piece goes out, to set what the job needs: it starts with `in` as the piece's number, size 1 and no home. `took(b, job, piece)` is called with each finished job. `ctx` is yours, in `b->ctx`.
+- Pass the batch every message the actor gets: `took(a, m)` returns true when the message was the batch's. `over()` says when every piece is answered.
+- `b->by_way[ALPH_CPU]`, `[ALPH_GPU]` and `[ALPH_FAR]` count how the pieces were done. A piece no place can run comes back with `job->status == ALPH_GONE`, counted in `b->gone`.
+
+At most 16 pieces are out at once. A piece that could not be placed, or whose machine was lost, is handed out again.
+
+For the GPU the same two layers do: [examples/tiles.mettle](../examples/tiles.mettle) calls `g_m.init(4, 0, true)`, gives `kind` a function for a core and one for the GPU that both call the same Mettle code, and begins a batch of tiles. See Places and jobs below for how a GPU function is written and how data that stays on the GPU is brought back.
 
 ## A node
 
@@ -483,7 +556,7 @@ g_places.far(PRIMES, b->helper);
 g_boss_machine.door.watch(b->far_place, b->helper);
 ```
 
-Fill in a job with `job->in` and `job->home = ALPH_NOWHERE`, and ask as before. A job can carry bytes instead of `in`: set `job->bytes` and `job->count`, and give the places the link with `net(link)`. The worker then gets `ALPH_WORK` with a parcel in `arg`. [examples/run.mettle](../examples/run.mettle) sends commands to run this way. In the `ALPH_DONE` answer, `way` is `ALPH_FAR` when the other machine did it, and `out` is what the worker answered. A job with data of its own cannot leave the machine. On the other machine the worker is sent `ALPH_WORK` with the job's `in` as `arg`. It answers `ALPH_WORKED` with the job's `out`:
+Fill in a job with `job->in` and `job->home = ALPH_NOWHERE`, and ask as before. A job can carry bytes instead of `in`: set `job->bytes` and `job->count`, and give the places the link with `net(link)`. The worker then gets `ALPH_WORK_BYTES` with a parcel in `arg`. A worker that cannot take a job now answers `ALPH_REFUSED`, and the asker gets the job back with status `ALPH_FULL`. [examples/run.mettle](../examples/run.mettle) sends commands to run this way. In the `ALPH_DONE` answer, `way` is `ALPH_FAR` when the other machine did it, and `out` is what the worker answered. A job with data of its own cannot leave the machine. On the other machine the worker is sent `ALPH_WORK` with the job's `in` as `arg`. It answers `ALPH_WORKED` with the job's `out`:
 
 ```mettle
 fn worker(a: AlphActor*, m: AlphMsg*) -> Word {

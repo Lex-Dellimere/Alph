@@ -103,6 +103,14 @@ Placement is one decision made from measured costs, not three separate features.
 
    The machine on the line can also pass the board's mail on (`src/tether/relay.mettle`). The other machines of the link are told the board's places are reached through it, and then any of them reaches the board's actors by pid, and the board theirs. `examples/mcu/relay_host.mettle` is the same board asked for numbers by a third machine, through the one on its line, and `check.sh` runs that too. Not built: a board on the UDP link itself, and a line that sends again what was lost.
 
+## The short way
+
+The layers above are small on purpose, and a program that uses several of them repeats the same setup and the same bookkeeping. Two layers on top take that away. `src/machine` is a Linux machine with every layer set up in one call, with sizes that suit most programs. `src/batch` hands out one kind of work in pieces, takes each answer, hands out again what could not be placed, and says when all is back.
+
+Sharing is what they are for. A machine says how a kind of job is done and that it is shared. It then does that kind for other machines, through its own places, and its own jobs of the kind may go to them. Every machine runs the same program, and the one whose actor begins a batch is the one that hands the work out. A job taken for another machine is not sent on again. In the test two machines each hand out 200 pieces at the same moment and each answers all of its own rightly. `examples/share.mettle` is the program: about forty lines of its own, counting primes on however many machines run it.
+
+Limits: one other machine at a time does a kind for a machine; a job that goes to another machine has no home, so it carries a word or up to 1,024 bytes; and the sizes are fixed.
+
 ## Crossings
 
 A message to another core moves cache lines over the memory bus. A job for the GPU moves data over PCIe. A message to another machine is a datagram. These are one thing, a crossing, and data is what makes a crossing expensive: a message is four words, data is megabytes. Two rules follow.

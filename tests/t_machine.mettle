@@ -1,0 +1,192 @@
+// The machine (src/machine) with sharing: two machines in one process run
+// the same setup, and both hand out a batch at the same moment. Every
+// piece is answered rightly on both, work crosses in both directions, a
+// job taken for another machine is not sent on again, and a kind whose
+// jobs carry bytes is shared the same way.
+
+import "std/io";
+import "std/thread";
+import "alph/actor/actor";
+import "alph/machine/machine";
+import "alph/batch/batch";
+
+const GO: Word = 1;
+const SQUARE: Word = 0;   // out is in times in, after a moment's work
+const LENGTH: Word = 1;   // out is the sum of the job's bytes
+const PIECES: Word = 200;
+
+var g_a: AlphMachine;
+var g_b: AlphMachine;
+var g_failures: int32 = 0;
+
+fn expect(ok: bool, what: string) {
+  if (!ok) {
+    println("FAIL {what}");
+    g_failures = g_failures + 1;
+  }
+}
+
+fn now_ns() -> Word {
+  var ts: int64[2];
+  syscall(228, 1, (int64)&ts[0]);
+  return (Word)(ts[0] * 1000000000 + ts[1]);
+}
+
+fn square(job: AlphJob*) -> Word {
+  var until: Word = now_ns() + 500000;
+  while (now_ns() < until) {
+  }
+  job->out = (Word)(job->in * job->in);
+  return 0;
+}
+
+fn sum_bytes(job: AlphJob*) -> Word {
+  var sum: Word = 0;
+  for i in 0..job->count {
+    sum = sum + (Word)job->bytes[i];
+  }
+  job->out = sum;
+  return 0;
+}
+
+// One machine's boss: its batch, and what came back.
+struct Side {
+  machine: AlphMachine*;
+  batch: AlphBatch;
+  kind: Word;
+  wrong: Word;
+  text: uint8[64];
+}
+
+var g_sides: Side[2];
+
+fn fill(b: AlphBatch*, job: AlphJob*, piece: Word) {
+  var s: Side* = (Side*)b->ctx;
+  job->in = piece + 3;
+  if (s->kind == LENGTH) {
+    job->bytes = &s->text[0];
+    job->count = (Word)(1 + piece % 60);
+  }
+}
+
+fn took(b: AlphBatch*, job: AlphJob*, piece: Word) {
+  var s: Side* = (Side*)b->ctx;
+  var want: Word = (Word)((piece + 3) * (piece + 3));
+  if (s->kind == LENGTH) {
+    want = 0;
+    for i in 0..(Word)(1 + piece % 60) {
+      want = want + (Word)s->text[i];
+    }
+  }
+  if (job->status != ALPH_OK || job->out != want) {
+    s->wrong = s->wrong + 1;
+  }
+}
+
+fn boss(a: AlphActor*, m: AlphMsg*) -> Word {
+  var s: Side* = (Side*)a->state;
+  // A machine goes on running when its own batch is over: the other may
+  // still have work here.
+  if (m->tag == GO) {
+    s->batch.begin(a, s->kind, PIECES, &fill, &took, (rawptr)s);
+  } else {
+    s->batch.took(a, m);
+  }
+  return 0;
+}
+
+fn machine(m: AlphMachine*, first: Word, other: Word, port: int64) {
+  m->init(3, first, false);
+  m->peer(other, 3, alph_ip4(127, 0, 0, 1), port);
+  m->kind(SQUARE, &square, 0);
+  m->kind(LENGTH, &sum_bytes, 0);
+  expect(m->share(SQUARE) == ALPH_OK && m->share(LENGTH) == ALPH_OK, "the machine shares its two kinds");
+}
+
+fn a_main(arg: cstring) -> uint32 {
+  g_a.run();
+  return 0;
+}
+
+fn b_main(arg: cstring) -> uint32 {
+  g_b.run();
+  return 0;
+}
+
+// Both machines hand out a batch at once, and both run until both are over.
+fn both(kind: Word, pid_a: Word, pid_b: Word) {
+  for i in 0..2 {
+    g_sides[i].kind = kind;
+    g_sides[i].wrong = 0;
+    g_sides[i].batch.begun = 0;
+  }
+  var a_thread: int64 = CreateThread(0, 0, &a_main, 0, 0, 0);
+  var b_thread: int64 = CreateThread(0, 0, &b_main, 0, 0, 0);
+  g_a.cores.send(pid_a, GO, 0);
+  g_b.cores.send(pid_b, GO, 0);
+  var waited: int32 = 0;
+  while (!(g_sides[0].batch.over() && g_sides[1].batch.over()) && waited < 40000) {
+    Sleep(1);
+    waited = waited + 1;
+  }
+  g_a.stop();
+  g_b.stop();
+  thread_join_infinite(a_thread);
+  thread_close(a_thread);
+  thread_join_infinite(b_thread);
+  thread_close(b_thread);
+}
+
+fn main() -> int32 {
+  var port_a: int64 = 14000 + (syscall(39) % 2000) * 2;
+  var port_b: int64 = port_a + 1;
+  machine(&g_a, 0, 3, port_b);
+  machine(&g_b, 3, 0, port_a);
+  g_sides[0].machine = &g_a;
+  g_sides[1].machine = &g_b;
+  for i in 0..2 {
+    g_sides[i].batch.init(&g_sides[i].machine->places);
+    for at in 0..64 {
+      g_sides[i].text[at] = (uint8)(at * 3 + i + 1);
+    }
+  }
+  var pid_a: Word = g_a.cores.spawn_on(0, &boss, (rawptr)&g_sides[0]);
+  var pid_b: Word = g_b.cores.spawn_on(0, &boss, (rawptr)&g_sides[1]);
+  expect(g_a.start(port_a) == ALPH_OK && g_b.start(port_b) == ALPH_OK, "both machines listen");
+
+  // Let each find the other's workers before the work begins.
+  var waited: int32 = 0;
+  while ((g_a.kinds[SQUARE].far == 0 || g_b.kinds[SQUARE].far == 0 || g_a.kinds[LENGTH].far == 0 || g_b.kinds[LENGTH].far == 0) && waited < 3000) {
+    g_a.core[0].node.turn();
+    g_b.core[0].node.turn();
+    Sleep(1);
+    waited = waited + 1;
+  }
+  expect(g_a.kinds[SQUARE].far != 0 && g_b.kinds[SQUARE].far != 0, "each machine finds the other's worker for a shared kind");
+
+  // Both hand out two hundred pieces at once.
+  both(SQUARE, pid_a, pid_b);
+  var a_far: Word = g_sides[0].batch.by_way[ALPH_FAR];
+  var b_far: Word = g_sides[1].batch.by_way[ALPH_FAR];
+  expect(g_sides[0].batch.over() && g_sides[1].batch.over(), "both batches are answered in full");
+  expect(g_sides[0].wrong == 0 && g_sides[1].wrong == 0, "every answer is right ({g_sides[0].wrong} and {g_sides[1].wrong} wrong)");
+  expect(a_far + g_sides[0].batch.by_way[ALPH_CPU] == PIECES, "each piece was done once, here or there");
+
+  // The same with jobs that carry bytes.
+  both(LENGTH, pid_a, pid_b);
+  expect(g_sides[0].batch.over() && g_sides[1].batch.over(), "batches of jobs with bytes are answered in full");
+  expect(g_sides[0].wrong == 0 && g_sides[1].wrong == 0, "and rightly ({g_sides[0].wrong} and {g_sides[1].wrong} wrong)");
+  var used: Word = 0;
+  for i in 0..16 {
+    used = used + g_a.parcels[i].used + g_b.parcels[i].used;
+  }
+  expect(used == 0, "every parcel is back in its pool ({used} are not)");
+
+  g_a.shut();
+  g_b.shut();
+  if (g_failures != 0) {
+    return 1;
+  }
+  println("machine ok: two machines each handed out {PIECES} pieces at once; {a_far} and {b_far} crossed to the other");
+  return 0;
+}

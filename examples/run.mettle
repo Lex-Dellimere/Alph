@@ -34,7 +34,6 @@ const RUN: Word = 0;        // the one kind of job: a command, out its exit stat
 const HELPER: Word = 1;     // the name the helper machine gives the actor that takes commands
 const GO: Word = 1;
 const QUIT: Word = 2;
-const BUSY: Word = -1;      // the helper's answer when it has no room: ask again
 const BOSS_PORT: int64 = 7441;
 const HELPER_PORT: int64 = 7442;
 
@@ -108,9 +107,9 @@ fn taker(a: AlphActor*, m: AlphMsg*) -> Word {
     a->cores()->stop();
     return 0;
   }
-  if (m->tag == ALPH_WORK) {
+  if (m->tag == ALPH_WORK_BYTES) {
     var parcel: AlphParcel* = (AlphParcel*)m->arg;
-    var answer: AlphMsg = { tag: ALPH_WORKED, from: a->pid, arg: BUSY, ref: m->ref };
+    var answer: AlphMsg = { tag: ALPH_REFUSED, from: a->pid, arg: ALPH_FULL, ref: m->ref };
     for i in 0..8 {
       var t: Taken* = &g_taken[i];
       if (!t->busy) {
@@ -169,7 +168,7 @@ fn boss(a: AlphActor*, m: AlphMsg*) -> Word {
     mine->door.watch(b->far_place, b->helper);
   } else if (m->tag == ALPH_DONE) {
     var done: AlphJob* = (AlphJob*)m->arg;
-    if (done->status == ALPH_OK && done->out != BUSY) {
+    if (done->status == ALPH_OK) {
       b->status[done->in] = done->out;
       b->back = b->back + 1;
       if (done->way == ALPH_FAR) {
