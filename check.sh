@@ -281,6 +281,8 @@ build_board() {
         --emit-flat "$OUT/slow_board.bin" -I ports/mcu >> "$log" 2>&1 &&
       "$METTLE" --release tests/mcu/asking_board.mettle --target riscv32-none --board qemu-virt \
         --emit-flat "$OUT/asking_board.bin" -I ports/mcu >> "$log" 2>&1 &&
+      "$METTLE" --release tests/mcu/safe_board.mettle --target riscv32-none --board qemu-virt \
+        --emit-flat "$OUT/safe_board.bin" -I ports/mcu >> "$log" 2>&1 &&
       "$METTLE" --build -s --release examples/mcu/arm_host.mettle -I ports/host -o "$OUT/arm_host" >> "$log" 2>&1 &&
       "$METTLE" --build -s --release tests/mcu/arm_test.mettle -I ports/host -o "$OUT/arm_test" >> "$log" 2>&1 || status=1
       ;;
@@ -478,7 +480,7 @@ step_arm() {
   else
     base=$((9441 + $$ % 300 * 12))
     at=0
-    for run in "arm_host" "arm_test lost" "arm_test beyond" "arm_test slow" "arm_test asks"; do
+    for run in "arm_host" "arm_test lost" "arm_test beyond" "arm_test slow" "arm_test asks" "arm_test quiet"; do
       port=$((base + at * 3))
       at=$((at + 1))
       prog=${run%% *}
@@ -489,6 +491,9 @@ step_arm() {
       fi
       if [ "$run" = "arm_test asks" ]; then
         board_bin="$OUT/asking_board.bin"
+      fi
+      if [ "$run" = "arm_test quiet" ]; then
+        board_bin="$OUT/safe_board.bin"
       fi
       # shellcheck disable=SC2086
       timeout 60 "$OUT/$prog" "$port" $mode > "$log.host" 2>&1 &

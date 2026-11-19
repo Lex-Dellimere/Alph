@@ -1,0 +1,65 @@
+// A board that stops by itself when its computer goes silent, for
+// tests/mcu/arm_test.mettle (mode `quiet`). It looks at g_board.heard ten
+// times a second. Once the computer has been heard, a second and a half
+// with nothing new means it is gone: the board stops, as one that moves
+// something would stop its motors. It returns 0 only if it heard the
+// computer first and then noticed the silence.
+
+import "port/board";
+import "alph/actor/actor";
+import "alph/time/time";
+import "alph/board/board";
+import "../../examples/mcu/arm_work";
+
+const TICK: Word = 1;
+
+var g_board: AlphBoard;
+var g_time: AlphTime;
+var g_timers: AlphTimer[2];
+var g_seen: Word = 0;    // g_board.heard at the last tick it moved
+var g_still: Word = 0;   // ticks since it moved
+var g_ticks: Word = 0;
+var g_safe: Word = 0;
+
+@interrupt fn mettle_trap() {
+  mettle_board_exit(99);
+}
+
+fn watch(a: AlphActor*, m: AlphMsg*) -> Word {
+  if (m->tag != TICK) {
+    return 0;
+  }
+  g_ticks = g_ticks + 1;
+  g_still = g_still + 1;
+  if (g_board.heard != g_seen) {
+    g_seen = g_board.heard;
+    g_still = 0;
+  }
+  if (g_seen > 4 && g_still >= 15) {
+    g_safe = 1;  // here a real board stops its motors
+    a->node->stop();
+    return 0;
+  }
+  if (g_ticks > 150) {
+    a->node->stop();  // never heard the computer, or never lost it
+    return 0;
+  }
+  g_time.after(100, a->pid, TICK, 0);
+  return 0;
+}
+
+fn main() -> int32 {
+  alph_board_start();
+  g_board.init(8, 0, 8);
+  g_time.init(&g_board.node, &g_timers[0], 2);
+  var me: Word = g_board.node.spawn(&watch, 0);
+  g_board.share(PRIMES, &count_primes);
+  mettle_irq_enable();
+  g_time.after(100, me, TICK, 0);
+  g_board.run();
+  g_time.stop();
+  if (g_safe == 0) {
+    return 1;
+  }
+  return 0;
+}

@@ -10,6 +10,10 @@
 //   arm_test <port> asks    the board is tests/mcu/asking_board.mettle, which
 //                           asks this machine to count primes: the board
 //                           checks the answers, this side that six were asked
+//   arm_test <port> quiet   the board is tests/mcu/safe_board.mettle: this
+//                           machine shares with it for a second and a half,
+//                           then says nothing more but keeps the line open.
+//                           The board must notice and stop by itself
 //   arm_test <port> slow    the board is tests/mcu/slow_board.mettle, whose
 //                           jobs take 700 ms each: all are answered, and
 //                           none is taken for lost while the board works
@@ -43,6 +47,7 @@ var g_lost: bool = false;
 var g_slow: bool = false;
 var g_beyond: bool = false;
 var g_asks: bool = false;
+var g_quiet: bool = false;
 var g_on_board: Word = 0;
 
 fn now_ns() -> Word {
@@ -88,6 +93,13 @@ fn boss(a: AlphActor*, m: AlphMsg*) -> Word {
   if (m->tag == LATE) {
     g_late = 1;
     a->cores()->stop();
+    return 0;
+  }
+  if (g_quiet) {
+    // Shares with the board for a second and a half, then stops for good.
+    if (m->tag == TICK) {
+      a->cores()->stop();
+    }
     return 0;
   }
   if (g_asks) {
@@ -147,7 +159,7 @@ fn near_main(arg: cstring) -> uint32 {
 
 fn main(argc: int32, argv: cstring*) -> int32 {
   if (argc < 3) {
-    println("arm_test <port> lost|beyond|slow|asks");
+    println("arm_test <port> lost|beyond|slow|asks|quiet");
     return 2;
   }
   var port: int64 = 0;
@@ -160,6 +172,7 @@ fn main(argc: int32, argv: cstring*) -> int32 {
   g_slow = argv[2][0] == 115;    // s
   g_beyond = argv[2][0] == 98;   // b
   g_asks = argv[2][0] == 97;     // a
+  g_quiet = argv[2][0] == 113;   // q
   var listening: int64 = alph_tcp_listen(port);
   if (listening < 0) {
     println("port {port} is taken");
@@ -216,11 +229,23 @@ fn main(argc: int32, argv: cstring*) -> int32 {
   if (g_asks) {
     asking->time.after(100, pid, TICK, 0);
   }
+  if (g_quiet) {
+    asking->time.after(1500, pid, TICK, 0);
+  }
   var near: int64 = 0;
   if (g_beyond) {
     near = CreateThread(0, 0, &near_main, 0, 0, 0);
   }
   asking->run();
+  if (g_quiet) {
+    // Nothing more is said. The line stays open until the board has had
+    // time to notice, and its exit code says whether it did.
+    Sleep(4000);
+    alph_close(line);
+    alph_close(listening);
+    println("board quiet ok: this machine stopped asking and kept the line open");
+    return 0;
+  }
   Sleep(100);
   if (g_beyond) {
     g_near.stop();

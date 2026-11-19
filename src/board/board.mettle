@@ -14,6 +14,12 @@
 // machine that hears nothing from it for two seconds takes it for lost, so
 // a job should take well under that.
 //
+// A machine that shares work with a board asks its door something twice a
+// second. b->heard goes up each time, so a board that moves something
+// looks at it on a timer of its own: if it has not gone up for a second
+// or two, the machine is gone or the line is cut, and the board stops
+// safely.
+//
 // Sizes: 12 actors, 8 messages a mailbox, 8 kinds. A program that needs
 // others puts the node and the tether together itself, as this file does.
 
@@ -36,6 +42,7 @@ export struct AlphBoard {
   node: AlphNode;
   tether: AlphTether;
   served: Word;       // jobs done for other machines
+  heard: Word;        // goes up each time a machine asks this board's door anything
   workers: Word[8];   // by kind: the actor that does it, 0 for none
   helpers: Word[8];   // by kind: the actor down the line that does it, 0 while not known
   door: Word;
@@ -49,6 +56,7 @@ export struct AlphBoard {
 // so the answer is sent as from the worker itself.
 fn alph_board_door(a: AlphActor*, m: AlphMsg*) -> Word {
   var b: AlphBoard* = (AlphBoard*)a->state;
+  b->heard = b->heard + 1;
   if (m->tag == ALPH_HERE && m->arg != 0 && m->ref >= 1 && m->ref <= 8) {
     b->helpers[m->ref - 1] = m->from;  // the answer to ask's question
   }
@@ -82,6 +90,7 @@ fn alph_board_serve(a: AlphActor*, m: AlphMsg*) -> Word {
 // program's own actors are spawned on b->node.
 export fn AlphBoard_init__ptr(b: AlphBoard*, place: Word, first: Word, count: Word) {
   b->served = 0;
+  b->heard = 0;
   for k in 0..8 {
     b->workers[k] = 0;
     b->helpers[k] = 0;

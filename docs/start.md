@@ -737,6 +737,7 @@ From then on a batch of `ANGLE` jobs goes to the board, and each `PRIMES` job go
 - A machine that is not the one on the board's line calls `beyond(peer, first, count)` in place of `board`, with the peer whose line the board is on.
 - The board does one job at a time and nothing else meanwhile, so keep a job well under two seconds. A machine sends it four jobs at a time. A job is one word in and one word out.
 - The board's own actors are spawned on `g_board.node`.
+- A board that moves something must stop when its computer is gone. The computer asks the board something twice a second, and `g_board.heard` goes up each time. Look at it on a timer of your own: when it has not gone up for a second or two, the computer has stopped or the line is cut. [tests/mcu/safe_board.mettle](../tests/mcu/safe_board.mettle) does this in twenty lines.
 - With a real board, open its serial device on the computer with `alph_serial_open("/dev/ttyACM0", 115200)` (from `port/serial`) and give the descriptor to `alph_line_open`.
 
 **Work that must not be done twice.** A job whose answer is lost on the way is normally placed again, so it can be done twice. For counting primes that wastes a little. For moving an arm it is wrong. Say that a kind is done at most once, on the computer and on the board:
