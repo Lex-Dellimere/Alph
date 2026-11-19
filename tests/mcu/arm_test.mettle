@@ -1,0 +1,247 @@
+// Two harder cases for a board that shares work (examples/mcu/arm.mettle
+// is the board, in QEMU). check.sh runs each.
+//
+//   arm_test <port> lost    the board is stopped in the middle of a batch:
+//                           every piece is still answered, and the program
+//                           hears that the board is down
+//   arm_test <port> beyond  the board is on another machine's line: a
+//                           machine that reaches it only through that one
+//                           still shares work with it
+//   arm_test <port> slow    the board is tests/mcu/slow_board.mettle, whose
+//                           jobs take 700 ms each: all are answered, and
+//                           none is taken for lost while the board works
+
+import "std/io";
+import "std/thread";
+import "port/net";
+import "port/line";
+import "alph/actor/actor";
+import "alph/machine/machine";
+import "alph/batch/batch";
+import "../../examples/mcu/arm_work";
+
+const LATE: Word = 4;
+const JOINTS: Word = 6;
+const CHUNKS: Word = 400;
+const BOARD: Word = 8;
+
+var g_near: AlphMachine;  // has the board on its line
+var g_far: AlphMachine;   // reaches the board through g_near
+var g_batch: AlphBatch;
+var g_primes: Word = 0;
+var g_angles: Word = 0;
+var g_wrong: Word = 0;
+var g_late: Word = 0;
+var g_down: Word = 0;
+var g_quit: Word = 0;
+var g_lost: bool = false;
+var g_slow: bool = false;
+var g_beyond: bool = false;
+var g_on_board: Word = 0;
+
+fn now_ns() -> Word {
+  var ts: int64[2];
+  syscall(228, 1, (int64)&ts[0]);
+  return (Word)(ts[0] * 1000000000 + ts[1]);
+}
+
+// Two milliseconds a chunk here, so the board gets a share and the batch
+// lasts long enough to lose the board in.
+fn primes_job(job: AlphJob*) -> Word {
+  var until: Word = now_ns() + 2000000;
+  while (now_ns() < until) {
+  }
+  job->out = count_primes(job->in);
+  return 0;
+}
+
+fn each(b: AlphBatch*, job: AlphJob*, piece: Word) {
+}
+
+fn answered(b: AlphBatch*, job: AlphJob*, piece: Word) {
+  if (job->status != ALPH_OK) {
+    g_wrong = g_wrong + 1;
+  } else if (b->kind == ANGLE) {
+    g_angles = g_angles + 1;
+    if (job->out != (Word)(piece * 3) + 1 || job->way != ALPH_FAR) {
+      g_wrong = g_wrong + 1;
+    }
+  } else {
+    g_primes = g_primes + job->out;
+  }
+}
+
+fn quit_board(a: AlphActor*) {
+  a->send((Word)((BOARD << ALPH_PLACE_SHIFT) | ((Word)1 << ALPH_INDEX_BITS) | 1), QUIT, 0);
+  g_quit = 1;
+}
+
+fn boss(a: AlphActor*, m: AlphMsg*) -> Word {
+  if (m->tag == LATE) {
+    g_late = 1;
+    a->cores()->stop();
+    return 0;
+  }
+  if (m->tag == ALPH_DOWN && m->arg == BOARD) {
+    g_down = 1;
+  }
+  if (m->tag == ALPH_UP && m->arg == BOARD && g_batch.begun == 0) {
+    if (g_lost) {
+      g_batch.begin(a, PRIMES, CHUNKS, &each, &answered, 0);
+    } else {
+      g_batch.begin(a, ANGLE, JOINTS, &each, &answered, 0);
+    }
+    return 0;
+  }
+  var mine: bool = g_batch.took(a, m);
+  if (g_lost) {
+    // Stop the board once it has done some of the work and more is out.
+    if (g_quit == 0 && g_batch.by_way[ALPH_FAR] >= 2) {
+      quit_board(a);
+    }
+    if (g_batch.over() && g_down != 0) {
+      g_on_board = g_batch.by_way[ALPH_FAR];
+      a->cores()->stop();
+    }
+    return 0;
+  }
+  if (mine && g_batch.over()) {
+    if (g_batch.kind == ANGLE && !g_slow) {
+      g_batch.begin(a, PRIMES, CHUNKS, &each, &answered, 0);
+    } else if (g_slow) {
+      quit_board(a);
+      a->cores()->stop();
+    } else {
+      // What went away went to the board or to the machine it is tied to.
+      g_on_board = g_batch.by_way[ALPH_FAR] - g_near.served;
+      quit_board(a);
+      a->cores()->stop();
+    }
+  }
+  return 0;
+}
+
+fn near_main(arg: cstring) -> uint32 {
+  g_near.run();
+  return 0;
+}
+
+fn main(argc: int32, argv: cstring*) -> int32 {
+  if (argc < 3) {
+    println("arm_test <port> lost|beyond|slow");
+    return 2;
+  }
+  var port: int64 = 0;
+  var i: int32 = 0;
+  while (argv[1][i] >= 48 && argv[1][i] <= 57) {
+    port = port * 10 + (int64)(argv[1][i] - 48);
+    i = i + 1;
+  }
+  g_lost = argv[2][0] == 108;    // l
+  g_slow = argv[2][0] == 115;    // s
+  g_beyond = argv[2][0] == 98;   // b
+  var listening: int64 = alph_tcp_listen(port);
+  if (listening < 0) {
+    println("port {port} is taken");
+    return 1;
+  }
+  var line: int64 = ALPH_LATER;
+  var waited: int32 = 0;
+  while (line < 0 && waited < 2000) {
+    line = alph_tcp_accept(listening);
+    waited = waited + 1;
+    Sleep(10);
+  }
+  if (line < 0) {
+    println("no board called");
+    return 1;
+  }
+  syscall(72, line, 4, 0);
+  alph_line_open(line);
+
+  // The machine with the board on its line: places 0 and 1.
+  var here: uint32 = alph_ip4(127, 0, 0, 1);
+  g_near.init(2, 0, false);
+  g_near.kind(PRIMES, &primes_job, 0);
+  g_near.share(PRIMES);
+  g_near.kind(ANGLE, 0, 0);
+  g_near.share(ANGLE);
+  var asking: AlphMachine* = &g_near;
+  if (g_beyond) {
+    g_near.peer(4, 2, here, port + 2);
+  }
+  g_near.board(BOARD, 1);
+  if (g_beyond) {
+    // The machine that asks: places 4 and 5, the board through the other.
+    asking = &g_far;
+    g_far.init(2, 4, false);
+    g_far.kind(PRIMES, &primes_job, 0);
+    g_far.share(PRIMES);
+    g_far.kind(ANGLE, 0, 0);
+    g_far.share(ANGLE);
+    g_far.peer(0, 2, here, port + 1);
+    if (g_far.beyond(0, BOARD, 1) != ALPH_OK) {
+      println("FAIL beyond");
+      return 1;
+    }
+    if (g_near.start(port + 1) != ALPH_OK || g_far.start(port + 2) != ALPH_OK) {
+      println("the ports after {port} are taken");
+      return 1;
+    }
+  }
+  g_batch.init(&asking->places);
+  var pid: Word = asking->cores.spawn_on(0, &boss, 0);
+  asking->tell(pid);
+  asking->time.after(25000, pid, LATE, 0);
+  var near: int64 = 0;
+  if (g_beyond) {
+    near = CreateThread(0, 0, &near_main, 0, 0, 0);
+  }
+  asking->run();
+  Sleep(100);
+  if (g_beyond) {
+    g_near.stop();
+    thread_join_infinite(near);
+    thread_close(near);
+    g_far.shut();
+  }
+  g_near.shut();
+  alph_close(line);
+  alph_close(listening);
+  var failures: int32 = 0;
+  if (g_late != 0) {
+    println("FAIL not done in 25 seconds");
+    failures = failures + 1;
+  }
+  if (g_wrong != 0 || (!g_slow && g_primes != 17984)) {
+    println("FAIL {g_wrong} pieces wrong, {g_primes} primes counted and not 17984");
+    failures = failures + 1;
+  }
+  if (!g_slow && g_on_board < 1) {
+    println("FAIL the board did none of the chunks");
+    failures = failures + 1;
+  }
+  if (g_slow && g_near.places.late != 0) {
+    println("FAIL {g_near.places.late} jobs were taken for lost while the board was working");
+    failures = failures + 1;
+  }
+  if (g_lost && g_down == 0) {
+    println("FAIL the board's loss was not told");
+    failures = failures + 1;
+  }
+  if (!g_lost && g_angles != JOINTS) {
+    println("FAIL {g_angles} angles of {JOINTS}");
+    failures = failures + 1;
+  }
+  if (failures != 0) {
+    return 1;
+  }
+  if (g_slow) {
+    println("board slow ok: {g_angles} jobs of 700 ms each answered by the board, none taken for lost");
+  } else if (g_lost) {
+    println("board lost ok: {g_on_board} chunks done by the board before it stopped, every one of {CHUNKS} answered, late {g_near.places.late}");
+  } else {
+    println("board beyond ok: {g_angles} angles and {g_on_board} of {CHUNKS} chunks from a board on another machine's line, {g_near.served} chunks done by that machine");
+  }
+  return 0;
+}

@@ -1,0 +1,43 @@
+// A board that takes part in a bigger machine's work: the chip in a robot's
+// arm, say, on the serial line of the computer that plans. It shares two
+// kinds of work. Counting primes is work the computer can do too, so alph
+// sends the board some of it. Reading a joint's angle is work only this
+// board can do, so all of that comes here. arm_host.mettle is the computer.
+//
+//   mettle --release examples/mcu/arm.mettle --target riscv32-none \
+//       --board qemu-virt --emit-flat arm.bin -I ports/mcu
+
+import "port/board";
+import "alph/actor/actor";
+import "alph/board/board";
+import "arm_work";
+
+var g_board: AlphBoard;
+
+@interrupt fn mettle_trap() {
+  mettle_board_exit(99);
+}
+
+// Stands for reading a sensor.
+fn angle(joint: Word) -> Word {
+  return (Word)(joint * 3) + 1;
+}
+
+fn quitter(a: AlphActor*, m: AlphMsg*) -> Word {
+  if (m->tag == QUIT) {
+    a->node->stop();
+  }
+  return 0;
+}
+
+// The board is place 8. The computer's places are below it.
+fn main() -> int32 {
+  alph_board_start();
+  g_board.init(8, 0, 8);
+  g_board.node.spawn(&quitter, 0);
+  g_board.share(PRIMES, &count_primes);
+  g_board.share(ANGLE, &angle);
+  mettle_irq_enable();
+  g_board.run();
+  return 0;
+}

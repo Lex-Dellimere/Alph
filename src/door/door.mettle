@@ -15,9 +15,8 @@ import "alph/cores/cores";
 import "alph/link/link";
 import "alph/name/name";
 import "alph/life/life";
+import "alph/door/words";
 
-export const ALPH_WHERE: Word = -10;  // to a door: arg is a name
-export const ALPH_HERE: Word = -11;   // from a door: arg is the pid with that name, or 0
 const ALPH_WATCH: Word = -12;         // door to door: watch the actor in arg for me, under this ref
 
 export struct AlphDoor {

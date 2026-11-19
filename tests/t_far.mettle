@@ -45,6 +45,7 @@ var g_time: AlphTime;
 var g_timers: AlphTimer[4];
 var g_forgetful: int32 = 0;  // the worker answers only every fourth request
 var g_asked: int32 = 0;
+var g_slow_once: int32 = 0;  // the worker takes 1.3 seconds over its next request
 var g_failures: int32 = 0;
 
 fn expect(ok: bool, what: string) {
@@ -84,6 +85,12 @@ fn worker(a: AlphActor*, m: AlphMsg*) -> Word {
     g_asked = g_asked + 1;
     if (g_forgetful != 0 && g_asked % 4 != 0) {
       return 0;
+    }
+    if (g_slow_once != 0) {
+      g_slow_once = 0;
+      var until: Word = now_ns() + 1300000000;
+      while (now_ns() < until) {
+      }
     }
     a->reply(m, ALPH_WORKED, m->arg * 2);
   }
@@ -218,6 +225,31 @@ fn main() -> int32 {
   expect(g_boss.back == 12 && g_boss.wrong == 0, "jobs whose requests were forgotten are still answered ({g_boss.back} of 12)");
   expect(g_places.late > 0, "because they were given up on and placed again ({g_places.late} times)");
   var late: Word = g_places.late;
+
+  // A job that only takes long: 1.3 seconds, once. It is given up on after
+  // a second and done somewhere else. Its answer still comes, and from it
+  // alph learns how long work there can take, so the next slow job is
+  // given the time.
+  for i in 0..192 {
+    g_kinds[0].since[i] = 20000000000;  // long enough ago that every way is tried again
+  }
+  g_slow_once = 1;
+  run(12);
+  expect(g_slow_once == 0, "the slow request was sent");
+  expect(g_boss.back == 12 && g_boss.wrong == 0, "a job that takes too long is still answered ({g_boss.back} of 12)");
+  expect(g_places.late > late, "because it was given up on ({g_places.late - late} times)");
+  waited = now_ns();
+  while ((Word)(now_ns() - waited) < 800000000) {
+    g_a.core[0].node.turn();
+  }
+  var learned: Word = 0;
+  for i in 128..192 {
+    if (g_kinds[0].last[i] > learned) {
+      learned = g_kinds[0].last[i];
+    }
+  }
+  expect(learned >= 1200000000, "its late answer says how long the work took ({learned / 1000000} ms)");
+  late = g_places.late;
 
   // B is lost with work on its way. What it had is done here, and nothing
   // more is sent to it.

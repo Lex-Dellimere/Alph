@@ -80,9 +80,16 @@ fn alph_batch_more(b: AlphBatch*, a: AlphActor*) {
     }
     if (asked < 0) {
       // No place has room now. With pieces out, the next answer tries
-      // again; with none out, the actor sends itself a word to.
-      if (b->out == 0 && b->nudged == 0 && a->send(a->pid, ALPH_BATCH_MORE, 0) == ALPH_OK) {
-        b->nudged = 1;
+      // again. With none out, the actor is sent a word to: two
+      // milliseconds on if the places have a clock, so a batch waiting
+      // for a place at its limit does not spin, and at once if not.
+      if (b->out == 0 && b->nudged == 0) {
+        var clock: AlphTime* = b->places->time;
+        if (clock != 0 && clock->after(2, a->pid, ALPH_BATCH_MORE, 0) > 0) {
+          b->nudged = 1;
+        } else if (a->send(a->pid, ALPH_BATCH_MORE, 0) == ALPH_OK) {
+          b->nudged = 1;
+        }
       }
       return;
     }

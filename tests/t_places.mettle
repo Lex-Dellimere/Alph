@@ -33,6 +33,7 @@ var g_jobs: AlphJob[16];
 var g_failures: int32 = 0;
 var g_gpu_tries: int32 = 0;
 var g_brings: int32 = 0;
+var g_over: int32 = 0;  // times a place held more than one job, counted while both have a limit of one
 var g_cpu_saw_gpu_data: int32 = 0;
 
 fn expect(ok: bool, what: string) {
@@ -65,6 +66,9 @@ fn trade_gpu(job: AlphJob*) -> Word {
 }
 
 fn slow_cpu(job: AlphJob*) -> Word {
+  if (g_seats[0].waiting > 1 || g_seats[1].waiting > 1) {
+    g_over = g_over + 1;
+  }
   burn(200000);
   return 0;
 }
@@ -324,6 +328,20 @@ fn main() -> int32 {
   expect(g_places.count == 3, "and the places stay three ({g_places.count})");
   run(QUICK, SMALL, 40, 4, 0);
   expect(g_boss.back == 40 && g_boss.by_way[ALPH_CPU] == 40, "jobs still run after a place could not be made ({g_boss.by_way[ALPH_CPU]} of 40)");
+
+  // A place with a limit holds no more jobs than that. With eight asked for
+  // at once and two places of one job each, the rest are refused for now
+  // and asked again, and every one is done.
+  g_places.limit(g_seats[0].pid, 1);
+  g_places.limit(g_seats[1].pid, 1);
+  g_over = 0;
+  run(NO_GPU, SMALL, 30, 8, 0);
+  expect(g_boss.back == 30 && g_boss.by_way[ALPH_CPU] == 30, "every job is done by places with a limit ({g_boss.by_way[ALPH_CPU]} of 30)");
+  expect(g_boss.refused > 0, "a job that finds every place at its limit is refused for now ({g_boss.refused} times)");
+  expect(g_over == 0, "no place held more than its limit ({g_over} times)");
+  expect(g_places.limit(12345, 1) == ALPH_GONE, "a limit for no place is gone");
+  g_places.limit(g_seats[0].pid, 0);
+  g_places.limit(g_seats[1].pid, 0);
 
   if (g_failures != 0) {
     return 1;

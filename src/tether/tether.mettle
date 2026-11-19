@@ -188,6 +188,7 @@ fn alph_tether_take(ctx: rawptr, byte: int32) {
 
 // Starts the line for a node that is already placed: mail off the line is
 // put through it. The other machine's places are first, first + 1, ...
+// Whether mail is passed on (relay) is left as it was set.
 export fn AlphTether_open__ptr(t: AlphTether*, node: AlphNode*, first: Word, count: Word) {
   t->node = node;
   t->first = first;
@@ -195,7 +196,6 @@ export fn AlphTether_open__ptr(t: AlphTether*, node: AlphNode*, first: Word, cou
   t->have = 0;
   t->escaped = 0;
   t->dropped = 0;
-  t->relay = 0;
   alph_line_put((uint8)END);
   alph_line_flush();
   alph_line_start(&alph_tether_take, (rawptr)t);
@@ -206,5 +206,6 @@ export fn AlphTether_open__ptr(t: AlphTether*, node: AlphNode*, first: Word, cou
 // Call it before the first spawn.
 export fn AlphTether_init__ptr(t: AlphTether*, node: AlphNode*, place: Word, first: Word, count: Word) {
   node->join(place, &alph_tether_far, (rawptr)t);
+  t->relay = 0;
   t->open(node, first, count);
 }

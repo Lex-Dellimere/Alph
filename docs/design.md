@@ -85,6 +85,15 @@ For the smallest tiles alph beats both, because it uses both. For the rest it ma
 
 Two boards can be tied the same way with no bigger machine: one device with several chips, each chip a place. `examples/mcu/asker.mettle` asks the first board for fifty numbers. The machine on the line can also pass the board's mail on (`src/tether/relay.mettle`), so the other machines of the link reach the board's actors by pid, and the board theirs. `examples/mcu/relay_host.mettle` has a third machine ask the board this way.
 
+`src/board` makes a board a place that takes work. The board says which kinds it does, each a function from one word to one word. The machines find out by asking, and from then on the board is one more place, chosen by the same rule as a core or a GPU. A kind is not only done faster in one place than another: some kinds can be done in one place only. A machine with no way of its own to do a kind sends every job of it away, so work that only a board can do (read a sensor, move an arm) is asked for like any other. `examples/mcu/arm.mettle` and `examples/mcu/arm_host.mettle` are a board and a computer that share two kinds, one that both can do and one that only the board can.
+
+A board is too small for a door and sends no beats, so two things differ from a Linux helper:
+
+- The machine asks the board twice a second which kinds it does. A board silent for two seconds is taken for lost, its jobs are placed again, and it is found again when it answers.
+- A pid inside a message does not cross the line, only the sender and the receiver do. So the board's answer about who does a kind is sent as from that actor.
+
+The board runs one job at a time, so a machine sends it at most four and a place has a limit for that. Nothing on the line is sent again: a job or an answer lost there is given up on after a second and placed again.
+
 ## Crossings
 
 A message to another core moves cache lines over the memory bus. A job for the GPU moves data over PCIe. A message to another machine is a datagram. These are one thing, a crossing, and data is what makes a crossing expensive: a message is four words, data is megabytes. Two rules follow.
@@ -139,6 +148,7 @@ The measurements that decide a choice are in the section for that choice: the re
 - Door: a lost machine's actors ended in about 540 ms.
 - Work: `examples/far.mettle` with two cores here and one worker there sent about a third of the chunks across.
 - Tether: a board in QEMU with a process on its line did 200 requests and replies.
+- Board: the `examples/mcu/arm.mettle` image is 4,480 bytes. All 6 jobs only the board could do went to it. Of 200 chunks of primes that both could count, the computer did 196 and the board in QEMU 4. With the computer's chunks slowed to two milliseconds each and the board on another machine's line, the board did 24 of 400. When the board was stopped in the middle of a batch, all 400 pieces were still answered.
 - Share: two machines each handed out 200 pieces at once and each answered all of its own rightly. With three machines and 300 pieces, the one that handed out did 110 and the other two 92 and 98. When one of the three was lost in the middle of a second batch, every piece was still answered.
 
 ## What is not built
@@ -149,6 +159,7 @@ The measurements that decide a choice are in the section for that choice: the re
 - Telling a sender that a full mailbox at the far end of a link dropped its message.
 - A sealed link has one key for all, so any holder can speak as any machine and there is no forward secrecy. Peers are listed by hand.
 - A board on the UDP link itself. A board joins through a serial line to one machine, and a line that sends again what was lost.
+- A board that hands out its own work through places. It takes jobs, and its actors ask others by pid.
 - A job for another machine with more than a word or 1,024 bytes, or with its data on a GPU.
 - A time for each other machine. The places keep one time for "another machine", so a slow helper is told from a fast one only by the work waiting at it.
 - A job's time predicted from more than its size. A Mandelbrot tile's time depends on where in the picture it is, so such work is placed less well.

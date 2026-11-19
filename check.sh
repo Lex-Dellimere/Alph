@@ -188,7 +188,7 @@ if [ "$#" -eq 0 ]; then
   log="$OUT/pico2.log"
   : > "$log"
   built=1
-  for name in blink tether asker; do
+  for name in blink tether asker arm; do
     if ! "$METTLE" --release "examples/mcu/$name.mettle" --target riscv32-none --board pico2 \
         --emit-flat "$OUT/pico2_$name.bin" -I ports/pico2 -I ports/mcu >> "$log" 2>&1; then
       echo "FAIL  pico2/$name build (see $log)"
@@ -201,13 +201,61 @@ if [ "$#" -eq 0 ]; then
      gcc -std=c99 -O2 -o "$OUT/rvsim" "$sim" -lm >> "$log" 2>&1; then
     got=$(timeout 30 "$OUT/rvsim" --machine rp2350 --load "$OUT/pico2_blink.bin" --until-ms 3000 2>> "$log" | tr -d '\r\n')
     if [ "$got" = "12345" ]; then
-      echo "ok    pico2/blink [on the chip's model, $(stat -c %s "$OUT/pico2_blink.bin") bytes; tether and asker build]"
+      echo "ok    pico2/blink [on the chip's model, $(stat -c %s "$OUT/pico2_blink.bin") bytes; tether, asker and arm build]"
     else
       echo "FAIL  pico2/blink printed '$got' on the model"
       fails=$((fails + 1))
     fi
   elif [ "$built" -eq 1 ]; then
-    echo "ok    pico2 [blink, tether and asker build; no model here to run them on]"
+    echo "ok    pico2 [blink, tether, asker and arm build; no model here to run them on]"
+  fi
+fi
+
+# A board that shares work with the machine on its line: the six jobs only
+# the board can do all go to it, and it takes some of the rest. Then the
+# board is lost in the middle of a batch, then it is reached from a machine
+# that is not the one on its line, and last a board whose jobs take 700 ms
+# each is waited for.
+if [ "$#" -eq 0 ] && command -v qemu-system-riscv32 > /dev/null 2>&1; then
+  bin="$OUT/arm.bin"
+  log="$OUT/arm.log"
+  if ! "$METTLE" --release examples/mcu/arm.mettle --target riscv32-none --board qemu-virt \
+      --emit-flat "$bin" -I ports/mcu > "$log" 2>&1 ||
+     ! "$METTLE" --release tests/mcu/slow_board.mettle --target riscv32-none --board qemu-virt \
+      --emit-flat "$OUT/slow_board.bin" -I ports/mcu >> "$log" 2>&1 ||
+     ! "$METTLE" --build -s --release examples/mcu/arm_host.mettle -I ports/host -o "$OUT/arm_host" >> "$log" 2>&1 ||
+     ! "$METTLE" --build -s --release tests/mcu/arm_test.mettle -I ports/host -o "$OUT/arm_test" >> "$log" 2>&1; then
+    echo "FAIL  mcu/arm build (see $log)"
+    fails=$((fails + 1))
+  else
+    base=$((9441 + $$ % 300 * 12))
+    at=0
+    for run in "arm_host" "arm_test lost" "arm_test beyond" "arm_test slow"; do
+      port=$((base + at * 3))
+      at=$((at + 1))
+      prog=${run%% *}
+      mode=${run#"$prog"}
+      board_bin="$bin"
+      if [ "$run" = "arm_test slow" ]; then
+        board_bin="$OUT/slow_board.bin"
+      fi
+      timeout 60 "$OUT/$prog" "$port" $mode > "$log.host" 2>&1 &
+      host_pid=$!
+      sleep 0.3
+      timeout 50 qemu-system-riscv32 -M virt -bios none -display none -monitor none \
+        -serial "tcp:127.0.0.1:$port" -device loader,file="$board_bin",addr=0x80000000,force-raw=on >> "$log" 2>&1
+      board=$?
+      wait "$host_pid"
+      code=$?
+      cat "$log.host" >> "$log"
+      if [ "$code" -eq 0 ] && [ "$board" -eq 0 ]; then
+        echo "ok    mcu/$run [$(stat -c %s "$board_bin") bytes: $(tail -n 1 "$log.host")]"
+      else
+        echo "FAIL  mcu/$run: host exit $code, board exit $board (see $log)"
+        tail -n 4 "$log.host" | sed 's/^/      /'
+        fails=$((fails + 1))
+      fi
+    done
   fi
 fi
 

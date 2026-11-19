@@ -1,0 +1,133 @@
+// A computer with a board on its serial line, working as one machine. The
+// board is examples/mcu/arm.mettle. The computer asks for two kinds of
+// work and never says where either is done:
+//
+//   - six joint angles, which only the board can read, so all six go there
+//   - the primes below 100,000 in 200 chunks, which both can count, so
+//     alph sends each chunk to a core here or to the board, wherever it
+//     should be done first
+//
+// check.sh runs the two together, the board in QEMU.
+//
+//   mettle --build -s --release examples/mcu/arm_host.mettle -I ports/host -o arm_host
+//   ./arm_host 7461 &
+//   qemu-system-riscv32 -M virt -bios none -display none -monitor none \
+//       -serial tcp:127.0.0.1:7461 -device loader,file=arm.bin,addr=0x80000000,force-raw=on
+//
+// With a real board, open its serial device and give that descriptor to
+// alph_line_open.
+
+import "std/io";
+import "std/thread";
+import "port/net";
+import "port/line";
+import "alph/actor/actor";
+import "alph/machine/machine";
+import "alph/batch/batch";
+import "arm_work";
+
+const LATE: Word = 4;
+const JOINTS: Word = 6;
+const CHUNKS: Word = 200;
+const BOARD: Word = 8;  // the board's place
+
+var g_m: AlphMachine;
+var g_batch: AlphBatch;
+var g_primes: Word = 0;
+var g_angles: Word = 0;
+var g_wrong: Word = 0;
+var g_late: Word = 0;
+var g_on_board: Word = 0;
+
+fn primes_job(job: AlphJob*) -> Word {
+  job->out = count_primes(job->in);
+  return 0;
+}
+
+fn each(b: AlphBatch*, job: AlphJob*, piece: Word) {
+}
+
+fn answered(b: AlphBatch*, job: AlphJob*, piece: Word) {
+  if (job->status != ALPH_OK) {
+    g_wrong = g_wrong + 1;
+  } else if (b->kind == ANGLE) {
+    g_angles = g_angles + 1;
+    if (job->out != (Word)(piece * 3) + 1 || job->way != ALPH_FAR) {
+      g_wrong = g_wrong + 1;
+    }
+  } else {
+    g_primes = g_primes + job->out;
+  }
+}
+
+// Begins when the board is heard: first the angles, then the primes.
+fn boss(a: AlphActor*, m: AlphMsg*) -> Word {
+  if (m->tag == LATE) {
+    g_late = 1;
+    a->cores()->stop();
+  } else if (m->tag == ALPH_UP && m->arg == BOARD) {
+    g_batch.begin(a, ANGLE, JOINTS, &each, &answered, 0);
+  } else if (g_batch.took(a, m) && g_batch.over()) {
+    if (g_batch.kind == ANGLE) {
+      g_batch.begin(a, PRIMES, CHUNKS, &each, &answered, 0);
+    } else {
+      g_on_board = g_batch.by_way[ALPH_FAR];
+      // The board's second actor is the one that stops it.
+      a->send((Word)((BOARD << ALPH_PLACE_SHIFT) | ((Word)1 << ALPH_INDEX_BITS) | 1), QUIT, 0);
+      a->cores()->stop();
+    }
+  }
+  return 0;
+}
+
+fn main(argc: int32, argv: cstring*) -> int32 {
+  var port: int64 = 7461;
+  if (argc > 1) {
+    port = 0;
+    var i: int32 = 0;
+    while (argv[1][i] >= 48 && argv[1][i] <= 57) {
+      port = port * 10 + (int64)(argv[1][i] - 48);
+      i = i + 1;
+    }
+  }
+  // QEMU's serial port calls in over TCP. That connection is the line.
+  var listening: int64 = alph_tcp_listen(port);
+  if (listening < 0) {
+    println("port {port} is taken");
+    return 1;
+  }
+  var line: int64 = ALPH_LATER;
+  var waited: int32 = 0;
+  while (line < 0 && waited < 2000) {
+    line = alph_tcp_accept(listening);
+    waited = waited + 1;
+    Sleep(10);
+  }
+  if (line < 0) {
+    println("no board called");
+    return 1;
+  }
+  syscall(72, line, 4, 0);  // the line's thread reads it and waits
+  alph_line_open(line);
+
+  g_m.init(2, 0, false);
+  g_m.kind(PRIMES, &primes_job, 0);
+  g_m.share(PRIMES);
+  g_m.kind(ANGLE, 0, 0);  // no way to do it here
+  g_m.share(ANGLE);
+  g_m.board(BOARD, 1);
+  g_batch.init(&g_m.places);
+  var pid: Word = g_m.cores.spawn_on(0, &boss, 0);
+  g_m.tell(pid);
+  g_m.time.after(20000, pid, LATE, 0);
+  g_m.run();
+  Sleep(100);  // let the word to stop reach the board
+  g_m.shut();
+  alph_close(line);
+  alph_close(listening);
+  println("{g_angles} angles read by the board. {g_primes} primes below {CHUNK * CHUNKS}: {CHUNKS - g_on_board} chunks counted here, {g_on_board} on the board");
+  if (g_late != 0 || g_wrong != 0 || g_angles != JOINTS || g_primes != 9592 || g_on_board < 1) {
+    return 1;
+  }
+  return 0;
+}

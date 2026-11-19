@@ -8,7 +8,7 @@ An actor is a state and a handler, and the handler runs once for each message th
 
 ## Building
 
-Each layer is one import: `alph/machine/machine` and `alph/batch/batch` (the short way), `alph/actor/actor` (the core), `alph/cores/cores`, `alph/time/time`, `alph/place/place`, `alph/poll/poll`, `alph/life/life`, `alph/link/link`, `alph/name/name`, `alph/door/door` and `alph/seal/seal`. Map alph in your program's `mettle.deps`:
+Each layer is one import: `alph/machine/machine` and `alph/batch/batch` (the short way), `alph/actor/actor` (the core), `alph/cores/cores`, `alph/time/time`, `alph/place/place`, `alph/poll/poll`, `alph/life/life`, `alph/link/link`, `alph/name/name`, `alph/door/door`, `alph/seal/seal`, `alph/tether/tether` and `alph/board/board` (the short way on a board). Map alph in your program's `mettle.deps`:
 
 ```text
 alph=<path to alph>/src
@@ -78,6 +78,7 @@ Every machine runs the same program. Each says how a kind of job is done (`kind`
 - `peer(first, count, ip, port)` adds another machine, up to eight. `start(port)` joins them. A machine on its own needs neither.
 - `kind(kind, cpu, gpu)` says how a kind of job (0 to 7) is done: a function for a core and one for the GPU, 0 for a way it does not have.
 - `share(kind)` shares a kind with the other machines, both ways. With several, a job goes to whichever is least busy. Only a job with no home leaves a machine: one word in, or bytes.
+- `board(first, count)` adds a microcontroller on this machine's serial line that takes work too. See "A board that shares work" under A microcontroller.
 - `tell(pid)` names your actor that hears `ALPH_UP` and `ALPH_DOWN`.
 - `run()` runs the cores until `stop()`, and `shut()` ends the timers and the link afterwards.
 - The layers are fields of the machine, for when you want them: `m.cores`, `m.link`, `m.names`, `m.life`, `m.door`, `m.time`, `m.places`.
@@ -666,6 +667,50 @@ g_far_link.through(0, 1, 1);
 
 A message goes over once: a byte lost on the line loses it. A pid from the bigger machine has to fit the board's word (place below 256, slot below 1,024, generation below 8,192), which holds for actors spawned at the start; a message whose pids do not fit is dropped.
 
+**A board that shares work.** `AlphBoard` is the short way for a board, as `AlphMachine` is for a Linux machine. It is a node, the tether, and an actor for each kind of work the board does for the others. A kind on a board is a function from one word to one word. This is [examples/mcu/arm.mettle](../examples/mcu/arm.mettle), the chip in a robot's arm:
+
+```mettle
+import "alph/board/board";
+import "arm_work";  // count_primes: the file beside it, built into the computer's program too
+
+var g_board: AlphBoard;
+
+fn angle(joint: Word) -> Word {
+  return (Word)(joint * 3) + 1;  // stands for reading a sensor
+}
+
+fn main() -> int32 {
+  alph_board_start();
+  g_board.init(8, 0, 8);  // this board is place 8, and places 0 to 7 are down the line
+  g_board.share(PRIMES, &count_primes);
+  g_board.share(ANGLE, &angle);
+  mettle_irq_enable();
+  g_board.run();
+  return 0;
+}
+```
+
+On the computer the board is one more line of the machine's setup. This is [examples/mcu/arm_host.mettle](../examples/mcu/arm_host.mettle):
+
+```mettle
+alph_line_open(line);  // the serial device, opened by the program
+g_m.init(2, 0, false);
+g_m.kind(PRIMES, &primes_job, 0);
+g_m.share(PRIMES);
+g_m.kind(ANGLE, 0, 0);  // no way to do it here
+g_m.share(ANGLE);
+g_m.board(8, 1);        // a board on this machine's line: place 8, one place
+```
+
+From then on a batch of `ANGLE` jobs goes to the board, and each `PRIMES` job goes to a core here or to the board, wherever it should be done first. The program never says which.
+
+- The actor given to `tell` is sent `ALPH_UP` with the board's place when the board has answered for its kinds, and `ALPH_DOWN` when it has said nothing for two seconds. Jobs out to a lost board are done somewhere else.
+- Begin work that only the board can do after its `ALPH_UP`. Before that no place can run it, and its pieces come back `ALPH_GONE`.
+- A kind given `0, 0` on a machine is only sent from there, never done there. That is how a machine asks for work only another can do.
+- A machine that is not the one on the board's line calls `beyond(peer, first, count)` in place of `board`, with the peer whose line the board is on.
+- The board does one job at a time and nothing else meanwhile, so keep a job well under two seconds. A machine sends it four jobs at a time. A job is one word in and one word out.
+- The board's own actors are spawned on `g_board.node`.
+
 ## Limits
 
 These are not built yet.
@@ -675,6 +720,7 @@ These are not built yet.
 - Sockets are Linux only, and there is no file IO.
 - A message between two cores costs 150 to 300 ns against about 20 ns inside a node. Removing that needs a queue per pair of cores that the sender writes without touching anything the receiver owns, which changes what a full mailbox can tell a sender. Not built.
 - A microcontroller joins through a serial line to one machine, and nothing lost on that line is sent again.
+- A board does jobs of one word in and one word out, one at a time. It takes work but does not hand its own out through places: its actors ask others by pid.
 - A full mailbox at the far end of a link drops its message and the sender is not told.
 - Peers are listed by hand.
 - A watch cannot be dropped across machines.

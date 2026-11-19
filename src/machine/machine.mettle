@@ -5,13 +5,19 @@
 // itself, as this file does.
 //
 // The first core has the door, a place for each other machine that work
-// can be sent to, and the program's own first actors. Every other core takes work. With a
-// GPU, the last core is the GPU's.
+// can be sent to, and the program's own first actors. Every other core
+// takes work. With a GPU, the last core is the GPU's.
 //
 // Sharing: a kind of job that is shared is done by whichever machine should
 // finish it first. Every machine runs the same program: each says how the
 // kind is done (kind) and that it is shared (share). The machine that asks
 // for work is the one that hands it out.
+//
+// A board on a serial line (src/board) shares too. It has no door and
+// sends no beats, so the machine asks it twice a second which kinds it
+// does. A board that has not answered for two seconds is taken for lost,
+// and found again when it answers. A board gets four jobs at a time and
+// each is one word in and one word out.
 
 import "port/port";
 import "alph/actor/actor";
@@ -22,10 +28,28 @@ import "alph/name/name";
 import "alph/life/life";
 import "alph/door/door";
 import "alph/place/place";
+import "alph/tether/tether";
+import "alph/tether/relay";
+import "port/alarm";
 
 const SLOTS: Word = 32;   // actors a core
 const ROOM: Word = 16;    // messages a mailbox
-const SHARED: Word = 1073741824;  // the name of a shared kind is this plus its number
+const ALPH_ROUND: Word = -19;  // the steward's timer: ask the boards again
+const ROUND_MS: Word = 500;
+const QUIET: Word = 4;         // rounds with no answer before a board is taken for lost
+const BOARD_JOBS: Word = 4;    // jobs at a board at once: half its worker's mailbox
+
+// A board this machine shares work with.
+struct AlphOnLine {
+  first: Word;
+  count: Word;      // how many places it has
+  place: Word;      // this machine's place that sends it work
+  up: Word;
+  heard: Word;      // it answered since the last round
+  quiet: Word;      // rounds since it last answered
+  workers: Word[8]; // by kind: its actor that does it, 0 for none
+  asked: Word[8];   // by kind: the ref of the question out to it
+}
 
 // A job taken for another machine.
 struct AlphTaken {
@@ -60,6 +84,12 @@ export struct AlphMachine {
   asked: Word[64];   // by other machine and kind: the ref of the question to its door
   serving: AlphServing[8];
   taken: AlphTaken[16];
+  tether: AlphTether;     // the line to a board, when there is one
+  boards: AlphOnLine[4];  // the boards work is shared with
+  board_count: Word;
+  round_at: Word;         // when the boards are asked next
+  round_owed: Word;       // the word to ask them could not be sent: send it with the next message
+  board_refs: Word;       // refs for questions to boards: small, to fit the 32 bits a line carries
   // The memory the layers work in.
   core: AlphCore[16];
   actors: AlphActor[512];
@@ -69,15 +99,144 @@ export struct AlphMachine {
   name_slots: AlphName[32];
   watches: AlphWatch[64];
   keeps: AlphKeep[32];
-  timers: AlphTimer[16];
+  timers: AlphTimer[32];
   seats: AlphPlace[26];
   kinds: AlphKind[8];
 }
 
+// A board stopped doing a kind, or was lost: its place no longer takes the
+// kind, and is told the worker ended so the jobs out to it go elsewhere.
+fn alph_machine_board_shut(a: AlphActor*, m: AlphMachine*, b: AlphOnLine*, kind: Word) {
+  var gone: AlphMsg = { tag: ALPH_ENDED, from: b->workers[kind], arg: ALPH_LOST, ref: 0 };
+  m->places.far_at(b->place, kind, 0);
+  b->workers[kind] = 0;
+  a->node->put(b->place, &gone);
+}
+
+// Asks a board who does each shared kind there. With none shared it is
+// still asked about one, so it is known to be there.
+fn alph_machine_round(a: AlphActor*, m: AlphMachine*, b: AlphOnLine*) {
+  if (b->heard == 0) {
+    b->quiet = b->quiet + 1;
+    if (b->quiet >= QUIET && b->up != 0) {
+      b->up = 0;
+      for k in 0..8 {
+        if (b->workers[k] != 0) {
+          alph_machine_board_shut(a, m, b, (Word)k);
+        }
+      }
+      if (m->told != 0) {
+        a->send(m->told, ALPH_DOWN, b->first);
+      }
+    }
+  } else {
+    b->quiet = 0;
+  }
+  b->heard = 0;
+  var any: bool = false;
+  for k in 0..8 {
+    b->asked[k] = 0;
+    if (m->shared[k] != 0 || (k == 7 && !any)) {
+      any = true;
+      m->board_refs = m->board_refs + 1;
+      if (m->board_refs >= 1000000) {
+        m->board_refs = 1;
+      }
+      var ask: AlphMsg = { tag: ALPH_WHERE, from: a->pid, arg: ALPH_SHARED + (Word)k, ref: m->board_refs };
+      b->asked[k] = a->node->put(alph_door_of(b->first), &ask);
+      if (b->asked[k] == ALPH_OK) {
+        b->asked[k] = m->board_refs;
+      }
+    }
+  }
+  // Jobs out to the board are looked at here too, in case the places had
+  // no timer free for it.
+  m->places.look(a, b->place);
+}
+
+// A board's answer: whether it does the kind it was asked about, sent as
+// from the actor that does it. Any answer from a board says it is there,
+// one to an earlier round's question too: a busy board answers late.
+fn alph_machine_board_said(a: AlphActor*, m: AlphMachine*, msg: AlphMsg*) -> bool {
+  var place: Word = (Word)(msg->from >> ALPH_PLACE_SHIFT);
+  for i in 0..m->board_count {
+    var b: AlphOnLine* = &m->boards[i];
+    if (place < b->first || place >= b->first + b->count) {
+      continue;
+    }
+    b->heard = 1;
+    for k in 0..8 {
+      if (b->asked[k] != msg->ref || msg->ref <= 0) {
+        continue;
+      }
+      b->asked[k] = 0;
+      var worker: Word = 0;
+      if (msg->arg != 0 && m->shared[k] != 0) {
+        worker = msg->from;
+      }
+      if (b->workers[k] != 0 && b->workers[k] != worker) {
+        alph_machine_board_shut(a, m, b, (Word)k);
+      }
+      if (worker != 0) {
+        // Said every round: the place may have shut the kind by itself,
+        // when the way to the board was gone for a moment.
+        b->workers[k] = worker;
+        m->places.far_at(b->place, (Word)k, worker);
+      }
+      // It is up once every question of a round is answered, so the
+      // program hears of it with all its kinds already in place.
+      var owed: bool = false;
+      for q in 0..8 {
+        if (b->asked[q] != 0) {
+          owed = true;
+        }
+      }
+      if (b->up == 0 && !owed) {
+        b->up = 1;
+        if (m->told != 0) {
+          a->send(m->told, ALPH_UP, b->first);
+        }
+      }
+      return true;
+    }
+    return true;
+  }
+  return false;
+}
+
 // Hears of machines coming and going, asks a new one's door for the worker
 // of every shared kind, and gives each one found to that machine's place.
+// It asks the boards the same on a timer.
 fn alph_machine_steward(a: AlphActor*, msg: AlphMsg*) -> Word {
   var m: AlphMachine* = (AlphMachine*)a->state;
+  if (m->round_owed != 0 && msg->tag != ALPH_ROUND) {
+    var round: AlphMsg = { tag: ALPH_ROUND, from: a->pid, arg: 0, ref: 0 };
+    if (a->node->put(a->pid, &round) == ALPH_OK) {
+      m->round_owed = 0;
+    }
+  }
+  if (msg->tag == ALPH_ROUND) {
+    // If no timer is free the steward sends itself the word, and waits for
+    // the time here. If that cannot be sent either, it goes with the next
+    // message the steward gets.
+    if (alph_now() >= m->round_at) {
+      for i in 0..m->board_count {
+        alph_machine_round(a, m, &m->boards[i]);
+      }
+      m->round_at = alph_now() + alph_ms(ROUND_MS);
+      if (m->time.after(ROUND_MS, a->pid, ALPH_ROUND, 0) > 0) {
+        return 0;
+      }
+    }
+    m->round_owed = 0;
+    if (a->node->put(a->pid, msg) != ALPH_OK) {
+      m->round_owed = 1;
+    }
+    return 0;
+  }
+  if (msg->tag == ALPH_HERE && alph_machine_board_said(a, m, msg)) {
+    return 0;
+  }
   if (msg->tag == ALPH_UP) {
     var again: bool = false;
     for i in 0..m->peer_count {
@@ -86,7 +245,7 @@ fn alph_machine_steward(a: AlphActor*, msg: AlphMsg*) -> Word {
       }
       for k in 0..8 {
         if (m->shared[k] != 0) {
-          m->asked[i * 8 + k] = m->door.find(a, msg->arg, SHARED + (Word)k);
+          m->asked[i * 8 + k] = m->door.find(a, msg->arg, ALPH_SHARED + (Word)k);
           if (m->asked[i * 8 + k] == ALPH_FULL) {
             again = true;
           }
@@ -195,6 +354,10 @@ export fn AlphMachine_init__ptr(m: AlphMachine*, cores: Word, first: Word, gpu: 
   m->told = 0;
   m->served = 0;
   m->peer_count = 0;
+  m->board_count = 0;
+  m->round_at = 0;
+  m->round_owed = 0;
+  m->board_refs = 0;
   m->far_place = 0;
   for k in 0..8 {
     m->shared[k] = 0;
@@ -214,7 +377,7 @@ export fn AlphMachine_init__ptr(m: AlphMachine*, cores: Word, first: Word, gpu: 
   m->door.init(&m->cores, &m->link, &m->names, &m->life);
   m->steward = m->cores.spawn_on(0, &alph_machine_steward, (rawptr)m);
   m->door.tell(m->steward);
-  m->time.init(&m->core[0].node, &m->timers[0], 16);
+  m->time.init(&m->core[0].node, &m->timers[0], 32);
   m->places.init(&m->seats[0], 26, &m->kinds[0], 8);
   m->places.clock(&m->time);
   m->places.net(&m->link);
@@ -246,6 +409,57 @@ export fn AlphMachine_peer__ptr(m: AlphMachine*, first: Word, count: Word, ip: u
   return ALPH_OK;
 }
 
+// A board this machine shares work with: its places are first, first + 1, ...
+fn alph_machine_board(m: AlphMachine*, first: Word, count: Word) -> Word {
+  if (m->board_count >= 4) {
+    return ALPH_FULL;
+  }
+  var b: AlphOnLine* = &m->boards[m->board_count];
+  b->first = first;
+  b->count = count;
+  b->up = 0;
+  b->heard = 0;
+  b->quiet = 0;
+  for k in 0..8 {
+    b->workers[k] = 0;
+    b->asked[k] = 0;
+  }
+  b->place = m->places.on_core(&m->cores, 0, ALPH_FAR);
+  if (b->place == 0) {
+    return ALPH_FULL;
+  }
+  m->places.limit(b->place, BOARD_JOBS);
+  m->board_count = m->board_count + 1;
+  if (m->board_count == 1) {
+    var round: AlphMsg = { tag: ALPH_ROUND, from: m->steward, arg: 0, ref: 0 };
+    m->cores.cores[0].node.put(m->steward, &round);
+  }
+  return ALPH_OK;
+}
+
+// A board on this machine's serial line (src/board): where its places
+// start and how many it has. This machine passes the board's mail on, so
+// the other machines reach it too. Give the port the line's descriptor
+// first (alph_line_open). Call it once, before start and run. Returns
+// ALPH_FULL when there is no room for it.
+export fn AlphMachine_board__ptr(m: AlphMachine*, first: Word, count: Word) -> Word {
+  var out: Word = alph_machine_board(m, first, count);
+  if (out == ALPH_OK) {
+    m->tether.relay(&m->link, first, count);
+  }
+  return out;
+}
+
+// A board on another machine's serial line: peer is where that machine's
+// places start, and it must be a peer already. Returns ALPH_GONE when it
+// is not, ALPH_FULL when there is no room for the board.
+export fn AlphMachine_beyond__ptr(m: AlphMachine*, peer: Word, first: Word, count: Word) -> Word {
+  if (m->link.through(peer, first, count) != ALPH_OK) {
+    return ALPH_GONE;
+  }
+  return alph_machine_board(m, first, count);
+}
+
 // Says how a kind of job (0 to 7) is done on a core and on the GPU, 0 for a
 // way it does not have.
 export fn AlphMachine_kind__ptr(m: AlphMachine*, kind: Word, cpu: fn(AlphJob*) -> Word, gpu: fn(AlphJob*) -> Word) {
@@ -256,12 +470,19 @@ export fn AlphMachine_kind__ptr(m: AlphMachine*, kind: Word, cpu: fn(AlphJob*) -
 
 // Shares a kind with the other machines: this machine does it for them, and
 // its own jobs of the kind may go to them. Call it after kind, on every
-// machine that should take part. Only jobs with no home (a word in, or
-// bytes) leave a machine. Returns ALPH_FULL when the first core has no room for one more
-// actor, ALPH_GONE for a kind that is not 0 to 7.
+// machine that should take part. A machine with no way of its own to do
+// the kind (kind was given 0 and 0) only sends it: that is how work only a
+// board can do, such as moving an arm, is asked for here. Only jobs with no
+// home (a word in, or bytes) leave a machine. Returns ALPH_FULL when the
+// first core has no room for one more actor, ALPH_GONE for a kind that is
+// not 0 to 7.
 export fn AlphMachine_share__ptr(m: AlphMachine*, kind: Word) -> Word {
   if (kind < 0 || kind >= 8) {
     return ALPH_GONE;
+  }
+  if (m->kinds[kind].cpu == 0 && m->kinds[kind].gpu == 0) {
+    m->shared[kind] = 1;
+    return ALPH_OK;
   }
   m->serving[kind].machine = m;
   m->serving[kind].kind = kind;
@@ -270,7 +491,7 @@ export fn AlphMachine_share__ptr(m: AlphMachine*, kind: Word) -> Word {
     return ALPH_FULL;
   }
   m->shared[kind] = 1;
-  return m->names.set(SHARED + kind, pid);
+  return m->names.set(ALPH_SHARED + kind, pid);
 }
 
 // The program's actor that is told ALPH_UP and ALPH_DOWN as other machines

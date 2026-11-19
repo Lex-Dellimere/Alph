@@ -96,10 +96,11 @@ fn alph_relay_beyond(l: AlphLink*, to: Word, m: AlphMsg*) -> Word {
 // are first, first + 1, ... Call it after the link's init and before its
 // start, with the line's descriptor already given to the port.
 export fn AlphTether_relay__ptr(t: AlphTether*, link: AlphLink*, first: Word, count: Word) {
-  t->open(&link->cores->cores[0].node, first, count);
+  // Set before the line is opened: its thread may take a message at once.
   t->relay = 1;
   g_tether = t;
   link->beyond = &alph_relay_beyond;
   link->beyond_ctx = (rawptr)t;
+  t->open(&link->cores->cores[0].node, first, count);
   CreateThread(0, 0, &alph_relay_main, 0, 0, 0);
 }

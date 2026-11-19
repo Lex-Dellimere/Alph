@@ -1,0 +1,30 @@
+// The work the board and the Linux machine both know how to do. It is one
+// file, built into both programs.
+
+import "port/port";
+
+export const PRIMES: Word = 0;  // in is a chunk's number, out the primes in that chunk
+export const ANGLE: Word = 1;   // in is a joint, out its angle: only the board can tell
+export const QUIT: Word = 3;
+export const CHUNK: Word = 500;
+
+export fn count_primes(chunk: Word) -> Word {
+  var n: Word = (Word)(chunk * CHUNK);
+  var end: Word = n + CHUNK;
+  var found: Word = 0;
+  while (n < end) {
+    var prime: bool = n >= 2;
+    var d: Word = 2;
+    while (prime && (Word)(d * d) <= n) {
+      if ((Word)(n % d) == 0) {
+        prime = false;
+      }
+      d = d + 1;
+    }
+    if (prime) {
+      found = found + 1;
+    }
+    n = n + 1;
+  }
+  return found;
+}
