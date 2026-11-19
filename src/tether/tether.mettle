@@ -13,7 +13,8 @@
 // start. A message's tag, arg and ref cross as 32 bits each, so a bigger
 // machine's larger numbers are cut short.
 //
-// A process has one line, and so one tether.
+// A board has one line, and so one tether. A Linux process has up to four
+// lines (see the host port's line file), each with a tether of its own.
 
 import "port/port";
 import "port/line";
@@ -55,6 +56,8 @@ export struct AlphTether {
   escaped: Word;
   dropped: Word;  // messages that came in damaged, or with a pid too big for here
   relay: Word;    // mail off the line for places other than this node's is passed on
+  line: Word;     // which of the port's lines this is: 0 on a board
+  sure: AlphSure*;  // what makes the line sure, 0 when it is not
   frame: uint8[34];
 }
 
@@ -85,7 +88,6 @@ export struct AlphSure {
   damage: Word;   // for tests: about one frame in so many has a byte changed
 }
 
-var g_keeper: AlphSure* = 0;  // the line's, as a process has one line
 
 fn alph_tether_put(out: uint8*, value: Word, bytes: Word) {
   for i in 0..bytes {
@@ -157,7 +159,7 @@ export fn AlphTether_send__ptr(t: AlphTether*, to: Word, m: AlphMsg*) -> Word {
   // One message at a time on the line. The line has a lock of its own and
   // not the node's gate: a slow line must not stop the node, and the two
   // machines must each go on reading while they write.
-  alph_line_lock();
+  alph_line_use(t->line);
   for i in 0..34 {
     alph_tether_byte((int32)out[i]);
   }
@@ -247,9 +249,13 @@ export fn AlphTether_open__ptr(t: AlphTether*, node: AlphNode*, first: Word, cou
   t->have = 0;
   t->escaped = 0;
   t->dropped = 0;
+  t->sure = 0;
+  t->line = alph_line_which();
+  alph_line_use(t->line);
   alph_line_put((uint8)END);
   alph_line_flush();
   alph_line_start(&alph_tether_take, (rawptr)t);
+  alph_line_unlock();
 }
 
 // Ties a node to the machine at the other end of the port's line. The node
@@ -319,7 +325,7 @@ fn alph_sure_helper(a: AlphActor*, m: AlphMsg*) -> Word {
       out[2] = out[2] + 1;
     }
     if (s->lose == 0 || (Word)(n % s->lose) != 0) {
-      alph_line_lock();
+      alph_line_use(s->t->line);
       for i in 0..7 {
         alph_line_put(out[i]);
       }
@@ -438,7 +444,7 @@ fn alph_sure_take(ctx: rawptr, byte: int32) {
 // are kept already, so the sender can try again later. On a line that is
 // not sure it is send.
 export fn AlphTether_keep__ptr(t: AlphTether*, to: Word, m: AlphMsg*) -> Word {
-  var s: AlphSure* = g_keeper;
+  var s: AlphSure* = t->sure;
   if (s == 0) {
     return t->send(to, m);
   }
@@ -486,7 +492,7 @@ fn alph_sure_longer(ticks: Word) -> Word {
 // twice as long, up to 8 ticks, unless messages came early: then one is
 // surely missing. On a line that is not sure it does nothing.
 export fn AlphTether_tick__ptr(t: AlphTether*) {
-  var s: AlphSure* = g_keeper;
+  var s: AlphSure* = t->sure;
   if (s == 0) {
     return;
   }
@@ -541,11 +547,13 @@ export fn AlphTether_sure__ptr(t: AlphTether*, s: AlphSure*, kept: AlphKept*, ro
     s->room = (Word)(s->room >> 1);
   }
   s->owe = OWE_CHASE;  // says this run is here
-  g_keeper = s;
+  t->sure = s;
   if (t->relay == 0) {
     t->node->far = &alph_sure_far;
   }
+  alph_line_use(t->line);
   alph_line_start(&alph_sure_take, (rawptr)s);
+  alph_line_unlock();
   alph_sure_wake(s);
   return ALPH_OK;
 }

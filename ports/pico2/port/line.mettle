@@ -5,6 +5,8 @@
 // has the board's external interrupt handler, so a program with other
 // external sources adds them here.
 
+import "port/port";
+
 var g_take: fn(rawptr, int32) -> void;
 var g_ctx: rawptr;
 
@@ -29,6 +31,14 @@ export fn alph_line_lock() {
 }
 
 export fn alph_line_unlock() {
+}
+
+// A board has one line: 0.
+export fn alph_line_which() -> Word {
+  return 0;
+}
+
+export fn alph_line_use(line: Word) {
 }
 
 @interrupt fn mettle_trap_external() {

@@ -14,6 +14,10 @@
 //                           machine shares with it for a second and a half,
 //                           then says nothing more but keeps the line open.
 //                           The board must notice and stop by itself
+//   arm_test <port> two     two boards on two serial lines of this one
+//                           machine (the second is tests/mcu/second_board,
+//                           calling in on port + 1): work only a board can
+//                           do goes to both
 //   arm_test <port> slow    the board is tests/mcu/slow_board.mettle, whose
 //                           jobs take 700 ms each: all are answered, and
 //                           none is taken for lost while the board works
@@ -48,6 +52,10 @@ var g_slow: bool = false;
 var g_beyond: bool = false;
 var g_asks: bool = false;
 var g_quiet: bool = false;
+var g_two: bool = false;
+var g_ups: Word = 0;
+var g_by_first: Word = 0;
+var g_by_second: Word = 0;
 var g_on_board: Word = 0;
 
 fn now_ns() -> Word {
@@ -74,6 +82,15 @@ fn each(b: AlphBatch*, job: AlphJob*, piece: Word) {
 fn answered(b: AlphBatch*, job: AlphJob*, piece: Word) {
   if (job->status != ALPH_OK) {
     g_wrong = g_wrong + 1;
+  } else if (g_two) {
+    // The first board answers a joint's number times 3 plus 1, the second plus 2.
+    if (job->out == (Word)(piece * 3) + 1) {
+      g_by_first = g_by_first + 1;
+    } else if (job->out == (Word)(piece * 3) + 2) {
+      g_by_second = g_by_second + 1;
+    } else {
+      g_wrong = g_wrong + 1;
+    }
   } else if (b->kind == ANGLE) {
     g_angles = g_angles + 1;
     if (job->out != (Word)(piece * 3) + 1 || job->way != ALPH_FAR) {
@@ -98,6 +115,20 @@ fn boss(a: AlphActor*, m: AlphMsg*) -> Word {
   if (g_quiet) {
     // Shares with the board for a second and a half, then stops for good.
     if (m->tag == TICK) {
+      a->cores()->stop();
+    }
+    return 0;
+  }
+  if (g_two) {
+    // Begins when both boards are heard, and stops both at the end.
+    if (m->tag == ALPH_UP && (m->arg == BOARD || m->arg == BOARD + 1)) {
+      g_ups = g_ups + 1;
+      if (g_ups == 2) {
+        g_batch.begin(a, ANGLE, 60, &each, &answered, 0);
+      }
+    } else if (g_batch.took(a, m) && g_batch.over()) {
+      quit_board(a);
+      a->send((Word)(((BOARD + 1) << ALPH_PLACE_SHIFT) | ((Word)1 << ALPH_INDEX_BITS) | 1), QUIT, 0);
       a->cores()->stop();
     }
     return 0;
@@ -159,7 +190,7 @@ fn near_main(arg: cstring) -> uint32 {
 
 fn main(argc: int32, argv: cstring*) -> int32 {
   if (argc < 3) {
-    println("arm_test <port> lost|beyond|slow|asks|quiet");
+    println("arm_test <port> lost|beyond|slow|asks|quiet|two");
     return 2;
   }
   var port: int64 = 0;
@@ -173,6 +204,7 @@ fn main(argc: int32, argv: cstring*) -> int32 {
   g_beyond = argv[2][0] == 98;   // b
   g_asks = argv[2][0] == 97;     // a
   g_quiet = argv[2][0] == 113;   // q
+  g_two = argv[2][0] == 116;     // t
   var listening: int64 = alph_tcp_listen(port);
   if (listening < 0) {
     println("port {port} is taken");
@@ -204,6 +236,28 @@ fn main(argc: int32, argv: cstring*) -> int32 {
     g_near.peer(4, 2, here, port + 2);
   }
   g_near.board(BOARD, 1);
+  var listening2: int64 = -1;
+  var line2: int64 = ALPH_LATER;
+  if (g_two) {
+    // The second board calls in on the next port: a second line.
+    listening2 = alph_tcp_listen(port + 1);
+    waited = 0;
+    while (listening2 >= 0 && line2 < 0 && waited < 2000) {
+      line2 = alph_tcp_accept(listening2);
+      waited = waited + 1;
+      Sleep(10);
+    }
+    if (line2 < 0) {
+      println("no second board called");
+      return 1;
+    }
+    syscall(ALPH_NR_FCNTL, line2, 4, 0);
+    alph_line_open(line2);
+    if (g_near.board(BOARD + 1, 1) != ALPH_OK) {
+      println("FAIL a second board");
+      return 1;
+    }
+  }
   if (g_beyond) {
     // The machine that asks: places 4 and 5, the board through the other.
     asking = &g_far;
@@ -257,6 +311,14 @@ fn main(argc: int32, argv: cstring*) -> int32 {
   alph_close(line);
   alph_close(listening);
   var failures: int32 = 0;
+  if (g_two) {
+    if (g_late != 0 || g_wrong != 0 || g_by_first == 0 || g_by_second == 0 || g_by_first + g_by_second != 60) {
+      println("FAIL two boards: {g_by_first} and {g_by_second} of 60 jobs, {g_wrong} wrong, late {g_late}");
+      return 1;
+    }
+    println("two boards ok: of 60 jobs only a board can do, {g_by_first} went to the first and {g_by_second} to the second");
+    return 0;
+  }
   if (g_asks) {
     if (g_late != 0 || g_near.served < 6) {
       println("FAIL the board asked for {g_near.served} jobs of 6");

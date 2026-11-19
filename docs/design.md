@@ -98,6 +98,8 @@ A board is too small for a door and sends no beats, so two things differ from a 
 
 A board asks for work too. It asks the door at the other end of its line who does a kind, and sends the job there. A door answers as from the actor it found, so the board learns that pid from who the answer is from. The other end can be a computer or another board, so two boards on one line share work with nothing else (`examples/mcu/two.mettle`).
 
+A computer has up to four serial lines, a board on each, so the two chips of an arm and the computer that plans are one machine. Each board is a place of its own with its own measured time. With two boards that both read angles, 60 jobs went 30 and 30.
+
 A board must also know when its machine is gone, because a board that moves something has to stop then. The machine's question twice a second is the sign of life: the board counts them (`heard`), and a program that sees the count stand still for a second or two stops what it drives. It costs the board one add.
 
 The board runs one job at a time, so a machine sends it at most four and a place has a limit for that. Nothing on the line is sent again: a job or an answer lost there is given up on after a second and placed again.

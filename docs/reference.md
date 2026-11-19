@@ -19,7 +19,8 @@ finish it first. Every machine runs the same program: each says how the
 kind is done (kind) and that it is shared (share). The machine that asks
 for work is the one that hands it out.
 
-A board on a serial line (src/board) shares too. It has no door and
+A board on a serial line (src/board) shares too, and a machine has up to
+four serial lines, a board on each. It has no door and
 sends no beats, so the machine asks it twice a second which kinds it
 does. A board that has not answered for two seconds is taken for lost,
 and found again when it answers. A board gets four jobs at a time and
@@ -47,7 +48,9 @@ export struct AlphMachine {
   serving: AlphServing[8];
   taken: AlphTaken[16];
   done: AlphOnce[8];      // by kind: what is remembered of jobs that must not be done twice
-  tether: AlphTether;     // the line to a board, when there is one
+  tether: AlphTether;     // the line to the first board on this machine's own lines,
+  more: AlphTether[3];    // and to the second, third and fourth
+  lines: Word;            // how many boards are on this machine's own lines
   boards: AlphOnLine[4];  // the boards work is shared with
   board_count: Word;
   round_at: Word;         // when the boards are asked next
@@ -103,11 +106,23 @@ export fn AlphMachine_board__ptr(m: AlphMachine*, first: Word, count: Word) -> W
 
 Call it as `m->board(first, count)`, or `m.board(first, count)` on a value.
 
-A board on this machine's serial line (src/board): where its places
-start and how many it has. This machine passes the board's mail on, so
-the other machines reach it too. Give the port the line's descriptor
-first (alph_line_open). Call it once, before start and run. Returns
-ALPH_FULL when there is no room for it.
+A board on one of this machine's serial lines (src/board): where its
+places start and how many it has. This machine passes the board's mail
+on, so the other machines and its other boards reach it too. Give the
+port the line's descriptor first (alph_line_open): the board is on the
+line opened last. Call it before start and run, once for each board, up
+to four. Returns ALPH_FULL when there is no room for it.
+
+### `AlphMachine_line__ptr`
+
+```mettle
+export fn AlphMachine_line__ptr(m: AlphMachine*, n: Word) -> AlphTether*
+```
+
+Call it as `m->line(n)`, or `m.line(n)` on a value.
+
+The line to the n-th board added with board, counted from 0: for making
+it sure (AlphTether_sure), say. 0 when n is not 0 to 3.
 
 ### `AlphMachine_beyond__ptr`
 
@@ -2536,7 +2551,10 @@ Closes the socket.
 
 A line of bytes to one other machine: any descriptor that carries bytes
 both ways, such as a serial port or a TCP connection. A thread reads it
-and hands each byte that arrives to take. A process has one line.
+and hands each byte that arrives to take. A process has up to four
+lines. Each is opened, then set up, before the next is opened. Senders
+pick a line with alph_line_use, which they hold until alph_line_unlock,
+so one message at a time goes out, on whichever line.
 
 ### `alph_line_open`
 
@@ -2544,8 +2562,17 @@ and hands each byte that arrives to take. A process has one line.
 export fn alph_line_open(fd: int64)
 ```
 
-The descriptor the line is: set it before the line is started. It must
-wait when read (not be set non-blocking).
+Adds a line: the descriptor it is. It must wait when read (not be set
+non-blocking). The line stays the one being set up (alph_line_which)
+until the next is opened. A fifth takes the fourth's place.
+
+### `alph_line_which`
+
+```mettle
+export fn alph_line_which() -> Word
+```
+
+Which line was opened last: 0 for the first.
 
 ### `alph_line_start`
 
@@ -2553,7 +2580,9 @@ wait when read (not be set non-blocking).
 export fn alph_line_start(take: fn(rawptr, int32) -> void, ctx: rawptr)
 ```
 
-Called again, it only changes where the bytes go: one thread reads.
+Says where the bytes that arrive on the line in use go, and starts
+reading it. Called again, it only changes where they go: one thread
+reads a line.
 
 ### `alph_line_put`
 
@@ -2561,7 +2590,7 @@ Called again, it only changes where the bytes go: one thread reads.
 export fn alph_line_put(byte: uint8)
 ```
 
-Puts one byte on the line. It goes out at the next flush, or when 128 are waiting.
+Puts one byte on the line in use. It goes out at the next flush, or when 128 are waiting.
 
 ### `alph_line_flush`
 
@@ -2570,6 +2599,15 @@ export fn alph_line_flush()
 ```
 
 Sends what was put. If the other end is gone the rest is dropped.
+
+### `alph_line_use`
+
+```mettle
+export fn alph_line_use(line: Word)
+```
+
+Takes the lines for one whole message on line `line`, so two senders'
+bytes do not mix. Give them back with alph_line_unlock.
 
 ### `alph_line_lock`
 
@@ -2621,7 +2659,8 @@ and its generation below 8,192, which holds for actors spawned at the
 start. A message's tag, arg and ref cross as 32 bits each, so a bigger
 machine's larger numbers are cut short.
 
-A process has one line, and so one tether.
+A board has one line, and so one tether. A Linux process has up to four
+lines (see the host port's line file), each with a tether of its own.
 
 ### `AlphKept`
 
@@ -2645,6 +2684,8 @@ export struct AlphTether {
   escaped: Word;
   dropped: Word;  // messages that came in damaged, or with a pid too big for here
   relay: Word;    // mail off the line for places other than this node's is passed on
+  line: Word;     // which of the port's lines this is: 0 on a board
+  sure: AlphSure*;  // what makes the line sure, 0 when it is not
   frame: uint8[34];
 }
 ```
@@ -2785,7 +2826,8 @@ thread, so the program has nothing more to do.
 The board has no door: its actors are reached by pid, not found by name
 or watched from other machines.
 
-Linux only, since the link is. A process has one relay, as it has one line.
+Linux only, since the link is. A process has up to four relays, one for
+each of its lines: open a line, then relay its board, then the next.
 
 ### `AlphTether_relay__ptr`
 
@@ -2797,7 +2839,8 @@ Call it as `t->relay(link, first, count)`, or `t.relay(link, first, count)` on a
 
 Puts a board on this machine's line behind its link. The board's places
 are first, first + 1, ... Call it after the link's init and before its
-start, with the line's descriptor already given to the port.
+start, with the line's descriptor just given to the port (alph_line_open):
+the board is on the line opened last. A fifth board is not taken.
 
 ## port/board (mcu port)
 

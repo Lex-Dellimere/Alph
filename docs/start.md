@@ -751,6 +751,7 @@ From then on a batch of `ANGLE` jobs goes to the board, and each `PRIMES` job go
 - Begin work that only the board can do after its `ALPH_UP`. Before that no place can run it, and its pieces come back `ALPH_GONE`.
 - A kind given `0, 0` on a machine is only sent from there, never done there. That is how a machine asks for work only another can do.
 - A machine that is not the one on the board's line calls `beyond(peer, first, count)` in place of `board`, with the peer whose line the board is on.
+- A computer can have up to four boards, each on a serial line of its own. Open a line, add its board, then the next: `alph_line_open(fd_a); g_m.board(8, 1); alph_line_open(fd_b); g_m.board(9, 1);`. Work goes to whichever board should finish it first, and `g_m.line(n)` is the line to the n-th board.
 - The board does one job at a time and nothing else meanwhile, so keep a job well under two seconds. A machine sends it four jobs at a time. A job is one word in and one word out.
 - The board's own actors are spawned on `g_board.node`.
 - A board that moves something must stop when its computer is gone. The computer asks the board something twice a second, and `g_board.heard` goes up each time. Look at it on a timer of your own: when it has not gone up for a second or two, the computer has stopped or the line is cut. [tests/mcu/safe_board.mettle](../tests/mcu/safe_board.mettle) does this in twenty lines.

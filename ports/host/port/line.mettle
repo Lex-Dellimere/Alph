@@ -1,9 +1,13 @@
 // A line of bytes to one other machine: any descriptor that carries bytes
 // both ways, such as a serial port or a TCP connection. A thread reads it
-// and hands each byte that arrives to take. A process has one line.
+// and hands each byte that arrives to take. A process has up to four
+// lines. Each is opened, then set up, before the next is opened. Senders
+// pick a line with alph_line_use, which they hold until alph_line_unlock,
+// so one message at a time goes out, on whichever line.
 
 import "std/thread";
 import "port/sys";
+import "port/port";
 
 const MSG_NOSIGNAL: int64 = 16384;
 const EINTR: int64 = -4;
@@ -14,61 +18,88 @@ extern fn mettle_atomic_compare_exchange_i32(target: int32*, exchange: int32, co
 
 var g_lock: int32 = 0;
 
-var g_fd: int64 = -1;
-var g_take: fn(rawptr, int32) -> void;
-var g_ctx: rawptr;
-var g_out: uint8[128];
-var g_have: int64 = 0;
-var g_started: int32 = 0;
+struct Line {
+  fd: int64;
+  take: fn(rawptr, int32) -> void;
+  ctx: rawptr;
+  have: int64;
+  started: int32;
+  out: uint8[128];
+}
 
-// The descriptor the line is: set it before the line is started. It must
-// wait when read (not be set non-blocking).
+var g_lines: Line[4];
+var g_count: int32 = 0;
+var g_setup: int32 = 0;  // the line opened last
+var g_cur: int32 = 0;    // the line the holder of the lock is using
+
+// Adds a line: the descriptor it is. It must wait when read (not be set
+// non-blocking). The line stays the one being set up (alph_line_which)
+// until the next is opened. A fifth takes the fourth's place.
 export fn alph_line_open(fd: int64) {
-  g_fd = fd;
+  alph_line_lock();
+  if (g_count < 4) {
+    g_count = g_count + 1;
+  }
+  g_setup = g_count - 1;
+  g_cur = g_setup;
+  g_lines[g_setup].fd = fd;
+  g_lines[g_setup].have = 0;
+  alph_line_unlock();
+}
+
+// Which line was opened last: 0 for the first.
+export fn alph_line_which() -> Word {
+  return (Word)g_setup;
 }
 
 fn alph_line_main(arg: cstring) -> uint32 {
+  var l: Line* = (Line*)arg;
   var bytes: uint8[256];
   while (true) {
-    var got: int64 = syscall(ALPH_NR_READ, g_fd, (int64)&bytes[0], 256);
+    var got: int64 = syscall(ALPH_NR_READ, l->fd, (int64)&bytes[0], 256);
     if (got <= 0) {
       return 0;  // the other end is gone
     }
     for i in 0..got {
-      g_take(g_ctx, (int32)bytes[i]);
+      l->take(l->ctx, (int32)bytes[i]);
     }
   }
   return 0;
 }
 
-// Called again, it only changes where the bytes go: one thread reads.
+// Says where the bytes that arrive on the line in use go, and starts
+// reading it. Called again, it only changes where they go: one thread
+// reads a line.
 export fn alph_line_start(take: fn(rawptr, int32) -> void, ctx: rawptr) {
-  g_ctx = ctx;
-  g_take = take;
-  if (g_started == 0) {
-    g_started = 1;
-    CreateThread(0, 0, &alph_line_main, 0, 0, 0);
+  var l: Line* = &g_lines[g_cur];
+  l->ctx = ctx;
+  l->take = take;
+  if (l->started == 0) {
+    l->started = 1;
+    CreateThread(0, 0, &alph_line_main, (cstring)l, 0, 0);
   }
 }
 
-// Puts one byte on the line. It goes out at the next flush, or when 128 are waiting.
+// Puts one byte on the line in use. It goes out at the next flush, or when 128 are waiting.
 export fn alph_line_put(byte: uint8) {
-  if (g_have == 128) {
+  var l: Line* = &g_lines[g_cur];
+  if (l->have == 128) {
     alph_line_flush();
   }
-  g_out[g_have] = byte;
-  g_have = g_have + 1;
+  l->out[l->have] = byte;
+  l->have = l->have + 1;
 }
 
 // Sends what was put. If the other end is gone the rest is dropped.
 export fn alph_line_flush() {
+  var l: Line* = &g_lines[g_cur];
   var sent: int64 = 0;
-  while (sent < g_have) {
+  while (sent < l->have) {
     // As a send that raises no signal: a plain write to a connection whose
     // other end is gone would end the process with SIGPIPE.
-    var put: int64 = syscall(ALPH_NR_SENDTO, g_fd, (int64)&g_out[sent], g_have - sent, MSG_NOSIGNAL, 0, 0);
+    var put: int64 = syscall(ALPH_NR_SENDTO, l->fd, (int64)&l->out[sent], l->have - sent, MSG_NOSIGNAL, 0, 0);
     if (put == ENOTSOCK) {
-      put = syscall(ALPH_NR_WRITE, g_fd, (int64)&g_out[sent], g_have - sent);
+      put = syscall(ALPH_NR_WRITE, l->fd, (int64)&l->out[sent], l->have - sent);
     }
     if (put == EINTR) {
       continue;
@@ -78,7 +109,14 @@ export fn alph_line_flush() {
     }
     sent = sent + put;
   }
-  g_have = 0;
+  l->have = 0;
+}
+
+// Takes the lines for one whole message on line `line`, so two senders'
+// bytes do not mix. Give them back with alph_line_unlock.
+export fn alph_line_use(line: Word) {
+  alph_line_lock();
+  g_cur = (int32)line;
 }
 
 // Held while one whole message is put and flushed, so two senders' bytes

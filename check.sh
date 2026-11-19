@@ -283,6 +283,8 @@ build_board() {
         --emit-flat "$OUT/asking_board.bin" -I ports/mcu >> "$log" 2>&1 &&
       "$METTLE" --release tests/mcu/safe_board.mettle --target riscv32-none --board qemu-virt \
         --emit-flat "$OUT/safe_board.bin" -I ports/mcu >> "$log" 2>&1 &&
+      "$METTLE" --release tests/mcu/second_board.mettle --target riscv32-none --board qemu-virt \
+        --emit-flat "$OUT/second_board.bin" -I ports/mcu >> "$log" 2>&1 &&
       "$METTLE" --build -s --release examples/mcu/arm_host.mettle -I ports/host -o "$OUT/arm_host" >> "$log" 2>&1 &&
       "$METTLE" --build -s --release tests/mcu/arm_test.mettle -I ports/host -o "$OUT/arm_test" >> "$log" 2>&1 || status=1
       ;;
@@ -525,6 +527,36 @@ step_arm() {
   fi
 }
 
+# One computer with two boards, each on a serial line of its own: work only
+# a board can do goes to both.
+step_lines() {
+  local log="$OUT/arm.log" port host_pid first_pid first second code
+  built arm || return
+  port=$((16431 + $$ % 300 * 3))
+  timeout 60 "$OUT/arm_test" "$port" two > "$log.host" 2>&1 &
+  host_pid=$!
+  sleep 0.3
+  timeout 50 qemu-system-riscv32 -M virt -bios none -display none -monitor none \
+    -serial "tcp:127.0.0.1:$port" -device loader,file="$OUT/arm.bin",addr=0x80000000,force-raw=on >> "$log" 2>&1 &
+  first_pid=$!
+  sleep 0.5
+  timeout 50 qemu-system-riscv32 -M virt -bios none -display none -monitor none \
+    -serial "tcp:127.0.0.1:$((port + 1))" -device loader,file="$OUT/second_board.bin",addr=0x80000000,force-raw=on >> "$log" 2>&1
+  second=$?
+  wait "$first_pid"
+  first=$?
+  wait "$host_pid"
+  code=$?
+  cat "$log.host" >> "$log"
+  if [ "$code" -eq 0 ] && [ "$first" -eq 0 ] && [ "$second" -eq 0 ]; then
+    echo "ok    mcu/arm_test two [$(tail -n 1 "$log.host")]"
+  else
+    echo "FAIL  mcu/arm_test two: host exit $code, boards exit $first and $second (see $log)"
+    tail -n 4 "$log.host" | sed 's/^/      /'
+    fails=$((fails + 1))
+  fi
+}
+
 # Both harts of one board: the cores layer with a node on each.
 step_harts() {
   local bin="$OUT/harts.bin" log="$OUT/harts.log" got
@@ -675,6 +707,7 @@ if [ "$boards" -eq 1 ]; then
   [ "$qemu" -eq 1 ] && step_relay
   step_pico2
   [ "$qemu" -eq 1 ] && step_arm
+  [ "$qemu" -eq 1 ] && step_lines
   [ "$qemu" -eq 1 ] && step_harts
   [ "$qemu" -eq 1 ] && step_pair
   [ "$qemu" -eq 1 ] && step_two
