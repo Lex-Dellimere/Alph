@@ -2,20 +2,14 @@
 // -I ports/pico2 -I ports/mcu --board pico2: this folder has what differs
 // on this board, and the rest is the one-hart port's.
 
-// The board's own trap install sends every trap to mettle_trap, so the
-// port's timer and console handlers would never run. This installs the
-// compiler's table of one handler per cause.
-@naked fn alph_board_vectors() {
-  asm {
-    la t0, mettle_trap_vector
-    csrw mtvec, t0
-    ret
-  }
-}
-
 // What the board needs before alph runs on it: its clocks, timer and UART0
-// come out of reset in pico2_init. Call it first in main.
+// come out of reset in pico2_init, and the traps go to one handler for
+// each cause. The console sends every byte as it is (no carriage return
+// before a line feed), because the console is also the line to another
+// machine. UART0 is GP0 out and GP1 in, at 115200 baud. Call it first in
+// main.
 export fn alph_board_start() {
   pico2_init();
-  alph_board_vectors();
+  mettle_board_trap_install();
+  pico2_console_raw(true);
 }
