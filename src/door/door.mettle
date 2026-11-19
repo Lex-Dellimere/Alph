@@ -19,6 +19,7 @@ import "alph/door/words";
 
 const ALPH_WATCH: Word = -12;         // door to door: watch the actor in arg for me, under this ref
 
+// A machine's door and the layers it answers from.
 export struct AlphDoor {
   cores: AlphCores*;
   link: AlphLink*;

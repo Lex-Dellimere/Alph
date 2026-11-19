@@ -8,7 +8,7 @@ An actor is a state and a handler, and the handler runs once for each message th
 
 ## Building
 
-Each layer is one import: `alph/machine/machine` and `alph/batch/batch` (the short way), `alph/actor/actor` (the core), `alph/cores/cores`, `alph/time/time`, `alph/place/place`, `alph/poll/poll`, `alph/life/life`, `alph/link/link`, `alph/name/name`, `alph/door/door`, `alph/seal/seal`, `alph/tether/tether` and `alph/board/board` (the short way on a board). Map alph in your program's `mettle.deps`:
+For the exact name or arguments of something, look in [reference.md](reference.md). Each layer is one import: `alph/machine/machine` and `alph/batch/batch` (the short way), `alph/actor/actor` (the core), `alph/cores/cores`, `alph/time/time`, `alph/place/place`, `alph/poll/poll`, `alph/life/life`, `alph/link/link`, `alph/name/name`, `alph/door/door`, `alph/seal/seal`, `alph/tether/tether` and `alph/board/board` (the short way on a board). Map alph in your program's `mettle.deps`:
 
 ```text
 alph=<path to alph>/src

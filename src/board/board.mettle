@@ -31,6 +31,7 @@ struct AlphBoardKind {
   run: fn(Word) -> Word;
 }
 
+// A board: its node, its line, what it shares, and the memory they work in.
 export struct AlphBoard {
   node: AlphNode;
   tether: AlphTether;
@@ -132,6 +133,7 @@ export fn AlphBoard_run__ptr(b: AlphBoard*) {
   b->node.run();
 }
 
+// Stops the board, so run returns.
 export fn AlphBoard_stop__ptr(b: AlphBoard*) {
   b->node.stop();
 }

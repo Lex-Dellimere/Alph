@@ -4,11 +4,13 @@
 import "port/port";
 import "alph/actor/actor";
 
+// One name and the pid behind it.
 export struct AlphName {
   name: Word;
   pid: Word;  // 0 while the slot is free
 }
 
+// The names of one machine.
 export struct AlphNames {
   gate: AlphGate;
   slots: AlphName*;

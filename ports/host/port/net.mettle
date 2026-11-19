@@ -135,6 +135,7 @@ export fn alph_write(fd: int64, bytes: uint8*, count: int64) -> int64 {
   return put;
 }
 
+// Closes a descriptor.
 export fn alph_close(fd: int64) {
   syscall(SYS_CLOSE, fd);
 }

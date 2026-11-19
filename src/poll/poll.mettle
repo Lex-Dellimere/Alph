@@ -42,6 +42,7 @@ export struct AlphEar {
   turn: uint32;  // goes up each time the slot is given to a descriptor or taken back
 }
 
+// The descriptors one node is waiting on.
 export struct AlphPoll {
   gate: AlphGate;
   node: AlphNode*;

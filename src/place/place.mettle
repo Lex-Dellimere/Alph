@@ -33,6 +33,7 @@ import "alph/time/time";
 import "alph/link/link";
 import "alph/place/words";
 
+// The ways a job can be run, and where its data can be.
 export const ALPH_CPU: Word = 0;
 export const ALPH_GPU: Word = 1;
 export const ALPH_FAR: Word = 2;       // on another machine
@@ -51,6 +52,8 @@ const SIZES: Word = 32;              // sizes are told apart by their power of t
 const FRESH: Word = 16;
 const TAKEN: Word = 1152921504606846976;  // 2^60: more than any backlog
 
+// A job: what it is, what it is given, and, once done, what came of it. The
+// program fills in the first fields and alph the rest.
 export struct AlphJob {
   kind: Word;
   size: Word;    // how much work, in the program's own unit
@@ -78,6 +81,7 @@ export struct AlphJob {
   next: AlphJob*;
 }
 
+// A kind of job: how it is run each way, and how long that has taken.
 export struct AlphKind {
   cpu: fn(AlphJob*) -> Word;
   gpu: fn(AlphJob*) -> Word;
@@ -113,6 +117,7 @@ struct AlphAt {
   row: Word*;  // est for the smallest size, the others after it
 }
 
+// A place: an actor that runs jobs one way, and the work waiting at it.
 export struct AlphPlace {
   places: AlphPlaces*;
   pid: Word;
@@ -137,6 +142,7 @@ export struct AlphPlace {
   own_kinds: Word;
 }
 
+// The places of one machine and the kinds of job they run.
 export struct AlphPlaces {
   gate: AlphGate;
   places: AlphPlace*;

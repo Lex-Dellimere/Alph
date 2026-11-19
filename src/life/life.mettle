@@ -22,6 +22,7 @@ import "alph/cores/cores";
 export const ALPH_LOST: Word = -8;   // the reason when an actor's machine was lost
 export const ALPH_ENDED: Word = -7;  // to a watcher: from is the actor, arg the reason, ref the watch
 
+// One watch: who is told when which actor ends.
 export struct AlphWatch {
   ref: Word;      // 0 while the slot is free
   watcher: Word;
@@ -31,6 +32,7 @@ export struct AlphWatch {
   far: Word;      // made for a watcher on another machine, with its ref
 }
 
+// One kept actor: how its state is set up again and how many restarts it has left.
 export struct AlphKeep {
   pid: Word;      // 0 while the slot is free
   reset: fn(rawptr) -> void;
@@ -38,6 +40,7 @@ export struct AlphKeep {
   restarts: Word;
 }
 
+// The watches and the kept actors of one set of cores.
 export struct AlphLife {
   gate: AlphGate;
   cores: AlphCores*;

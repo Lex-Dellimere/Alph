@@ -1,0 +1,2414 @@
+# alph reference
+
+This page lists the structs, constants and functions of the newer layers, with the comment from the source above each. It is built by `tools/apidoc.sh --new` from the source files, so do not edit it by hand. [docs/start.md](start.md) shows how to use the layers and [docs/design.md](design.md) says why they are built this way. A function named `Type_name__ptr` is a method: the line under its signature shows how to call it.
+
+## alph/machine/machine
+
+A machine: everything a Linux process needs to be one machine among
+several, set up in one call. It is the layers put together with sizes
+that suit most programs: up to 16 cores, 32 actors a core, 8 other
+machines. A program that needs other sizes puts the layers together
+itself, as this file does.
+
+The first core has the door, a place for each other machine that work
+can be sent to, and the program's own first actors. Every other core
+takes work. With a GPU, the last core is the GPU's.
+
+Sharing: a kind of job that is shared is done by whichever machine should
+finish it first. Every machine runs the same program: each says how the
+kind is done (kind) and that it is shared (share). The machine that asks
+for work is the one that hands it out.
+
+A board on a serial line (src/board) shares too. It has no door and
+sends no beats, so the machine asks it twice a second which kinds it
+does. A board that has not answered for two seconds is taken for lost,
+and found again when it answers. A board gets four jobs at a time and
+each is one word in and one word out.
+
+### `AlphMachine`
+
+```mettle
+export struct AlphMachine {
+  cores: AlphCores;
+  link: AlphLink;
+  names: AlphNames;
+  life: AlphLife;
+  door: AlphDoor;
+  time: AlphTime;
+  places: AlphPlaces;
+  far_place: Word;   // the place that sends work to the first other machine
+  far_places: Word[8];  // and to each, in the order they were added
+  peer_count: Word;
+  steward: Word;     // the actor that finds other machines' workers
+  told: Word;        // the program's actor that hears of machines coming and going
+  served: Word;      // jobs done here for other machines
+  shared: Word[8];   // by kind: shared or not
+  asked: Word[64];   // by other machine and kind: the ref of the question to its door
+  serving: AlphServing[8];
+  taken: AlphTaken[16];
+  tether: AlphTether;     // the line to a board, when there is one
+  boards: AlphOnLine[4];  // the boards work is shared with
+  board_count: Word;
+  round_at: Word;         // when the boards are asked next
+  round_owed: Word;       // the word to ask them could not be sent: send it with the next message
+  board_refs: Word;       // refs for questions to boards: small, to fit the 32 bits a line carries
+  // The memory the layers work in.
+  core: AlphCore[16];
+  actors: AlphActor[512];
+  mail: AlphMsg[8192];
+  peers: AlphPeer[8];
+  parcels: AlphParcel[16];
+  name_slots: AlphName[32];
+  watches: AlphWatch[64];
+  keeps: AlphKeep[32];
+  timers: AlphTimer[32];
+  seats: AlphPlace[26];
+  far_times: AlphTimes[96];  // each other machine's and board's own times, eight kinds each
+  kinds: AlphKind[8];
+}
+```
+
+One machine: its layers, what it shares, and the memory they work in.
+
+### `AlphMachine_init__ptr`
+
+```mettle
+export fn AlphMachine_init__ptr(m: AlphMachine*, cores: Word, first: Word, gpu: bool)
+```
+
+Call it as `m->init(cores, first, gpu)`, or `m.init(cores, first, gpu)` on a value.
+
+Sets the machine up with `cores` cores (1 to 16), its places starting at
+`first`. With gpu, the last core is the GPU's place and takes no other
+work. Call it before anything else.
+
+### `AlphMachine_peer__ptr`
+
+```mettle
+export fn AlphMachine_peer__ptr(m: AlphMachine*, first: Word, count: Word, ip: uint32, port: int64) -> Word
+```
+
+Call it as `m->peer(first, count, ip, port)`, or `m.peer(first, count, ip, port)` on a value.
+
+Another machine: where its places start, how many it has, and where it
+listens. It gets a place of its own here, which work for it goes through.
+Returns ALPH_FULL after eight.
+
+### `AlphMachine_board__ptr`
+
+```mettle
+export fn AlphMachine_board__ptr(m: AlphMachine*, first: Word, count: Word) -> Word
+```
+
+Call it as `m->board(first, count)`, or `m.board(first, count)` on a value.
+
+A board on this machine's serial line (src/board): where its places
+start and how many it has. This machine passes the board's mail on, so
+the other machines reach it too. Give the port the line's descriptor
+first (alph_line_open). Call it once, before start and run. Returns
+ALPH_FULL when there is no room for it.
+
+### `AlphMachine_beyond__ptr`
+
+```mettle
+export fn AlphMachine_beyond__ptr(m: AlphMachine*, peer: Word, first: Word, count: Word) -> Word
+```
+
+Call it as `m->beyond(peer, first, count)`, or `m.beyond(peer, first, count)` on a value.
+
+A board on another machine's serial line: peer is where that machine's
+places start, and it must be a peer already. Returns ALPH_GONE when it
+is not, ALPH_FULL when there is no room for the board.
+
+### `AlphMachine_kind__ptr`
+
+```mettle
+export fn AlphMachine_kind__ptr(m: AlphMachine*, kind: Word, cpu: fn(AlphJob*) -> Word, gpu: fn(AlphJob*) -> Word)
+```
+
+Call it as `m->kind(kind, cpu, gpu)`, or `m.kind(kind, cpu, gpu)` on a value.
+
+Says how a kind of job (0 to 7) is done on a core and on the GPU, 0 for a
+way it does not have.
+
+### `AlphMachine_share__ptr`
+
+```mettle
+export fn AlphMachine_share__ptr(m: AlphMachine*, kind: Word) -> Word
+```
+
+Call it as `m->share(kind)`, or `m.share(kind)` on a value.
+
+Shares a kind with the other machines: this machine does it for them, and
+its own jobs of the kind may go to them. Call it after kind, on every
+machine that should take part. A machine with no way of its own to do
+the kind (kind was given 0 and 0) only sends it: that is how work only a
+board can do, such as moving an arm, is asked for here. Only jobs with no
+home (a word in, or bytes) leave a machine. Returns ALPH_FULL when the
+first core has no room for one more actor, ALPH_GONE for a kind that is
+not 0 to 7.
+
+### `AlphMachine_tell__ptr`
+
+```mettle
+export fn AlphMachine_tell__ptr(m: AlphMachine*, pid: Word)
+```
+
+Call it as `m->tell(pid)`, or `m.tell(pid)` on a value.
+
+The program's actor that is told ALPH_UP and ALPH_DOWN as other machines
+come and go.
+
+### `AlphMachine_start__ptr`
+
+```mettle
+export fn AlphMachine_start__ptr(m: AlphMachine*, port: int64) -> Word
+```
+
+Call it as `m->start(port)`, or `m.start(port)` on a value.
+
+Listens on a port and joins the other machines. Returns ALPH_GONE when
+the port cannot be had. A machine with no peers need not call it.
+
+### `AlphMachine_run__ptr`
+
+```mettle
+export fn AlphMachine_run__ptr(m: AlphMachine*)
+```
+
+Call it as `m->run()`, or `m.run()` on a value.
+
+Runs the cores until stop, the first on this thread.
+
+### `AlphMachine_stop__ptr`
+
+```mettle
+export fn AlphMachine_stop__ptr(m: AlphMachine*)
+```
+
+Call it as `m->stop()`, or `m.stop()` on a value.
+
+Stops the cores, so run returns. Any actor or thread may call it.
+
+### `AlphMachine_shut__ptr`
+
+```mettle
+export fn AlphMachine_shut__ptr(m: AlphMachine*)
+```
+
+Call it as `m->shut()`, or `m.shut()` on a value.
+
+Ends the timers and leaves the other machines. Call it after run has
+returned.
+
+## alph/batch/batch
+
+A batch: one kind of work in many pieces. The batch hands the pieces to
+the places, a few at a time, takes each answer, asks again for a piece
+that could not be placed, and says when all are back. It is what a
+program would otherwise write around the places every time.
+
+An actor owns a batch. It begins it, and passes it every message it gets:
+took says whether the message was the batch's.
+
+### `AlphBatch`
+
+```mettle
+export struct AlphBatch {
+  places: AlphPlaces*;
+  kind: Word;
+  total: Word;
+  next: Word;        // the next piece not yet handed out
+  back: Word;        // pieces answered
+  gone: Word;        // of those, pieces no place could run
+  out: Word;         // pieces handed out and not yet answered
+  by_way: Word[3];   // how many each way did: ALPH_CPU, ALPH_GPU, ALPH_FAR
+  fill: fn(AlphBatch*, AlphJob*, Word) -> void;
+  each: fn(AlphBatch*, AlphJob*, Word) -> void;  // called with every answer
+  ctx: rawptr;       // the program's own
+  nudged: Word;
+  begun: Word;
+  again: Word[16];   // pieces to hand out again
+  again_count: Word;
+  piece: Word[16];   // by job: the piece it carries
+  free: Word[16];    // jobs not in use
+  free_count: Word;
+  jobs: AlphJob[16];
+}
+```
+
+One batch, and the sixteen jobs its pieces go out in.
+
+### `AlphBatch_init__ptr`
+
+```mettle
+export fn AlphBatch_init__ptr(b: AlphBatch*, places: AlphPlaces*)
+```
+
+Call it as `b->init(places)`, or `b.init(places)` on a value.
+
+Ties a batch to the places its pieces will go to. Call it once, before begin.
+
+### `AlphBatch_begin__ptr`
+
+```mettle
+export fn AlphBatch_begin__ptr(b: AlphBatch*, a: AlphActor*, kind: Word, total: Word,
+                               fill: fn(AlphBatch*, AlphJob*, Word) -> void,
+                               took: fn(AlphBatch*, AlphJob*, Word) -> void, ctx: rawptr) -> Word
+```
+
+Call it as `b->begin(a, kind, total, fill, took, ctx)`, or `b.begin(a, kind, total, fill, took, ctx)` on a value.
+
+Starts handing out `total` pieces of a kind. fill is called for each
+piece before it goes out, with the job and the piece's number (0 to
+total - 1): it sets what the job needs (size, in, data, bytes, home; the
+job starts with size 1, in the piece's number and no home). took is
+called with each piece's finished job: its status is ALPH_OK, or
+ALPH_GONE for a piece no place could run. ctx is the program's own, in
+b->ctx. Call it from the actor that will get the answers. Returns
+ALPH_OK, or ALPH_FULL when pieces of the batch before are still out: a
+batch is begun again only once it is over.
+
+### `AlphBatch_took__ptr`
+
+```mettle
+export fn AlphBatch_took__ptr(b: AlphBatch*, a: AlphActor*, m: AlphMsg*) -> bool
+```
+
+Call it as `b->took(a, m)`, or `b.took(a, m)` on a value.
+
+Give the batch every message its actor gets. Returns true when the
+message was the batch's: an answer, which it has passed to took, or its
+own word to itself.
+
+### `AlphBatch_over__ptr`
+
+```mettle
+export fn AlphBatch_over__ptr(b: AlphBatch*) -> bool
+```
+
+Call it as `b->over()`, or `b.over()` on a value.
+
+Whether every piece of a batch that was begun has been answered. A batch
+of no pieces is over at once.
+
+## alph/board/board
+
+A board: what a microcontroller needs to be one machine among several,
+set up in one call. It is a node, the line to the machine at the other
+end, and an actor for each kind of work it does for the others.
+
+A kind here is a function from one word to one word. The bigger machines
+find out by asking that the board does it (see AlphMachine_board), and
+from then on the board is one more place their work can go.
+
+A board asks for work too (ask): the machine at the other end of the
+line does the kind, whether that is a computer or another board. So two
+boards on one line share work with no bigger machine at all.
+
+The board runs one job at a time, and nothing else while it does. A
+machine that hears nothing from it for two seconds takes it for lost, so
+a job should take well under that.
+
+Sizes: 12 actors, 8 messages a mailbox, 8 kinds. A program that needs
+others puts the node and the tether together itself, as this file does.
+
+### `AlphBoard`
+
+```mettle
+export struct AlphBoard {
+  node: AlphNode;
+  tether: AlphTether;
+  served: Word;       // jobs done for other machines
+  workers: Word[8];   // by kind: the actor that does it, 0 for none
+  helpers: Word[8];   // by kind: the actor down the line that does it, 0 while not known
+  door: Word;
+  kinds: AlphBoardKind[8];
+  actors: AlphActor[12];
+  mail: AlphMsg[96];
+}
+```
+
+A board: its node, its line, what it shares, and the memory they work in.
+
+### `AlphBoard_init__ptr`
+
+```mettle
+export fn AlphBoard_init__ptr(b: AlphBoard*, place: Word, first: Word, count: Word)
+```
+
+Call it as `b->init(place, first, count)`, or `b.init(place, first, count)` on a value.
+
+Sets the board up as place `place`, tied by the port's line to a machine
+whose places are first, first + 1, ... Call it before anything else. The
+program's own actors are spawned on b->node.
+
+### `AlphBoard_share__ptr`
+
+```mettle
+export fn AlphBoard_share__ptr(b: AlphBoard*, kind: Word, run: fn(Word) -> Word) -> Word
+```
+
+Call it as `b->share(kind, run)`, or `b.share(kind, run)` on a value.
+
+Does a kind of work (0 to 7) for the other machines: run is given a
+job's in and returns its out. Returns ALPH_OK, ALPH_FULL when there is
+no actor left for it, ALPH_GONE for a kind that is not 0 to 7 or is
+shared already.
+
+### `AlphBoard_ask__ptr`
+
+```mettle
+export fn AlphBoard_ask__ptr(b: AlphBoard*, a: AlphActor*, kind: Word, in: Word) -> Word
+```
+
+Call it as `b->ask(a, kind, in)`, or `b.ask(a, kind, in)` on a value.
+
+Asks the machine at the other end of the line to do a job of a kind it
+shares. The answer comes to `a` as ALPH_WORKED with the job's out in arg
+and the ref this returns, or as ALPH_REFUSED when that machine cannot
+take it. Returns ALPH_FULL while the board does not know yet who does
+the kind there: it has asked, so ask again shortly. Returns ALPH_GONE
+for a kind that is not 0 to 7. The line sends nothing again, so a
+program that must have its answer asks once more when none has come.
+
+### `AlphBoard_run__ptr`
+
+```mettle
+export fn AlphBoard_run__ptr(b: AlphBoard*)
+```
+
+Call it as `b->run()`, or `b.run()` on a value.
+
+Runs the board until stop.
+
+### `AlphBoard_stop__ptr`
+
+```mettle
+export fn AlphBoard_stop__ptr(b: AlphBoard*)
+```
+
+Call it as `b->stop()`, or `b.stop()` on a value.
+
+Stops the board, so run returns.
+
+## alph/actor/actor
+
+alph's core: actors, messages and the loop that runs them.
+
+An actor is a state and a handler. A message is four words. A node holds
+the actors and runs one message at a time. Everything else (time, IO, a
+GPU, other cores, other machines) is something that sends messages.
+
+A pid names a place, a slot there and which actor the slot held. A node is
+one place. Mail for any other place goes to the node's far function.
+
+The node owns no memory: the caller hands it the actor slots and the
+mailboxes. What differs between devices lives in the port, picked at
+build time with -I ports/<name>.
+
+What a send returns: sent, the mailbox is full, or there is no such actor.
+
+```mettle
+export const ALPH_OK: Word = 0;
+export const ALPH_FULL: Word = -1;  // the mailbox is full
+export const ALPH_GONE: Word = -2;  // no such actor
+export const ALPH_END: Word = 1;       // a handler returns this when its actor is finished
+export const ALPH_CRASHED: Word = -9;  // the reason an actor ends with when its handler crashes
+```
+
+### `AlphMsg`
+
+```mettle
+export struct AlphMsg {
+  tag: Word;
+  from: Word;
+  arg: Word;
+  ref: Word;
+}
+```
+
+A message: four words.
+
+### `AlphActor`
+
+```mettle
+export struct AlphActor {
+  next: AlphActor*;
+  node: AlphNode*;
+  pid: Word;     // this slot's pid; the next one's once the actor is gone
+  alive: Word;
+  queued: Word;  // on the run queue, or running
+  handle: fn(AlphActor*, AlphMsg*) -> Word;
+  state: rawptr;
+  mail: AlphMsg*;
+  head: Word;
+  count: Word;
+}
+```
+
+An actor: a state, a handler and a mailbox. The handler is given the
+actor and one message at a time.
+
+### `AlphNode`
+
+```mettle
+export struct AlphNode {
+  gate: AlphGate;
+  actors: AlphActor*;
+  slots: Word;
+  room: Word;   // messages a mailbox holds
+  free: AlphActor*;       // the slot free the longest: the next one used
+  free_last: AlphActor*;
+  first: AlphActor*;
+  last: AlphActor*;
+  live: Word;
+  stopped: Word;
+  refs: Word;   // the last ref given out
+  place: Word;
+  far: fn(AlphNode*, Word, AlphMsg*) -> Word;
+  world: rawptr;  // whoever set far
+  ended: fn(AlphNode*, AlphActor*, Word) -> Word;
+  life: rawptr;   // whoever set ended
+  guard: AlphGuard;
+  running: AlphActor*;  // the actor whose handler is running
+}
+```
+
+A node: the actors of one place. It runs one message at a time.
+
+### `AlphNode_init__ptr`
+
+```mettle
+export fn AlphNode_init__ptr(n: AlphNode*, actors: AlphActor*, slots: Word, mail: AlphMsg*, room: Word)
+```
+
+Call it as `n->init(actors, slots, mail, room)`, or `n.init(actors, slots, mail, room)` on a value.
+
+mail holds slots * room messages.
+
+### `AlphNode_join__ptr`
+
+```mettle
+export fn AlphNode_join__ptr(n: AlphNode*, place: Word, far: fn(AlphNode*, Word, AlphMsg*) -> Word,
+                             world: rawptr)
+```
+
+Call it as `n->join(place, far, world)`, or `n.join(place, far, world)` on a value.
+
+Makes the node one place of many: far takes the mail for the others.
+Call it before the first spawn.
+
+### `AlphNode_on_end__ptr`
+
+```mettle
+export fn AlphNode_on_end__ptr(n: AlphNode*, ended: fn(AlphNode*, AlphActor*, Word) -> Word, life: rawptr)
+```
+
+Call it as `n->on_end(ended, life)`, or `n.on_end(ended, life)` on a value.
+
+Has ended called whenever a handler returns non-zero, with the actor and
+what the handler returned, before the actor is gone. If ended returns
+non-zero the actor is not ended: it keeps its pid and its mail.
+
+### `AlphNode_bury__ptr`
+
+```mettle
+export fn AlphNode_bury__ptr(n: AlphNode*, a: AlphActor*)
+```
+
+Call it as `n->bury(a)`, or `n.bury(a)` on a value.
+
+For ended to call, on an actor it will let end: from here mail for it is
+refused and it counts as gone, so whoever is told next that it ended
+cannot still reach it.
+
+### `AlphNode_alive__ptr`
+
+```mettle
+export fn AlphNode_alive__ptr(n: AlphNode*, pid: Word) -> bool
+```
+
+Call it as `n->alive(pid)`, or `n.alive(pid)` on a value.
+
+Whether a pid names an actor here that is alive now.
+
+### `AlphNode_spawn__ptr`
+
+```mettle
+export fn AlphNode_spawn__ptr(n: AlphNode*, handle: fn(AlphActor*, AlphMsg*) -> Word,
+                              state: rawptr) -> Word
+```
+
+Call it as `n->spawn(handle, state)`, or `n.spawn(handle, state)` on a value.
+
+Returns the new actor's pid, or 0 when every slot is taken.
+
+### `AlphNode_put__ptr`
+
+```mettle
+export fn AlphNode_put__ptr(n: AlphNode*, to: Word, m: AlphMsg*) -> Word
+```
+
+Call it as `n->put(to, m)`, or `n.put(to, m)` on a value.
+
+Delivers a whole message. ALPH_FULL and ALPH_GONE are refusals.
+
+### `AlphNode_send__ptr`
+
+```mettle
+export fn AlphNode_send__ptr(n: AlphNode*, to: Word, tag: Word, arg: Word) -> Word
+```
+
+Call it as `n->send(to, tag, arg)`, or `n.send(to, tag, arg)` on a value.
+
+From outside an actor: another thread, an interrupt, main.
+
+### `AlphActor_send__ptr`
+
+```mettle
+export fn AlphActor_send__ptr(a: AlphActor*, to: Word, tag: Word, arg: Word) -> Word
+```
+
+Call it as `a->send(to, tag, arg)`, or `a.send(to, tag, arg)` on a value.
+
+Sends a message from this actor. Returns ALPH_OK, ALPH_FULL when the
+mailbox it is for is full, ALPH_GONE when there is no such actor.
+
+### `AlphActor_ask__ptr`
+
+```mettle
+export fn AlphActor_ask__ptr(a: AlphActor*, to: Word, tag: Word, arg: Word) -> Word
+```
+
+Call it as `a->ask(to, tag, arg)`, or `a.ask(to, tag, arg)` on a value.
+
+Sends a request. Returns its ref (above 0), which the reply carries, or
+ALPH_FULL or ALPH_GONE.
+
+### `AlphActor_reply__ptr`
+
+```mettle
+export fn AlphActor_reply__ptr(a: AlphActor*, m: AlphMsg*, tag: Word, arg: Word) -> Word
+```
+
+Call it as `a->reply(m, tag, arg)`, or `a.reply(m, tag, arg)` on a value.
+
+Answers m: the same ref goes back to its sender.
+
+### `AlphNode_stop__ptr`
+
+```mettle
+export fn AlphNode_stop__ptr(n: AlphNode*)
+```
+
+Call it as `n->stop()`, or `n.stop()` on a value.
+
+Makes run return once the handler in progress is done. Before run, it
+makes the next run return at once.
+
+### `AlphNode_run__ptr`
+
+```mettle
+export fn AlphNode_run__ptr(n: AlphNode*)
+```
+
+Call it as `n->run()`, or `n.run()` on a value.
+
+Runs actors until stop. A handler that returns non-zero ends its actor,
+and what it returned is the reason. A handler that crashes ends its actor
+with ALPH_CRASHED and the node goes on (on Linux, in a program built with
+-s). With nothing to do the node sleeps until a message arrives.
+
+### `AlphNode_turn__ptr`
+
+```mettle
+export fn AlphNode_turn__ptr(n: AlphNode*) -> Word
+```
+
+Call it as `n->turn()`, or `n.turn()` on a value.
+
+Runs the messages that are waiting and returns how many that was: for a
+program with a loop of its own, such as one that draws a frame each time
+round. A stop ends the turn early and is left for the next run.
+
+## alph/cores/cores
+
+Many nodes, one on each core: a thread each in a Linux process, a hart
+each on a chip with several. A core is a place: an actor
+sends to a pid on another core the same way it sends next door, and the
+message is put straight into that core's node.
+
+Like the node, this owns no memory: the caller hands it the cores, the
+actor slots and the mailboxes, which it shares out evenly.
+
+### `AlphCore`
+
+```mettle
+export struct AlphCore {
+  node: AlphNode;
+  thread: int64;
+}
+```
+
+### `AlphCores`
+
+```mettle
+export struct AlphCores {
+  cores: AlphCore*;
+  count: Word;
+  first: Word;  // the first core's place: the cores are first, first + 1, ...
+  far: fn(AlphCores*, Word, AlphMsg*) -> Word;
+  world: rawptr;  // whoever set far
+}
+```
+
+### `AlphCores_join__ptr`
+
+```mettle
+export fn AlphCores_join__ptr(c: AlphCores*, first: Word, far: fn(AlphCores*, Word, AlphMsg*) -> Word, world: rawptr)
+```
+
+Call it as `c->join(first, far, world)`, or `c.join(first, far, world)` on a value.
+
+Makes the cores some of the places of a wider world: theirs start at
+first, and far takes the mail for the rest. Call it before the first spawn.
+
+### `AlphCores_init__ptr`
+
+```mettle
+export fn AlphCores_init__ptr(c: AlphCores*, cores: AlphCore*, count: Word, actors: AlphActor*, slots: Word,
+                              mail: AlphMsg*, room: Word)
+```
+
+Call it as `c->init(cores, count, actors, slots, mail, room)`, or `c.init(cores, count, actors, slots, mail, room)` on a value.
+
+actors holds count * slots actors, mail holds count * slots * room messages.
+
+### `AlphCores_spawn_on__ptr`
+
+```mettle
+export fn AlphCores_spawn_on__ptr(c: AlphCores*, core: Word, handle: fn(AlphActor*, AlphMsg*) -> Word,
+                                  state: rawptr) -> Word
+```
+
+Call it as `c->spawn_on(core, handle, state)`, or `c.spawn_on(core, handle, state)` on a value.
+
+Spawns on a chosen core, counted from 0. Returns the pid, or 0 when that
+core is full.
+
+### `AlphCores_spawn__ptr`
+
+```mettle
+export fn AlphCores_spawn__ptr(c: AlphCores*, handle: fn(AlphActor*, AlphMsg*) -> Word,
+                               state: rawptr) -> Word
+```
+
+Call it as `c->spawn(handle, state)`, or `c.spawn(handle, state)` on a value.
+
+Spawns on the core with the fewest actors. Returns the pid, or 0 when
+every core is full.
+
+### `AlphCores_alive__ptr`
+
+```mettle
+export fn AlphCores_alive__ptr(c: AlphCores*, pid: Word) -> bool
+```
+
+Call it as `c->alive(pid)`, or `c.alive(pid)` on a value.
+
+Whether a pid names an actor on one of these cores that is alive now.
+
+### `AlphCores_send__ptr`
+
+```mettle
+export fn AlphCores_send__ptr(c: AlphCores*, to: Word, tag: Word, arg: Word) -> Word
+```
+
+Call it as `c->send(to, tag, arg)`, or `c.send(to, tag, arg)` on a value.
+
+From outside an actor.
+
+### `AlphActor_cores__ptr`
+
+```mettle
+export fn AlphActor_cores__ptr(a: AlphActor*) -> AlphCores*
+```
+
+Call it as `a->cores()`, or `a.cores()` on a value.
+
+The cores an actor runs among.
+
+### `AlphCores_run__ptr`
+
+```mettle
+export fn AlphCores_run__ptr(c: AlphCores*)
+```
+
+Call it as `c->run()`, or `c.run()` on a value.
+
+Runs every core until stop: the first on this thread, the rest on their
+own. Every run starts new threads, so what belongs to a thread (a GPU a
+handler opened) does not last from one run to the next.
+
+### `AlphCores_stop__ptr`
+
+```mettle
+export fn AlphCores_stop__ptr(c: AlphCores*)
+```
+
+Call it as `c->stop()`, or `c.stop()` on a value.
+
+## alph/time/time
+
+Timers: a message sent later. Time stays out of the core, because a timer
+is one more thing that sends messages.
+
+The timers wait in the caller's array. The port's alarm rings when the
+soonest is due: the board's timer interrupt on a microcontroller, a
+sleeping thread on Linux.
+
+Setting, cancelling and sending a timer each look at every slot. That is
+the smallest code and right for tens of timers, not for thousands.
+
+### `AlphTimer`
+
+```mettle
+export struct AlphTimer {
+  at: Word;   // in the port's ticks
+  to: Word;
+  tag: Word;
+  arg: Word;
+  ref: Word;  // 0 while the slot is free
+}
+```
+
+One timer: the message it will send and when.
+
+### `AlphTime`
+
+```mettle
+export struct AlphTime {
+  gate: AlphGate;
+  alarm: AlphAlarm;
+  node: AlphNode*;
+  slots: AlphTimer*;
+  room: Word;
+  refs: Word;
+}
+```
+
+The timers of one node.
+
+### `AlphTime_init__ptr`
+
+```mettle
+export fn AlphTime_init__ptr(t: AlphTime*, node: AlphNode*, timers: AlphTimer*, room: Word)
+```
+
+Call it as `t->init(node, timers, room)`, or `t.init(node, timers, room)` on a value.
+
+timers holds room timers. Messages go out through node.
+
+### `AlphTime_after__ptr`
+
+```mettle
+export fn AlphTime_after__ptr(t: AlphTime*, ms: Word, to: Word, tag: Word, arg: Word) -> Word
+```
+
+Call it as `t->after(ms, to, tag, arg)`, or `t.after(ms, to, tag, arg)` on a value.
+
+Sends tag and arg to an actor ms milliseconds from now: never sooner, and
+up to a tick later. The message
+carries the ref this returns (above 0) and comes from pid 0. Returns
+ALPH_FULL when every timer is in use.
+
+### `AlphTime_cancel__ptr`
+
+```mettle
+export fn AlphTime_cancel__ptr(t: AlphTime*, ref: Word) -> Word
+```
+
+Call it as `t->cancel(ref)`, or `t.cancel(ref)` on a value.
+
+Takes a timer back. ALPH_GONE when its message was already sent.
+
+### `AlphTime_stop__ptr`
+
+```mettle
+export fn AlphTime_stop__ptr(t: AlphTime*)
+```
+
+Call it as `t->stop()`, or `t.stop()` on a value.
+
+No timer's message is sent after this returns. Waiting timers are dropped.
+
+## alph/time/wheel
+
+Timers for programs with thousands of them: a timer wheel. It behaves as
+AlphTime does, but setting and cancelling a timer take the same time
+however many wait.
+
+The wheel is a ring of spokes, one per tick, that goes round every
+spoke_count ticks. A timer waits in the spoke of the tick it is due in,
+in a list threaded through the timers themselves. When the alarm rings
+the wheel steps tick by tick from where it stopped up to now, and in each
+spoke sends the timers due by then. A timer due a turn or more later
+shares the spoke and stays. Free timers wait on a list of their own.
+
+A timer's ref says which slot it is in, so cancel goes straight to it.
+
+Limits: a turn of the wheel should be longer than most delays, or the
+alarm rings once a turn for a far timer and sends nothing. A ring more
+than a whole turn late sends what is that overdue with its spoke, so
+among those the soonest may not go first.
+
+### `AlphWheelTimer`
+
+```mettle
+export struct AlphWheelTimer {
+  at: Word;    // in the port's ticks
+  to: Word;
+  tag: Word;
+  arg: Word;
+  ref: Word;   // 0 while the slot is free
+  next: Word;  // slot indexes; a spoke's list is a ring, so its first's prev is its last
+  prev: Word;
+}
+```
+
+One timer on the wheel: the message it will send, when, and its
+neighbours in its spoke.
+
+### `AlphWheel`
+
+```mettle
+export struct AlphWheel {
+  gate: AlphGate;
+  alarm: AlphAlarm;
+  node: AlphNode*;
+  slots: AlphWheelTimer*;
+  room: Word;
+  spokes: Word*;
+  mask: Word;
+  free: Word;
+  waiting: Word;
+  done: Word;     // the last tick whose spoke was sent
+  armed: Word;
+  next: Word;     // the tick the alarm is set for, while armed
+  serial: Word;
+  serials: Word;  // serial stays below this, so a ref never overflows
+}
+```
+
+A timer wheel: the timers and the spokes they wait in.
+
+### `AlphWheel_init__ptr`
+
+```mettle
+export fn AlphWheel_init__ptr(w: AlphWheel*, node: AlphNode*, timers: AlphWheelTimer*, room: Word,
+    spokes: Word*, spoke_count: Word)
+```
+
+Call it as `w->init(node, timers, room, spokes, spoke_count)`, or `w.init(node, timers, room, spokes, spoke_count)` on a value.
+
+timers holds room timers. spokes holds spoke_count list heads, at least
+one; a count that is not a power of two is rounded down to one. Messages
+go out through node.
+
+### `AlphWheel_after__ptr`
+
+```mettle
+export fn AlphWheel_after__ptr(w: AlphWheel*, ms: Word, to: Word, tag: Word, arg: Word) -> Word
+```
+
+Call it as `w->after(ms, to, tag, arg)`, or `w.after(ms, to, tag, arg)` on a value.
+
+Sends tag and arg to an actor ms milliseconds from now: never sooner, and
+up to a tick later. The message carries the ref this returns (above 0)
+and comes from pid 0. Returns ALPH_FULL when every timer is in use.
+
+### `AlphWheel_cancel__ptr`
+
+```mettle
+export fn AlphWheel_cancel__ptr(w: AlphWheel*, ref: Word) -> Word
+```
+
+Call it as `w->cancel(ref)`, or `w.cancel(ref)` on a value.
+
+Takes a timer back. ALPH_GONE when its message was already sent.
+
+### `AlphWheel_stop__ptr`
+
+```mettle
+export fn AlphWheel_stop__ptr(w: AlphWheel*)
+```
+
+Call it as `w->stop()`, or `w.stop()` on a value.
+
+No timer's message is sent after this returns. Waiting timers are dropped.
+
+## alph/place/place
+
+Places: a job goes where it will finish first.
+
+A job is a piece of work of some kind and size. A kind can be run in more
+than one way: on a CPU core or on a GPU. A place is an actor that runs jobs
+one way, so a GPU is one place and every core that takes work is another.
+
+For each way, kind and size, alph keeps how long a job takes. A new job
+goes to the place where the work already waiting plus this job's own time
+is least. A way not yet tried is tried. A way that lost is tried again
+once the time spent since is 16 times what a run of it costs, so a wrong
+number costs little and is found.
+
+Work travels, data stays. A job says where its data is: its home. Running
+it the other way means the data must cross first, so alph keeps separate
+times for a job run where its data is and one run away from it, and a job
+tends to stay with its data. Data on the GPU that a core needs is brought
+by the GPU's own place, the only thread that may touch the GPU.
+
+A third way is another machine. A job that is one word in and one word
+out, or that carries a few bytes, can be sent to an actor there that does
+the kind's work and answers. Each other machine is one more place, with
+its own work waiting, so work goes to another machine when that is where
+it will finish first, and to the one of several that is least busy.
+
+The program writes the two ways. alph only times them, so nothing here
+knows what a GPU is. x86-64 Linux, like the cores.
+
+The ways a job can be run, and where its data can be.
+
+```mettle
+export const ALPH_CPU: Word = 0;
+export const ALPH_GPU: Word = 1;
+export const ALPH_FAR: Word = 2;       // on another machine
+export const ALPH_NOWHERE: Word = -1;  // a job's home when it has no data yet
+export const ALPH_RUN: Word = -1;    // to a place: run the job in arg
+export const ALPH_DONE: Word = -2;   // from a place: the job in arg is done
+```
+
+### `AlphJob`
+
+```mettle
+export struct AlphJob {
+  kind: Word;
+  size: Word;    // how much work, in the program's own unit
+  data: rawptr;
+  in: Word;      // what a job that can go to another machine is given,
+  out: Word;     // and what it gives back
+  bytes: uint8*; // bytes that go with it to another machine, up to ALPH_PARCEL_BYTES,
+  count: Word;   // and how many: 0 for none
+  stay: Word;    // not 0: it must be done on this machine
+  home: Word;    // where its data is: ALPH_CPU, ALPH_GPU or ALPH_NOWHERE. alph sets it to where the job ran
+  status: Word;  // ALPH_OK, ALPH_GONE when no place can run it, ALPH_FULL to ask again
+  way: Word;     // how it was run
+  ns: Word;      // how long that took, bringing its data included
+  asker: Word;
+  ref: Word;
+  owed: Word;
+  at: Word;      // which of the kind's times this run is
+  was_home: Word;  // its home when its place was picked
+  moved: Word;   // ns spent bringing its data
+  far_ref: Word; // the ref its request to another machine carries,
+  far_to: Word;  // the worker it went to,
+  far_seen: Word; // how many answers its place had had by then,
+  began: Word;   // and when
+  to: AlphPlace*;
+  next: AlphJob*;
+}
+```
+
+A job: what it is, what it is given, and, once done, what came of it. The
+program fills in the first fields and alph the rest.
+
+### `AlphKind`
+
+```mettle
+export struct AlphKind {
+  cpu: fn(AlphJob*) -> Word;
+  gpu: fn(AlphJob*) -> Word;
+  bring: fn(AlphJob*) -> Word;
+  far: Word;       // an actor on another machine that does this kind's work, 0 when no machine does
+  off: Word[3];    // this way cannot run the kind
+  warm: Word[3];   // its first run is over: that one pays for starting up
+  // Times are kept by way, by whether the data was at home there or had to
+  // cross, and by size.
+  est: Word[192];   // ns a job takes on average, 0 when not known
+  low: Word[192];   // ns it takes when nothing gets in its way
+  last: Word[192];  // the time before, 0 when there was none
+  since: Word[192]; // ns of work done other ways since this one was timed
+}
+```
+
+A kind of job: how it is run each way, and how long that has taken.
+
+### `AlphTimes`
+
+```mettle
+export struct AlphTimes {
+  est: Word[32];
+  low: Word[32];
+  last: Word[32];
+  since: Word[32];
+  warm: Word;
+}
+```
+
+A far place's own times for one kind of work, by size. Without them
+every far place goes by the kind's one time for work sent away.
+
+### `AlphPlace`
+
+```mettle
+export struct AlphPlace {
+  places: AlphPlaces*;
+  pid: Word;
+  way: Word;
+  waiting: Word;      // jobs sent here and not yet done
+  backlog: Word;      // the ns they are expected to take
+  ran: Word;
+  unsent: AlphJob*;   // done, but the asker's mailbox was full
+  nudged: Word;       // a nudge is on its way
+  open: AlphJob*;     // sent to another machine and not yet answered
+  far_refs: Word;
+  workers: Word[16];  // a far place: by kind, the actor on its machine that does it, 0 for none
+  looking: Word;      // a timer to look at the open jobs is set
+  limit: Word;        // no more jobs than this are here at once, 0 for any number
+  answers: Word;      // a far place: answers that have come back,
+  answered: Word;     // and when the last one did
+  gave_ref: Word[4];  // the last jobs given up on: the ref each went out with,
+  gave_began: Word[4];  // when,
+  gave_at: Word[4];   // and its kind times 192 plus which of the kind's times it is
+  gave_next: Word;
+  own: AlphTimes*;    // a far place's own times, one for each of its first own_kinds kinds, 0 for none
+  own_kinds: Word;
+}
+```
+
+A place: an actor that runs jobs one way, and the work waiting at it.
+
+### `AlphPlaces`
+
+```mettle
+export struct AlphPlaces {
+  gate: AlphGate;
+  places: AlphPlace*;
+  room: Word;
+  count: Word;
+  kinds: AlphKind*;
+  kind_count: Word;
+  time: AlphTime*;  // for far jobs that are never answered, 0 for none
+  link: AlphLink*;  // for far jobs that carry bytes, 0 for none
+  late: Word;       // far jobs given up on and placed again
+}
+```
+
+The places of one machine and the kinds of job they run.
+
+### `AlphPlaces_init__ptr`
+
+```mettle
+export fn AlphPlaces_init__ptr(p: AlphPlaces*, places: AlphPlace*, room: Word, kinds: AlphKind*, count: Word)
+```
+
+Call it as `p->init(places, room, kinds, count)`, or `p.init(places, room, kinds, count)` on a value.
+
+places holds room places, kinds holds count kinds.
+
+### `AlphPlaces_kind__ptr`
+
+```mettle
+export fn AlphPlaces_kind__ptr(p: AlphPlaces*, kind: Word, cpu: fn(AlphJob*) -> Word,
+                               gpu: fn(AlphJob*) -> Word)
+```
+
+Call it as `p->kind(kind, cpu, gpu)`, or `p.kind(kind, cpu, gpu)` on a value.
+
+Says how a kind is run each way. A way the kind does not have is 0. Each
+returns 0, or non-zero when it cannot run here (no GPU, say): the job then
+goes another way and that way is not tried again.
+
+### `AlphPlaces_bring__ptr`
+
+```mettle
+export fn AlphPlaces_bring__ptr(p: AlphPlaces*, kind: Word, bring: fn(AlphJob*) -> Word)
+```
+
+Call it as `p->bring(kind, bring)`, or `p.bring(kind, bring)` on a value.
+
+Says how a kind's data on the GPU is brought to the host. It runs on the
+GPU's place and returns 0, or non-zero when it could not, after which it
+is not tried again. Without it, a job whose data is on the GPU runs only
+there. Call it after kind.
+
+### `AlphPlaces_far_at__ptr`
+
+```mettle
+export fn AlphPlaces_far_at__ptr(p: AlphPlaces*, place: Word, kind: Word, worker: Word) -> Word
+```
+
+Call it as `p->far_at(place, kind, worker)`, or `p.far_at(place, kind, worker)` on a value.
+
+Says which actor on another machine does a kind's work, for one far
+place: the place with pid `place` is that machine. The actor is sent
+ALPH_WORK with the job's in as arg, and answers ALPH_WORKED with the
+job's out and the same ref, or ALPH_REFUSED with arg ALPH_FULL when it
+cannot take the job now and ALPH_GONE when it never can. A worker of 0
+takes the kind away from that machine. Call it after kind, with a kind
+below 16. For the machine's loss to be noticed, have the far place watch
+the worker: it treats ALPH_ENDED from a worker as the end of its work
+there. Returns ALPH_GONE when there is no such far place or kind.
+
+### `AlphPlaces_limit__ptr`
+
+```mettle
+export fn AlphPlaces_limit__ptr(p: AlphPlaces*, place: Word, jobs: Word) -> Word
+```
+
+Call it as `p->limit(place, jobs)`, or `p.limit(place, jobs)` on a value.
+
+Lets a place have no more than `jobs` jobs at once, 0 for any number. It
+is for a small machine, such as a board, whose mailbox must not be
+overrun and which does its jobs one after another. So a far place with a
+limit is sent no job with bytes, and a job out to it is taken for lost
+only when the place has gone quiet or has answered twice its limit of
+later jobs. A job that finds every place that could run it at its limit
+is answered ALPH_FULL. Returns ALPH_GONE when there is no such place.
+
+### `AlphPlaces_own__ptr`
+
+```mettle
+export fn AlphPlaces_own__ptr(p: AlphPlaces*, place: Word, times: AlphTimes*, kinds: Word) -> Word
+```
+
+Call it as `p->own(place, times, kinds)`, or `p.own(place, times, kinds)` on a value.
+
+Gives a far place times of its own: `times` is an array with one entry
+for each of the first `kinds` kinds. The place then learns how long that
+machine takes, apart from every other, so a slow machine and a quick one
+that do the same kind are told apart. Returns ALPH_GONE when there is no
+such far place.
+
+### `AlphPlaces_look__ptr`
+
+```mettle
+export fn AlphPlaces_look__ptr(p: AlphPlaces*, a: AlphActor*, place: Word) -> Word
+```
+
+Call it as `p->look(a, place)`, or `p.look(a, place)` on a value.
+
+Has a far place look now for jobs out too long. The place looks by
+itself on the places' clock; this is for a program that wants to be sure
+of it when timers may have run out.
+
+### `AlphPlaces_far__ptr`
+
+```mettle
+export fn AlphPlaces_far__ptr(p: AlphPlaces*, kind: Word, worker: Word)
+```
+
+Call it as `p->far(kind, worker)`, or `p.far(kind, worker)` on a value.
+
+The same for a program with one far place: its first.
+
+### `AlphPlaces_clock__ptr`
+
+```mettle
+export fn AlphPlaces_clock__ptr(p: AlphPlaces*, time: AlphTime*)
+```
+
+Call it as `p->clock(time)`, or `p.clock(time)` on a value.
+
+Gives the places a clock. With it, a job sent to another machine that is
+not answered in eight times its usual time (and at least a second) is
+given up on and placed again, so a request or an answer that was lost
+costs a wait, not the job. Without it such a job waits for ever.
+
+### `AlphPlaces_net__ptr`
+
+```mettle
+export fn AlphPlaces_net__ptr(p: AlphPlaces*, link: AlphLink*)
+```
+
+Call it as `p->net(link)`, or `p.net(link)` on a value.
+
+Gives the places the link, so a job for another machine can carry bytes
+(job->bytes and job->count). Its worker then gets ALPH_WORK_BYTES with a
+parcel in arg, which it gives back to its own link when it has read it,
+and the job's in is not sent. Give the link its parcels first.
+
+### `AlphPlaces_add__ptr`
+
+```mettle
+export fn AlphPlaces_add__ptr(p: AlphPlaces*, way: Word) -> AlphPlace*
+```
+
+Call it as `p->add(way)`, or `p.add(way)` on a value.
+
+A new place that runs jobs one way. Spawn alph_place_run with it as the
+state, then put the pid in it. Returns 0 when there is no room.
+
+### `AlphPlaces_on_core__ptr`
+
+```mettle
+export fn AlphPlaces_on_core__ptr(p: AlphPlaces*, cores: AlphCores*, core: Word, way: Word) -> Word
+```
+
+Call it as `p->on_core(cores, core, way)`, or `p.on_core(cores, core, way)` on a value.
+
+A new place on one core. A GPU's place wants a core to itself: a GPU
+belongs to the one thread that opened it. Returns its pid, or 0 when the
+core or the places are full. Set places up one at a time.
+
+### `AlphPlaces_ask__ptr`
+
+```mettle
+export fn AlphPlaces_ask__ptr(p: AlphPlaces*, a: AlphActor*, job: AlphJob*) -> Word
+```
+
+Call it as `p->ask(a, job)`, or `p.ask(a, job)` on a value.
+
+Sends a job to the place where it should finish first. The answer is an
+ALPH_DONE message with the job in arg and the ref this returns. From here
+until that answer the job is alph's: leave it where it is and do not read
+or write it. Set its kind, size and home first. Returns ALPH_FULL when that place's
+mailbox is full, ALPH_GONE when no place can run the kind or there is no
+such kind.
+
+### `alph_place_run`
+
+```mettle
+export fn alph_place_run(a: AlphActor*, m: AlphMsg*) -> Word
+```
+
+The handler of every place.
+
+## alph/place/words
+
+What a machine that hands out work and a worker on another machine say
+to each other. They are apart from the places so that a board, which is
+too small for the places, can still be a worker.
+
+```mettle
+export const ALPH_WORK: Word = -13;        // to a worker on another machine: arg is the job's in
+export const ALPH_WORKED: Word = -14;      // its answer: arg is the job's out, with the same ref
+export const ALPH_WORK_BYTES: Word = -17;  // as ALPH_WORK, for a job with bytes: arg is a parcel
+export const ALPH_REFUSED: Word = -18;     // a worker's answer when it cannot take the job: arg is ALPH_FULL for now, ALPH_GONE for never
+export const ALPH_SHARED: Word = 1073741824;  // the name of the worker for a shared kind is this plus the kind
+```
+
+## alph/life/life
+
+Lives: what happens when an actor ends.
+
+A handler that returns non-zero ends its actor, and what it returned is
+the reason: ALPH_END for an actor that is finished, anything else for one
+that failed.
+
+Watching: an actor that watches another is sent ALPH_ENDED when it ends,
+with the reason. Watching one that is already gone says so at once.
+
+Keeping: a kept actor that fails is not ended. Its state is set up again
+and it goes on, with the same pid and the mail it had, so nothing that
+knows it has to learn a new pid. After its last allowed restart it ends
+like any other.
+
+The memory is the caller's, as everywhere: an array of watches and an
+array of keeps.
+
+```mettle
+export const ALPH_LOST: Word = -8;   // the reason when an actor's machine was lost
+export const ALPH_ENDED: Word = -7;  // to a watcher: from is the actor, arg the reason, ref the watch
+```
+
+### `AlphWatch`
+
+```mettle
+export struct AlphWatch {
+  ref: Word;      // 0 while the slot is free
+  watcher: Word;
+  target: Word;
+  owed: Word;     // the target ended and the watcher's mailbox was full
+  reason: Word;
+  far: Word;      // made for a watcher on another machine, with its ref
+}
+```
+
+One watch: who is told when which actor ends.
+
+### `AlphKeep`
+
+```mettle
+export struct AlphKeep {
+  pid: Word;      // 0 while the slot is free
+  reset: fn(rawptr) -> void;
+  left: Word;     // restarts still allowed
+  restarts: Word;
+}
+```
+
+One kept actor: how its state is set up again and how many restarts it has left.
+
+### `AlphLife`
+
+```mettle
+export struct AlphLife {
+  gate: AlphGate;
+  cores: AlphCores*;
+  watches: AlphWatch*;
+  watch_room: Word;
+  keeps: AlphKeep*;
+  keep_room: Word;
+  refs: Word;
+}
+```
+
+The watches and the kept actors of one set of cores.
+
+### `AlphLife_settle__ptr`
+
+```mettle
+export fn AlphLife_settle__ptr(l: AlphLife*)
+```
+
+Call it as `l->settle()`, or `l.settle()` on a value.
+
+Tells every watcher that is still owed word because its mailbox was full.
+alph calls it whenever something ends or is watched. Nothing calls it
+when the mailbox empties, so a program that fills its watchers' mailboxes
+calls it now and then.
+
+### `AlphLife_init__ptr`
+
+```mettle
+export fn AlphLife_init__ptr(l: AlphLife*, cores: AlphCores*, watches: AlphWatch*, watch_room: Word, keeps: AlphKeep*,
+                             keep_room: Word)
+```
+
+Call it as `l->init(cores, watches, watch_room, keeps, keep_room)`, or `l.init(cores, watches, watch_room, keeps, keep_room)` on a value.
+
+watches holds watch_room watches, keeps holds keep_room keeps. Call it
+after the cores are set up and before they run.
+
+### `AlphLife_watch__ptr`
+
+```mettle
+export fn AlphLife_watch__ptr(l: AlphLife*, watcher: Word, target: Word) -> Word
+```
+
+Call it as `l->watch(watcher, target)`, or `l.watch(watcher, target)` on a value.
+
+Has watcher sent ALPH_ENDED when target ends. Returns the watch's ref
+(above 0), ALPH_GONE when the target is already gone, ALPH_FULL when
+every watch is in use. A target on another machine cannot be checked: it
+is watched, and ends for its watchers when its machine is lost.
+
+### `AlphLife_watch_as__ptr`
+
+```mettle
+export fn AlphLife_watch_as__ptr(l: AlphLife*, watcher: Word, target: Word, ref: Word) -> Word
+```
+
+Call it as `l->watch_as(watcher, target, ref)`, or `l.watch_as(watcher, target, ref)` on a value.
+
+A watch made for a watcher on another machine, under the ref that
+machine chose: its door asks for it. Returns ALPH_OK, ALPH_GONE when the
+target is already gone, ALPH_FULL when every watch is in use.
+
+### `AlphLife_ended_far__ptr`
+
+```mettle
+export fn AlphLife_ended_far__ptr(l: AlphLife*, target: Word, ref: Word, reason: Word)
+```
+
+Call it as `l->ended_far(target, ref, reason)`, or `l.ended_far(target, ref, reason)` on a value.
+
+An actor watched on another machine ended there: its door says so.
+
+### `AlphLife_unwatch__ptr`
+
+```mettle
+export fn AlphLife_unwatch__ptr(l: AlphLife*, ref: Word) -> Word
+```
+
+Call it as `l->unwatch(ref)`, or `l.unwatch(ref)` on a value.
+
+Stops watching. ALPH_GONE when the watch is over or its message is on
+the way.
+
+### `AlphLife_keep__ptr`
+
+```mettle
+export fn AlphLife_keep__ptr(l: AlphLife*, pid: Word, reset: fn(rawptr) -> void, times: Word) -> Word
+```
+
+Call it as `l->keep(pid, reset, times)`, or `l.keep(pid, reset, times)` on a value.
+
+Keeps an actor: when its handler fails, reset is called on its state and
+it goes on, up to times times. Keeping it again sets times anew. Returns
+ALPH_FULL when every keep is in use, ALPH_GONE when the actor is not on
+these cores or not alive.
+
+### `AlphLife_lost__ptr`
+
+```mettle
+export fn AlphLife_lost__ptr(l: AlphLife*, first: Word, count: Word)
+```
+
+Call it as `l->lost(first, count)`, or `l.lost(first, count)` on a value.
+
+A machine was lost: every actor watched on its places has ended, with the
+reason ALPH_LOST, and the watches kept here for its watchers are over. first and count are the machine's places, as a link's
+ALPH_DOWN gives them.
+
+## alph/name/name
+
+Names: a number a program chooses, for a pid it wants found. The names
+wait in the caller's array.
+
+### `AlphName`
+
+```mettle
+export struct AlphName {
+  name: Word;
+  pid: Word;  // 0 while the slot is free
+}
+```
+
+One name and the pid behind it.
+
+### `AlphNames`
+
+```mettle
+export struct AlphNames {
+  gate: AlphGate;
+  slots: AlphName*;
+  room: Word;
+}
+```
+
+The names of one machine.
+
+### `AlphNames_init__ptr`
+
+```mettle
+export fn AlphNames_init__ptr(n: AlphNames*, slots: AlphName*, room: Word)
+```
+
+Call it as `n->init(slots, room)`, or `n.init(slots, room)` on a value.
+
+slots holds room names.
+
+### `AlphNames_set__ptr`
+
+```mettle
+export fn AlphNames_set__ptr(n: AlphNames*, name: Word, pid: Word) -> Word
+```
+
+Call it as `n->set(name, pid)`, or `n.set(name, pid)` on a value.
+
+Gives a pid a name, or gives the name to another pid. Returns ALPH_FULL
+when every name is in use.
+
+### `AlphNames_get__ptr`
+
+```mettle
+export fn AlphNames_get__ptr(n: AlphNames*, name: Word) -> Word
+```
+
+Call it as `n->get(name)`, or `n.get(name)` on a value.
+
+The pid with this name, or 0.
+
+### `AlphNames_forget__ptr`
+
+```mettle
+export fn AlphNames_forget__ptr(n: AlphNames*, name: Word)
+```
+
+Call it as `n->forget(name)`, or `n.forget(name)` on a value.
+
+Takes a name away. A name is not taken away when its actor ends: sends to
+it are then refused as for any actor that is gone.
+
+## alph/door/door
+
+The door: the first actor of a machine, at a pid any other machine can
+work out. Through it an actor finds another machine's actors by name and
+watches them, with nothing but messages.
+
+Finding: find asks a machine's door for the pid behind a name, and the
+answer is an ALPH_HERE message.
+
+Watching: watch works for an actor anywhere. For one on another machine
+the door there keeps the watch and tells this door when the actor ends,
+and if that machine is lost first, the actor has ended with ALPH_LOST.
+
+### `AlphDoor`
+
+```mettle
+export struct AlphDoor {
+  cores: AlphCores*;
+  link: AlphLink*;
+  names: AlphNames*;
+  life: AlphLife*;
+  pid: Word;
+  tell: Word;  // the actor that hears of machines coming and going, 0 for none
+}
+```
+
+A machine's door and the layers it answers from.
+
+### `AlphDoor_init__ptr`
+
+```mettle
+export fn AlphDoor_init__ptr(d: AlphDoor*, cores: AlphCores*, link: AlphLink*, names: AlphNames*, life: AlphLife*) -> Word
+```
+
+Call it as `d->init(cores, link, names, life)`, or `d.init(cores, link, names, life)` on a value.
+
+Opens this machine's door. It must be the first actor spawned on the
+cores, after the link, the names and the lives are set up and before the
+link starts. Returns its pid, or ALPH_GONE when it was not the first.
+
+### `AlphDoor_tell__ptr`
+
+```mettle
+export fn AlphDoor_tell__ptr(d: AlphDoor*, pid: Word)
+```
+
+Call it as `d->tell(pid)`, or `d.tell(pid)` on a value.
+
+The actor sent ALPH_UP and ALPH_DOWN as machines come and go.
+
+### `AlphDoor_find__ptr`
+
+```mettle
+export fn AlphDoor_find__ptr(d: AlphDoor*, a: AlphActor*, place: Word, name: Word) -> Word
+```
+
+Call it as `d->find(a, place, name)`, or `d.find(a, place, name)` on a value.
+
+Asks the machine that has a place for the pid behind a name. The answer
+is ALPH_HERE with the ref this returns: arg is the pid, 0 when that
+machine has no such name. Returns ALPH_GONE when no machine has the
+place or it cannot be reached.
+
+### `AlphDoor_watch__ptr`
+
+```mettle
+export fn AlphDoor_watch__ptr(d: AlphDoor*, watcher: Word, target: Word) -> Word
+```
+
+Call it as `d->watch(watcher, target)`, or `d.watch(watcher, target)` on a value.
+
+Has watcher sent ALPH_ENDED when target ends, wherever target is.
+Returns the watch's ref, ALPH_FULL when every watch is in use or the way
+to the target's machine is full for now, ALPH_GONE when the target is
+gone or its machine cannot be reached. A target on
+another machine that was already gone there is told as an end, with the
+reason ALPH_GONE, and one that machine has no watch left for with the
+reason ALPH_FULL.
+
+## alph/door/words
+
+What is said to a door and what it says back. They are apart from the
+door so that a board, which is too small for a door, can still answer.
+
+```mettle
+export const ALPH_WHERE: Word = -10;  // to a door: arg is a name
+export const ALPH_HERE: Word = -11;   // from a door: arg is the pid with that name, or 0. It comes as from that actor
+```
+
+### `alph_door_of`
+
+```mettle
+export fn alph_door_of(first: Word) -> Word
+```
+
+The pid of the door on the machine whose places start at first.
+
+## alph/link/link
+
+Links: other machines as places. Each machine owns a run of place
+numbers, so a pid says which machine its actor is on, and an actor sends
+to it the way it sends next door.
+
+A message crosses in one datagram. Messages to a machine are numbered,
+the machine says how far it has them, and what it has not got in a
+twenty-fifth of a second is sent again: so between two machines messages
+arrive once and in the order they were sent, for as long as both are up.
+A full mailbox at the far end still drops its message, and the sender is
+not told. Every machine tells its peers it is alive 20 times a second.
+One that stays quiet for half a second is down: sends to it return
+ALPH_GONE and the watcher is told. If it was only out of reach, what was
+on its way is sent again when it is back. A machine that was restarted is
+a new one, with a new life: what was on its way to the old one is lost,
+and mail meant for the old one is not handed to the new.
+
+A message can carry bytes: up to 1,024 of them, in a parcel. They cross
+with the same numbering as every other message, so they too arrive once
+and in order. The parcels are the caller's memory: a pool the link is
+given. A parcel that arrives belongs to the actor it was sent to, which
+gives it back with release when it has read it.
+
+A link is in the clear unless it is sealed: see src/seal.
+
+```mettle
+export const ALPH_UP: Word = -4;    // to the watcher: arg is the first place of a machine now reachable
+export const ALPH_DOWN: Word = -5;  // to the watcher: arg is the first place of a machine now lost
+```
+
+The most bytes one message can carry.
+
+```mettle
+export const ALPH_PARCEL_BYTES: Word = 1024;
+export const ALPH_DATAGRAM: int64 = 1104;  // the most a datagram holds before it is sealed
+```
+
+### `AlphParcel`
+
+```mettle
+export struct AlphParcel {
+  count: Word;  // how many of the bytes are in use
+  used: Word;   // taken from the pool
+  bytes: uint8[1024];
+}
+```
+
+Bytes that travel with a message.
+
+### `AlphPeer`
+
+```mettle
+export struct AlphPeer {
+  first: Word;   // its places are first, first + 1, ...
+  count: Word;
+  more_first: Word;  // places reached through it, such as a board on its serial line
+  more_count: Word;
+  ip: uint32;
+  port: int64;
+  life: uint32;  // which run of that machine this is, 0 before it is heard
+  alive: Word;
+  told: Word;    // the watcher was told it is up,
+  told_life: uint32;  // and this was its life then
+  seen: Word;
+  gate: AlphGate;     // what follows is shared by senders and the link's thread
+  sent: uint32;       // the number of the last message sent to it
+  acked: uint32;      // it has every message up to this one
+  heard: Word;        // on a sealed link: the count of the last datagram taken from it,
+  newest: Word;       // and when the latest run of it ever heard began, so nothing recorded can be played again
+  got: uint32;        // every message from it up to this one was taken
+  owed: Word;         // messages taken since it was last told so
+  waiting_since: Word;
+  again_ms: Word;     // how long its word is waited for before sending again
+  window: AlphPacket[64];  // the messages it has not yet said it has
+  held: AlphParcel*[64];   // and the bytes of those that carry any
+}
+```
+
+Another machine: its places, its address, and how far the messages to
+it and from it have got.
+
+### `AlphLink`
+
+```mettle
+export struct AlphLink {
+  wire: AlphWire;
+  cores: AlphCores*;
+  peers: AlphPeer*;
+  room: Word;
+  count: Word;
+  life: uint32;   // this run: the low half of born, never 0
+  born: Word;     // when this run began, in milliseconds
+  watcher: Word;
+  thread: int64;
+  stopping: int32;
+  port: int64;    // the port the wire is open on, 0 when it is not
+  resent: Word;   // messages sent again
+  lose: Word;     // for tests: one in so many messages is not sent the first time
+  lost: Word;
+  deaf: Word;     // for tests: hears nothing while this is set
+  // A sealed link: seal turns a datagram into one only the holders of the
+  // key can read or make, open turns it back and says who sent it and which
+  // datagram of theirs it is. Set by src/seal. 0 for a link in the clear.
+  seal: fn(rawptr, uint8*, uint8*, int64) -> int64;
+  open: fn(rawptr, uint8*, uint8*, int64, uint32*, Word*, Word*) -> int64;
+  sealer: rawptr;
+  refused: Word;  // datagrams not sealed with the key, or already heard
+  // Mail for a place that is neither on these cores nor a peer's goes to
+  // beyond, if it is set: a board on this machine's serial line, say.
+  beyond: fn(AlphLink*, Word, AlphMsg*) -> Word;
+  beyond_ctx: rawptr;
+  parcels: AlphParcel*;
+  parcel_room: Word;
+  parcel_gate: AlphGate;
+}
+```
+
+This machine's link to the others.
+
+### `AlphLink_release__ptr`
+
+```mettle
+export fn AlphLink_release__ptr(l: AlphLink*, parcel: AlphParcel*)
+```
+
+Call it as `l->release(parcel)`, or `l.release(parcel)` on a value.
+
+Gives a parcel back to the pool. The actor a parcel was sent to calls
+this when it has read it, on the link of its own machine. A machine whose
+actors keep every parcel can take no more bytes, and since messages
+arrive in order, nothing else from that sender either until one is given
+back.
+
+### `AlphLink_init__ptr`
+
+```mettle
+export fn AlphLink_init__ptr(l: AlphLink*, cores: AlphCores*, first: Word, peers: AlphPeer*, room: Word)
+```
+
+Call it as `l->init(cores, first, peers, room)`, or `l.init(cores, first, peers, room)` on a value.
+
+Makes the cores one machine among several. Its places start at first.
+peers holds room peers. Call it before the first spawn.
+
+### `AlphLink_peer__ptr`
+
+```mettle
+export fn AlphLink_peer__ptr(l: AlphLink*, first: Word, count: Word, ip: uint32, port: int64) -> Word
+```
+
+Call it as `l->peer(first, count, ip, port)`, or `l.peer(first, count, ip, port)` on a value.
+
+Another machine: where its places start, how many it has, and where it
+listens. Returns ALPH_FULL when there is no room for it.
+
+### `AlphLink_parcels__ptr`
+
+```mettle
+export fn AlphLink_parcels__ptr(l: AlphLink*, parcels: AlphParcel*, room: Word)
+```
+
+Call it as `l->parcels(parcels, room)`, or `l.parcels(parcels, room)` on a value.
+
+Gives the link its parcels: room of them. Without any, no message can
+carry bytes. Call it before start.
+
+### `AlphLink_send_bytes__ptr`
+
+```mettle
+export fn AlphLink_send_bytes__ptr(l: AlphLink*, from: Word, to: Word, tag: Word, ref: Word, bytes: uint8*, count: Word) -> Word
+```
+
+Call it as `l->send_bytes(from, to, tag, ref, bytes, count)`, or `l.send_bytes(from, to, tag, ref, bytes, count)` on a value.
+
+Sends a message with bytes, up to ALPH_PARCEL_BYTES of them, to an actor
+on this machine or another. The actor gets the message with a parcel in
+arg ((AlphParcel*)m->arg): it reads the bytes and gives the parcel back
+with release. from and ref are what the message carries. Returns ALPH_OK,
+ALPH_FULL when too few parcels are free (half the pool is kept for what
+arrives) or too much is waiting for that machine, ALPH_GONE when the
+actor or its machine cannot be reached or the bytes are too many.
+
+### `AlphLink_through__ptr`
+
+```mettle
+export fn AlphLink_through__ptr(l: AlphLink*, peer: Word, first: Word, count: Word) -> Word
+```
+
+Call it as `l->through(peer, first, count)`, or `l.through(peer, first, count)` on a value.
+
+Says that places first, first + 1, ... are reached through the peer whose
+own places start at peer: a board on that machine's serial line, which it
+passes mail on to. Returns ALPH_GONE when there is no such peer.
+
+### `AlphLink_watch__ptr`
+
+```mettle
+export fn AlphLink_watch__ptr(l: AlphLink*, pid: Word)
+```
+
+Call it as `l->watch(pid)`, or `l.watch(pid)` on a value.
+
+The actor told when a machine becomes reachable (ALPH_UP) or is lost
+(ALPH_DOWN). Set it before start.
+
+### `AlphLink_start__ptr`
+
+```mettle
+export fn AlphLink_start__ptr(l: AlphLink*, port: int64) -> Word
+```
+
+Call it as `l->start(port)`, or `l.start(port)` on a value.
+
+Listens on a port and starts telling the peers this machine is alive.
+Add the peers first. Returns ALPH_GONE when the port cannot be had.
+
+### `AlphLink_first_of__ptr`
+
+```mettle
+export fn AlphLink_first_of__ptr(l: AlphLink*, place: Word) -> Word
+```
+
+Call it as `l->first_of(place)`, or `l.first_of(place)` on a value.
+
+The first place of the machine a place is on, this machine included, or
+-1 when no machine has it.
+
+### `AlphLink_count_of__ptr`
+
+```mettle
+export fn AlphLink_count_of__ptr(l: AlphLink*, first: Word) -> Word
+```
+
+Call it as `l->count_of(first)`, or `l.count_of(first)` on a value.
+
+How many places the machine starting at first has, 0 when there is none.
+
+### `AlphLink_reaches__ptr`
+
+```mettle
+export fn AlphLink_reaches__ptr(l: AlphLink*, place: Word) -> bool
+```
+
+Call it as `l->reaches(place)`, or `l.reaches(place)` on a value.
+
+Whether a place on another machine can be reached now.
+
+### `AlphLink_stop__ptr`
+
+```mettle
+export fn AlphLink_stop__ptr(l: AlphLink*)
+```
+
+Call it as `l->stop()`, or `l.stop()` on a value.
+
+Goes quiet. To its peers this machine is down half a second later. The
+port stays open, because an actor may be in the middle of a send: start
+uses it again, close gives it up.
+
+### `AlphLink_close__ptr`
+
+```mettle
+export fn AlphLink_close__ptr(l: AlphLink*)
+```
+
+Call it as `l->close()`, or `l.close()` on a value.
+
+Gives the port up. Only once nothing can send: after stop, with the
+cores stopped too.
+
+## alph/seal/seal
+
+Seals: a link only the holders of one key can read or speak on.
+
+Every machine of the network is given the same 32-byte key. Each datagram
+is encrypted and signed with it (XChaCha20-Poly1305), under a number used
+once: the sender's first place, when the sender's run began, a count that
+goes up with every datagram, and four random bytes drawn when it began.
+A datagram made without the key, changed on the way, or played again is
+dropped, and so is everything from a run earlier than the latest heard.
+
+What it does not give: one key for all means any holder can speak as any
+machine, and someone who gets the key later can read what they recorded
+before. A machine whose clock was set back before a restart is taken for
+an earlier run and not heard until its clock has passed its last start.
+Sizes, timing and who talks to whom are not hidden.
+
+This is its own layer so that a program that does not seal its link does
+not need the crypto package.
+
+### `AlphSeal`
+
+```mettle
+export struct AlphSeal {
+  key: CrKey32;
+  salt: uint8[4];
+  link: AlphLink*;
+  lock: int32;
+  count: int64;
+}
+```
+
+A sealed link's key and its count of datagrams sent.
+
+### `AlphSeal_init__ptr`
+
+```mettle
+export fn AlphSeal_init__ptr(s: AlphSeal*, link: AlphLink*, key: uint8*) -> Word
+```
+
+Call it as `s->init(link, key)`, or `s.init(link, key)` on a value.
+
+Seals a link with a key of 32 bytes. Call it once, after the link's init
+and before its start. Returns ALPH_GONE when the link is sealed already
+or the system gave no random bytes.
+
+### `AlphSeal_make__ptr`
+
+```mettle
+export fn AlphSeal_make__ptr(s: AlphSeal*, out: uint8*, plain: uint8*, count: int64) -> int64
+```
+
+Call it as `s->make(out, plain, count)`, or `s.make(out, plain, count)` on a value.
+
+A datagram sealed as this machine would seal it: for tests.
+
+## alph/poll/poll
+
+Polls: a socket or any other file descriptor sends a message when it is
+ready. Handlers never wait: they read and write what can be done now, and
+ask to be told when there is more.
+
+One thread sleeps in the kernel until something is ready and sends the
+messages. Each asking is for one message: an actor asks again when it
+wants the next. So a busy socket cannot flood a mailbox, and an actor
+that is not ready for more is not told.
+
+x86-64 Linux (epoll).
+
+```mettle
+export const ALPH_READ: Word = 1;    // ready for reading, or the other side closed
+export const ALPH_WRITE: Word = 2;   // ready for writing
+export const ALPH_ERROR: Word = 4;   // the descriptor failed
+```
+
+### `AlphEar`
+
+```mettle
+export struct AlphEar {
+  fd: int64;     // -1 while the slot is free
+  to: Word;
+  tag: Word;
+  owed: Word;    // what was ready when its actor's mailbox was full
+  turn: uint32;  // goes up each time the slot is given to a descriptor or taken back
+}
+```
+
+One descriptor someone asked about.
+
+### `AlphPoll`
+
+```mettle
+export struct AlphPoll {
+  gate: AlphGate;
+  node: AlphNode*;
+  ears: AlphEar*;
+  room: Word;
+  epoll: int64;
+  thread: int64;
+  stopping: int32;
+}
+```
+
+The descriptors one node is waiting on.
+
+### `AlphPoll_init__ptr`
+
+```mettle
+export fn AlphPoll_init__ptr(p: AlphPoll*, node: AlphNode*, ears: AlphEar*, room: Word) -> Word
+```
+
+Call it as `p->init(node, ears, room)`, or `p.init(node, ears, room)` on a value.
+
+ears holds room ears: one for each descriptor asked about at a time.
+Messages go out through node. Returns ALPH_GONE when the kernel gave no
+epoll.
+
+### `AlphPoll_want__ptr`
+
+```mettle
+export fn AlphPoll_want__ptr(p: AlphPoll*, fd: int64, what: Word, to: Word, tag: Word) -> Word
+```
+
+Call it as `p->want(fd, what, to, tag)`, or `p.want(fd, what, to, tag)` on a value.
+
+Asks for one message when a descriptor is ready: for reading (ALPH_READ),
+for writing (ALPH_WRITE) or either (both). The message has the tag given,
+the descriptor in arg, and in ref what it is ready for, with ALPH_ERROR
+if it failed. Ask again for the next. Returns ALPH_FULL when every ear is
+in use, ALPH_GONE when the kernel refuses the descriptor.
+
+### `AlphPoll_forget__ptr`
+
+```mettle
+export fn AlphPoll_forget__ptr(p: AlphPoll*, fd: int64)
+```
+
+Call it as `p->forget(fd)`, or `p.forget(fd)` on a value.
+
+Stops asking about a descriptor. Do this before closing it.
+
+### `AlphPoll_stop__ptr`
+
+```mettle
+export fn AlphPoll_stop__ptr(p: AlphPoll*)
+```
+
+Call it as `p->stop()`, or `p.stop()` on a value.
+
+No message is sent after this returns, and asking after it is refused.
+
+## port/net (host port)
+
+TCP over IPv4 without waiting: every call returns at once.
+
+```mettle
+export const ALPH_LATER: int64 = -1;   // nothing now: ask to be told when the socket is ready
+export const ALPH_BROKEN: int64 = -2;  // the connection failed or is not there
+```
+
+### `alph_tcp_listen`
+
+```mettle
+export fn alph_tcp_listen(port: int64) -> int64
+```
+
+A socket that takes connections on a port. Returns it, or ALPH_BROKEN
+when the port cannot be had.
+
+### `alph_tcp_accept`
+
+```mettle
+export fn alph_tcp_accept(listener: int64) -> int64
+```
+
+The next connection waiting on a listening socket. Returns it, ALPH_LATER
+when none is waiting, or ALPH_BROKEN.
+
+### `alph_tcp_connect`
+
+```mettle
+export fn alph_tcp_connect(ip: uint32, port: int64) -> int64
+```
+
+Starts a connection to a.b.c.d (as one number) and a port. Returns the
+socket: it is connected once it is ready for writing and alph_tcp_failed
+says it did not fail. ALPH_BROKEN when it could not start.
+
+### `alph_tcp_failed`
+
+```mettle
+export fn alph_tcp_failed(fd: int64) -> bool
+```
+
+Whether a socket's connection has failed.
+
+### `alph_read`
+
+```mettle
+export fn alph_read(fd: int64, bytes: uint8*, room: int64) -> int64
+```
+
+Reads what is there, up to room bytes. Returns how many, 0 when the other
+side has closed, ALPH_LATER when nothing is there yet, or ALPH_BROKEN.
+
+### `alph_write`
+
+```mettle
+export fn alph_write(fd: int64, bytes: uint8*, count: int64) -> int64
+```
+
+Writes as much as fits now. Returns how many bytes were taken, which may
+be fewer than count, ALPH_LATER when none can be taken yet, or ALPH_BROKEN.
+
+### `alph_close`
+
+```mettle
+export fn alph_close(fd: int64)
+```
+
+Closes a descriptor.
+
+## port/proc (host port)
+
+Other programs: start one, and have a descriptor that is ready for
+reading when it has ended. With src/poll that is a message, like any
+other descriptor.
+
+```mettle
+export const ALPH_RUNNING: int64 = -1;  // the program has not ended yet
+export const ALPH_NO_PROGRAM: int64 = -2;  // the program could not be started
+```
+
+### `alph_proc_env`
+
+```mettle
+export fn alph_proc_env(envp: cstring*)
+```
+
+The environment programs are started with: what main was given, as
+argv + argc + 1. Without it they get only a PATH.
+
+### `alph_proc_start`
+
+```mettle
+export fn alph_proc_start(command: cstring) -> int64
+```
+
+Starts a command, run by /bin/sh -c. Returns a descriptor that is ready
+for reading once the program has ended, or ALPH_NO_PROGRAM when it could
+not be started. Close the descriptor when its result has been read.
+
+### `alph_proc_result`
+
+```mettle
+export fn alph_proc_result(fd: int64) -> int64
+```
+
+How a program ended: its exit status (0 to 255), or 128 plus the signal
+that ended it. ALPH_RUNNING while it has not ended. Call it once per
+program: it also lets the system forget the program.
+
+### `alph_proc_wait`
+
+```mettle
+export fn alph_proc_wait(fd: int64) -> int64
+```
+
+Waits for a program to end and returns how it did, as alph_proc_result
+does. For a thread whose work is to run the program, not for a handler
+that others wait behind.
+
+## port/wire (host port)
+
+Datagrams between machines: UDP over IPv4.
+
+### `AlphWire`
+
+```mettle
+export struct AlphWire {
+  fd: int64;
+}
+```
+
+A UDP socket.
+
+### `alph_ip4`
+
+```mettle
+export fn alph_ip4(a: int64, b: int64, c: int64, d: int64) -> uint32
+```
+
+The address a.b.c.d as one number.
+
+### `AlphWire_open__ptr`
+
+```mettle
+export fn AlphWire_open__ptr(w: AlphWire*, port: int64, wait_ms: int64) -> bool
+```
+
+Call it as `w->open(port, wait_ms)`, or `w.open(port, wait_ms)` on a value.
+
+Listens on a port. recv gives up after wait_ms with nothing. False when
+the port cannot be had.
+
+### `AlphWire_send__ptr`
+
+```mettle
+export fn AlphWire_send__ptr(w: AlphWire*, ip: uint32, port: int64, bytes: uint8*, count: int64) -> bool
+```
+
+Call it as `w->send(ip, port, bytes, count)`, or `w.send(ip, port, bytes, count)` on a value.
+
+Any thread may send. False when the datagram could not go out.
+
+### `AlphWire_recv__ptr`
+
+```mettle
+export fn AlphWire_recv__ptr(w: AlphWire*, bytes: uint8*, room: int64, ip: uint32*, port: int64*) -> int64
+```
+
+Call it as `w->recv(bytes, room, ip, port)`, or `w.recv(bytes, room, ip, port)` on a value.
+
+The next datagram, and who sent it. Returns its length, or 0 when none
+came in time.
+
+### `AlphWire_close__ptr`
+
+```mettle
+export fn AlphWire_close__ptr(w: AlphWire*)
+```
+
+Call it as `w->close()`, or `w.close()` on a value.
+
+Closes the socket.
+
+## port/line (host port)
+
+A line of bytes to one other machine: any descriptor that carries bytes
+both ways, such as a serial port or a TCP connection. A thread reads it
+and hands each byte that arrives to take. A process has one line.
+
+### `alph_line_open`
+
+```mettle
+export fn alph_line_open(fd: int64)
+```
+
+The descriptor the line is: set it before the line is started. It must
+wait when read (not be set non-blocking).
+
+### `alph_line_start`
+
+```mettle
+export fn alph_line_start(take: fn(rawptr, int32) -> void, ctx: rawptr)
+```
+
+### `alph_line_put`
+
+```mettle
+export fn alph_line_put(byte: uint8)
+```
+
+### `alph_line_flush`
+
+```mettle
+export fn alph_line_flush()
+```
+
+Sends what was put. If the other end is gone the rest is dropped.
+
+### `alph_line_lock`
+
+```mettle
+export fn alph_line_lock()
+```
+
+Held while one whole message is put and flushed, so two senders' bytes
+do not mix.
+
+### `alph_line_unlock`
+
+```mettle
+export fn alph_line_unlock()
+```
+
+## port/serial (host port)
+
+A serial device as a line of bytes: a board's UART on /dev/ttyACM0 or
+/dev/ttyUSB0, say. The device is set to carry bytes as they are (eight
+bits, no parity, one stop bit, nothing translated, no flow control) at
+the speed asked for. Give the descriptor to alph_line_open.
+
+### `alph_serial_open`
+
+```mettle
+export fn alph_serial_open(path: cstring, baud: int64) -> int64
+```
+
+Opens a serial device at `baud` bits a second. Returns its descriptor, or
+a negative number when it cannot be opened or set.
+
+## alph/tether/tether
+
+A tether: a node tied to one other machine by a line of bytes, such as a
+board's serial port. It is the small way for a microcontroller to be a
+place among bigger machines: no numbering, no beats, nothing sent again.
+A message goes over once, and a byte lost on the line loses it.
+
+A message is 34 bytes on the line, then a byte that marks its end. The
+pids in it are their three parts, because a 32-bit board and a 64-bit
+server pack them differently. A pid too big for this machine's word
+cannot be held here, so its message is dropped: an actor on a bigger
+machine talks to a board if its place is below 256, its slot below 1,024
+and its generation below 8,192, which holds for actors spawned at the
+start. A message's tag, arg and ref cross as 32 bits each, so a bigger
+machine's larger numbers are cut short.
+
+A process has one line, and so one tether.
+
+### `AlphTether`
+
+```mettle
+export struct AlphTether {
+  node: AlphNode*;
+  first: Word;    // the other machine's places are first, first + 1, ...
+  count: Word;
+  have: Word;
+  escaped: Word;
+  dropped: Word;  // messages that came in damaged, or with a pid too big for here
+  relay: Word;    // mail off the line for places other than this node's is passed on
+  frame: uint8[34];
+}
+```
+
+### `AlphTether_send__ptr`
+
+```mettle
+export fn AlphTether_send__ptr(t: AlphTether*, to: Word, m: AlphMsg*) -> Word
+```
+
+Call it as `t->send(to, m)`, or `t.send(to, m)` on a value.
+
+Puts a message on the line, whoever it is for.
+
+### `AlphTether_open__ptr`
+
+```mettle
+export fn AlphTether_open__ptr(t: AlphTether*, node: AlphNode*, first: Word, count: Word)
+```
+
+Call it as `t->open(node, first, count)`, or `t.open(node, first, count)` on a value.
+
+Starts the line for a node that is already placed: mail off the line is
+put through it. The other machine's places are first, first + 1, ...
+Whether mail is passed on (relay) is left as it was set.
+
+### `AlphTether_init__ptr`
+
+```mettle
+export fn AlphTether_init__ptr(t: AlphTether*, node: AlphNode*, place: Word, first: Word, count: Word)
+```
+
+Call it as `t->init(node, place, first, count)`, or `t.init(node, place, first, count)` on a value.
+
+Ties a node to the machine at the other end of the port's line. The node
+is place `place`. The other machine's places are first, first + 1, ...
+Call it before the first spawn.
+
+## alph/tether/relay
+
+A relay: a machine on the link that has a board on its serial line and
+passes mail both ways, so any machine of the network reaches the board's
+actors by pid and the board reaches theirs. The other machines are told
+the board's places are reached through this one (AlphLink_through).
+
+Mail for the board waits in a short queue that a thread of its own writes
+to the line. So a slow line holds up neither the link, which must go on
+saying this machine is alive, nor the actors that send. When 64 messages
+are waiting, a sender gets ALPH_FULL and mail passed on from another
+machine is dropped.
+
+The board has no door: its actors are reached by pid, not found by name
+or watched from other machines.
+
+Linux only, since the link is. A process has one relay, as it has one line.
+
+### `AlphTether_relay__ptr`
+
+```mettle
+export fn AlphTether_relay__ptr(t: AlphTether*, link: AlphLink*, first: Word, count: Word)
+```
+
+Call it as `t->relay(link, first, count)`, or `t.relay(link, first, count)` on a value.
+
+Puts a board on this machine's line behind its link. The board's places
+are first, first + 1, ... Call it after the link's init and before its
+start, with the line's descriptor already given to the port.
+
+## port/board (mcu port)
+
+What a board needs before alph runs on it. Call it first in main. Other
+boards have their own in their port's folder, so a program is the same
+source on each.
+
+### `alph_board_start`
+
+```mettle
+export fn alph_board_start()
+```
+
+Does what this board needs before anything else. Call it first in main.

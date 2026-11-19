@@ -12,6 +12,7 @@ import "port/port";
 import "port/alarm";
 import "alph/actor/actor";
 
+// One timer: the message it will send and when.
 export struct AlphTimer {
   at: Word;   // in the port's ticks
   to: Word;
@@ -20,6 +21,7 @@ export struct AlphTimer {
   ref: Word;  // 0 while the slot is free
 }
 
+// The timers of one node.
 export struct AlphTime {
   gate: AlphGate;
   alarm: AlphAlarm;

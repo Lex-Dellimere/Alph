@@ -11,6 +11,7 @@ const SOCK_DGRAM: int64 = 2;
 const SOL_SOCKET: int64 = 1;
 const SO_RCVTIMEO: int64 = 20;
 
+// A UDP socket.
 export struct AlphWire {
   fd: int64;
 }
@@ -75,6 +76,7 @@ export fn AlphWire_recv__ptr(w: AlphWire*, bytes: uint8*, room: int64, ip: uint3
   return got;
 }
 
+// Closes the socket.
 export fn AlphWire_close__ptr(w: AlphWire*) {
   syscall(SYS_CLOSE, w->fd);
   w->fd = -1;

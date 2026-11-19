@@ -13,6 +13,7 @@ import "alph/place/place";
 const ALPH_BATCH_MORE: Word = -16;  // from a batch's actor to itself: try the pieces that were refused
 const OUT: Word = 16;               // pieces out at once
 
+// One batch, and the sixteen jobs its pieces go out in.
 export struct AlphBatch {
   places: AlphPlaces*;
   kind: Word;
@@ -35,6 +36,7 @@ export struct AlphBatch {
   jobs: AlphJob[16];
 }
 
+// Ties a batch to the places its pieces will go to. Call it once, before begin.
 export fn AlphBatch_init__ptr(b: AlphBatch*, places: AlphPlaces*) {
   b->places = places;
   b->total = 0;

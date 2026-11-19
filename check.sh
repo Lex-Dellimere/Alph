@@ -60,6 +60,13 @@ if [ $# -eq 0 ]; then
     sed 's/^/      /' "$OUT/apidoc.log"
     fails=$((fails + 1))
   fi
+  if tools/apidoc.sh --new --check > "$OUT/apidoc_new.log" 2>&1; then
+    echo "ok    docs/reference.md matches the source"
+  else
+    echo "FAIL  docs/reference.md (see $OUT/apidoc_new.log)"
+    sed 's/^/      /' "$OUT/apidoc_new.log"
+    fails=$((fails + 1))
+  fi
 fi
 
 for src in "${tests[@]}"; do

@@ -22,6 +22,8 @@ import "alph/actor/actor";
 
 const NONE: Word = -1;
 
+// One timer on the wheel: the message it will send, when, and its
+// neighbours in its spoke.
 export struct AlphWheelTimer {
   at: Word;    // in the port's ticks
   to: Word;
@@ -32,6 +34,7 @@ export struct AlphWheelTimer {
   prev: Word;
 }
 
+// A timer wheel: the timers and the spokes they wait in.
 export struct AlphWheel {
   gate: AlphGate;
   alarm: AlphAlarm;

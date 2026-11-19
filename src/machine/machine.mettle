@@ -66,6 +66,7 @@ struct AlphServing {
   kind: Word;
 }
 
+// One machine: its layers, what it shares, and the memory they work in.
 export struct AlphMachine {
   cores: AlphCores;
   link: AlphLink;
@@ -514,6 +515,7 @@ export fn AlphMachine_run__ptr(m: AlphMachine*) {
   m->cores.run();
 }
 
+// Stops the cores, so run returns. Any actor or thread may call it.
 export fn AlphMachine_stop__ptr(m: AlphMachine*) {
   m->cores.stop();
 }

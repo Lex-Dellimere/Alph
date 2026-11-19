@@ -14,7 +14,7 @@ const WEXITED: int64 = 4;
 const CLD_EXITED: int32 = 1;
 
 export const ALPH_RUNNING: int64 = -1;  // the program has not ended yet
-export const ALPH_NO_PROGRAM: int64 = -2;
+export const ALPH_NO_PROGRAM: int64 = -2;  // the program could not be started
 
 var g_envp: cstring* = 0;
 

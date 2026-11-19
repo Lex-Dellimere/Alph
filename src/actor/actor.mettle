@@ -14,12 +14,14 @@
 import "port/port";
 import "port/guard";
 
+// What a send returns: sent, the mailbox is full, or there is no such actor.
 export const ALPH_OK: Word = 0;
 export const ALPH_FULL: Word = -1;  // the mailbox is full
 export const ALPH_GONE: Word = -2;  // no such actor
 export const ALPH_END: Word = 1;       // a handler returns this when its actor is finished
 export const ALPH_CRASHED: Word = -9;  // the reason an actor ends with when its handler crashes
 
+// A message: four words.
 export struct AlphMsg {
   tag: Word;
   from: Word;
@@ -27,6 +29,8 @@ export struct AlphMsg {
   ref: Word;
 }
 
+// An actor: a state, a handler and a mailbox. The handler is given the
+// actor and one message at a time.
 export struct AlphActor {
   next: AlphActor*;
   node: AlphNode*;
@@ -40,6 +44,7 @@ export struct AlphActor {
   count: Word;
 }
 
+// A node: the actors of one place. It runs one message at a time.
 export struct AlphNode {
   gate: AlphGate;
   actors: AlphActor*;
@@ -218,6 +223,8 @@ export fn AlphNode_send__ptr(n: AlphNode*, to: Word, tag: Word, arg: Word) -> Wo
   return n->put(to, &m);
 }
 
+// Sends a message from this actor. Returns ALPH_OK, ALPH_FULL when the
+// mailbox it is for is full, ALPH_GONE when there is no such actor.
 export fn AlphActor_send__ptr(a: AlphActor*, to: Word, tag: Word, arg: Word) -> Word {
   var m: AlphMsg = { tag: tag, from: a->pid, arg: arg, ref: 0 };
   return a->node->put(to, &m);

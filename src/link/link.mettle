@@ -42,6 +42,7 @@ const MAIL_BYTES: int64 = 80;
 const WINDOW: uint32 = 64;   // messages to one machine that may be waiting for its word
 const AGAIN_MS: Word = 40;   // how long that word is waited for before sending again
 const ACK_EVERY: Word = 16;  // messages taken before saying so at once
+// The most bytes one message can carry.
 export const ALPH_PARCEL_BYTES: Word = 1024;
 export const ALPH_DATAGRAM: int64 = 1104;  // the most a datagram holds before it is sealed
 
@@ -74,6 +75,8 @@ struct AlphPacket {
   ref: int64;
 }
 
+// Another machine: its places, its address, and how far the messages to
+// it and from it have got.
 export struct AlphPeer {
   first: Word;   // its places are first, first + 1, ...
   count: Word;
@@ -99,6 +102,7 @@ export struct AlphPeer {
   held: AlphParcel*[64];   // and the bytes of those that carry any
 }
 
+// This machine's link to the others.
 export struct AlphLink {
   wire: AlphWire;
   cores: AlphCores*;

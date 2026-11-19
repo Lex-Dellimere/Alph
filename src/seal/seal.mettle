@@ -25,6 +25,7 @@ import "alph/link/link";
 const HEAD: int64 = 24;  // place 4, run 8, count 8, salt 4: sent in the clear, and the number used once
 const TAG: int64 = 16;
 
+// A sealed link's key and its count of datagrams sent.
 export struct AlphSeal {
   key: CrKey32;
   salt: uint8[4];

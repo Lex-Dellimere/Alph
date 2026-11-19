@@ -66,7 +66,7 @@ This is [examples/count.mettle](examples/count.mettle). The node owns no memory:
 | Machine and batch | The short way: a machine set up in one call, and one kind of work handed out in pieces to cores, the GPU, other machines and boards | [src/machine](src/machine/machine.mettle), [src/batch](src/batch/batch.mettle) |
 | Ports | What differs per device: `mcu` (one hart, no OS), `harts` (several harts, no OS), `pico2` (a Raspberry Pi Pico 2) and `host` (x86-64 Linux) | [ports](ports) |
 
-[docs/start.md](docs/start.md) shows how to use each of these. [docs/design.md](docs/design.md) explains why they are built this way, what was measured, and what is not built yet.
+[docs/start.md](docs/start.md) shows how to use each of these. [docs/design.md](docs/design.md) explains why they are built this way, what was measured, and what is not built yet. Every struct, constant and function of these layers is listed in [docs/reference.md](docs/reference.md).
 
 ## Try it
 
@@ -223,10 +223,11 @@ src/core, src/heal, src/work, src/net, src/io, src/sched, src/sys
                             the first runtime
 docs/start.md               how to use the new alph, layer by layer
 docs/design.md              the design of the new alph, with what was measured
+docs/reference.md           every struct, constant and function of the new alph, built from the source
 docs/guide.md, docs/api.md  the first runtime's guide and reference
 examples/                   small programs, run by check.sh
 tests/                      self-checking test programs
-tools/                      apidoc.sh, which builds docs/api.md
+tools/                      apidoc.sh, which builds docs/api.md and docs/reference.md
 ```
 
 ## License
