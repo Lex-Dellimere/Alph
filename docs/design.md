@@ -44,6 +44,10 @@ A timer is something that sends a message later, so it is a layer (`src/time`), 
 
 Every operation looks at every timer slot. That is the smallest code and right for tens of timers. A server with thousands needs a timer wheel behind the same four functions, which is not built.
 
+## Polls
+
+`src/poll` is how a socket, or any file descriptor, sends a message when it is ready. Handlers never wait: they read and write what can be done now, and ask to be told when there is more. One thread sleeps in the kernel until something is ready and sends the messages. Each asking is for one message, so a busy socket cannot flood a mailbox and an actor that is not ready for more is not told. The host port has the TCP calls that go with it, none of which waits. `examples/talk.mettle` is an echo server with an actor for each connection, and the test runs twenty clients against one at once. This is Linux only.
+
 ## Ports
 
 What differs between devices is in a port, a folder picked at build time with `-I ports/<name>`:

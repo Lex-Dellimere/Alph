@@ -8,7 +8,7 @@ An actor is a state and a handler, and the handler runs once for each message th
 
 ## Building
 
-Each layer is one import: `alph/actor/actor` (the core), `alph/cores/cores`, `alph/time/time`, `alph/place/place`, `alph/life/life`, `alph/link/link`, `alph/name/name`, `alph/door/door` and `alph/seal/seal`. Map alph in your program's `mettle.deps`:
+Each layer is one import: `alph/actor/actor` (the core), `alph/cores/cores`, `alph/time/time`, `alph/place/place`, `alph/poll/poll`, `alph/life/life`, `alph/link/link`, `alph/name/name`, `alph/door/door` and `alph/seal/seal`. Map alph in your program's `mettle.deps`:
 
 ```text
 alph=<path to alph>/src
@@ -181,6 +181,54 @@ fn main() -> int32 {
 - `stop()` makes sure no timer's message is sent after it returns. Waiting timers are dropped.
 
 If the mailbox of the actor a timer is for is full when it falls due, the timer tries again a tick later. Every timer operation looks at every slot, which is right for tens of timers, not for thousands.
+
+## Sockets
+
+`AlphPoll` has a socket, or any file descriptor, send a message when it is ready. A handler never waits: it reads and writes what can be done now, and asks to be told when there is more. The host port's `port/net` has TCP calls to go with it, and none of them waits. This is the connection actor of the echo server in [examples/talk.mettle](../examples/talk.mettle):
+
+```mettle
+import "port/net";
+import "alph/poll/poll";
+
+var g_poll: AlphPoll;
+var g_ears: AlphEar[4];
+
+fn echo(a: AlphActor*, m: AlphMsg*) -> Word {
+  var c: Conn* = (Conn*)a->state;
+  while (true) {
+    if (c->sent < c->have) {
+      var put: int64 = alph_write(c->fd, &c->bytes[c->sent], c->have - c->sent);
+      if (put == ALPH_LATER) {
+        g_poll.want(c->fd, ALPH_WRITE, a->pid, READY);
+        return 0;
+      }
+      if (put < 0) {
+        break;
+      }
+      c->sent = c->sent + put;
+      continue;
+    }
+    var got: int64 = alph_read(c->fd, &c->bytes[0], 64);
+    if (got == ALPH_LATER) {
+      g_poll.want(c->fd, ALPH_READ, a->pid, READY);
+      return 0;
+    }
+    if (got <= 0) {
+      break;  // the client closed
+    }
+    c->have = got;
+    c->sent = 0;
+  }
+  g_poll.forget(c->fd);
+  alph_close(c->fd);
+  return ALPH_END;
+}
+```
+
+- `init(node, ears, room)` starts the poll with `room` ears in your array, one for each descriptor asked about at a time. Messages go out through `node`. `stop()` ends it.
+- `want(fd, what, to, tag)` asks for one message when `fd` is ready for `ALPH_READ`, `ALPH_WRITE` or both. The message has your `tag`, the descriptor in `arg`, and in `ref` what it is ready for, with `ALPH_ERROR` if it failed. Ask again for the next one. It returns `ALPH_FULL` when every ear is in use and `ALPH_GONE` when the kernel refuses the descriptor.
+- `forget(fd)` stops asking. Do this before closing the descriptor.
+- `alph_tcp_listen(port)`, `alph_tcp_accept(listener)` and `alph_tcp_connect(ip, port)` give sockets. `alph_read` and `alph_write` return how many bytes moved, `ALPH_LATER` when nothing can be done yet, or `ALPH_BROKEN`. `alph_read` returns 0 when the other side has closed. A connection made with `alph_tcp_connect` is ready once it is ready for writing and `alph_tcp_failed(fd)` is false.
 
 ## Lives
 
@@ -452,7 +500,7 @@ These are not built yet.
 - A sealed link has one key for the whole network: any holder can speak as any machine, and someone who gets the key later can read what they recorded before.
 - A job with data of its own cannot go to another machine, only a job of one word in and one word out.
 - Timers look at every timer slot: right for tens of timers, not thousands. A timer wheel behind the same four functions is not built.
-- There is no socket or file IO on the new core.
+- Sockets are Linux only, and there is no file IO.
 - A message between two cores costs 150 to 300 ns against about 20 ns inside a node. Removing that needs a queue per pair of cores that the sender writes without touching anything the receiver owns, which changes what a full mailbox can tell a sender. Not built.
 - The microcontroller port has no link to other machines.
 - A full mailbox at the far end of a link drops its message and the sender is not told.

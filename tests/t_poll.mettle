@@ -1,0 +1,274 @@
+// Polls (src/poll) with the port's TCP helpers: an echo server with an actor
+// for each connection and twenty clients at once, on two cores. Every byte
+// comes back, a closed connection is noticed, writing to one the other side
+// closed is an error and not the end of the process, and a descriptor the
+// kernel does not know and an ear too many are refused.
+
+import "std/io";
+import "port/net";
+import "port/wire";
+import "alph/actor/actor";
+import "alph/cores/cores";
+import "alph/poll/poll";
+
+const GO: Word = 1;
+const READY: Word = 2;
+const CLIENTS: Word = 20;
+const ROUNDS: Word = 200;
+
+var g_cores: AlphCores;
+var g_core: AlphCore[2];
+var g_actors: AlphActor[64];
+var g_mail: AlphMsg[512];
+var g_poll: AlphPoll;
+var g_ears: AlphEar[48];
+var g_port: int64 = 0;
+var g_failures: int32 = 0;
+
+fn expect(ok: bool, what: string) {
+  if (!ok) {
+    println("FAIL {what}");
+    g_failures = g_failures + 1;
+  }
+}
+
+// One connection of the server: sends back whatever arrives.
+struct Conn {
+  fd: int64;
+  have: int64;
+  sent: int64;
+  bytes: uint8[64];
+}
+
+var g_conns: Conn[24];
+var g_conn_count: Word = 0;
+var g_closed: int32 = 0;
+
+fn echo(a: AlphActor*, m: AlphMsg*) -> Word {
+  var c: Conn* = (Conn*)a->state;
+  while (true) {
+    if (c->sent < c->have) {
+      var put: int64 = alph_write(c->fd, &c->bytes[c->sent], c->have - c->sent);
+      if (put == ALPH_LATER) {
+        g_poll.want(c->fd, ALPH_WRITE, a->pid, READY);
+        return 0;
+      }
+      if (put < 0) {
+        break;
+      }
+      c->sent = c->sent + put;
+      continue;
+    }
+    var got: int64 = alph_read(c->fd, &c->bytes[0], 64);
+    if (got == ALPH_LATER) {
+      g_poll.want(c->fd, ALPH_READ, a->pid, READY);
+      return 0;
+    }
+    if (got <= 0) {
+      break;
+    }
+    c->have = got;
+    c->sent = 0;
+  }
+  // The other side closed, or the connection broke.
+  g_poll.forget(c->fd);
+  alph_close(c->fd);
+  atomic_inc_i32(&g_closed);
+  return ALPH_END;
+}
+
+// Takes connections and gives each an actor.
+fn listener(a: AlphActor*, m: AlphMsg*) -> Word {
+  var fd: int64* = (int64*)a->state;
+  while (true) {
+    var conn: int64 = alph_tcp_accept(*fd);
+    if (conn < 0) {
+      break;
+    }
+    var c: Conn* = &g_conns[g_conn_count];
+    g_conn_count = g_conn_count + 1;
+    c->fd = conn;
+    c->have = 0;
+    c->sent = 0;
+    g_poll.want(conn, ALPH_READ, a->cores()->spawn_on(0, &echo, (rawptr)c), READY);
+  }
+  g_poll.want(*fd, ALPH_READ, a->pid, READY);
+  return 0;
+}
+
+// A client: sends its number and the round, 16 bytes, and checks they come
+// back, ROUNDS times.
+struct Client {
+  id: int64;
+  fd: int64;
+  round: int64;
+  sent: int64;
+  have: int64;
+  out: int64[2];
+  back: int64[2];
+  wrong: Word;
+}
+
+var g_clients: Client[20];
+var g_done: int32 = 0;
+
+fn client(a: AlphActor*, m: AlphMsg*) -> Word {
+  var c: Client* = (Client*)a->state;
+  if (m->tag == GO) {
+    c->fd = alph_tcp_connect(alph_ip4(127, 0, 0, 1), g_port);
+    c->round = 0;
+    c->sent = 0;
+    c->have = 0;
+    c->out[0] = c->id;
+    c->out[1] = 0;
+    if (c->fd < 0 || g_poll.want(c->fd, ALPH_WRITE, a->pid, READY) != ALPH_OK) {
+      c->wrong = c->wrong + 1000;
+      a->cores()->stop();
+      return ALPH_END;
+    }
+    return 0;
+  }
+  if ((Word)(m->ref & ALPH_ERROR) != 0 || alph_tcp_failed(c->fd)) {
+    c->wrong = c->wrong + 1000;
+    a->cores()->stop();
+    return ALPH_END;
+  }
+  while (c->round < ROUNDS) {
+    if (c->sent < 16) {
+      var put: int64 = alph_write(c->fd, (uint8*)&c->out[0] + c->sent, 16 - c->sent);
+      if (put == ALPH_LATER) {
+        g_poll.want(c->fd, ALPH_WRITE, a->pid, READY);
+        return 0;
+      }
+      c->sent = c->sent + put;
+      continue;
+    }
+    var got: int64 = alph_read(c->fd, (uint8*)&c->back[0] + c->have, 16 - c->have);
+    if (got == ALPH_LATER) {
+      g_poll.want(c->fd, ALPH_READ, a->pid, READY);
+      return 0;
+    }
+    if (got <= 0) {
+      c->wrong = c->wrong + 1000;
+      break;
+    }
+    c->have = c->have + got;
+    if (c->have == 16) {
+      if (c->back[0] != c->id || c->back[1] != c->round) {
+        c->wrong = c->wrong + 1;
+      }
+      c->round = c->round + 1;
+      c->out[1] = c->round;
+      c->sent = 0;
+      c->have = 0;
+    }
+  }
+  g_poll.forget(c->fd);
+  alph_close(c->fd);
+  if (atomic_inc_i32(&g_done) == (int32)CLIENTS) {
+    a->cores()->stop();
+  }
+  return ALPH_END;
+}
+
+fn main() -> int32 {
+  var listening: int64 = -1;
+  g_port = 9000 + syscall(39) % 900;
+  g_cores.init(&g_core[0], 2, &g_actors[0], 32, &g_mail[0], 8);
+  expect(g_poll.init(&g_core[0].node, &g_ears[0], 48) == ALPH_OK, "the poll starts");
+
+  expect(g_poll.want(-1, ALPH_READ, 1, READY) == ALPH_GONE, "a descriptor the kernel does not know is refused");
+  expect(g_ears[0].fd == -1, "and takes no ear");
+
+  // Listening before any client is started, so none is turned away.
+  listening = alph_tcp_listen(g_port);
+  expect(listening >= 0, "the server listens");
+  g_cores.send(g_cores.spawn_on(0, &listener, (rawptr)&listening), GO, 0);
+  for i in 0..CLIENTS {
+    g_clients[i].id = (int64)i + 100;
+    g_clients[i].wrong = 0;
+    g_cores.send(g_cores.spawn_on(1, &client, (rawptr)&g_clients[i]), GO, 0);
+  }
+  g_cores.run();
+
+  var wrong: Word = 0;
+  var rounds: int64 = 0;
+  for i in 0..CLIENTS {
+    wrong = wrong + g_clients[i].wrong;
+    rounds = rounds + g_clients[i].round;
+  }
+  expect(rounds == CLIENTS * ROUNDS, "every round of every client came back ({rounds})");
+  expect(wrong == 0, "with the bytes that were sent ({wrong} wrong)");
+  expect(g_conn_count == CLIENTS, "the server took {CLIENTS} connections ({g_conn_count})");
+
+  // The clients closed: each connection's actor is told and ends.
+  var waited: Word = 0;
+  while (g_closed < (int32)CLIENTS && waited < 2000) {
+    g_core[0].node.turn();
+    waited = waited + 1;
+    Sleep(1);
+  }
+  expect(g_closed == (int32)CLIENTS, "the server noticed every connection close ({g_closed})");
+  var live_ears: Word = 0;
+  for i in 0..48 {
+    if (g_ears[i].fd >= 0) {
+      live_ears = live_ears + 1;
+    }
+  }
+  expect(live_ears == 1, "only the listening socket is still asked about ({live_ears})");
+
+  // Writing to a connection whose other side has gone is an error to the
+  // writer, not the end of the process.
+  var lost: int64 = alph_tcp_connect(alph_ip4(127, 0, 0, 1), g_port);
+  var theirs: int64 = -1;
+  waited = 0;
+  while (theirs < 0 && waited < 2000) {
+    theirs = alph_tcp_accept(listening);
+    waited = waited + 1;
+    Sleep(1);
+  }
+  expect(lost >= 0 && theirs >= 0, "one more connection, held by hand");
+  alph_close(theirs);
+  var junk: uint8[8];
+  var broke: bool = false;
+  for i in 0..200 {
+    if (alph_write(lost, &junk[0], 8) == ALPH_BROKEN) {
+      broke = true;
+      break;
+    }
+    Sleep(1);
+  }
+  expect(broke, "writing to a connection the other side closed is refused, and the process lives");
+  alph_close(lost);
+
+  // Every ear in use.
+  var pipes: int64[2];
+  var extra: int64[94];
+  var taken: Word = 0;
+  for i in 0..47 {
+    syscall(293, (int64)&pipes[0], 0);
+    extra[i * 2] = pipes[0];
+    extra[i * 2 + 1] = pipes[1];
+    if (g_poll.want(pipes[0], ALPH_READ, 1, READY) == ALPH_OK) {
+      taken = taken + 1;
+    }
+  }
+  expect(taken == 47, "the ears fill up ({taken} more)");
+  syscall(293, (int64)&pipes[0], 0);
+  expect(g_poll.want(pipes[0], ALPH_READ, 1, READY) == ALPH_FULL, "one more is refused");
+  g_poll.forget(extra[0]);
+  expect(g_poll.want(pipes[0], ALPH_READ, 1, READY) == ALPH_OK, "until one is forgotten");
+
+  g_poll.stop();
+  alph_close(pipes[0]);
+  alph_close(pipes[1]);
+  for i in 0..94 {
+    alph_close(extra[i]);
+  }
+  alph_close(listening);
+  if (g_failures != 0) {
+    return 1;
+  }
+  println("poll ok: {CLIENTS} clients, {rounds} round trips over TCP, every byte back");
+  return 0;
+}

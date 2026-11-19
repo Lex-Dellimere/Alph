@@ -1,0 +1,220 @@
+// Polls: a socket or any other file descriptor sends a message when it is
+// ready. Handlers never wait: they read and write what can be done now, and
+// ask to be told when there is more.
+//
+// One thread sleeps in the kernel until something is ready and sends the
+// messages. Each asking is for one message: an actor asks again when it
+// wants the next. So a busy socket cannot flood a mailbox, and an actor
+// that is not ready for more is not told.
+//
+// x86-64 Linux (epoll).
+
+import "std/thread";
+import "port/port";
+import "alph/actor/actor";
+
+export const ALPH_READ: Word = 1;    // ready for reading, or the other side closed
+export const ALPH_WRITE: Word = 2;   // ready for writing
+export const ALPH_ERROR: Word = 4;   // the descriptor failed
+
+const SYS_CLOSE: int64 = 3;
+const SYS_EPOLL_WAIT: int64 = 232;
+const SYS_EPOLL_CTL: int64 = 233;
+const SYS_EPOLL_CREATE1: int64 = 291;
+const EPOLL_ADD: int64 = 1;
+const EPOLL_DEL: int64 = 2;
+const EPOLL_MOD: int64 = 3;
+const EPOLLIN: uint32 = 1;
+const EPOLLOUT: uint32 = 4;
+const EPOLLERR: uint32 = 8;
+const EPOLLHUP: uint32 = 16;
+const EPOLLRDHUP: uint32 = 8192;
+const EPOLLONESHOT: uint32 = 1073741824;
+const EEXIST: int64 = -17;
+const ENOENT: int64 = -2;
+
+// One descriptor someone asked about.
+export struct AlphEar {
+  fd: int64;     // -1 while the slot is free
+  to: Word;
+  tag: Word;
+  owed: Word;    // what was ready when its actor's mailbox was full
+  turn: uint32;  // goes up each time the slot is given to a descriptor or taken back
+}
+
+export struct AlphPoll {
+  gate: AlphGate;
+  node: AlphNode*;
+  ears: AlphEar*;
+  room: Word;
+  epoll: int64;
+  thread: int64;
+  stopping: int32;
+}
+
+// The kernel's event record: 12 bytes, the events, then what we gave it to
+// hand back: the slot and the slot's turn, so that word about a descriptor
+// the slot no longer holds is dropped.
+struct AlphEvent {
+  events: uint32;
+  slot: uint32;
+  turn: uint32;
+}
+
+fn alph_poll_main(arg: cstring) -> uint32 {
+  var p: AlphPoll* = (AlphPoll*)arg;
+  var events: AlphEvent[32];
+  while (p->stopping == 0) {
+    var n: int64 = syscall(SYS_EPOLL_WAIT, p->epoll, (int64)&events[0], 32, 10);
+    var was: int32 = p->gate.enter();
+    for i in 0..n {
+      var e: AlphEar* = &p->ears[(int64)events[i].slot];
+      var ready: Word = 0;
+      if ((events[i].events & (EPOLLIN | EPOLLHUP | EPOLLRDHUP)) != 0) {
+        ready = (Word)(ready | ALPH_READ);
+      }
+      if ((events[i].events & EPOLLOUT) != 0) {
+        ready = (Word)(ready | ALPH_WRITE);
+      }
+      if ((events[i].events & EPOLLERR) != 0) {
+        ready = (Word)(ready | ALPH_ERROR);
+      }
+      if (e->fd >= 0 && e->turn == events[i].turn) {
+        e->owed = (Word)(e->owed | ready);
+      }
+    }
+    // Told now, or on a later pass if the actor's mailbox is full.
+    for i in 0..p->room {
+      var e: AlphEar* = &p->ears[i];
+      if (e->fd >= 0 && e->owed != 0) {
+        var m: AlphMsg = { tag: e->tag, from: 0, arg: (Word)e->fd, ref: e->owed };
+        var out: Word = p->node->put(e->to, &m);
+        if (out == ALPH_OK) {
+          e->owed = 0;
+        } else if (out == ALPH_GONE) {
+          // Its actor ended without forgetting it.
+          syscall(SYS_EPOLL_CTL, p->epoll, EPOLL_DEL, e->fd, 0);
+          e->fd = -1;
+          e->owed = 0;
+          e->turn = e->turn + 1;
+        }
+      }
+    }
+    p->gate.leave(was);
+  }
+  return 0;
+}
+
+// ears holds room ears: one for each descriptor asked about at a time.
+// Messages go out through node. Returns ALPH_GONE when the kernel gave no
+// epoll.
+export fn AlphPoll_init__ptr(p: AlphPoll*, node: AlphNode*, ears: AlphEar*, room: Word) -> Word {
+  p->gate.init();
+  p->node = node;
+  p->ears = ears;
+  p->room = room;
+  p->stopping = 0;
+  p->thread = 0;
+  for i in 0..room {
+    ears[i].fd = -1;
+    ears[i].owed = 0;
+    ears[i].turn = 0;
+  }
+  p->epoll = syscall(SYS_EPOLL_CREATE1, 0);
+  if (p->epoll < 0) {
+    p->epoll = -1;
+    return ALPH_GONE;
+  }
+  p->thread = CreateThread(0, 0, &alph_poll_main, (cstring)p, 0, 0);
+  return ALPH_OK;
+}
+
+// Asks for one message when a descriptor is ready: for reading (ALPH_READ),
+// for writing (ALPH_WRITE) or either (both). The message has the tag given,
+// the descriptor in arg, and in ref what it is ready for, with ALPH_ERROR
+// if it failed. Ask again for the next. Returns ALPH_FULL when every ear is
+// in use, ALPH_GONE when the kernel refuses the descriptor.
+export fn AlphPoll_want__ptr(p: AlphPoll*, fd: int64, what: Word, to: Word, tag: Word) -> Word {
+  var event: AlphEvent;
+  var mine: Word = -1;
+  var out: Word = ALPH_OK;
+  var was: int32 = p->gate.enter();
+  if (p->epoll < 0) {
+    p->gate.leave(was);
+    return ALPH_GONE;
+  }
+  for i in 0..p->room {
+    if (p->ears[i].fd == fd) {
+      mine = (Word)i;
+      break;
+    }
+    if (p->ears[i].fd < 0 && mine < 0) {
+      mine = (Word)i;
+    }
+  }
+  if (mine < 0) {
+    p->gate.leave(was);
+    return ALPH_FULL;
+  }
+  var e: AlphEar* = &p->ears[mine];
+  if (e->fd != fd || e->to != to) {
+    // A new descriptor in the slot, or a new actor asking: what was ready
+    // for the last one is not theirs.
+    e->owed = 0;
+    e->turn = e->turn + 1;
+  }
+  e->fd = fd;
+  e->to = to;
+  e->tag = tag;
+  event.events = EPOLLONESHOT;
+  if ((Word)(what & ALPH_READ) != 0) {
+    event.events = event.events | EPOLLIN | EPOLLRDHUP;
+  }
+  if ((Word)(what & ALPH_WRITE) != 0) {
+    event.events = event.events | EPOLLOUT;
+  }
+  event.slot = (uint32)mine;
+  event.turn = e->turn;
+  var done: int64 = syscall(SYS_EPOLL_CTL, p->epoll, EPOLL_MOD, fd, (int64)&event);
+  if (done == ENOENT) {
+    done = syscall(SYS_EPOLL_CTL, p->epoll, EPOLL_ADD, fd, (int64)&event);
+  }
+  if (done < 0) {
+    e->fd = -1;
+    e->owed = 0;
+    e->turn = e->turn + 1;
+    out = ALPH_GONE;
+  }
+  p->gate.leave(was);
+  return out;
+}
+
+// Stops asking about a descriptor. Do this before closing it.
+export fn AlphPoll_forget__ptr(p: AlphPoll*, fd: int64) {
+  var was: int32 = p->gate.enter();
+  for i in 0..p->room {
+    if (p->ears[i].fd == fd) {
+      if (p->epoll >= 0) {
+        syscall(SYS_EPOLL_CTL, p->epoll, EPOLL_DEL, fd, 0);
+      }
+      p->ears[i].fd = -1;
+      p->ears[i].owed = 0;
+      p->ears[i].turn = p->ears[i].turn + 1;
+    }
+  }
+  p->gate.leave(was);
+}
+
+// No message is sent after this returns, and asking after it is refused.
+export fn AlphPoll_stop__ptr(p: AlphPoll*) {
+  if (p->epoll < 0) {
+    return;
+  }
+  p->stopping = 1;
+  thread_join_infinite(p->thread);
+  thread_close(p->thread);
+  var was: int32 = p->gate.enter();
+  syscall(SYS_CLOSE, p->epoll);
+  p->epoll = -1;
+  p->gate.leave(was);
+}

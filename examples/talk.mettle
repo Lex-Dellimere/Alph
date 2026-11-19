@@ -1,0 +1,170 @@
+// An echo server and a client over TCP, in one process. The server has an
+// actor for each connection. No handler ever waits: it reads and writes
+// what can be done now, and asks the poll to tell it when there is more.
+//
+//   mettle --build -s --release examples/talk.mettle -I ports/host -o talk
+
+import "std/io";
+import "port/net";
+import "port/wire";
+import "alph/actor/actor";
+import "alph/cores/cores";
+import "alph/poll/poll";
+
+const GO: Word = 1;
+const READY: Word = 2;
+const PORT: int64 = 7411;
+const LINES: int64 = 1000;
+
+var g_cores: AlphCores;
+var g_core: AlphCore[2];
+var g_actors: AlphActor[8];
+var g_mail: AlphMsg[64];
+var g_poll: AlphPoll;
+var g_ears: AlphEar[4];
+
+// One connection: what was read and how much of it has been sent back.
+struct Conn {
+  fd: int64;
+  have: int64;
+  sent: int64;
+  bytes: uint8[64];
+}
+
+var g_conn: Conn;
+
+fn echo(a: AlphActor*, m: AlphMsg*) -> Word {
+  var c: Conn* = (Conn*)a->state;
+  while (true) {
+    if (c->sent < c->have) {
+      var put: int64 = alph_write(c->fd, &c->bytes[c->sent], c->have - c->sent);
+      if (put == ALPH_LATER) {
+        g_poll.want(c->fd, ALPH_WRITE, a->pid, READY);
+        return 0;
+      }
+      if (put < 0) {
+        break;
+      }
+      c->sent = c->sent + put;
+      continue;
+    }
+    var got: int64 = alph_read(c->fd, &c->bytes[0], 64);
+    if (got == ALPH_LATER) {
+      g_poll.want(c->fd, ALPH_READ, a->pid, READY);
+      return 0;
+    }
+    if (got <= 0) {
+      break;  // the client closed
+    }
+    c->have = got;
+    c->sent = 0;
+  }
+  g_poll.forget(c->fd);
+  alph_close(c->fd);
+  a->cores()->stop();
+  return ALPH_END;
+}
+
+// Takes the one connection this example makes and gives it an actor.
+fn listener(a: AlphActor*, m: AlphMsg*) -> Word {
+  var fd: int64* = (int64*)a->state;
+  var conn: int64 = alph_tcp_accept(*fd);
+  if (conn < 0) {
+    g_poll.want(*fd, ALPH_READ, a->pid, READY);
+    return 0;
+  }
+  g_conn.fd = conn;
+  g_conn.have = 0;
+  g_conn.sent = 0;
+  g_poll.want(conn, ALPH_READ, a->cores()->spawn_on(0, &echo, (rawptr)&g_conn), READY);
+  g_poll.forget(*fd);
+  alph_close(*fd);
+  return ALPH_END;
+}
+
+// Sends a number, waits for it to come back, and goes on to the next.
+struct Client {
+  fd: int64;
+  line: int64;
+  sent: int64;
+  have: int64;
+  back: int64;
+  wrong: int64;
+}
+
+fn client(a: AlphActor*, m: AlphMsg*) -> Word {
+  var c: Client* = (Client*)a->state;
+  if (m->tag == GO) {
+    c->fd = alph_tcp_connect(alph_ip4(127, 0, 0, 1), PORT);
+    if (c->fd < 0 || g_poll.want(c->fd, ALPH_WRITE, a->pid, READY) != ALPH_OK) {
+      a->cores()->stop();  // no connection: main reports what was sent
+      return ALPH_END;
+    }
+    return 0;
+  }
+  if ((Word)(m->ref & ALPH_ERROR) != 0 || alph_tcp_failed(c->fd)) {
+    a->cores()->stop();
+    return ALPH_END;
+  }
+  while (c->line < LINES) {
+    if (c->sent < 8) {
+      var put: int64 = alph_write(c->fd, (uint8*)&c->line + c->sent, 8 - c->sent);
+      if (put == ALPH_LATER) {
+        g_poll.want(c->fd, ALPH_WRITE, a->pid, READY);
+        return 0;
+      }
+      if (put < 0) {
+        break;
+      }
+      c->sent = c->sent + put;
+      continue;
+    }
+    var got: int64 = alph_read(c->fd, (uint8*)&c->back + c->have, 8 - c->have);
+    if (got == ALPH_LATER) {
+      g_poll.want(c->fd, ALPH_READ, a->pid, READY);
+      return 0;
+    }
+    if (got <= 0) {
+      break;
+    }
+    c->have = c->have + got;
+    if (c->have == 8) {
+      if (c->back != c->line) {
+        c->wrong = c->wrong + 1;
+      }
+      c->line = c->line + 1;
+      c->sent = 0;
+      c->have = 0;
+    }
+  }
+  g_poll.forget(c->fd);
+  alph_close(c->fd);  // the server sees this and stops the cores
+  return ALPH_END;
+}
+
+fn main() -> int32 {
+  var c: Client;
+  c.line = 0;
+  c.sent = 0;
+  c.have = 0;
+  c.wrong = 0;
+  var listening: int64 = alph_tcp_listen(PORT);
+  if (listening < 0) {
+    println("port {PORT} is taken");
+    return 1;
+  }
+  g_cores.init(&g_core[0], 2, &g_actors[0], 4, &g_mail[0], 8);
+  if (g_poll.init(&g_core[0].node, &g_ears[0], 4) != ALPH_OK) {
+    println("no poll");
+    return 1;
+  }
+  g_poll.want(listening, ALPH_READ, g_cores.spawn_on(0, &listener, (rawptr)&listening), READY);
+  g_cores.send(g_cores.spawn_on(1, &client, (rawptr)&c), GO, 0);
+  g_cores.run();
+  g_poll.stop();
+  println("{c.line} numbers sent and echoed over TCP, {c.wrong} wrong");
+  if (c.line != LINES || c.wrong != 0) {
+    return 1;
+  }
+  return 0;
+}

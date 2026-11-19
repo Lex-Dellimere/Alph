@@ -56,6 +56,7 @@ This is [examples/count.mettle](examples/count.mettle). The node owns no memory:
 | Cores | One node per thread. An actor sends to another core the way it sends next door | [src/cores](src/cores/cores.mettle) |
 | Time | A message sent later | [src/time](src/time/time.mettle) |
 | Places | A job goes to a core, the GPU or another machine, whichever alph has timed as finishing it first. A job stays where its data is | [src/place](src/place/place.mettle) |
+| Polls | A socket sends a message when it is ready, so no handler waits. TCP calls that go with it | [src/poll](src/poll/poll.mettle) |
 | Lives | Watch an actor to be told when it ends and why. Keep one, and a crash restarts it in place with the same pid | [src/life](src/life/life.mettle) |
 | Links | Other machines over UDP. Messages arrive once and in order, and a lost machine is noticed in half a second | [src/link](src/link/link.mettle) |
 | Names and the door | Find an actor on another machine by name, and watch it | [src/name](src/name/name.mettle), [src/door](src/door/door.mettle) |
@@ -96,6 +97,12 @@ Work shared with another machine, [examples/far.mettle](examples/far.mettle). Wi
 mettle --build -s --release examples/far.mettle -I ports/host -o far
 ```
 
+An echo server and a client over TCP, with an actor for each connection, [examples/talk.mettle](examples/talk.mettle):
+
+```bash
+mettle --build -s --release examples/talk.mettle -I ports/host -o talk
+```
+
 Two actors and a timer on a bare 32-bit RISC-V board, in a 3.3 KB image, [examples/mcu/blink.mettle](examples/mcu/blink.mettle):
 
 ```bash
@@ -108,7 +115,7 @@ qemu-system-riscv32 -M virt -bios none -nographic -device loader,file=blink.bin,
 - A sealed link has one key for the whole network: any holder can speak as any machine, and someone who gets the key later can read what they recorded before.
 - A job with data of its own cannot go to another machine, only a job of one word in and one word out.
 - Timers look at every timer slot: right for tens of timers, not thousands.
-- There is no socket or file IO on the new core.
+- Sockets are Linux only, and there is no file IO.
 - A message between two cores costs 150 to 300 ns against about 20 ns inside a node.
 - The microcontroller port has no link to other machines.
 
@@ -134,6 +141,7 @@ src/actor/actor.mettle      the core: actors, messages, the run loop
 src/cores/cores.mettle      the core on several threads, one node each
 src/time/time.mettle        timers: a message sent later
 src/place/place.mettle      places: a job goes to a core, the GPU or another machine
+src/poll/poll.mettle        polls: a socket sends a message when it is ready
 src/life/life.mettle        lives: watching and keeping actors
 src/link/link.mettle        links: other machines, over UDP
 src/name/name.mettle        names: a number for a pid
