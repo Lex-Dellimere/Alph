@@ -136,7 +136,7 @@ A timer sends a message later, so it is a layer (`src/time`), not part of the co
 
 A program that uses several layers repeats the same setup and bookkeeping. Two layers on top take that away. `src/machine` is a Linux machine with every layer set up in one call, with sizes that suit most programs. `src/batch` hands out one kind of work in pieces, takes each answer, hands out again what could not be placed, and says when all is back.
 
-A machine says how a kind of job is done and that it is shared. It then does that kind for other machines, through its own places, and its own jobs of the kind may go to them. Every machine runs the same program, and the one whose actor begins a batch hands the work out. A job taken for another machine is not sent on again. Each other machine is a place of its own, with its own work waiting, so with several the work goes to whichever is least busy. `examples/share.mettle` is about forty lines of its own.
+A machine says how a kind of job is done and that it is shared. It then does that kind for other machines, through its own places, and its own jobs of the kind may go to them. Every machine runs the same program, and the one whose actor begins a batch hands the work out. A job taken for another machine is not sent on again. Each other machine is a place of its own, with its own work waiting and its own measured time, so a slow machine and a quick one that do the same kind are told apart. With one time for both, 80 jobs asked for one at a time all went to the slow machine, because it was listed first. With a time each, 78 went to the quick one. `examples/share.mettle` is about forty lines of its own.
 
 ## What was measured
 
@@ -148,7 +148,7 @@ The measurements that decide a choice are in the section for that choice: the re
 - Door: a lost machine's actors ended in about 540 ms.
 - Work: `examples/far.mettle` with two cores here and one worker there sent about a third of the chunks across.
 - Tether: a board in QEMU with a process on its line did 200 requests and replies.
-- Board: the `examples/mcu/arm.mettle` image is 4,480 bytes. All 6 jobs only the board could do went to it. Of 200 chunks of primes that both could count, the computer did 196 and the board in QEMU 4. With the computer's chunks slowed to two milliseconds each and the board on another machine's line, the board did 24 of 400. When the board was stopped in the middle of a batch, all 400 pieces were still answered.
+- Board: the `examples/mcu/arm.mettle` image is 4,480 bytes. All 6 jobs only the board could do went to it. Of 200 chunks of primes that both could count, the computer did 196 and the board in QEMU 4. With the computer's chunks slowed to two milliseconds each and the board on another machine's line, the board did 7 of 400 and the machine on its line 191: the asking machine had timed each and sent the board little. When the board was stopped in the middle of a batch, all 400 pieces were still answered.
 - Share: two machines each handed out 200 pieces at once and each answered all of its own rightly. With three machines and 300 pieces, the one that handed out did 110 and the other two 92 and 98. When one of the three was lost in the middle of a second batch, every piece was still answered.
 
 ## What is not built
@@ -161,7 +161,6 @@ The measurements that decide a choice are in the section for that choice: the re
 - A board on the UDP link itself. A board joins through a serial line to one machine, and a line that sends again what was lost.
 - A board that hands out its own work through places. It takes jobs, and its actors ask others by pid.
 - A job for another machine with more than a word or 1,024 bytes, or with its data on a GPU.
-- A time for each other machine. The places keep one time for "another machine", so a slow helper is told from a fast one only by the work waiting at it.
 - A job's time predicted from more than its size. A Mandelbrot tile's time depends on where in the picture it is, so such work is placed less well.
 - Sizes for `src/machine` other than the fixed ones.
 - Sockets off Linux, and file IO.

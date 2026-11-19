@@ -93,6 +93,26 @@ export struct AlphKind {
   since: Word[192]; // ns of work done other ways since this one was timed
 }
 
+// A far place's own times for one kind of work, by size. Without them
+// every far place goes by the kind's one time for work sent away.
+export struct AlphTimes {
+  est: Word[32];
+  low: Word[32];
+  last: Word[32];
+  since: Word[32];
+  warm: Word;
+}
+
+// Where the times of one place, kind and size are kept.
+struct AlphAt {
+  est: Word*;
+  low: Word*;
+  last: Word*;
+  since: Word*;
+  warm: Word*;
+  row: Word*;  // est for the smallest size, the others after it
+}
+
 export struct AlphPlace {
   places: AlphPlaces*;
   pid: Word;
@@ -113,6 +133,8 @@ export struct AlphPlace {
   gave_began: Word[4];  // when,
   gave_at: Word[4];   // and its kind times 192 plus which of the kind's times it is
   gave_next: Word;
+  own: AlphTimes*;    // a far place's own times, one for each of its first own_kinds kinds, 0 for none
+  own_kinds: Word;
 }
 
 export struct AlphPlaces {
@@ -186,6 +208,16 @@ export fn AlphPlaces_init__ptr(p: AlphPlaces*, places: AlphPlace*, room: Word, k
   }
 }
 
+fn alph_place_clear(t: AlphTimes*) {
+  t->warm = 0;
+  for i in 0..32 {
+    t->est[i] = 0;
+    t->low[i] = 0;
+    t->last[i] = 0;
+    t->since[i] = 0;
+  }
+}
+
 // Says how a kind is run each way. A way the kind does not have is 0. Each
 // returns 0, or non-zero when it cannot run here (no GPU, say): the job then
 // goes another way and that way is not tried again.
@@ -213,6 +245,12 @@ export fn AlphPlaces_kind__ptr(p: AlphPlaces*, kind: Word, cpu: fn(AlphJob*) -> 
     k->low[i] = 0;
     k->last[i] = 0;
     k->since[i] = 0;
+  }
+  for i in 0..p->count {
+    var x: AlphPlace* = &p->places[i];
+    if (x->own != 0 && kind < x->own_kinds) {
+      alph_place_clear(&x->own[kind]);
+    }
   }
 }
 
@@ -286,6 +324,29 @@ export fn AlphPlaces_limit__ptr(p: AlphPlaces*, place: Word, jobs: Word) -> Word
   return out;
 }
 
+// Gives a far place times of its own: `times` is an array with one entry
+// for each of the first `kinds` kinds. The place then learns how long that
+// machine takes, apart from every other, so a slow machine and a quick one
+// that do the same kind are told apart. Returns ALPH_GONE when there is no
+// such far place.
+export fn AlphPlaces_own__ptr(p: AlphPlaces*, place: Word, times: AlphTimes*, kinds: Word) -> Word {
+  var out: Word = ALPH_GONE;
+  for i in 0..kinds {
+    alph_place_clear(&times[i]);
+  }
+  var was: int32 = p->gate.enter();
+  for i in 0..p->count {
+    var x: AlphPlace* = &p->places[i];
+    if (x->way == ALPH_FAR && x->pid == place) {
+      x->own = times;
+      x->own_kinds = kinds;
+      out = ALPH_OK;
+    }
+  }
+  p->gate.leave(was);
+  return out;
+}
+
 // Has a far place look now for jobs out too long. The place looks by
 // itself on the places' clock; this is for a program that wants to be sure
 // of it when timers may have run out.
@@ -341,6 +402,8 @@ export fn AlphPlaces_add__ptr(p: AlphPlaces*, way: Word) -> AlphPlace* {
     x->answers = 0;
     x->answered = 0;
     x->gave_next = 0;
+    x->own = 0;
+    x->own_kinds = 0;
     for g in 0..4 {
       x->gave_ref[g] = 0;
     }
@@ -370,20 +433,42 @@ export fn AlphPlaces_on_core__ptr(p: AlphPlaces*, cores: AlphCores*, core: Word,
   return x->pid;
 }
 
+// Finds the times of one place, kind and size: the place's own when it has
+// some for the kind, the kind's if not. Called inside the gate.
+fn alph_place_at(k: AlphKind*, x: AlphPlace*, kind: Word, at: Word, t: AlphAt*) {
+  var size: Word = (Word)(at % SIZES);
+  if (x->own != 0 && kind < x->own_kinds) {
+    var o: AlphTimes* = &x->own[kind];
+    t->est = &o->est[size];
+    t->low = &o->low[size];
+    t->last = &o->last[size];
+    t->since = &o->since[size];
+    t->warm = &o->warm;
+    t->row = &o->est[0];
+    return;
+  }
+  t->est = &k->est[at];
+  t->low = &k->low[at];
+  t->last = &k->last[at];
+  t->since = &k->since[at];
+  t->warm = &k->warm[x->way];
+  t->row = &k->est[at - size];
+}
+
 // What a job of a size not yet timed this way should take: on the line
 // through the two nearest sizes that were timed. 0 with fewer than two. So a
 // way already known to be slow for big jobs is not tried on a bigger one
 // just to find out.
-fn alph_place_guess(k: AlphKind*, row: Word, mine: Word) -> Word {
+fn alph_place_guess(est: Word*, mine: Word) -> Word {
   var near: Word[2];
   var found: Word = 0;
   var d: Word = 1;
   while (d < SIZES && found < 2) {
-    if (mine - d >= 0 && k->est[row + mine - d] != 0) {
+    if (mine - d >= 0 && est[mine - d] != 0) {
       near[found] = mine - d;
       found = found + 1;
     }
-    if (found < 2 && mine + d < SIZES && k->est[row + mine + d] != 0) {
+    if (found < 2 && mine + d < SIZES && est[mine + d] != 0) {
       near[found] = mine + d;
       found = found + 1;
     }
@@ -394,8 +479,8 @@ fn alph_place_guess(k: AlphKind*, row: Word, mine: Word) -> Word {
   }
   var x0: float64 = (float64)((int64)1 << (int64)near[0]);
   var x1: float64 = (float64)((int64)1 << (int64)near[1]);
-  var y0: float64 = (float64)k->est[row + near[0]];
-  var y1: float64 = (float64)k->est[row + near[1]];
+  var y0: float64 = (float64)est[near[0]];
+  var y1: float64 = (float64)est[near[1]];
   var slope: float64 = (y1 - y0) / (x1 - x0);
   if (slope < (float64)0) {
     slope = (float64)0;
@@ -436,10 +521,12 @@ fn alph_place_pick(p: AlphPlaces*, job: AlphJob*) -> AlphPlace* {
     }
     var row: Word = alph_place_row(job, x->way);
     var at: Word = row + size;
-    var est: Word = k->est[at];
-    var low: Word = k->low[at];
+    var t: AlphAt;
+    alph_place_at(k, x, job->kind, at, &t);
+    var est: Word = t.est[0];
+    var low: Word = t.low[0];
     if (est == 0) {
-      est = alph_place_guess(k, row, size);
+      est = alph_place_guess(t.row, size);
       low = est;
     }
     var cost: Word = x->backlog + est;
@@ -448,7 +535,7 @@ fn alph_place_pick(p: AlphPlaces*, job: AlphJob*) -> AlphPlace* {
       if (x->waiting > 0) {
         cost = TAKEN + x->waiting;
       }
-    } else if (x->waiting == 0 && k->since[at] >= (Word)(low * FRESH)) {
+    } else if (x->waiting == 0 && t.since[0] >= (Word)(low * FRESH)) {
       cost = -1;
     }
     if (best == 0 || cost < best_cost) {
@@ -535,16 +622,18 @@ export fn AlphPlaces_ask__ptr(p: AlphPlaces*, a: AlphActor*, job: AlphJob*) -> W
 fn alph_place_ran(p: AlphPlaces*, x: AlphPlace*, job: AlphJob*, ns: Word, failed: Word) {
   var k: AlphKind* = &p->kinds[job->kind];
   var way: Word = x->way;
+  var t: AlphAt;
   var was: int32 = p->gate.enter();
   alph_place_left(p, x, job);
+  alph_place_at(k, x, job->kind, job->at, &t);
   if (failed != 0) {
     k->off[way] = 1;
-  } else if (k->warm[way] == 0) {
-    k->warm[way] = 1;
+  } else if (t.warm[0] == 0) {
+    t.warm[0] = 1;
     if (way == ALPH_FAR) {
       // Not counted in the average, but kept so the next job out is given
       // long enough.
-      k->last[job->at] = ns;
+      t.last[0] = ns;
     }
   } else {
     var at: Word = job->at;
@@ -552,22 +641,30 @@ fn alph_place_ran(p: AlphPlaces*, x: AlphPlace*, job: AlphJob*, ns: Word, failed
     if (seen < 1) {
       seen = 1;
     }
-    var before: Word = k->last[at];
-    k->last[at] = seen;
+    var before: Word = t.last[0];
+    t.last[0] = seen;
     if (before != 0) {
       var low: Word = seen;
       if (before < low) {
         low = before;
       }
-      k->low[at] = low;
-      if (k->est[at] == 0) {
-        k->est[at] = low;
+      t.low[0] = low;
+      if (t.est[0] == 0) {
+        t.est[0] = low;
       } else {
-        k->est[at] = k->est[at] + (Word)((seen - k->est[at]) / 8);
+        t.est[0] = t.est[0] + (Word)((seen - t.est[0]) / 8);
       }
     }
-    // Every other way has gone that much longer without being timed.
-    k->since[at] = 0;
+    // Every other way has gone that much longer without being timed, and
+    // so has every other machine that keeps its own times.
+    t.since[0] = 0;
+    for i in 0..p->count {
+      var y: AlphPlace* = &p->places[i];
+      if (y != x && y->own != 0 && job->kind < y->own_kinds) {
+        var theirs: AlphTimes* = &y->own[job->kind];
+        theirs->since[(Word)(at % SIZES)] = theirs->since[(Word)(at % SIZES)] + ns;
+      }
+    }
     var home: Word = job->home;
     job->home = job->was_home;
     for other in 0..WAYS {
@@ -719,9 +816,11 @@ export fn alph_place_run(a: AlphActor*, m: AlphMsg*) -> Word {
       // this long. The next job out is given time for that.
       for g in 0..4 {
         if (x->gave_ref[g] == m->ref && m->ref != 0) {
-          var slow: AlphKind* = &p->kinds[(Word)(x->gave_at[g] / 192)];
+          var slow: Word = (Word)(x->gave_at[g] / 192);
+          var t: AlphAt;
           var was: int32 = p->gate.enter();
-          slow->last[(Word)(x->gave_at[g] % 192)] = x->answered - x->gave_began[g];
+          alph_place_at(&p->kinds[slow], x, slow, (Word)(x->gave_at[g] % 192), &t);
+          t.last[0] = x->answered - x->gave_began[g];
           p->gate.leave(was);
           x->gave_ref[g] = 0;
         }
@@ -750,16 +849,18 @@ export fn alph_place_run(a: AlphActor*, m: AlphMsg*) -> Word {
         if (m->arg == ALPH_GONE) {
           alph_place_shut_far(p, x, job->kind);
         }
+        var t: AlphAt;
         var was: int32 = p->gate.enter();
         if (m->arg != ALPH_GONE) {
-          var slow: Word = (Word)(k->est[job->at] * 2);
+          alph_place_at(k, x, job->kind, job->at, &t);
+          var slow: Word = (Word)(t.est[0] * 2);
           var took: Word = alph_place_ns() - job->began;
           if (slow < took) {
             slow = took;
           }
-          k->est[job->at] = slow;
-          k->low[job->at] = slow;
-          k->since[job->at] = 0;
+          t.est[0] = slow;
+          t.low[0] = slow;
+          t.since[0] = 0;
         }
         p->gate.leave(was);
         alph_place_elsewhere(a, p, x, job);
@@ -801,7 +902,11 @@ export fn alph_place_run(a: AlphActor*, m: AlphMsg*) -> Word {
       var after: AlphJob* = job->next;
       // The limit comes from the last time an answer really took, not from
       // the estimate, which a job given up on makes longer below.
-      var limit: Word = (Word)(p->kinds[job->kind].last[job->at] * LONG);
+      var t: AlphAt;
+      var gate: int32 = p->gate.enter();
+      alph_place_at(&p->kinds[job->kind], x, job->kind, job->at, &t);
+      var limit: Word = (Word)(t.last[0] * LONG);
+      p->gate.leave(gate);
       if (limit < LONG_NS) {
         limit = LONG_NS;
       }
@@ -825,11 +930,10 @@ export fn alph_place_run(a: AlphActor*, m: AlphMsg*) -> Word {
         x->gave_next = (Word)((x->gave_next + 1) % 4);
         // The time it was given up after is now what that way is taken to
         // cost, so the next jobs go another way until it is tried again.
-        var k: AlphKind* = &p->kinds[job->kind];
         var was: int32 = p->gate.enter();
-        k->est[job->at] = now - job->began;
-        k->low[job->at] = now - job->began;
-        k->since[job->at] = 0;
+        t.est[0] = now - job->began;
+        t.low[0] = now - job->began;
+        t.since[0] = 0;
         p->gate.leave(was);
         p->late = p->late + 1;
         alph_place_elsewhere(a, p, x, job);

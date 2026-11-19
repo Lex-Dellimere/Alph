@@ -101,6 +101,7 @@ export struct AlphMachine {
   keeps: AlphKeep[32];
   timers: AlphTimer[32];
   seats: AlphPlace[26];
+  far_times: AlphTimes[96];  // each other machine's and board's own times, eight kinds each
   kinds: AlphKind[8];
 }
 
@@ -402,6 +403,7 @@ export fn AlphMachine_peer__ptr(m: AlphMachine*, first: Word, count: Word, ip: u
     return ALPH_FULL;
   }
   m->far_places[m->peer_count] = m->places.on_core(&m->cores, 0, ALPH_FAR);
+  m->places.own(m->far_places[m->peer_count], &m->far_times[m->peer_count * 8], 8);
   if (m->peer_count == 0) {
     m->far_place = m->far_places[0];
   }
@@ -429,6 +431,7 @@ fn alph_machine_board(m: AlphMachine*, first: Word, count: Word) -> Word {
     return ALPH_FULL;
   }
   m->places.limit(b->place, BOARD_JOBS);
+  m->places.own(b->place, &m->far_times[(8 + m->board_count) * 8], 8);
   m->board_count = m->board_count + 1;
   if (m->board_count == 1) {
     var round: AlphMsg = { tag: ALPH_ROUND, from: m->steward, arg: 0, ref: 0 };

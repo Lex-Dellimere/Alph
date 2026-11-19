@@ -77,7 +77,7 @@ Every machine runs the same program. Each says how a kind of job is done (`kind`
 - `init(cores, first, gpu)` sets up `cores` cores (1 to 16) whose places start at `first`. The first core has the door and the program's own actors, and the others take work. With `gpu` true the last core is the GPU's.
 - `peer(first, count, ip, port)` adds another machine, up to eight. `start(port)` joins them. A machine on its own needs neither.
 - `kind(kind, cpu, gpu)` says how a kind of job (0 to 7) is done: a function for a core and one for the GPU, 0 for a way it does not have.
-- `share(kind)` shares a kind with the other machines, both ways. With several, a job goes to whichever is least busy. Only a job with no home leaves a machine: one word in, or bytes.
+- `share(kind)` shares a kind with the other machines, both ways. With several, a job goes to whichever should finish it first: the machine keeps a time for each of the others. Only a job with no home leaves a machine: one word in, or bytes.
 - `board(first, count)` adds a microcontroller on this machine's serial line that takes work too. See "A board that shares work" under A microcontroller.
 - `tell(pid)` names your actor that hears `ALPH_UP` and `ALPH_DOWN`.
 - `run()` runs the cores until `stop()`, and `shut()` ends the timers and the link afterwards.
@@ -576,6 +576,18 @@ g_places.clock(&g_time);
 ```
 
 `examples/far.mettle` counts primes on two machines. With no arguments both machines run in one process. On two computers, start `./far helper <the boss's address>` on one and `./far boss <the helper's address>` on the other. If the other machine is not there, or is lost on the way, the work is done here.
+
+With several other machines, make a far place for each and say which worker each has. Give each place times of its own, so a slow machine and a quick one are told apart, and give a small machine a limit:
+
+```mettle
+var g_times: AlphTimes[2];  // one for each kind, for this far place
+
+g_places.far_at(far_place, PRIMES, worker);  // this far place's machine does PRIMES with this worker
+g_places.own(far_place, &g_times[0], 2);     // it keeps its own times for kinds 0 and 1
+g_places.limit(far_place, 4);                // and holds no more than four jobs at once
+```
+
+`AlphMachine` does all three for every machine and board it is given.
 
 ## A microcontroller
 
