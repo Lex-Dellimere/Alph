@@ -706,7 +706,7 @@ g_m.tether.sure(&g_sure, &g_kept[0], 8);      // on the computer, after board()
 - Sending again needs something to drive it. The computer's side does that by itself. A board need not: the computer asks it to send again. With two boards and no computer, one of them calls `tether.tick()` on a timer, about as often as a message goes there and back.
 - A side that restarts is noticed, and the two start numbering again by themselves. What was kept for the run before is lost.
 - It costs a board about 1.1 KB. A board that does not turn it on pays nothing and speaks the same bytes as before.
-- A full mailbox at the far end still drops a message, and a lost message is sent again with all the ones after it, so a line that loses a lot is slow.
+- A message for an actor whose mailbox is full is not lost either: it is sent again until there is room. A lost message is sent again with all the ones after it, so a line that loses a lot is slow.
 
 A message goes over once when the line is not sure: a byte lost on the line loses it. A pid from the bigger machine has to fit the board's word (place below 256, slot below 1,024, generation below 8,192), which holds for actors spawned at the start; a message whose pids do not fit is dropped.
 

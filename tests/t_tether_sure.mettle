@@ -331,10 +331,30 @@ fn main() -> int32 {
   settle();
   expect(s.notes == 4 && s.args[3] == 105, "the new run's first message arrives");
 
+  // Nine messages at once for an actor whose mailbox holds eight, with the
+  // node not running. The ninth is not said to be had, so it is not lost:
+  // sent again once there is room, it arrives.
+  while (hear(&h[0]) > 0) {
+  }
+  for i in 2..11 {
+    header(MSG, (int64)i, 1, 2, 1);
+    message(&f2[0], 200 + (int64)i);
+    speak(&f2[0], 34);
+  }
+  Sleep(100);
+  expect(g_sure.got == 9, "a message for a full mailbox is not said to be had (had up to {g_sure.got})");
+  settle();
+  expect(s.notes == 12, "the eight that fitted arrive ({s.notes - 4})");
+  header(MSG, 10, 1, 2, 1);
+  message(&f2[0], 210);
+  speak(&f2[0], 34);
+  settle();
+  expect(s.notes == 13 && g_sure.got == 10, "and the ninth, sent again, arrives too ({s.notes - 4} of 9)");
+
   syscall(ALPH_NR_CLOSE, g_fd);
   if (g_failures != 0) {
     return 1;
   }
-  println("tether sure ok: numbered, acked, full at 4, sent again on tick and when asked, a new run started afresh");
+  println("tether sure ok: numbered, acked, full at 4, sent again on tick and when asked, a new run started afresh, nothing lost to a full mailbox");
   return 0;
 }

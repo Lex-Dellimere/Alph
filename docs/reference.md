@@ -2685,6 +2685,7 @@ export struct AlphTether {
   dropped: Word;  // messages that came in damaged, or with a pid too big for here
   relay: Word;    // mail off the line for places other than this node's is passed on
   line: Word;     // which of the port's lines this is: 0 on a board
+  full: Word;     // the last message off the line found its actor's mailbox full
   sure: AlphSure*;  // what makes the line sure, 0 when it is not
   frame: uint8[34];
 }

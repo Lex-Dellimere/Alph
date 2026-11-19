@@ -57,6 +57,7 @@ export struct AlphTether {
   dropped: Word;  // messages that came in damaged, or with a pid too big for here
   relay: Word;    // mail off the line for places other than this node's is passed on
   line: Word;     // which of the port's lines this is: 0 on a board
+  full: Word;     // the last message off the line found its actor's mailbox full
   sure: AlphSure*;  // what makes the line sure, 0 when it is not
   frame: uint8[34];
 }
@@ -236,7 +237,10 @@ fn alph_tether_take(ctx: rawptr, byte: int32) {
   }
   var m: AlphMsg = { tag: alph_tether_word(&t->frame[20]), from: from, arg: alph_tether_word(&t->frame[24]),
                      ref: alph_tether_word(&t->frame[28]) };
-  t->node->put(to, &m);
+  t->full = 0;
+  if (t->node->put(to, &m) == ALPH_FULL) {
+    t->full = 1;
+  }
 }
 
 // Starts the line for a node that is already placed: mail off the line is
@@ -413,23 +417,26 @@ fn alph_sure_take(ctx: rawptr, byte: int32) {
     // said to be had either way. One that comes early says one before it
     // was lost: the other side is asked for them again, once until the
     // gap is filled.
-    var was: int32 = s->gate.enter();
+    // It is put in its actor's mailbox before it is said to be had. If
+    // the mailbox is full it is not had: it will be sent again, and by
+    // then there may be room. So a full mailbox loses nothing.
     var ahead: Word = (Word)((next - s->got - 1) & 127);
-    s->owe = (Word)(s->owe | OWE_ACK);
+    t->full = 0;
     if (ahead == 0) {
-      s->got = (Word)(next & 127);
-      s->quiet = 0;
-      s->gap = 0;
-    } else if (ahead < 64 && s->gap == 0) {
-      s->gap = 1;
-      s->owe = (Word)(OWE_ACK | OWE_CHASE);
-    }
-    var take: bool = ahead == 0;
-    s->gate.leave(was);
-    if (take) {
       t->have = BYTES;
       alph_tether_take((rawptr)t, END);
     }
+    var was: int32 = s->gate.enter();
+    s->owe = (Word)(s->owe | OWE_ACK);
+    if (ahead == 0 && t->full == 0) {
+      s->got = (Word)(next & 127);
+      s->quiet = 0;
+      s->gap = 0;
+    } else if (ahead != 0 && ahead < 64 && s->gap == 0) {
+      s->gap = 1;
+      s->owe = (Word)(OWE_ACK | OWE_CHASE);
+    }
+    s->gate.leave(was);
   } else {
     if (had != 0) {
       t->dropped = t->dropped + 1;
