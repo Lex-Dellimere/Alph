@@ -1,0 +1,237 @@
+// Places (src/place): jobs go to the faster way for their size, a way that
+// cannot run is left for good, a kind no place can run comes back as gone,
+// work spreads over the places of one way, an answer waits for room in its
+// asker's mailbox, and a kind or a place that does not exist does no harm. The two ways here are stand-ins that take a known
+// time, so the test needs no GPU.
+
+import "std/io";
+import "alph/actor/actor";
+import "alph/cores/cores";
+import "alph/place/place";
+
+const GO: Word = 1;
+const SMALL: Word = 16;
+const LARGE: Word = 4096;
+
+const TRADE: Word = 0;   // cpu: 1 us an item. gpu: 300 us, then 10 ns an item
+const NO_GPU: Word = 1;  // the gpu way always fails
+const NOWHERE: Word = 2; // no cpu way, and the gpu way fails
+const QUICK: Word = 3;   // cpu only, takes no time
+
+var g_cores: AlphCores;
+var g_core: AlphCore[4];
+var g_actors: AlphActor[8];
+var g_mail: AlphMsg[64];
+var g_places: AlphPlaces;
+var g_seats: AlphPlace[4];
+var g_kinds: AlphKind[4];
+var g_jobs: AlphJob[16];
+var g_failures: int32 = 0;
+var g_gpu_tries: int32 = 0;
+
+fn expect(ok: bool, what: string) {
+  if (!ok) {
+    println("FAIL {what}");
+    g_failures = g_failures + 1;
+  }
+}
+
+fn now_ns() -> Word {
+  var ts: int64[2];
+  syscall(228, 1, (int64)&ts[0]);
+  return (Word)(ts[0] * 1000000000 + ts[1]);
+}
+
+fn burn(ns: Word) {
+  var until: Word = now_ns() + ns;
+  while (now_ns() < until) {
+  }
+}
+
+fn trade_cpu(job: AlphJob*) -> Word {
+  burn((Word)(job->size * 1000));
+  return 0;
+}
+
+fn trade_gpu(job: AlphJob*) -> Word {
+  burn((Word)(300000 + job->size * 10));
+  return 0;
+}
+
+fn slow_cpu(job: AlphJob*) -> Word {
+  burn(200000);
+  return 0;
+}
+
+fn no_gpu(job: AlphJob*) -> Word {
+  atomic_inc_i32(&g_gpu_tries);
+  return 1;
+}
+
+fn quick_cpu(job: AlphJob*) -> Word {
+  return 0;
+}
+
+fn idle(a: AlphActor*, m: AlphMsg*) -> Word {
+  return 0;
+}
+
+// Asks for total jobs of one kind and size, at most window at a time.
+struct Boss {
+  kind: Word;
+  size: Word;
+  total: Word;
+  window: Word;
+  linger: Word;  // ns to stay in the handler after asking, mailbox filling
+  sent: Word;
+  back: Word;
+  by_way: Word[2];
+  gone: Word;
+  refused: Word;
+  strays: Word;  // answers that were not for this run
+  free: AlphJob*;
+}
+
+fn boss(a: AlphActor*, m: AlphMsg*) -> Word {
+  var b: Boss* = (Boss*)a->state;
+  if (m->tag == ALPH_DONE) {
+    var done: AlphJob* = (AlphJob*)m->arg;
+    b->back = b->back + 1;
+    if (done->status == ALPH_OK) {
+      b->by_way[done->way] = b->by_way[done->way] + 1;
+    } else {
+      b->gone = b->gone + 1;
+    }
+    if (done->kind != b->kind || done->size != b->size) {
+      b->strays = b->strays + 1;
+    }
+    done->next = b->free;
+    b->free = done;
+  }
+  while (b->sent < b->total && b->sent - b->back < b->window && b->free != 0) {
+    var job: AlphJob* = b->free;
+    b->free = job->next;
+    job->kind = b->kind;
+    job->size = b->size;
+    var out: Word = g_places.ask(a, job);
+    if (out < 0) {
+      job->next = b->free;
+      b->free = job;
+    }
+    if (out == ALPH_FULL) {
+      b->refused = b->refused + 1;
+      break;
+    }
+    b->sent = b->sent + 1;
+    if (out == ALPH_GONE) {
+      b->back = b->back + 1;
+      b->gone = b->gone + 1;
+    }
+  }
+  if (b->linger > 0 && m->tag == GO) {
+    burn(b->linger);
+  }
+  if (b->back == b->total) {
+    a->cores()->stop();
+  }
+  return 0;
+}
+
+var g_boss: Boss;
+var g_boss_pid: Word = 0;
+
+fn run(kind: Word, size: Word, total: Word, window: Word, linger: Word) {
+  g_boss.kind = kind;
+  g_boss.size = size;
+  g_boss.total = total;
+  g_boss.window = window;
+  g_boss.linger = linger;
+  g_boss.sent = 0;
+  g_boss.back = 0;
+  g_boss.by_way[0] = 0;
+  g_boss.by_way[1] = 0;
+  g_boss.gone = 0;
+  g_boss.refused = 0;
+  g_cores.send(g_boss_pid, GO, 0);
+  g_cores.run();
+  expect(g_boss.strays == 0, "every answer is for a job of this run ({g_boss.strays} were not)");
+  var free: Word = 0;
+  var j: AlphJob* = g_boss.free;
+  while (j != 0 && free < 100) {
+    free = free + 1;
+    j = j->next;
+  }
+  expect(free == 16, "every job came back once ({free} of 16 free)");
+}
+
+fn main() -> int32 {
+  g_cores.init(&g_core[0], 4, &g_actors[0], 2, &g_mail[0], 8);
+  g_places.init(&g_seats[0], 4, &g_kinds[0], 4);
+  g_places.kind(TRADE, &trade_cpu, &trade_gpu);
+  g_places.kind(NO_GPU, &slow_cpu, &no_gpu);
+  g_places.kind(NOWHERE, 0, &no_gpu);
+  g_places.kind(QUICK, &quick_cpu, 0);
+  g_boss_pid = g_cores.spawn_on(0, &boss, (rawptr)&g_boss);
+  g_boss.strays = 0;
+  g_boss.free = 0;
+  for i in 0..16 {
+    g_jobs[i].next = g_boss.free;
+    g_boss.free = &g_jobs[i];
+  }
+  expect(g_places.on_core(&g_cores, 1, ALPH_CPU) > 0, "a cpu place on core 1");
+  expect(g_places.on_core(&g_cores, 2, ALPH_CPU) > 0, "a cpu place on core 2");
+  expect(g_places.on_core(&g_cores, 3, ALPH_GPU) > 0, "a gpu place on core 3");
+
+  // Small jobs: 16 us on a cpu, 300 us on the gpu.
+  run(TRADE, SMALL, 300, 2, 0);
+  var small_cpu: Word = g_boss.by_way[ALPH_CPU];
+  expect(g_boss.back == 300 && g_boss.gone == 0, "every small job is answered");
+  expect(small_cpu >= 270, "small jobs go to the cpu ({small_cpu} of 300)");
+  expect(g_boss.by_way[ALPH_GPU] >= 2, "after the gpu was tried ({g_boss.by_way[ALPH_GPU]} jobs)");
+
+  // Large jobs: 4 ms on a cpu, 340 us on the gpu.
+  run(TRADE, LARGE, 100, 2, 0);
+  var large_gpu: Word = g_boss.by_way[ALPH_GPU];
+  expect(g_boss.back == 100 && g_boss.gone == 0, "every large job is answered");
+  expect(large_gpu >= 85, "large jobs go to the gpu ({large_gpu} of 100)");
+
+  // A way that cannot run: tried once, then the cpu does all of it, on both
+  // of its places.
+  var ran1: Word = g_seats[0].ran;
+  var ran2: Word = g_seats[1].ran;
+  run(NO_GPU, SMALL, 40, 2, 0);
+  expect(g_boss.by_way[ALPH_CPU] == 40 && g_boss.gone == 0, "the cpu runs what the gpu cannot ({g_boss.by_way[ALPH_CPU]} of 40)");
+  expect(g_gpu_tries == 1, "the gpu way is tried once ({g_gpu_tries})");
+  expect(g_seats[0].ran > ran1 && g_seats[1].ran > ran2, "both cpu places take work");
+
+  // A kind nothing can run comes back as gone.
+  g_gpu_tries = 0;
+  run(NOWHERE, SMALL, 3, 1, 0);
+  expect(g_boss.gone == 3 && g_boss.back == 3, "a kind no place can run is gone ({g_boss.gone} of 3)");
+  expect(g_gpu_tries == 1, "and its one way is tried once ({g_gpu_tries})");
+
+  // Twelve answers for a mailbox of eight: the rest wait at their places.
+  run(QUICK, SMALL, 12, 12, 3000000);
+  expect(g_boss.back == 12 && g_boss.by_way[ALPH_CPU] == 12, "every answer arrives, the late ones too ({g_boss.back} of 12)");
+
+  // A kind that does not exist.
+  var stray: AlphJob;
+  stray.kind = 4;
+  stray.size = 1;
+  expect(g_places.ask(&g_actors[0], &stray) == ALPH_GONE, "a kind past the last is gone");
+  stray.kind = -1;
+  expect(g_places.ask(&g_actors[0], &stray) == ALPH_GONE, "a kind below 0 is gone");
+
+  // A place that could not be spawned is no place: work still gets done.
+  expect(g_cores.spawn_on(0, &idle, 0) > 0, "core 0 takes one more actor");
+  expect(g_places.on_core(&g_cores, 0, ALPH_CPU) == 0, "a full core gives no place");
+  expect(g_places.count == 3, "and the places stay three ({g_places.count})");
+  run(QUICK, SMALL, 40, 4, 0);
+  expect(g_boss.back == 40 && g_boss.by_way[ALPH_CPU] == 40, "jobs still run after a place could not be made ({g_boss.by_way[ALPH_CPU]} of 40)");
+
+  if (g_failures != 0) {
+    return 1;
+  }
+  println("places ok: small jobs {small_cpu}/300 on the cpu, large jobs {large_gpu}/100 on the gpu");
+  return 0;
+}

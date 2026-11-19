@@ -41,14 +41,14 @@ export fn AlphCores_init__ptr(c: AlphCores*, cores: AlphCore*, count: Word, acto
 }
 
 // Spawns on a chosen core. Returns the pid, or 0 when that core is full.
-export fn AlphCores_spawn_on__ptr(c: AlphCores*, place: Word, handle: fn(AlphActor*, AlphMsg*) -> Word with alloc, syscall, asm,
+export fn AlphCores_spawn_on__ptr(c: AlphCores*, place: Word, handle: fn(AlphActor*, AlphMsg*) -> Word,
                                   state: rawptr) -> Word {
   return c->cores[place].node.spawn(handle, state);
 }
 
 // Spawns on the core with the fewest actors. Returns the pid, or 0 when
 // every core is full.
-export fn AlphCores_spawn__ptr(c: AlphCores*, handle: fn(AlphActor*, AlphMsg*) -> Word with alloc, syscall, asm,
+export fn AlphCores_spawn__ptr(c: AlphCores*, handle: fn(AlphActor*, AlphMsg*) -> Word,
                                state: rawptr) -> Word {
   var best: Word = 0;
   for i in 1..c->count {
@@ -81,7 +81,9 @@ fn alph_core_main(arg: cstring) -> uint32 {
   return 0;
 }
 
-// Runs every core until stop: the first on this thread, the rest on their own.
+// Runs every core until stop: the first on this thread, the rest on their
+// own. Every run starts new threads, so what belongs to a thread (a GPU a
+// handler opened) does not last from one run to the next.
 export fn AlphCores_run__ptr(c: AlphCores*) {
   for i in 1..c->count {
     c->cores[i].thread = CreateThread(0, 0, &alph_core_main, (cstring)&c->cores[i].node, 0, 0);

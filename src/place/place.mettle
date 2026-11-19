@@ -1,0 +1,383 @@
+// Places: a job goes where it will finish first.
+//
+// A job is a piece of work of some kind and size. A kind can be run in more
+// than one way: on a CPU core or on a GPU. A place is an actor that runs jobs
+// one way, so a GPU is one place and every core that takes work is another.
+//
+// For each way, kind and size, alph keeps how long a job takes. A new job
+// goes to the place where the work already waiting plus this job's own time
+// is least. A way not yet tried is tried. A way that lost is tried again
+// once the time spent since is 16 times what a run of it costs, so a wrong
+// number costs little and is found.
+//
+// The program writes the two ways. alph only times them, so nothing here
+// knows what a GPU is. x86-64 Linux, like the cores.
+
+import "port/port";
+import "alph/actor/actor";
+import "alph/cores/cores";
+
+export const ALPH_CPU: Word = 0;
+export const ALPH_GPU: Word = 1;
+export const ALPH_RUN: Word = -1;    // to a place: run the job in arg
+export const ALPH_DONE: Word = -2;   // from a place: the job in arg is done
+const ALPH_NUDGE: Word = -3;
+const WAYS: Word = 2;
+const SIZES: Word = 32;              // sizes are told apart by their power of two
+const FRESH: Word = 16;
+const TAKEN: Word = 1152921504606846976;  // 2^60: more than any backlog
+
+export struct AlphJob {
+  kind: Word;
+  size: Word;    // how much work, in the program's own unit
+  data: rawptr;
+  status: Word;  // ALPH_OK, ALPH_GONE when no place can run it, ALPH_FULL to ask again
+  way: Word;     // how it was run
+  ns: Word;      // how long that took
+  asker: Word;
+  ref: Word;
+  owed: Word;
+  next: AlphJob*;
+}
+
+export struct AlphKind {
+  cpu: fn(AlphJob*) -> Word;
+  gpu: fn(AlphJob*) -> Word;
+  off: Word[2];    // this way cannot run the kind
+  warm: Word[2];   // its first run is over: that one pays for starting up
+  est: Word[64];   // ns a job of this size takes on average, 0 when not known
+  low: Word[64];   // ns it takes when nothing gets in its way
+  last: Word[64];  // the time before, 0 when there was none
+  since: Word[64]; // ns of work done the other way since this one was timed
+}
+
+export struct AlphPlace {
+  places: AlphPlaces*;
+  pid: Word;
+  way: Word;
+  waiting: Word;      // jobs sent here and not yet done
+  backlog: Word;      // the ns they are expected to take
+  ran: Word;
+  unsent: AlphJob*;   // done, but the asker's mailbox was full
+  nudged: Word;       // a nudge is on its way
+}
+
+export struct AlphPlaces {
+  gate: AlphGate;
+  places: AlphPlace*;
+  room: Word;
+  count: Word;
+  kinds: AlphKind*;
+  kind_count: Word;
+}
+
+fn alph_place_ns() -> Word {
+  var ts: int64[2];
+  syscall(228, 1, (int64)&ts[0]);
+  return (Word)(ts[0] * 1000000000 + ts[1]);
+}
+
+fn alph_place_slot(way: Word, size: Word) -> Word {
+  var b: Word = 0;
+  var s: Word = size;
+  while (s > 1 && b < SIZES - 1) {
+    s = (Word)(s >> 1);
+    b = b + 1;
+  }
+  return (Word)(way * SIZES + b);
+}
+
+// places holds room places, kinds holds count kinds.
+export fn AlphPlaces_init__ptr(p: AlphPlaces*, places: AlphPlace*, room: Word, kinds: AlphKind*, count: Word) {
+  p->gate.init();
+  p->places = places;
+  p->room = room;
+  p->count = 0;
+  p->kinds = kinds;
+  p->kind_count = count;
+  for i in 0..count {
+    kinds[i].off[0] = 1;
+    kinds[i].off[1] = 1;
+  }
+}
+
+// Says how a kind is run each way. A way the kind does not have is 0. Each
+// returns 0, or non-zero when it cannot run here (no GPU, say): the job then
+// goes another way and that way is not tried again.
+export fn AlphPlaces_kind__ptr(p: AlphPlaces*, kind: Word, cpu: fn(AlphJob*) -> Word,
+                               gpu: fn(AlphJob*) -> Word) {
+  var k: AlphKind* = &p->kinds[kind];
+  k->cpu = cpu;
+  k->gpu = gpu;
+  k->off[ALPH_CPU] = 0;
+  k->off[ALPH_GPU] = 0;
+  if (cpu == 0) {
+    k->off[ALPH_CPU] = 1;
+  }
+  if (gpu == 0) {
+    k->off[ALPH_GPU] = 1;
+  }
+  for i in 0..2 {
+    k->warm[i] = 0;
+  }
+  for i in 0..64 {
+    k->est[i] = 0;
+    k->low[i] = 0;
+    k->last[i] = 0;
+    k->since[i] = 0;
+  }
+}
+
+// A new place that runs jobs one way. Spawn alph_place_run with it as the
+// state, then put the pid in it. Returns 0 when there is no room.
+export fn AlphPlaces_add__ptr(p: AlphPlaces*, way: Word) -> AlphPlace* {
+  var x: AlphPlace* = 0;
+  var was: int32 = p->gate.enter();
+  if (p->count < p->room) {
+    x = &p->places[p->count];
+    x->places = p;
+    x->pid = 0;
+    x->way = way;
+    x->waiting = 0;
+    x->backlog = 0;
+    x->ran = 0;
+    x->unsent = 0;
+    x->nudged = 0;
+    p->count = p->count + 1;
+  }
+  p->gate.leave(was);
+  return x;
+}
+
+// A new place on one core. A GPU's place wants a core to itself: a GPU
+// belongs to the one thread that opened it. Returns its pid, or 0 when the
+// core or the places are full. Set places up one at a time.
+export fn AlphPlaces_on_core__ptr(p: AlphPlaces*, cores: AlphCores*, core: Word, way: Word) -> Word {
+  var x: AlphPlace* = p->add(way);
+  if (x == 0) {
+    return 0;
+  }
+  x->pid = cores->spawn_on(core, &alph_place_run, (rawptr)x);
+  if (x->pid == 0) {
+    var was: int32 = p->gate.enter();
+    p->count = p->count - 1;
+    p->gate.leave(was);
+  }
+  return x->pid;
+}
+
+// What a job of a size not yet timed this way should take: on the line
+// through the two nearest sizes that were timed. 0 with fewer than two. So a
+// way already known to be slow for big jobs is not tried on a bigger one
+// just to find out.
+fn alph_place_guess(k: AlphKind*, way: Word, size: Word) -> Word {
+  var mine: Word = (Word)(alph_place_slot(way, size) - way * SIZES);
+  var near: Word[2];
+  var found: Word = 0;
+  var d: Word = 1;
+  while (d < SIZES && found < 2) {
+    if (mine - d >= 0 && k->est[way * SIZES + mine - d] != 0) {
+      near[found] = mine - d;
+      found = found + 1;
+    }
+    if (found < 2 && mine + d < SIZES && k->est[way * SIZES + mine + d] != 0) {
+      near[found] = mine + d;
+      found = found + 1;
+    }
+    d = d + 1;
+  }
+  if (found < 2) {
+    return 0;
+  }
+  var x0: float64 = (float64)((int64)1 << (int64)near[0]);
+  var x1: float64 = (float64)((int64)1 << (int64)near[1]);
+  var y0: float64 = (float64)k->est[way * SIZES + near[0]];
+  var y1: float64 = (float64)k->est[way * SIZES + near[1]];
+  var slope: float64 = (y1 - y0) / (x1 - x0);
+  if (slope < (float64)0) {
+    slope = (float64)0;
+  }
+  var y: float64 = y0 + slope * ((float64)((int64)1 << (int64)mine) - x0);
+  if (y < (float64)1) {
+    y = (float64)1;
+  }
+  return (Word)(int64)y;
+}
+
+// The place where the job should finish first, with the job counted as
+// waiting there. 0 when no place can run its kind.
+fn alph_place_pick(p: AlphPlaces*, job: AlphJob*) -> AlphPlace* {
+  var k: AlphKind* = &p->kinds[job->kind];
+  var best: AlphPlace* = 0;
+  var best_cost: Word = 0;
+  var best_est: Word = 0;
+  var was: int32 = p->gate.enter();
+  for i in 0..p->count {
+    var x: AlphPlace* = &p->places[i];
+    if (k->off[x->way] != 0) {
+      continue;
+    }
+    var at: Word = alph_place_slot(x->way, job->size);
+    var est: Word = k->est[at];
+    var low: Word = k->low[at];
+    if (est == 0) {
+      est = alph_place_guess(k, x->way, job->size);
+      low = est;
+    }
+    var cost: Word = x->backlog + est;
+    if (est == 0) {
+      cost = -2;
+      if (x->waiting > 0) {
+        cost = TAKEN + x->waiting;
+      }
+    } else if (x->waiting == 0 && k->since[at] >= (Word)(low * FRESH)) {
+      cost = -1;
+    }
+    if (best == 0 || cost < best_cost) {
+      best = x;
+      best_cost = cost;
+      best_est = est;
+    }
+  }
+  if (best != 0) {
+    job->owed = best_est;
+    best->backlog = best->backlog + best_est;
+    best->waiting = best->waiting + 1;
+  }
+  p->gate.leave(was);
+  return best;
+}
+
+fn alph_place_left(p: AlphPlaces*, x: AlphPlace*, job: AlphJob*) {
+  x->backlog = x->backlog - job->owed;
+  x->waiting = x->waiting - 1;
+}
+
+// Sends a job to the place where it should finish first. The answer is an
+// ALPH_DONE message with the job in arg and the ref this returns. From here
+// until that answer the job is alph's: leave it where it is and do not read
+// or write it. Returns ALPH_FULL when that place's
+// mailbox is full, ALPH_GONE when no place can run the kind or there is no
+// such kind.
+export fn AlphPlaces_ask__ptr(p: AlphPlaces*, a: AlphActor*, job: AlphJob*) -> Word {
+  if (job->kind < 0 || job->kind >= p->kind_count) {
+    return ALPH_GONE;
+  }
+  var x: AlphPlace* = alph_place_pick(p, job);
+  if (x == 0) {
+    return ALPH_GONE;
+  }
+  var out: Word = a->ask(x->pid, ALPH_RUN, (Word)job);
+  if (out < 0) {
+    var was: int32 = p->gate.enter();
+    alph_place_left(p, x, job);
+    p->gate.leave(was);
+  }
+  return out;
+}
+
+// The job ran here, or could not: keeps the time, or shuts the way. Two
+// numbers are kept for a way, kind and size. The average decides where jobs
+// go. The lesser of the last two times is what a run costs when nothing gets
+// in its way (one slow run may only mean the thread lost its CPU), and it
+// decides how soon a way that lost is tried again.
+fn alph_place_ran(p: AlphPlaces*, x: AlphPlace*, job: AlphJob*, ns: Word, failed: Word) {
+  var k: AlphKind* = &p->kinds[job->kind];
+  var way: Word = x->way;
+  var was: int32 = p->gate.enter();
+  alph_place_left(p, x, job);
+  if (failed != 0) {
+    k->off[way] = 1;
+  } else if (k->warm[way] == 0) {
+    k->warm[way] = 1;
+  } else {
+    var at: Word = alph_place_slot(way, job->size);
+    var seen: Word = ns;
+    if (seen < 1) {
+      seen = 1;
+    }
+    var before: Word = k->last[at];
+    k->last[at] = seen;
+    if (before != 0) {
+      var low: Word = seen;
+      if (before < low) {
+        low = before;
+      }
+      k->low[at] = low;
+      if (k->est[at] == 0) {
+        k->est[at] = low;
+      } else {
+        k->est[at] = k->est[at] + (Word)((seen - k->est[at]) / 8);
+      }
+    }
+    k->since[at] = 0;
+    var other: Word = alph_place_slot(1 - way, job->size);
+    k->since[other] = k->since[other] + ns;
+    x->ran = x->ran + 1;
+  }
+  p->gate.leave(was);
+}
+
+// Answers for finished jobs. One that finds its asker's mailbox full waits
+// here, and the place nudges itself to try again.
+fn alph_place_answer(a: AlphActor*, x: AlphPlace*) {
+  while (x->unsent != 0) {
+    var job: AlphJob* = x->unsent;
+    var after: AlphJob* = job->next;  // once sent, the job is the asker's again
+    var r: AlphMsg = { tag: ALPH_DONE, from: a->pid, arg: (Word)job, ref: job->ref };
+    if (a->node->put(job->asker, &r) == ALPH_FULL) {
+      if (x->nudged == 0 && a->send(a->pid, ALPH_NUDGE, 0) == ALPH_OK) {
+        x->nudged = 1;
+      }
+      return;
+    }
+    x->unsent = after;
+  }
+}
+
+// The handler of every place.
+export fn alph_place_run(a: AlphActor*, m: AlphMsg*) -> Word {
+  var x: AlphPlace* = (AlphPlace*)a->state;
+  var p: AlphPlaces* = x->places;
+  if (m->tag == ALPH_NUDGE) {
+    x->nudged = 0;
+  }
+  if (m->tag == ALPH_RUN) {
+    var job: AlphJob* = (AlphJob*)m->arg;
+    var k: AlphKind* = &p->kinds[job->kind];
+    job->asker = m->from;
+    job->ref = m->ref;
+    var began: Word = alph_place_ns();
+    var failed: Word = 0;
+    if (x->way == ALPH_CPU) {
+      failed = k->cpu(job);
+    } else {
+      failed = k->gpu(job);
+    }
+    var ns: Word = alph_place_ns() - began;
+    alph_place_ran(p, x, job, ns, failed);
+    job->status = ALPH_OK;
+    job->way = x->way;
+    job->ns = ns;
+    if (failed != 0) {
+      job->status = ALPH_GONE;
+      var next: AlphPlace* = alph_place_pick(p, job);
+      if (next != 0) {
+        var again: AlphMsg = { tag: ALPH_RUN, from: job->asker, arg: (Word)job, ref: job->ref };
+        var out: Word = a->node->put(next->pid, &again);
+        if (out == ALPH_OK) {
+          alph_place_answer(a, x);
+          return 0;
+        }
+        job->status = out;
+        var was: int32 = p->gate.enter();
+        alph_place_left(p, next, job);
+        p->gate.leave(was);
+      }
+    }
+    job->next = x->unsent;
+    x->unsent = job;
+  }
+  alph_place_answer(a, x);
+  return 0;
+}

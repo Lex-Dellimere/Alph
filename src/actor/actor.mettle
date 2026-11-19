@@ -30,7 +30,7 @@ export struct AlphActor {
   pid: Word;     // this slot's pid; the next one's once the actor is gone
   alive: Word;
   queued: Word;  // on the run queue, or running
-  handle: fn(AlphActor*, AlphMsg*) -> Word with alloc, syscall, asm;
+  handle: fn(AlphActor*, AlphMsg*) -> Word;
   state: rawptr;
   mail: AlphMsg*;
   head: Word;
@@ -50,7 +50,7 @@ export struct AlphNode {
   stopped: Word;
   refs: Word;   // the last ref given out
   place: Word;
-  far: fn(AlphNode*, Word, AlphMsg*) -> Word with alloc, syscall, asm;
+  far: fn(AlphNode*, Word, AlphMsg*) -> Word;
   world: rawptr;  // whoever set far
 }
 
@@ -93,7 +93,7 @@ export fn AlphNode_init__ptr(n: AlphNode*, actors: AlphActor*, slots: Word, mail
 
 // Makes the node one place of many: far takes the mail for the others.
 // Call it before the first spawn.
-export fn AlphNode_join__ptr(n: AlphNode*, place: Word, far: fn(AlphNode*, Word, AlphMsg*) -> Word with alloc, syscall, asm,
+export fn AlphNode_join__ptr(n: AlphNode*, place: Word, far: fn(AlphNode*, Word, AlphMsg*) -> Word,
                              world: rawptr) {
   n->place = place;
   n->far = far;
@@ -104,7 +104,7 @@ export fn AlphNode_join__ptr(n: AlphNode*, place: Word, far: fn(AlphNode*, Word,
 }
 
 // Returns the new actor's pid, or 0 when every slot is taken.
-export fn AlphNode_spawn__ptr(n: AlphNode*, handle: fn(AlphActor*, AlphMsg*) -> Word with alloc, syscall, asm,
+export fn AlphNode_spawn__ptr(n: AlphNode*, handle: fn(AlphActor*, AlphMsg*) -> Word,
                               state: rawptr) -> Word {
   var was: int32 = n->gate.enter();
   var a: AlphActor* = n->free;

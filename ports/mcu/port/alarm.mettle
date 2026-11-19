@@ -3,7 +3,7 @@
 
 import "port/port";
 
-var g_ring: fn(rawptr) -> void with alloc, syscall, asm;
+var g_ring: fn(rawptr) -> void;
 var g_ctx: rawptr;
 
 export struct AlphAlarm {
@@ -23,7 +23,7 @@ export fn alph_ms(ms: Word) -> Word {
   return ms - (Word)((ms >> 7) * 3) - (Word)(((ms & 127) * 3) >> 7);
 }
 
-export fn AlphAlarm_start__ptr(al: AlphAlarm*, ring: fn(rawptr) -> void with alloc, syscall, asm, ctx: rawptr) {
+export fn AlphAlarm_start__ptr(al: AlphAlarm*, ring: fn(rawptr) -> void, ctx: rawptr) {
   g_ring = ring;
   g_ctx = ctx;
 }
