@@ -1,6 +1,6 @@
 # First run on real hardware
 
-Nothing in alph has run on a real board yet. Everything below has run in QEMU, and the Pico 2 images on the compiler's model of the chip. This page is the order to try things in on a real Pico 2, what each step proves, and what to look at when a step fails. Each step uses only what the steps before it proved.
+Nothing in alph has run on a real board yet. Everything below has run in QEMU. On the compiler's model of the Pico 2's chip, step 1 runs, and so does step 2 with the computer's side played from a script: fifty messages in over the chip's UART at 115,200 baud and fifty answers out, with nothing the model finds wrong in how the chip is used. This page is the order to try things in on a real Pico 2, what each step proves, and what to look at when a step fails. Each step uses only what the steps before it proved.
 
 ## What you need
 

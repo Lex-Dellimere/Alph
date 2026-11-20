@@ -271,6 +271,8 @@ build_board() {
           status=1
         fi
       done
+      # What speaks to the tether image on the model, and checks its answers.
+      "$METTLE" --build -s --release tests/mcu/model_line.mettle -I ports/host -o "$OUT/model_line" >> "$log" 2>&1 || status=1
       sim="$(dirname "$METTLE")/../tools/riscv-sim/rvsim.c"
       if [ "$status" -eq 0 ] && ! { [ -f "$sim" ] && command -v gcc > /dev/null 2>&1 &&
          gcc -std=c99 -O2 -o "$OUT/rvsim" "$sim" -lm >> "$log" 2>&1; }; then
@@ -489,9 +491,22 @@ step_pico2() {
   elif built pico2; then
     got=$(timeout 30 "$OUT/rvsim" --machine rp2350 --load "$OUT/pico2_blink.bin" --until-ms 3000 2>> "$log" | tr -d '\r\n')
     if [ "$got" = "12345" ]; then
-      echo "ok    pico2/blink [on the chip's model, $(stat -c %s "$OUT/pico2_blink.bin") bytes; tether, asker, arm and two build]"
+      echo "ok    pico2/blink [on the chip's model, $(stat -c %s "$OUT/pico2_blink.bin") bytes; asker, arm and two build]"
     else
       echo "FAIL  pico2/blink printed '$got' on the model"
+      fails=$((fails + 1))
+    fi
+    # The tether image on the model: fifty questions come in on the chip's
+    # UART at 115,200 baud, as a computer on the line would send them, and
+    # its fifty answers are read back. Any use of the chip the model finds
+    # wrong ends the run.
+    "$OUT/model_line" script 50 > "$OUT/pico2_line.script"
+    got=$(timeout 60 "$OUT/rvsim" --machine rp2350 --load "$OUT/pico2_tether.bin" --until-ms 400 --strict-fatal \
+      --uart-script "$OUT/pico2_line.script" 2>> "$log" | "$OUT/model_line" check 50)
+    if [ "$got" = "50 answers over the board's UART, 0 wrong" ]; then
+      echo "ok    pico2/tether [on the chip's model, $(stat -c %s "$OUT/pico2_tether.bin") bytes: $got, at 115,200 baud]"
+    else
+      echo "FAIL  pico2/tether on the model: '$got' (see $log)"
       fails=$((fails + 1))
     fi
   else
