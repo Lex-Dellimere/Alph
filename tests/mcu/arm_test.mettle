@@ -53,6 +53,7 @@ var g_beyond: bool = false;
 var g_asks: bool = false;
 var g_quiet: bool = false;
 var g_two: bool = false;
+var g_passes: bool = false;  // the board asks a machine that has no way to do the work: it is passed on to another
 var g_ups: Word = 0;
 var g_by_first: Word = 0;
 var g_by_second: Word = 0;
@@ -133,6 +134,17 @@ fn boss(a: AlphActor*, m: AlphMsg*) -> Word {
     }
     return 0;
   }
+  if (g_passes) {
+    // Only waits, on the machine the work is passed on to.
+    if (m->tag == TICK) {
+      if (g_far.served >= 6) {
+        a->cores()->stop();
+      } else {
+        g_far.time.after(100, a->pid, TICK, 0);
+      }
+    }
+    return 0;
+  }
   if (g_asks) {
     // Only waits: the board does the asking. Looks every tenth of a second.
     if (m->tag == TICK) {
@@ -190,7 +202,7 @@ fn near_main(arg: cstring) -> uint32 {
 
 fn main(argc: int32, argv: cstring*) -> int32 {
   if (argc < 3) {
-    println("arm_test <port> lost|beyond|slow|asks|quiet|two");
+    println("arm_test <port> lost|beyond|slow|asks|quiet|two|passes");
     return 2;
   }
   var port: int64 = 0;
@@ -205,6 +217,7 @@ fn main(argc: int32, argv: cstring*) -> int32 {
   g_asks = argv[2][0] == 97;     // a
   g_quiet = argv[2][0] == 113;   // q
   g_two = argv[2][0] == 116;     // t
+  g_passes = argv[2][0] == 112;  // p
   var listening: int64 = alph_tcp_listen(port);
   if (listening < 0) {
     println("port {port} is taken");
@@ -227,12 +240,16 @@ fn main(argc: int32, argv: cstring*) -> int32 {
   // The machine with the board on its line: places 0 and 1.
   var here: uint32 = alph_ip4(127, 0, 0, 1);
   g_near.init(2, 0, false);
-  g_near.kind(PRIMES, &primes_job, 0);
+  if (g_passes) {
+    g_near.kind(PRIMES, 0, 0);  // no way here: what the board asks for is done by the other machine
+  } else {
+    g_near.kind(PRIMES, &primes_job, 0);
+  }
   g_near.share(PRIMES);
   g_near.kind(ANGLE, 0, 0);
   g_near.share(ANGLE);
   var asking: AlphMachine* = &g_near;
-  if (g_beyond) {
+  if (g_beyond || g_passes) {
     g_near.peer(4, 2, here, port + 2);
   }
   g_near.board(BOARD, 1);
@@ -258,6 +275,18 @@ fn main(argc: int32, argv: cstring*) -> int32 {
       return 1;
     }
   }
+  if (g_passes) {
+    // The other machine: places 4 and 5. It can count primes.
+    asking = &g_far;
+    g_far.init(2, 4, false);
+    g_far.kind(PRIMES, &primes_job, 0);
+    g_far.share(PRIMES);
+    g_far.peer(0, 2, here, port + 1);
+    if (g_near.start(port + 1) != ALPH_OK || g_far.start(port + 2) != ALPH_OK) {
+      println("the ports after {port} are taken");
+      return 1;
+    }
+  }
   if (g_beyond) {
     // The machine that asks: places 4 and 5, the board through the other.
     asking = &g_far;
@@ -280,14 +309,14 @@ fn main(argc: int32, argv: cstring*) -> int32 {
   var pid: Word = asking->cores.spawn_on(0, &boss, 0);
   asking->tell(pid);
   asking->time.after(25000, pid, LATE, 0);
-  if (g_asks) {
+  if (g_asks || g_passes) {
     asking->time.after(100, pid, TICK, 0);
   }
   if (g_quiet) {
     asking->time.after(1500, pid, TICK, 0);
   }
   var near: int64 = 0;
-  if (g_beyond) {
+  if (g_beyond || g_passes) {
     near = CreateThread(0, 0, &near_main, 0, 0, 0);
   }
   asking->run();
@@ -301,7 +330,7 @@ fn main(argc: int32, argv: cstring*) -> int32 {
     return 0;
   }
   Sleep(100);
-  if (g_beyond) {
+  if (g_beyond || g_passes) {
     g_near.stop();
     thread_join_infinite(near);
     thread_close(near);
@@ -317,6 +346,14 @@ fn main(argc: int32, argv: cstring*) -> int32 {
       return 1;
     }
     println("two boards ok: of 60 jobs only a board can do, {g_by_first} went to the first and {g_by_second} to the second");
+    return 0;
+  }
+  if (g_passes) {
+    if (g_late != 0 || g_near.served < 6 || g_far.served < 6) {
+      println("FAIL the board asked for {g_near.served} jobs of 6 and {g_far.served} were passed on");
+      return 1;
+    }
+    println("board passes ok: {g_near.served} jobs the board asked for, all done by another machine ({g_far.served})");
     return 0;
   }
   if (g_asks) {

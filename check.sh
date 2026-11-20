@@ -545,7 +545,7 @@ step_arm() {
   else
     base=$((9441 + $$ % 300 * 12))
     at=0
-    for run in "arm_host" "arm_test lost" "arm_test beyond" "arm_test slow" "arm_test asks" "arm_test quiet"; do
+    for run in "arm_host" "arm_test lost" "arm_test beyond" "arm_test slow" "arm_test asks" "arm_test quiet" "arm_test passes"; do
       port=$((base + at * 3))
       at=$((at + 1))
       prog=${run%% *}
@@ -554,7 +554,7 @@ step_arm() {
       if [ "$run" = "arm_test slow" ]; then
         board_bin="$OUT/slow_board.bin"
       fi
-      if [ "$run" = "arm_test asks" ]; then
+      if [ "$run" = "arm_test asks" ] || [ "$run" = "arm_test passes" ]; then
         board_bin="$OUT/asking_board.bin"
       fi
       if [ "$run" = "arm_test quiet" ]; then

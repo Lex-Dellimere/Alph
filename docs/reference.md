@@ -186,7 +186,9 @@ Shares a kind with the other machines: this machine does it for them, and
 its own jobs of the kind may go to them. Call it after kind, on every
 machine that should take part. A machine with no way of its own to do
 the kind (kind was given 0 and 0) only sends it: that is how work only a
-board can do, such as moving an arm, is asked for here. Only jobs with no
+board can do, such as moving an arm, is asked for here. A job a board on
+this machine's line asks for is placed as this machine's own, on its
+cores, its GPU or another machine, so a board reaches all of them. Only jobs with no
 home (a word in, or bytes) leave a machine. Returns ALPH_FULL when the
 first core has no room for one more actor, ALPH_GONE for a kind that is
 not 0 to 7.

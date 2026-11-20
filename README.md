@@ -242,7 +242,7 @@ mettle --release examples/mcu/two_b.mettle --target riscv32-none --board qemu-vi
 - Sockets are Linux only, and there is no file IO.
 - A message between two cores costs 150 to 300 ns against about 20 ns inside a node. Lanes bring a stream of them down to about 70 ns, but a single request and its reply are no quicker.
 - A microcontroller joins through a serial line to one machine, and a machine has at most four such lines. What is lost on that line is sent again only when both ends make the line sure, which costs a board about 1.1 KB.
-- A board's jobs are one word in and one word out, one at a time. A board asks the machine at the other end of its line, not the best of several places.
+- A board's jobs are one word in and one word out, one at a time.
 - A job of a kind done at most once carries a word and gives a word back, and when its worker is lost the program is told it cannot know, not what happened.
 
 ## Test

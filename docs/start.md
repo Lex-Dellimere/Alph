@@ -877,6 +877,8 @@ From then on a batch of `ANGLE` jobs goes to the board, and each `PRIMES` job go
 - A board that moves something must stop when its computer is gone. The computer asks the board something twice a second, and `g_board.heard` goes up each time. Look at it on a timer of your own: when it has not gone up for a second or two, the computer has stopped or the line is cut. [tests/mcu/safe_board.mettle](../tests/mcu/safe_board.mettle) does this in twenty lines.
 - With a real board, open its serial device on the computer with `alph_serial_open("/dev/ttyACM0", 115200)` (from `port/serial`) and give the descriptor to `alph_line_open`.
 
+**A board uses the whole network.** What a board asks of the computer on its line, the computer places like a job of its own: on one of its cores, on its GPU, or on another machine. The board's code is the same `g_board.ask(a, kind, in)`. The computer shares the kind, with a way of its own or none, and has the other machines as peers. A job that came from another machine is never sent on.
+
 **Work that must not be done twice.** A job whose answer is lost on the way is normally placed again, so it can be done twice. For counting primes that wastes a little. For moving an arm it is wrong. Say that a kind is done at most once, on the computer and on the board:
 
 ```mettle
@@ -971,7 +973,7 @@ These are not built yet.
 - Sockets are Linux only, and there is no file IO.
 - A message between two cores costs 150 to 300 ns against about 20 ns inside a node. Lanes bring a stream of them down to about 70 ns, but one request and its reply are no quicker, and lanes are for Linux only.
 - A microcontroller joins through a serial line to one machine. What is lost on that line is sent again only when both ends make the line sure.
-- A board's jobs are one word in and one word out, one at a time. A board asks the machine at the other end of its line, not the best of several places.
+- A board's jobs are one word in and one word out, one at a time.
 - A job of a kind done at most once carries a word and gives a word back. When its worker is lost the program is told `ALPH_LOST`: it cannot know whether the job was done.
 - A machine has room for 128 pieces out over all its batches, which is 56 cores at work, and takes 32 jobs for others at once, two for each of the 16 cores it can have.
 - Peers are listed by hand.

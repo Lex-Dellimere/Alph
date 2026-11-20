@@ -434,6 +434,21 @@ fn alph_machine_serve(a: AlphActor*, msg: AlphMsg*) -> Word {
   var taken: bool = false;
   var why: Word = ALPH_FULL;
   var room: bool = true;
+  // A job from a board on this machine's own line is placed as this
+  // machine's own would be, and may go on to another machine. One from
+  // another machine stays here, so that no job goes round, and is refused
+  // if this machine has no way to do the kind itself.
+  var from_board: bool = false;
+  var asker_place: Word = (Word)(msg->from >> ALPH_PLACE_SHIFT);
+  for i in 0..m->board_count {
+    if (asker_place >= m->boards[i].first && asker_place < m->boards[i].first + m->boards[i].count) {
+      from_board = true;
+    }
+  }
+  if (!from_board && m->kinds[s->kind].cpu == 0 && m->kinds[s->kind].gpu == 0) {
+    why = ALPH_GONE;
+    room = false;
+  }
   if (msg->tag == ALPH_WORK_LONG) {
     whole = (AlphLong*)msg->arg;
     if (whole == 0) {
@@ -461,6 +476,9 @@ fn alph_machine_serve(a: AlphActor*, msg: AlphMsg*) -> Word {
       t->job.size = 1;
       t->job.home = ALPH_NOWHERE;
       t->job.stay = 1;  // it came from another machine: it is not sent on
+      if (from_board) {
+        t->job.stay = 0;
+      }
       t->job.in = msg->arg;
       t->job.data = 0;
       t->job.bytes = 0;
@@ -550,6 +568,7 @@ export fn AlphMachine_init__ptr(m: AlphMachine*, cores: Word, first: Word, gpu: 
   for k in 0..8 {
     m->shared[k] = 0;
     m->far_places[k] = 0;
+    m->serving[k].machine = 0;
   }
   for i in 0..64 {
     m->asked[i] = 0;
@@ -641,7 +660,29 @@ fn alph_machine_board(m: AlphMachine*, first: Word, count: Word) -> Word {
     var round: AlphMsg = { tag: ALPH_ROUND, from: m->steward, arg: 0, ref: 0 };
     m->cores.cores[0].node.put(m->steward, &round);
   }
+  // A board asks this machine for work, and the machine places it as its
+  // own: a kind it only sends is taken from a board all the same.
+  for k in 0..8 {
+    if (m->shared[k] != 0) {
+      alph_machine_serves(m, (Word)k);
+    }
+  }
   return ALPH_OK;
+}
+
+// The actor that takes jobs of a shared kind from others, made once.
+fn alph_machine_serves(m: AlphMachine*, kind: Word) -> Word {
+  if (m->serving[kind].machine != 0) {
+    return ALPH_OK;
+  }
+  m->serving[kind].kind = kind;
+  m->done[kind].init();
+  var pid: Word = m->cores.spawn_on(0, &alph_machine_serve, (rawptr)&m->serving[kind]);
+  if (pid == 0) {
+    return ALPH_FULL;
+  }
+  m->serving[kind].machine = m;
+  return m->names.set(ALPH_SHARED + kind, pid);
 }
 
 // A board on one of this machine's serial lines (src/board): where its
@@ -696,7 +737,9 @@ export fn AlphMachine_kind__ptr(m: AlphMachine*, kind: Word, cpu: fn(AlphJob*) -
 // its own jobs of the kind may go to them. Call it after kind, on every
 // machine that should take part. A machine with no way of its own to do
 // the kind (kind was given 0 and 0) only sends it: that is how work only a
-// board can do, such as moving an arm, is asked for here. Only jobs with no
+// board can do, such as moving an arm, is asked for here. A job a board on
+// this machine's line asks for is placed as this machine's own, on its
+// cores, its GPU or another machine, so a board reaches all of them. Only jobs with no
 // home (a word in, or bytes) leave a machine. Returns ALPH_FULL when the
 // first core has no room for one more actor, ALPH_GONE for a kind that is
 // not 0 to 7.
@@ -704,19 +747,11 @@ export fn AlphMachine_share__ptr(m: AlphMachine*, kind: Word) -> Word {
   if (kind < 0 || kind >= 8) {
     return ALPH_GONE;
   }
-  if (m->kinds[kind].cpu == 0 && m->kinds[kind].gpu == 0) {
-    m->shared[kind] = 1;
+  m->shared[kind] = 1;
+  if (m->kinds[kind].cpu == 0 && m->kinds[kind].gpu == 0 && m->board_count == 0) {
     return ALPH_OK;
   }
-  m->serving[kind].machine = m;
-  m->serving[kind].kind = kind;
-  m->done[kind].init();
-  var pid: Word = m->cores.spawn_on(0, &alph_machine_serve, (rawptr)&m->serving[kind]);
-  if (pid == 0) {
-    return ALPH_FULL;
-  }
-  m->shared[kind] = 1;
-  return m->names.set(ALPH_SHARED + kind, pid);
+  return alph_machine_serves(m, kind);
 }
 
 // Gives the machine long buffers, so that a job for another machine can

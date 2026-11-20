@@ -214,6 +214,8 @@ A robot's parts stamp what they measure, and a stamp is only worth something if 
 
 With three machines in one process whose clocks were set seven seconds ahead and three behind, readings taken together were 0 to 33 µs apart, and with the first machine lost the other two stayed within 20 µs while the time went on without a jump. That is over loopback, where the way there and back is about 15 µs. Over a real network it is as good as that way is steady.
 
+A board asks the machine at the other end of its line for work, and that machine places the job as it would one of its own: on a core, on its GPU, or on another machine. So a board of a few kilobytes reaches whatever the network has, and never knows more than its one line. A job that came from another machine is still never sent on, so no job goes round. In the check a board asks a computer that cannot count primes for six chunks, and another computer counts them.
+
 A board is too small to follow anyone, and has no need to. It stamps what it measures with its own clock and sends the stamp along. The machine on its line already asks the board's door something twice a second, and a board that has set its clock answers with what the clock reads. From the answer with the shortest way there and back the machine knows what the board's clock read at one moment of the shared time, and turns any stamp of the board's into that time. A board's tick is 1,024 µs, so this is good to a millisecond or two. Forty stamps of a board in QEMU all fell inside the moment their job was out. It cost the board's image no bytes.
 
 ## What is not built
@@ -223,7 +225,6 @@ A board is too small to follow anyone, and has no need to. It stamps what it mea
 - A crossing that carries everything waiting between the cores of one machine without lanes, and for messages with bytes, which still take a datagram each.
 - A sealed link has one key for all, so any holder can speak as any machine and there is no forward secrecy. Peers are listed by hand.
 - A board on the UDP link itself. A board joins through a serial line to one machine.
-- A board that sends its work to the best of several places. It asks the machine at the other end of its line.
 - A job for another machine with more bytes than a long buffer holds, or with its data on a GPU.
 - A job's time predicted from more than its size. A Mandelbrot tile's time depends on where in the picture it is, so such work is placed less well.
 - Sizes for `src/machine` other than the fixed ones.
