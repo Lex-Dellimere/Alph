@@ -1,0 +1,97 @@
+// A board's stamps in the machines' time (AlphMachine_board_now). The board
+// is tests/mcu/clock_board.mettle: each job gives back what the board's
+// clock read when it was done. Turned into the machines' time, that must
+// lie between when the job was sent and when its answer came, give or take
+// the board's tick of a millisecond.
+//
+//   clock_host 7491 &
+//   qemu-system-riscv32 ... -serial tcp:127.0.0.1:7491 -device loader,file=clock_board.bin,...
+
+import "std/io";
+import "std/thread";
+import "port/net";
+import "port/line";
+import "alph/actor/actor";
+import "alph/machine/machine";
+import "alph/batch/batch";
+import "../../examples/mcu/host_line";
+import "port/sys";
+
+const STAMP: Word = 0;
+const QUIT: Word = 3;
+const LATE: Word = 9;
+const JOBS: Word = 40;
+const BOARD: Word = 8;
+const SLACK: Word = 3000000;  // ns: a tick of the board's clock is 1,024,000
+
+var g_m: AlphMachine;
+var g_batch: AlphBatch;
+var g_sent: Word[40];
+var g_outside: Word = 0;
+var g_worst: Word = 0;
+var g_unknown: Word = 0;
+var g_done: Word = 0;
+var g_late: Word = 0;
+
+fn each(b: AlphBatch*, job: AlphJob*, piece: Word) {
+  g_sent[piece] = g_m.now();
+}
+
+fn answered(b: AlphBatch*, job: AlphJob*, piece: Word) {
+  var back: Word = g_m.now();
+  var at: Word = g_m.board_now(BOARD, job->out);
+  g_done = g_done + 1;
+  if (job->status != ALPH_OK || at < 0) {
+    g_unknown = g_unknown + 1;
+    return;
+  }
+  var off: Word = 0;
+  if (at < g_sent[piece]) {
+    off = g_sent[piece] - at;
+  } else if (at > back) {
+    off = at - back;
+  }
+  if (off > g_worst) {
+    g_worst = off;
+  }
+  if (off > SLACK) {
+    g_outside = g_outside + 1;
+  }
+}
+
+fn boss(a: AlphActor*, m: AlphMsg*) -> Word {
+  if (m->tag == LATE) {
+    g_late = 1;
+    a->cores()->stop();
+  } else if (m->tag == ALPH_UP && m->arg == BOARD) {
+    g_batch.begin(a, STAMP, JOBS, &each, &answered, 0);
+  } else if (g_batch.took(a, m) && g_batch.over()) {
+    a->send((Word)((BOARD << ALPH_PLACE_SHIFT) | ((Word)1 << ALPH_INDEX_BITS) | 1), QUIT, 0);
+    a->cores()->stop();
+  }
+  return 0;
+}
+
+fn main(argc: int32, argv: cstring*) -> int32 {
+  var line: int64 = host_line(argc, argv, 7491);
+  if (line < 0) {
+    return 1;
+  }
+  g_m.init(2, 0, false);
+  g_m.kind(STAMP, 0, 0);
+  g_m.share(STAMP);
+  g_m.board(BOARD, 1);
+  g_m.batch(&g_batch);
+  var pid: Word = g_m.cores.spawn_on(0, &boss, 0);
+  g_m.tell(pid);
+  g_m.time.after(20000, pid, LATE, 0);
+  g_m.run();
+  Sleep(100);
+  g_m.shut();
+  alph_close(line);
+  println("{g_done} stamps of a board's clock turned into the machines' time: {g_outside} outside the moment their job was out, the worst by {g_worst / 1000} us, {g_unknown} not known");
+  if (g_late != 0 || g_done != JOBS || g_outside != 0 || g_unknown != 0) {
+    return 1;
+  }
+  return 0;
+}

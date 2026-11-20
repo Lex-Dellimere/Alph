@@ -14,6 +14,11 @@
 // machine that hears nothing from it for two seconds takes it for lost, so
 // a job should take well under that.
 //
+// A board that stamps what it measures sets b->clock to its port's
+// alph_now. Its door then says what the clock reads each time it is asked,
+// and the machine at the other end can turn a stamp of the board's into
+// the time all the machines share (AlphMachine_board_now).
+//
 // A machine that shares work with a board asks its door something twice a
 // second. b->heard goes up each time, so a board that moves something
 // looks at it on a timer of its own: if it has not gone up for a second
@@ -46,6 +51,7 @@ export struct AlphBoard {
   workers: Word[8];   // by kind: the actor that does it, 0 for none
   helpers: Word[8];   // by kind: the actor down the line that does it, 0 while not known
   door: Word;
+  clock: fn() -> Word;  // the board's own clock, 0 for none: set it to alph_now and a machine can read the board's stamps
   kinds: AlphBoardKind[8];
   actors: AlphActor[12];
   mail: AlphMsg[96];
@@ -68,6 +74,9 @@ fn alph_board_door(a: AlphActor*, m: AlphMsg*) -> Word {
   if (kind >= 0 && kind < 8 && b->workers[kind] != 0) {
     answer.from = b->workers[kind];
     answer.arg = 1;
+    if (b->clock != 0) {
+      answer.arg = (Word)(b->clock() | 1);  // and what its clock says, which is how a machine follows it
+    }
   }
   a->node->put(m->from, &answer);
   return 0;
@@ -89,6 +98,7 @@ fn alph_board_serve(a: AlphActor*, m: AlphMsg*) -> Word {
 // whose places are first, first + 1, ... Call it before anything else. The
 // program's own actors are spawned on b->node.
 export fn AlphBoard_init__ptr(b: AlphBoard*, place: Word, first: Word, count: Word) {
+  b->clock = 0;
   b->served = 0;
   b->heard = 0;
   for k in 0..8 {

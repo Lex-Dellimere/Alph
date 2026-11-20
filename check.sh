@@ -332,6 +332,12 @@ build_board() {
       "$METTLE" --release tests/mcu/once_asker.mettle --target riscv32-none --board pico2 \
         --emit-flat "$OUT/pico2_once_asker.bin" -I ports/pico2 -I ports/mcu >> "$log" 2>&1 || status=1
       ;;
+    clock)
+      log="$OUT/clock.log"
+      "$METTLE" --release tests/mcu/clock_board.mettle --target riscv32-none --board qemu-virt \
+        --emit-flat "$OUT/clock_board.bin" -I ports/mcu > "$log" 2>&1 &&
+      "$METTLE" --build -s --release tests/mcu/clock_host.mettle -I ports/host -o "$OUT/clock_host" >> "$log" 2>&1 || status=1
+      ;;
     two)
       log="$OUT/two.log"
       "$METTLE" --release examples/mcu/two_a.mettle --target riscv32-none --board qemu-virt \
@@ -364,7 +370,7 @@ built() { [ "$(cat "$OUT/$1.built" 2> /dev/null)" = "${2:-0}" ]; }
 board_steps=()
 if [ "$boards" -eq 1 ]; then
   board_steps=(pico2 arm64)
-  [ "$qemu" -eq 1 ] && board_steps+=(blink tether relay arm harts pair two once sure irq)
+  [ "$qemu" -eq 1 ] && board_steps+=(blink tether relay arm harts pair two once clock sure irq)
   rm -f "$OUT"/*.built "$OUT/pico2.unbuilt" "$OUT/arm64.unbuilt"
 fi
 
@@ -734,6 +740,33 @@ step_once() {
   fi
 }
 
+# A board's stamps in the machines' time: forty jobs each give back what the
+# board's clock read, and each reading falls in the moment its job was out.
+step_clock() {
+  local log="$OUT/clock.log" port host_pid board code
+  if ! built clock; then
+    echo "FAIL  mcu/clock build (see $log)"
+    fails=$((fails + 1))
+  else
+    port=$((17431 + $$ % 500))
+    timeout 40 "$OUT/clock_host" "$port" > "$log.host" 2>&1 &
+    host_pid=$!
+    sleep 0.3
+    timeout 30 qemu-system-riscv32 -M virt -bios none -display none -monitor none \
+      -serial "tcp:127.0.0.1:$port" -device loader,file="$OUT/clock_board.bin",addr=0x80000000,force-raw=on >> "$log" 2>&1
+    board=$?
+    wait "$host_pid"
+    code=$?
+    cat "$log.host" >> "$log"
+    if [ "$code" -eq 0 ] && [ "$board" -eq 0 ]; then
+      echo "ok    mcu/clock [$(stat -c %s "$OUT/clock_board.bin") bytes: $(tail -n 1 "$log.host")]"
+    else
+      echo "FAIL  mcu/clock: host exit $code, board exit $board (see $log)"
+      fails=$((fails + 1))
+    fi
+  fi
+}
+
 # An interrupt as a message: the QEMU board's clock raises five alarms, and
 # each reaches an actor as a message.
 step_irq() {
@@ -838,6 +871,7 @@ if [ "$boards" -eq 1 ]; then
   [ "$qemu" -eq 1 ] && step_pair
   [ "$qemu" -eq 1 ] && step_two
   [ "$qemu" -eq 1 ] && step_once
+  [ "$qemu" -eq 1 ] && step_clock
   [ "$qemu" -eq 1 ] && step_sure
   [ "$qemu" -eq 1 ] && step_irq
   step_arm64

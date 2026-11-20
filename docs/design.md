@@ -212,7 +212,9 @@ The measurements that decide a choice are in the section for that choice: the re
 
 A robot's parts stamp what they measure, and a stamp is only worth something if the parts agree what time it is. Each machine has a clock of its own that started when it did. A machine's timekeeper asks the machine with the lowest places it reaches what time it is, takes the answer plus half the way there and back as the time now, and keeps the answer whose way was shortest, since that one was least in doubt. An older answer's way counts an eighth longer each round, so a clock that drifts is followed. The machine the others follow asks nobody. If it is lost the next lowest goes on from the time it had.
 
-With three machines in one process whose clocks were set seven seconds ahead and three behind, readings taken together were 0 to 33 µs apart, and with the first machine lost the other two stayed within 20 µs while the time went on without a jump. That is over loopback, where the way there and back is about 15 µs. Over a real network it is as good as that way is steady. A board does not take part yet.
+With three machines in one process whose clocks were set seven seconds ahead and three behind, readings taken together were 0 to 33 µs apart, and with the first machine lost the other two stayed within 20 µs while the time went on without a jump. That is over loopback, where the way there and back is about 15 µs. Over a real network it is as good as that way is steady.
+
+A board is too small to follow anyone, and has no need to. It stamps what it measures with its own clock and sends the stamp along. The machine on its line already asks the board's door something twice a second, and a board that has set its clock answers with what the clock reads. From the answer with the shortest way there and back the machine knows what the board's clock read at one moment of the shared time, and turns any stamp of the board's into that time. A board's tick is 1,024 µs, so this is good to a millisecond or two. Forty stamps of a board in QEMU all fell inside the moment their job was out. It cost the board's image no bytes.
 
 ## What is not built
 

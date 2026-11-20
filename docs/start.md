@@ -142,6 +142,7 @@ var doubt: Word = g_m.apart();  // how far off it may be: -1 before the first an
 - If the machine the others follow is lost, the next lowest goes on from the time it had, so the time does not jump.
 - It can step by about `apart()` when a better answer comes, so measure a span with two readings on one machine, not with one from each.
 - A machine with no peers reads its own clock.
+- A board stamps what it measures with its own clock, `alph_now()`, and sends the stamp along. The machine on whose line the board is turns it into this time with `m.board_now(first, stamp)`, good to a millisecond or two. For that the board sets `g_board.clock = &alph_now;` after its `init`.
 
 **The batch.**
 

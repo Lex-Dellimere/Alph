@@ -59,6 +59,10 @@ struct AlphOnLine {
   quiet: Word;      // rounds since it last answered
   workers: Word[8]; // by kind: its actor that does it, 0 for none
   asked: Word[8];   // by kind: the ref of the question out to it
+  asked_at: Word;   // when this round's questions went, by this machine's own clock
+  ticks: Word;      // what the board's clock read in the answer its time is taken from, 0 for none yet,
+  ticks_at: Word;   // the machines' time at that moment,
+  ticks_trip: Word; // and the way there and back of that asking
 }
 
 // A job taken for another machine.
@@ -179,6 +183,10 @@ fn alph_machine_round(a: AlphActor*, m: AlphMachine*, b: AlphOnLine*) {
     b->quiet = 0;
   }
   b->heard = 0;
+  b->asked_at = alph_machine_clock(m);
+  if (b->ticks_trip > 0) {
+    b->ticks_trip = b->ticks_trip + (Word)(b->ticks_trip / 8) + 1;
+  }
   var any: bool = false;
   for k in 0..8 {
     b->asked[k] = 0;
@@ -219,6 +227,18 @@ fn alph_machine_board_said(a: AlphActor*, m: AlphMachine*, msg: AlphMsg*) -> boo
       var worker: Word = 0;
       if (msg->arg != 0 && m->shared[k] != 0) {
         worker = msg->from;
+      }
+      var read: Word = (Word)(msg->arg & 4294967294);
+      if (read != 0) {
+        // The board's clock, read about half the way there and back ago.
+        // The answer with the shortest way is the one its time is taken
+        // from, as between machines.
+        var trip: Word = alph_machine_clock(m) - b->asked_at;
+        if (b->ticks == 0 || trip <= b->ticks_trip) {
+          b->ticks = read;
+          b->ticks_trip = trip;
+          b->ticks_at = m->now() - (Word)(trip / 2);
+        }
       }
       if (b->workers[k] != 0 && b->workers[k] != worker) {
         alph_machine_board_shut(a, m, b, (Word)k);
@@ -602,6 +622,10 @@ fn alph_machine_board(m: AlphMachine*, first: Word, count: Word) -> Word {
   b->up = 0;
   b->heard = 0;
   b->quiet = 0;
+  b->asked_at = 0;
+  b->ticks = 0;
+  b->ticks_at = 0;
+  b->ticks_trip = 0;
   for k in 0..8 {
     b->workers[k] = 0;
     b->asked[k] = 0;
@@ -785,6 +809,26 @@ fn alph_machine_clock(m: AlphMachine*) -> Word {
 // machine with no peers reads its own clock.
 export fn AlphMachine_now__ptr(m: AlphMachine*) -> Word {
   return alph_machine_clock(m) + m->time_off;
+}
+
+// The machines' time (now) at which a board's clock read `ticks`: a stamp
+// the board took with its alph_now and sent along with what it measured.
+// The board must have set its clock (AlphBoard's clock) and be on this
+// machine's own line, with its first place `first`. A board's tick is
+// 1,024 microseconds, so this is good to a millisecond or two, and to the
+// way to the board and back. Returns -1 while the board's clock has not
+// been heard.
+export fn AlphMachine_board_now__ptr(m: AlphMachine*, first: Word, ticks: Word) -> Word {
+  for i in 0..m->board_count {
+    var b: AlphOnLine* = &m->boards[i];
+    if (b->first == first && b->ticks != 0) {
+      // The board counts in 32 bits and goes round every 50 days: the
+      // stamp is taken as the one nearest the last reading.
+      var since: int64 = (int64)(int32)((int64)ticks - (int64)b->ticks);
+      return b->ticks_at + (Word)(since * 1024000);
+    }
+  }
+  return -1;
 }
 
 // How far now may be from the time of the machine this one follows, in

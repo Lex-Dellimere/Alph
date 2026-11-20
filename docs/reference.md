@@ -286,6 +286,22 @@ measures so that another can order it, or to act at the same moment on
 several. It can step by that much when a better asking comes in. A
 machine with no peers reads its own clock.
 
+### `AlphMachine_board_now__ptr`
+
+```mettle
+export fn AlphMachine_board_now__ptr(m: AlphMachine*, first: Word, ticks: Word) -> Word
+```
+
+Call it as `m->board_now(first, ticks)`, or `m.board_now(first, ticks)` on a value.
+
+The machines' time (now) at which a board's clock read `ticks`: a stamp
+the board took with its alph_now and sent along with what it measured.
+The board must have set its clock (AlphBoard's clock) and be on this
+machine's own line, with its first place `first`. A board's tick is
+1,024 microseconds, so this is good to a millisecond or two, and to the
+way to the board and back. Returns -1 while the board's clock has not
+been heard.
+
 ### `AlphMachine_apart__ptr`
 
 ```mettle
@@ -522,6 +538,11 @@ The board runs one job at a time, and nothing else while it does. A
 machine that hears nothing from it for two seconds takes it for lost, so
 a job should take well under that.
 
+A board that stamps what it measures sets b->clock to its port's
+alph_now. Its door then says what the clock reads each time it is asked,
+and the machine at the other end can turn a stamp of the board's into
+the time all the machines share (AlphMachine_board_now).
+
 A machine that shares work with a board asks its door something twice a
 second. b->heard goes up each time, so a board that moves something
 looks at it on a timer of its own: if it has not gone up for a second
@@ -542,6 +563,7 @@ export struct AlphBoard {
   workers: Word[8];   // by kind: the actor that does it, 0 for none
   helpers: Word[8];   // by kind: the actor down the line that does it, 0 while not known
   door: Word;
+  clock: fn() -> Word;  // the board's own clock, 0 for none: set it to alph_now and a machine can read the board's stamps
   kinds: AlphBoardKind[8];
   actors: AlphActor[12];
   mail: AlphMsg[96];
