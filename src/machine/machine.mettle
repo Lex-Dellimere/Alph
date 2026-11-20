@@ -40,6 +40,11 @@ const TAKEN: Word = 32;   // jobs taken for other machines at once: two for each
 const ROOM: Word = 16;    // messages a mailbox
 const ALPH_ROUND: Word = -19;  // the steward's timer: ask the boards again
 const WORK_BEGIN: Word = 1;    // to the actor behind work: begin the batch
+const ALPH_TIME: Word = -26;     // one machine's timekeeper to another's: what time is it?
+const ALPH_TIME_IS: Word = -27;  // the answer: the time in arg
+const TIME_TICK: Word = 1;       // the timekeeper's timer
+const TIME_FIRST_MS: Word = 20;  // between askings while the time is being found,
+const TIME_MS: Word = 250;       // and once it is
 const ROUND_MS: Word = 500;
 const QUIET: Word = 4;         // rounds with no answer before a board is taken for lost
 const BOARD_JOBS: Word = 4;    // jobs at a board at once: half its worker's mailbox
@@ -132,6 +137,13 @@ export struct AlphMachine {
   run_took: fn(Word, Word, rawptr) -> void;  // and the program's function for each answer,
   run_ctx: rawptr;        // with its own
   outs: uint8[73728];     // what each job of several pieces gives back: 512 bytes a slot
+  timekeeper: Word;       // the actor that keeps this machine's time in step with the others' (now)
+  time_off: Word;         // what is added to this machine's own clock to give that time, in ns
+  time_trip: Word;        // the way there and back of the asking it came from, in ns: -1 before any
+  time_asked: Word;       // the ref of the asking that is out, 0 for none,
+  time_sent: Word;        // and when it went, by this machine's own clock
+  time_rounds: Word;      // askings answered
+  time_skew: Word;        // for tests: added to this machine's own clock
   slots: AlphBatchSlot[128];  // room for the batches tied to this machine (batch)
   slots_used: Word;
   far_times: AlphTimes[96];  // each other machine's and board's own times, eight kinds each
@@ -536,6 +548,12 @@ export fn AlphMachine_init__ptr(m: AlphMachine*, cores: Word, first: Word, gpu: 
   m->steward = m->cores.spawn_on(0, &alph_machine_steward, (rawptr)m);
   m->door.tell(m->steward);
   m->time.init(&m->core[0].node, &m->timers[0], 32);
+  m->timekeeper = m->cores.spawn_on(0, &alph_machine_timekeeper, (rawptr)m);
+  m->time_off = 0;
+  m->time_trip = -1;
+  m->time_asked = 0;
+  m->time_rounds = 0;
+  m->time_skew = 0;
   m->places.init(&m->seats[0], 26, &m->kinds[0], 8);
   m->places.clock(&m->time);
   m->places.net(&m->link);
@@ -745,7 +763,101 @@ export fn AlphMachine_tell__ptr(m: AlphMachine*, pid: Word) {
 // Listens on a port and joins the other machines. Returns ALPH_GONE when
 // the port cannot be had. A machine with no peers need not call it.
 export fn AlphMachine_start__ptr(m: AlphMachine*, port: int64) -> Word {
-  return m->link.start(port);
+  var out: Word = m->link.start(port);
+  if (out == ALPH_OK && m->peer_count > 0) {
+    m->cores.send(m->timekeeper, TIME_TICK, 0);
+  }
+  return out;
+}
+
+fn alph_machine_clock(m: AlphMachine*) -> Word {
+  var ts: int64[2];
+  syscall(ALPH_NR_CLOCK_GETTIME, 1, (int64)&ts[0]);
+  return (Word)(ts[0] * 1000000000 + ts[1]) + m->time_skew;
+}
+
+// The time the machines agree on, in nanoseconds. Every machine follows
+// the one with the lowest places among those it reaches, so all of them
+// read about the same time at the same moment: within the way to that
+// machine and back, which apart says. Use it to stamp what one machine
+// measures so that another can order it, or to act at the same moment on
+// several. It can step by that much when a better asking comes in. A
+// machine with no peers reads its own clock.
+export fn AlphMachine_now__ptr(m: AlphMachine*) -> Word {
+  return alph_machine_clock(m) + m->time_off;
+}
+
+// How far now may be from the time of the machine this one follows, in
+// nanoseconds: half the way there and back of the asking it was set from.
+// 0 on the machine the others follow, and -1 on one that has not heard
+// from it yet.
+export fn AlphMachine_apart__ptr(m: AlphMachine*) -> Word {
+  if (m->time_trip < 0) {
+    for i in 0..m->peer_count {
+      if (m->peers[i].first < m->link.cores->first && m->link.reaches(m->peers[i].first)) {
+        return -1;
+      }
+    }
+    return 0;
+  }
+  return (Word)(m->time_trip / 2);
+}
+
+// Keeps this machine's time in step. On its timer it asks the machine with
+// the lowest places it reaches, if those are lower than its own, what time
+// it is. The answer is that machine's time when it answered. Half the way
+// there and back has passed since, so the time now is the answer plus
+// that, and the asking with the shortest way is the one to trust: its
+// answer was least in doubt. An older asking's way is counted an eighth
+// longer each round, so a clock that drifts is followed. The machine the
+// others follow asks nobody. If it is lost, the next lowest goes on from
+// the time it had, so the time does not jump.
+fn alph_machine_timekeeper(a: AlphActor*, msg: AlphMsg*) -> Word {
+  var m: AlphMachine* = (AlphMachine*)a->state;
+  if (msg->tag == ALPH_TIME) {
+    a->reply(msg, ALPH_TIME_IS, m->now());
+    return 0;
+  }
+  if (msg->tag == ALPH_TIME_IS) {
+    if (msg->ref != m->time_asked || m->time_asked == 0) {
+      return 0;  // the answer to an asking given up
+    }
+    var here: Word = alph_machine_clock(m);
+    var trip: Word = here - m->time_sent;
+    m->time_asked = 0;
+    m->time_rounds = m->time_rounds + 1;
+    if (m->time_trip < 0 || trip <= m->time_trip) {
+      m->time_trip = trip;
+      m->time_off = msg->arg + (Word)(trip / 2) - here;
+    }
+    return 0;
+  }
+  if (msg->tag != TIME_TICK) {
+    return 0;
+  }
+  var mine: Word = m->link.cores->first;
+  var lead: Word = mine;
+  for i in 0..m->peer_count {
+    if (m->peers[i].first < lead && m->link.reaches(m->peers[i].first)) {
+      lead = m->peers[i].first;
+    }
+  }
+  if (lead != mine) {
+    if (m->time_trip > 0) {
+      m->time_trip = m->time_trip + (Word)(m->time_trip / 8) + 1;
+    }
+    m->time_sent = alph_machine_clock(m);
+    m->time_asked = a->ask((Word)(a->pid - ((mine - lead) << ALPH_PLACE_SHIFT)), ALPH_TIME, 0);
+    if (m->time_asked < 0) {
+      m->time_asked = 0;
+    }
+  }
+  var wait: Word = TIME_MS;
+  if (m->time_rounds < 8) {
+    wait = TIME_FIRST_MS;
+  }
+  m->time.after(wait, a->pid, TIME_TICK, 0);
+  return 0;
 }
 
 // The actor behind work: begins the batch, takes its answers, and stops

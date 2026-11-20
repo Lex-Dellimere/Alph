@@ -124,11 +124,24 @@ Every machine runs the same program. Each says how a kind of job is done (`kind`
 - `work(kind, total, fill, took, ctx)` does a whole batch and returns when it is over.
 - `batch(&batch)` ties a batch to the machine. See The batch below.
 - `longs(memory, each, count)` gives the machine long buffers, so a job for another machine can carry more than 1,024 bytes. `gives(kind, bytes)` says a job of a kind gives back up to that many, when that is more than 1,016. Call both on every machine. See Jobs on other machines.
+- `now()` is the time all the machines agree on, in nanoseconds, and `apart()` how far it may be off. See One time below.
 - `tell(pid)` names your actor that hears `ALPH_UP` and `ALPH_DOWN`.
 - `run()` runs the cores until `stop()`, and `shut()` ends the timers and the link afterwards.
 - The layers are fields of the machine, for when you want them: `m.cores`, `m.link`, `m.names`, `m.life`, `m.door`, `m.time`, `m.places`.
 
 The sizes are fixed: 32 actors a core, 16 messages a mailbox, 8 kinds. A program that needs others puts the layers together itself, as the sections below show and as `src/machine/machine.mettle` does.
+
+**One time.** Machines started at different moments have clocks that say different things. `m.now()` is one time for all of them: every machine follows the one with the lowest places among those it reaches, asking it the time a few times a second. So a reading stamped on one machine can be ordered against one stamped on another, and two machines can act at the same moment.
+
+```mettle
+var stamp: Word = g_m.now();    // nanoseconds, the same on every machine at the same moment
+var doubt: Word = g_m.apart();  // how far off it may be: -1 before the first answer
+```
+
+- Between three machines on one computer the readings were 0 to 33 µs apart. Over a real network it is as good as the way there and back is steady.
+- If the machine the others follow is lost, the next lowest goes on from the time it had, so the time does not jump.
+- It can step by about `apart()` when a better answer comes, so measure a span with two readings on one machine, not with one from each.
+- A machine with no peers reads its own clock.
 
 **The batch.**
 

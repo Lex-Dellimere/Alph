@@ -208,6 +208,12 @@ The measurements that decide a choice are in the section for that choice: the re
 - Wide: with two helpers of eight working cores, a batch of 600 pieces had more than 34 out at once, never more than 16 waiting at a helper or 2 at the core here, and each helper did about 280.
 - Share: two machines each handed out 200 pieces at once and each answered all of its own rightly. With three machines and 300 pieces, the one that handed out did 110 and the other two 92 and 98. When one of the three was lost in the middle of a second batch, every piece was still answered.
 
+### One time
+
+A robot's parts stamp what they measure, and a stamp is only worth something if the parts agree what time it is. Each machine has a clock of its own that started when it did. A machine's timekeeper asks the machine with the lowest places it reaches what time it is, takes the answer plus half the way there and back as the time now, and keeps the answer whose way was shortest, since that one was least in doubt. An older answer's way counts an eighth longer each round, so a clock that drifts is followed. The machine the others follow asks nobody. If it is lost the next lowest goes on from the time it had.
+
+With three machines in one process whose clocks were set seven seconds ahead and three behind, readings taken together were 0 to 33 µs apart, and with the first machine lost the other two stayed within 20 µs while the time went on without a jump. That is over loopback, where the way there and back is about 15 µs. Over a real network it is as good as that way is steady. A board does not take part yet.
+
 ## What is not built
 
 - Restart limits counted over time rather than in all, and groups that restart together.

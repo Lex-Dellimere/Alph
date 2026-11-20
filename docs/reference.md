@@ -85,6 +85,13 @@ export struct AlphMachine {
   run_took: fn(Word, Word, rawptr) -> void;  // and the program's function for each answer,
   run_ctx: rawptr;        // with its own
   outs: uint8[73728];     // what each job of several pieces gives back: 512 bytes a slot
+  timekeeper: Word;       // the actor that keeps this machine's time in step with the others' (now)
+  time_off: Word;         // what is added to this machine's own clock to give that time, in ns
+  time_trip: Word;        // the way there and back of the asking it came from, in ns: -1 before any
+  time_asked: Word;       // the ref of the asking that is out, 0 for none,
+  time_sent: Word;        // and when it went, by this machine's own clock
+  time_rounds: Word;      // askings answered
+  time_skew: Word;        // for tests: added to this machine's own clock
   slots: AlphBatchSlot[128];  // room for the batches tied to this machine (batch)
   slots_used: Word;
   far_times: AlphTimes[96];  // each other machine's and board's own times, eight kinds each
@@ -262,6 +269,35 @@ Call it as `m->start(port)`, or `m.start(port)` on a value.
 
 Listens on a port and joins the other machines. Returns ALPH_GONE when
 the port cannot be had. A machine with no peers need not call it.
+
+### `AlphMachine_now__ptr`
+
+```mettle
+export fn AlphMachine_now__ptr(m: AlphMachine*) -> Word
+```
+
+Call it as `m->now()`, or `m.now()` on a value.
+
+The time the machines agree on, in nanoseconds. Every machine follows
+the one with the lowest places among those it reaches, so all of them
+read about the same time at the same moment: within the way to that
+machine and back, which apart says. Use it to stamp what one machine
+measures so that another can order it, or to act at the same moment on
+several. It can step by that much when a better asking comes in. A
+machine with no peers reads its own clock.
+
+### `AlphMachine_apart__ptr`
+
+```mettle
+export fn AlphMachine_apart__ptr(m: AlphMachine*) -> Word
+```
+
+Call it as `m->apart()`, or `m.apart()` on a value.
+
+How far now may be from the time of the machine this one follows, in
+nanoseconds: half the way there and back of the asking it was set from.
+0 on the machine the others follow, and -1 on one that has not heard
+from it yet.
 
 ### `AlphMachine_work__ptr`
 

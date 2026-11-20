@@ -50,15 +50,15 @@ ALONE="$TIMED $LOADED"
 #   9000-9899 overlap; t_link 12000-31999 overlaps t_parcel 13000-16999,
 #   t_machine 14000-17999, t_three 15000-20999, t_own 21000-26999 and
 #   t_wide 26000-31999, t_long 13000-16999, t_big 22000-25999 and
-#   t_bundle 28000-30999 and t_pieces 24000-27999; t_far
+#   t_bundle 28000-30999, t_pieces 24000-27999 and t_clock 19000-24999; t_far
 #   10000-10999 and t_seal 11000-11899 overlap only their own other mode.
 # - Examples on fixed ports: their debug and release runs take the same one.
 PORTS="t_door:8000 t_poll:8000 t_link:12000 t_parcel:12000 t_machine:12000
   t_three:12000 t_own:12000 t_back:12000 t_wide:12000 t_long:12000
-  t_big:12000 t_bundle:12000 t_pieces:12000 t_far:10000 t_seal:11000
+  t_big:12000 t_bundle:12000 t_pieces:12000 t_clock:12000 t_far:10000 t_seal:11000
   far:7401 talk:7411 run:7441 share:7451 picture:7471 frames:7481"
 # --quick: the new layers only, for use between small edits.
-QUICK_TESTS="t_actor t_cores t_time t_wheel t_places t_life t_link t_seal t_door t_far t_parcel t_poll t_proc t_tether t_batch t_machine t_three t_own t_cross t_back t_once t_serial t_tether_sure t_wide t_long t_big t_bundle t_pieces"
+QUICK_TESTS="t_actor t_cores t_time t_wheel t_places t_life t_link t_seal t_door t_far t_parcel t_poll t_proc t_tether t_batch t_machine t_three t_own t_cross t_back t_once t_serial t_tether_sure t_wide t_long t_big t_bundle t_pieces t_clock"
 QUICK_EXAMPLES="count primes spread render far run share picture frames tiles talk"
 mkdir -p "$OUT"
 
@@ -345,7 +345,7 @@ build_board() {
       for src in tests/t_actor tests/t_cores tests/t_cross tests/t_time tests/t_wheel tests/t_places \
           tests/t_life tests/t_link tests/t_seal tests/t_door tests/t_far tests/t_parcel tests/t_poll \
           tests/t_proc tests/t_tether tests/t_batch tests/t_machine tests/t_three tests/t_own \
-          tests/t_serial tests/t_back tests/t_once tests/t_wide tests/t_long tests/t_big tests/t_bundle tests/t_pieces examples/tiles examples/render examples/share \
+          tests/t_serial tests/t_back tests/t_once tests/t_wide tests/t_long tests/t_big tests/t_bundle tests/t_pieces tests/t_clock examples/tiles examples/render examples/share \
           examples/picture examples/frames examples/primes examples/run examples/count examples/spread examples/far examples/talk \
           examples/mcu/arm_host examples/mcu/tether_host examples/mcu/relay_host tests/mcu/arm_test; do
         name=$(basename "$src")

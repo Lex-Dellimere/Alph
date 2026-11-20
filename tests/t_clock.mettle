@@ -1,0 +1,126 @@
+// One time for several machines (src/machine now and apart): three machines
+// whose own clocks are seconds apart read the same time to within a
+// fraction of a millisecond, the one the others follow can be lost without
+// the time jumping, and a machine alone reads its own clock.
+
+import "std/io";
+import "std/thread";
+import "alph/actor/actor";
+import "alph/machine/machine";
+import "alph/batch/batch";
+import "port/sys";
+
+var g_m: AlphMachine[3];
+var g_alone: AlphMachine;
+var g_failures: int32 = 0;
+
+fn expect(ok: bool, what: string) {
+  if (!ok) {
+    println("FAIL {what}");
+    g_failures = g_failures + 1;
+  }
+}
+
+fn run_main(arg: cstring) -> uint32 {
+  var m: AlphMachine* = (AlphMachine*)arg;
+  m->run();
+  return 0;
+}
+
+fn apart(a: Word, b: Word) -> Word {
+  if (a > b) {
+    return a - b;
+  }
+  return b - a;
+}
+
+// The most two machines' times differ over ten readings taken together.
+fn worst(a: AlphMachine*, b: AlphMachine*) -> Word {
+  var most: Word = 0;
+  for i in 0..10 {
+    var first: Word = a->now();
+    var second: Word = b->now();
+    var third: Word = a->now();
+    // b was read between two readings of a: it should lie between them,
+    // give or take what the two are apart.
+    var off: Word = 0;
+    if (second < first) {
+      off = first - second;
+    } else if (second > third) {
+      off = second - third;
+    }
+    if (off > most) {
+      most = off;
+    }
+    Sleep(2);
+  }
+  return most;
+}
+
+fn main() -> int32 {
+  var port: int64 = 19000 + (syscall(ALPH_NR_GETPID) % 2000) * 3;
+  var here: uint32 = alph_ip4(127, 0, 0, 1);
+  var threads: int64[3];
+  for i in 0..3 {
+    g_m[i].init(2, (Word)(i * 4), false);
+    for other in 0..3 {
+      if (other != i) {
+        g_m[i].peer((Word)(other * 4), 2, here, port + (int64)other);
+      }
+    }
+  }
+  // Their own clocks are far apart: the second is seven seconds ahead of
+  // the first, the third three seconds behind.
+  g_m[1].time_skew = 7000000000;
+  g_m[2].time_skew = -3000000000;
+  for i in 0..3 {
+    expect(g_m[i].start(port + (int64)i) == ALPH_OK, "the machine listens");
+    threads[i] = CreateThread(0, 0, &run_main, (cstring)&g_m[i], 0, 0);
+  }
+  var waited: int32 = 0;
+  while ((g_m[1].time_rounds < 8 || g_m[2].time_rounds < 8) && waited < 5000) {
+    Sleep(1);
+    waited = waited + 1;
+  }
+  expect(g_m[1].time_rounds >= 8 && g_m[2].time_rounds >= 8, "the two that follow have asked the time ({g_m[1].time_rounds} and {g_m[2].time_rounds} answers)");
+  var d1: Word = worst(&g_m[0], &g_m[1]);
+  var d2: Word = worst(&g_m[0], &g_m[2]);
+  expect(d1 < 500000 && d2 < 500000, "three machines seconds apart read one time ({d1 / 1000} and {d2 / 1000} us off)");
+  expect(g_m[0].apart() == 0, "the one the others follow is not apart from itself ({g_m[0].apart()})");
+  expect(g_m[1].apart() > 0 && g_m[1].apart() < 500000, "and each of the others says how far off it may be ({g_m[1].apart() / 1000} us)");
+  expect(g_m[0].time_rounds == 0, "the one the others follow asks nobody ({g_m[0].time_rounds})");
+
+  // The first machine is lost. The second, now the lowest, goes on from the
+  // time it had, and the third follows it.
+  var before: Word = g_m[1].now();
+  var own_before: Word = g_m[0].now();
+  g_m[0].link.deaf = 1;
+  g_m[0].link.stop();
+  Sleep(1500);
+  var after: Word = g_m[1].now();
+  var passed: Word = after - before;
+  expect(passed > 1400000000 && passed < 1700000000, "with the first machine lost the time goes on without a jump ({passed / 1000000} ms passed in about 1500)");
+  var d3: Word = worst(&g_m[1], &g_m[2]);
+  expect(d3 < 500000, "and the two that are left still read one time ({d3 / 1000} us off)");
+  expect(apart(g_m[1].now() - own_before, g_m[0].now() - own_before) < 2000000, "which is still the time the lost machine keeps ({apart(g_m[1].now(), g_m[0].now()) / 1000} us off)");
+
+  // A machine alone reads its own clock.
+  g_alone.init(2, 40, false);
+  var ts: int64[2];
+  syscall(ALPH_NR_CLOCK_GETTIME, 1, (int64)&ts[0]);
+  var own: Word = (Word)(ts[0] * 1000000000 + ts[1]);
+  expect(apart(g_alone.now(), own) < 1000000 && g_alone.apart() == 0, "a machine alone reads its own clock");
+
+  for i in 0..3 {
+    g_m[i].stop();
+    thread_join_infinite(threads[i]);
+    thread_close(threads[i]);
+    g_m[i].shut();
+  }
+  g_alone.shut();
+  if (g_failures != 0) {
+    return 1;
+  }
+  println("clock ok: three machines whose clocks were 7 s and 3 s apart read one time, {d1 / 1000} and {d2 / 1000} us off; with the first lost the time went on, the other two {d3 / 1000} us off");
+  return 0;
+}
