@@ -6,6 +6,7 @@ export type Word = int64;
 export const ALPH_INDEX_BITS: Word = 24;   // 16 million actors in a node
 export const ALPH_PLACE_SHIFT: Word = 48;  // 24 bits of generation, then 15 of place
 export const ALPH_GATHER: Word = 16;  // messages a node runs between gathers while it is busy
+export const ALPH_ON_RUN: Word = 1;  // a node can be watched: see AlphNode on_run
 
 const FUTEX_WAIT: int64 = 128;  // private
 const FUTEX_WAKE: int64 = 129;

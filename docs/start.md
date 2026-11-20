@@ -459,6 +459,62 @@ The reason is what the handler returned: `ALPH_END` for an actor that finished a
 
 Crash recovery is for Linux, in a program built with `-s`. A crash ends only its actor, or restarts it if it is kept, and the other actors on its core never notice.
 
+## A record of the last messages
+
+A record holds the last messages a node ran, to be read when something has gone wrong. It is for the host port. Give a node one before it runs:
+
+```mettle
+import "alph/record/record";
+
+var g_record: AlphRecord;
+var g_memory: uint8[4096];
+
+g_record.init(&g_memory[0], 4096);  // returns how many messages it holds: 64 here
+g_record.on(&g_node);
+```
+
+`init` returns how many messages the memory holds: the largest power of two that fits, at 48 bytes each after the first 64. From then on every message is written down just before its handler runs. `held()` is how many the record holds now and `back(i)` is the message run `i` before the last, so `back(0)` is the last. Each is an `AlphSeen`: `to`, `tag`, `from`, `arg`, `ref` and `at`. When a handler crashes, `back(0)` is the message that crashed it.
+
+**A machine.** `g_m.record(memory, bytes)` gives every core a record with a clock, after `init` and before `run`. `alph_record_show` (in `alph/record/show`) prints the last messages of all the cores as one, oldest first:
+
+```mettle
+g_m.record(&g_memory[0], 147648);  // 1,024 messages for each of three cores
+...
+alph_record_show(&g_m.records[0], g_m.recorded, 6);
+```
+
+```text
+-1.332 us  2:1.1  tag 4  arg 1995  ref 0  from 1:1.1
+-1.021 us  1:1.1  tag 4  arg 1996  ref 0  from 2:1.1
+-0.791 us  2:1.1  tag 4  arg 1997  ref 0  from 1:1.1
+-0.490 us  1:1.1  tag 4  arg 1998  ref 0  from 2:1.1
+-0.260 us  2:1.1  tag 4  arg 1999  ref 0  from 1:1.1
+-0.000 us  1:1.1  tag 4  arg 2000  ref 0  from 2:1.1
+```
+
+Each line is how long before the last message this one ran, the actor it was for as place:slot.turn, its tag, arg and ref, and who sent it.
+
+**A file.** A record in a file is still there after the program is gone, even when it was killed. `alph_record_file` (in `alph/record/file`) opens a file as memory:
+
+```mettle
+var length: Word = 0;
+var memory: uint8* = alph_record_file("/dev/shm/my_program.record", 37056, &length);
+g_m.record(memory, length);
+```
+
+Another program, or the same one when it starts again, reads it. With 0 for the bytes the file is taken as long as it is:
+
+```mettle
+var records: AlphRecord[16];
+var memory: uint8* = alph_record_file("/dev/shm/my_program.record", 0, &length);
+var count: Word = alph_records_open(&records[0], 16, memory, length);
+alph_record_show(&records[0], count, 20);
+```
+
+A file under `/dev/shm` is in memory only, so it costs no disk and lasts until the machine restarts. `examples/record.mettle` is a program that is killed in the middle of its work and then reads what its record says.
+
+A record costs a core about 4 ns a message, and 9 with its clock. The times of several machines' records are in the machines' shared time (see One time in [design.md](design.md)), so their files can be read as one too.
+
 ## Places and jobs
 
 `AlphPlaces` sends a job to the place where it will finish first: a core, the GPU or another machine. You describe a kind of work once, with a function for each way it can run. alph times each way and chooses. It is for x86-64 Linux, like the cores.
@@ -971,6 +1027,7 @@ These are not built yet.
 - A job for another machine carries at most 1,024 bytes and gives back at most 1,016, unless the machines are given long buffers. Then the most is what one buffer holds, and each job in flight holds a buffer at each end.
 - A job of a kind done at most once carries no bytes.
 - Sockets are Linux only, and there is no file IO.
+- A board keeps no record of its last messages, and a record cannot be played again.
 - A message between two cores costs 150 to 300 ns against about 20 ns inside a node. Lanes bring a stream of them down to about 70 ns, but one request and its reply are no quicker, and lanes are for Linux only.
 - A microcontroller joins through a serial line to one machine. What is lost on that line is sent again only when both ends make the line sure.
 - A board's jobs are one word in and one word out, one at a time.

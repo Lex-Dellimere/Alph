@@ -72,6 +72,9 @@ NEW_MODULES=(
   src/place/words.mettle
   src/place/once.mettle
   src/life/life.mettle
+  src/record/record.mettle
+  src/record/file.mettle
+  src/record/show.mettle
   src/name/name.mettle
   src/door/door.mettle
   src/door/words.mettle

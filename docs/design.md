@@ -166,6 +166,18 @@ A handler that returns non-zero ends its actor, and what it returned is the reas
 - **Keeping.** A kept actor that fails or crashes is not ended. Its state is set up again and it goes on with the same pid and the mail it had, so nothing that knows it learns a new pid. After its last allowed restart it ends like any other.
 - **Lost machines.** When a link reports a machine down, every actor watched on that machine ends for its watchers with the reason `ALPH_LOST`.
 
+## A record
+
+When a program fails, the first question is what it was doing. An actor program has a short answer: the messages it ran last. `src/record` writes each one down just before its handler runs: the actor it was for and the four words. The record is a ring in the caller's memory that holds the last ones and forgets the oldest. When a handler crashes, the newest entry is the message that did it and the ones before are what led there.
+
+The node has one hook for this, `on_run`, a function called before each handler. With no record it is one test of a pointer, which could not be measured. A board's port leaves the hook out, because the test and the call cost its image 64 bytes.
+
+The memory begins with a few words that say how to read the rest, so it can be a file. `alph_record_file` maps one, and the record is then still there when the program is gone, however it went: the system keeps what was written to a mapped file even when the program is killed. Another program opens the file and reads the last messages. It costs nothing more per message than memory does. It does not outlast the machine losing power: nothing is forced to the disk.
+
+A record can have a clock, and a machine's records do: the CPU's count of cycles, which takes a few cycles to read where the system's clock takes a system call. The machine measures once how fast the count goes and tells each record what time it was at one count, in the machines' shared time. So the records of several cores, and of several machines, can be read as one in the order things happened. In the check a ball goes 2,000 times between two cores, and the last 500 hops read from the two records are each before the next.
+
+Keeping a record cost a node 4 ns a message, and 9 with the clock, on a message that takes 20.
+
 ## Time
 
 A timer sends a message later, so it is a layer (`src/time`), not part of the core. `after` sends a message in so many milliseconds and returns a ref, `cancel` takes it back. The port's alarm rings when the soonest timer is due: the board's timer interrupt on `mcu`, one sleeping thread on `host`.
@@ -230,6 +242,7 @@ A board is too small to follow anyone, and has no need to. It stamps what it mea
 - Sizes for `src/machine` other than the fixed ones.
 - Sockets off Linux, and file IO.
 - Catching a crash on a microcontroller, where it is still the board's trap.
+- A record on a board, and a record that can be played again: it holds what was run, not what each send returned.
 
 ## The first runtime
 

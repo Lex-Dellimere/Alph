@@ -10,6 +10,7 @@ export type Word = int32;
 export const ALPH_INDEX_BITS: Word = 10;   // 1,024 actors in a node
 export const ALPH_PLACE_SHIFT: Word = 23;  // 13 bits of generation, then 8 of place
 export const ALPH_GATHER: Word = 0;  // no mail comes but through put
+export const ALPH_ON_RUN: Word = 0;  // no on_run: it would cost every image 64 bytes
 
 const SOFTWARE: uint64 = 8;       // the software interrupt's bit in mie
 const WAKE_BASE: int32 = 33554432;  // the CLINT: one word a hart, at 0x2000000

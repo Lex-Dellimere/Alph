@@ -33,6 +33,8 @@ import "alph/place/once";
 import "alph/batch/batch";
 import "alph/tether/tether";
 import "alph/tether/relay";
+import "alph/record/record";
+import "alph/record/file";
 import "port/alarm";
 
 const SLOTS: Word = 32;   // actors a core
@@ -124,6 +126,8 @@ export struct AlphMachine {
   timers: AlphTimer[32];
   seats: AlphPlace[26];
   gives: Word[8];         // by kind: the most bytes a job gives back (gives)
+  records: AlphRecord[16];  // by core: the last messages it ran (record)
+  recorded: Word;         // how many cores have one
   longs: AlphLong[16];    // the link's long buffers, in the program's memory (longs)
   worked: AlphBatch;      // the batch of the last work (work): its counts are the program's to read
   work_actor: Word;       // the actor that hands it out
@@ -553,6 +557,7 @@ export fn AlphMachine_init__ptr(m: AlphMachine*, cores: Word, first: Word, gpu: 
   }
   m->told = 0;
   m->served = 0;
+  m->recorded = 0;
   m->slots_used = 0;
   m->work_actor = 0;
   for k in 0..8 {
@@ -829,6 +834,41 @@ export fn AlphMachine_start__ptr(m: AlphMachine*, port: int64) -> Word {
   return out;
 }
 
+// Tells the records what time it is, so their entries can be read in the
+// machines' time.
+fn alph_machine_recorded(m: AlphMachine*) {
+  if (m->recorded == 0) {
+    return;
+  }
+  var stamp: Word = alph_record_stamp();
+  var now: Word = m->now();
+  for i in 0..m->recorded {
+    m->records[i].at(stamp, now);
+  }
+}
+
+// Keeps a record of the last messages every core ran, with their times
+// (src/record), in the program's memory: a file's (alph_record_file) to
+// have it when the program is gone. Call it after init and before run.
+// Returns how many messages are kept for each core, 0 when the memory is
+// too small. To print the last 20:
+// alph_record_show(&m.records[0], m.recorded, 20).
+export fn AlphMachine_record__ptr(m: AlphMachine*, memory: uint8*, bytes: Word) -> Word {
+  var n: Word = m->cores.count;
+  var room: Word = alph_records_init(&m->records[0], n, memory, bytes);
+  if (room == 0) {
+    return 0;
+  }
+  var per_ms: Word = alph_record_per_ms();
+  for i in 0..n {
+    m->records[i].timed(&alph_record_stamp, per_ms);
+    m->records[i].on(&m->core[i].node);
+  }
+  m->recorded = n;
+  alph_machine_recorded(m);
+  return room;
+}
+
 fn alph_machine_clock(m: AlphMachine*) -> Word {
   var ts: int64[2];
   syscall(ALPH_NR_CLOCK_GETTIME, 1, (int64)&ts[0]);
@@ -914,6 +954,7 @@ fn alph_machine_timekeeper(a: AlphActor*, msg: AlphMsg*) -> Word {
   if (msg->tag != TIME_TICK) {
     return 0;
   }
+  alph_machine_recorded(m);
   var mine: Word = m->link.cores->first;
   var lead: Word = mine;
   for i in 0..m->peer_count {

@@ -1,0 +1,92 @@
+// A program that is killed while it works, and what its record says
+// afterwards.
+//
+// The program keeps a record of the last messages each core ran
+// (src/record), in a file. One actor sends orders to another on a second
+// core, and gets each back done. At order 300 the program is killed: no
+// handler finishes, nothing is written out, nothing is said.
+//
+// The record is still in the file. This example reads it and prints the
+// last eight messages, both cores as one, each with how long before the
+// end it ran. The last line is the order the program died on.
+//
+//   mettle --build -s --release examples/record.mettle -I ports/host -o record
+//   ./record
+
+import "std/io";
+import "port/sys";
+import "port/proc";
+import "alph/actor/actor";
+import "alph/machine/machine";
+import "alph/record/record";
+import "alph/record/file";
+import "alph/record/show";
+
+const ORDER: Word = 1;
+const DONE: Word = 2;
+const FATAL: Word = 300;
+const BYTES: Word = 37056;  // three cores, 256 messages each
+const SIGKILL: int64 = 9;
+
+var g_m: AlphMachine;
+var g_packer: Word = 0;
+
+fn feeder(a: AlphActor*, m: AlphMsg*) -> Word {
+  a->send(g_packer, ORDER, m->arg + 1);
+  return 0;
+}
+
+fn packer(a: AlphActor*, m: AlphMsg*) -> Word {
+  if (m->arg == FATAL) {
+    syscall(ALPH_NR_KILL, syscall(ALPH_NR_GETPID), SIGKILL);
+  }
+  a->send(m->from, DONE, m->arg);
+  return 0;
+}
+
+// The program that is killed.
+fn work(file: cstring) {
+  var length: Word = 0;
+  var memory: uint8* = alph_record_file(file, BYTES, &length);
+  if (memory == 0) {
+    return;
+  }
+  g_m.init(3, 0, false);
+  g_m.record(memory, length);
+  var first: Word = g_m.cores.spawn_on(1, &feeder, 0);
+  g_packer = g_m.cores.spawn_on(2, &packer, 0);
+  g_m.cores.send(first, DONE, 0);
+  g_m.run();
+}
+
+fn main() -> int32 {
+  var file: cstring = "/tmp/alph_record_example";
+  var child: int64 = alph_sys_fork();
+  if (child == 0) {
+    work(file);
+    syscall(ALPH_NR_EXIT_GROUP, 1);
+  }
+  var ended: int64 = alph_proc_wait(syscall(ALPH_NR_PIDFD_OPEN, child, 0));
+  println("The program ended with {ended}: killed. Its last messages:");
+
+  var records: AlphRecord[16];
+  var length: Word = 0;
+  var memory: uint8* = alph_record_file(file, 0, &length);
+  if (memory == 0) {
+    return 1;
+  }
+  var count: Word = alph_records_open(&records[0], 16, memory, length);
+  alph_record_show(&records[0], count, 8);
+  alph_sys_unlink(file);
+
+  // The packer's core is the third: the last message it ran is the order
+  // that killed the program.
+  if (ended != 128 + SIGKILL || count != 3 || records[2].held() == 0) {
+    return 1;
+  }
+  var last: AlphSeen* = records[2].back(0);
+  if (last->tag != ORDER || last->arg != FATAL) {
+    return 1;
+  }
+  return 0;
+}

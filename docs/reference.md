@@ -68,6 +68,8 @@ export struct AlphMachine {
   timers: AlphTimer[32];
   seats: AlphPlace[26];
   gives: Word[8];         // by kind: the most bytes a job gives back (gives)
+  records: AlphRecord[16];  // by core: the last messages it ran (record)
+  recorded: Word;         // how many cores have one
   longs: AlphLong[16];    // the link's long buffers, in the program's memory (longs)
   worked: AlphBatch;      // the batch of the last work (work): its counts are the program's to read
   work_actor: Word;       // the actor that hands it out
@@ -271,6 +273,21 @@ Call it as `m->start(port)`, or `m.start(port)` on a value.
 
 Listens on a port and joins the other machines. Returns ALPH_GONE when
 the port cannot be had. A machine with no peers need not call it.
+
+### `AlphMachine_record__ptr`
+
+```mettle
+export fn AlphMachine_record__ptr(m: AlphMachine*, memory: uint8*, bytes: Word) -> Word
+```
+
+Call it as `m->record(memory, bytes)`, or `m.record(memory, bytes)` on a value.
+
+Keeps a record of the last messages every core ran, with their times
+(src/record), in the program's memory: a file's (alph_record_file) to
+have it when the program is gone. Call it after init and before run.
+Returns how many messages are kept for each core, 0 when the memory is
+too small. To print the last 20:
+alph_record_show(&m.records[0], m.recorded, 20).
 
 ### `AlphMachine_now__ptr`
 
@@ -805,6 +822,8 @@ export struct AlphNode {
   guard: AlphGuard;
   running: AlphActor*;  // the actor whose handler is running
   held: int32*;  // not 0 and not at 0: mail for other machines waits for this node to send it (src/link)
+  seen: fn(AlphNode*, AlphActor*, AlphMsg*) -> void;
+  seer: rawptr;   // whoever set seen
 }
 ```
 
@@ -843,6 +862,19 @@ Call it as `n->on_end(ended, life)`, or `n.on_end(ended, life)` on a value.
 Has ended called whenever a handler returns non-zero, with the actor and
 what the handler returned, before the actor is gone. If ended returns
 non-zero the actor is not ended: it keeps its pid and its mail.
+
+### `AlphNode_on_run__ptr`
+
+```mettle
+export fn AlphNode_on_run__ptr(n: AlphNode*, seen: fn(AlphNode*, AlphActor*, AlphMsg*) -> void, seer: rawptr)
+```
+
+Call it as `n->on_run(seen, seer)`, or `n.on_run(seen, seer)` on a value.
+
+Has seen called with each message just before its handler runs, on the
+node's own thread: for a record of what the node did (src/record), or a
+count of it. seen must not send. Only in a port whose ALPH_ON_RUN is not
+0: a board's port leaves it out to stay small.
 
 ### `AlphNode_bury__ptr`
 
@@ -2060,6 +2092,254 @@ Call it as `l->lost(first, count)`, or `l.lost(first, count)` on a value.
 A machine was lost: every actor watched on its places has ended, with the
 reason ALPH_LOST, and the watches kept here for its watchers are over. first and count are the machine's places, as a link's
 ALPH_DOWN gives them.
+
+## alph/record/record
+
+A record of the last messages a node ran, for after something went wrong.
+
+Each message is written down just before its handler runs: who it was
+for and its four words. The record holds the last ones and forgets the
+oldest. When an actor crashes, the newest entry is the message that did
+it, and the ones before it are what led there.
+
+The memory is the caller's. It begins with a few words that say how to
+read the rest, so memory that outlives the program (a file:
+src/record/file) can be read by another program afterwards.
+
+A record can have a clock. Then every entry says when it ran, and
+several records (one for each core, or for each machine) can be read as
+one, in the order things happened.
+
+A record costs a node about 3 ns a message, and what its clock costs. It
+needs a port with ALPH_ON_RUN, which a board's port leaves out.
+
+### `AlphSeen`
+
+```mettle
+export struct AlphSeen {
+  to: Word;
+  tag: Word;
+  from: Word;
+  arg: Word;
+  ref: Word;
+  at: Word;  // when, by the record's clock; 0 without one
+}
+```
+
+One message that was run.
+
+### `AlphRecordHead`
+
+```mettle
+export struct AlphRecordHead {
+  mark: Word;
+  room: Word;   // entries it holds, a power of two
+  count: Word;  // messages recorded since it was set up
+  place: Word;  // the node's place
+  per_ms: Word; // the clock's steps in a millisecond; 0 with no clock
+  stamp: Word;  // the clock read this
+  now: Word;    // when the time was this, in nanoseconds
+  spare: Word;
+}
+```
+
+What a record's memory begins with.
+
+### `AlphRecord`
+
+```mettle
+export struct AlphRecord {
+  head: AlphRecordHead*;
+  seen: AlphSeen*;
+  mask: Word;
+  clock: fn() -> Word;
+}
+```
+
+### `AlphRecord_init__ptr`
+
+```mettle
+export fn AlphRecord_init__ptr(r: AlphRecord*, memory: uint8*, bytes: Word) -> Word
+```
+
+Call it as `r->init(memory, bytes)`, or `r.init(memory, bytes)` on a value.
+
+Sets up an empty record in memory of that many bytes. Returns how many
+messages it holds: the largest power of two that fits, at 48 bytes each
+after the first 64. 0 when not even one fits: such a record is not to
+be read.
+
+### `AlphRecord_open__ptr`
+
+```mettle
+export fn AlphRecord_open__ptr(r: AlphRecord*, memory: uint8*, bytes: Word) -> Word
+```
+
+Call it as `r->open(memory, bytes)`, or `r.open(memory, bytes)` on a value.
+
+Reads a record that is already in memory: one another program left in a
+file, or this one before it was started again. Returns how many messages
+it holds, or -1 when the memory is not a record.
+
+### `AlphRecord_timed__ptr`
+
+```mettle
+export fn AlphRecord_timed__ptr(r: AlphRecord*, clock: fn() -> Word, per_ms: Word)
+```
+
+Call it as `r->timed(clock, per_ms)`, or `r.timed(clock, per_ms)` on a value.
+
+Has every entry stamped with what clock returns, which goes up by per_ms
+in a millisecond. The clock is called once a message, so its cost is the
+record's.
+
+### `AlphRecord_at__ptr`
+
+```mettle
+export fn AlphRecord_at__ptr(r: AlphRecord*, stamp: Word, now: Word)
+```
+
+Call it as `r->at(stamp, now)`, or `r.at(stamp, now)` on a value.
+
+Says what time it was, in nanoseconds, when the clock read stamp. Say it
+again whenever the time is known better: when reads from then on.
+
+### `AlphRecord_when__ptr`
+
+```mettle
+export fn AlphRecord_when__ptr(r: AlphRecord*, s: AlphSeen*) -> Word
+```
+
+Call it as `r->when(s)`, or `r.when(s)` on a value.
+
+When an entry ran, in nanoseconds of the time given with at. Only for a
+record with a clock.
+
+### `AlphRecord_bytes__ptr`
+
+```mettle
+export fn AlphRecord_bytes__ptr(r: AlphRecord*) -> Word
+```
+
+Call it as `r->bytes()`, or `r.bytes()` on a value.
+
+How many bytes of its memory the record uses: where the next one starts
+when several lie one after another.
+
+### `AlphRecord_on__ptr`
+
+```mettle
+export fn AlphRecord_on__ptr(r: AlphRecord*, n: AlphNode*)
+```
+
+Call it as `r->on(n)`, or `r.on(n)` on a value.
+
+Starts recording what a node runs. Call it before the node runs. A node
+has one record. A record that holds nothing records nothing.
+
+### `AlphRecord_held__ptr`
+
+```mettle
+export fn AlphRecord_held__ptr(r: AlphRecord*) -> Word
+```
+
+Call it as `r->held()`, or `r.held()` on a value.
+
+How many messages the record holds now.
+
+### `AlphRecord_count__ptr`
+
+```mettle
+export fn AlphRecord_count__ptr(r: AlphRecord*) -> Word
+```
+
+Call it as `r->count()`, or `r.count()` on a value.
+
+How many messages were recorded since it was set up, the forgotten ones
+too.
+
+### `AlphRecord_back__ptr`
+
+```mettle
+export fn AlphRecord_back__ptr(r: AlphRecord*, back: Word) -> AlphSeen*
+```
+
+Call it as `r->back(back)`, or `r.back(back)` on a value.
+
+The message run `back` messages before the last one: 0 is the last. back
+must be less than held.
+
+### `alph_records_init`
+
+```mettle
+export fn alph_records_init(r: AlphRecord*, count: Word, memory: uint8*, bytes: Word) -> Word
+```
+
+Sets up count records one after another in memory of that many bytes,
+each with the same room. Returns the room, 0 when the memory is too
+small.
+
+### `alph_records_open`
+
+```mettle
+export fn alph_records_open(r: AlphRecord*, most: Word, memory: uint8*, bytes: Word) -> Word
+```
+
+Reads the records that lie one after another in memory, up to most of
+them. Returns how many there are.
+
+## alph/record/file
+
+What a record takes from Linux: a file for its memory, so that what it
+holds is still there when the program is gone, however it went, and the
+CPU's count of cycles for its clock.
+
+A file under /dev/shm is in memory only: it costs no disk, and lasts
+until the machine restarts.
+
+### `alph_record_file`
+
+```mettle
+export fn alph_record_file(path: cstring, bytes: Word, length: Word*) -> uint8*
+```
+
+Opens a file as memory, making it when it is not there. With bytes above
+0 the file is made that long. With 0 it is taken as long as it is, to
+read what another program left. Returns the memory and puts its length
+in *length, or returns 0 when the file cannot be opened.
+
+### `alph_record_stamp`
+
+```mettle
+export fn alph_record_stamp() -> Word
+```
+
+A clock for a record: the CPU's count.
+
+### `alph_record_per_ms`
+
+```mettle
+export fn alph_record_per_ms() -> Word
+```
+
+How far that clock goes in a millisecond. It sleeps two milliseconds to
+measure it.
+
+## alph/record/show
+
+Prints what records hold.
+
+### `alph_record_show`
+
+```mettle
+export fn alph_record_show(r: AlphRecord*, records: Word, most: Word)
+```
+
+Prints the last `most` messages of count records, oldest first, one to a
+line: when it ran, in microseconds before the last one, the actor it was
+for as place:slot.turn, its tag, arg and ref, and who sent it. Records
+with clocks are read as one, in the order things ran. Without clocks
+they are printed one after another. Up to 64 records.
 
 ## alph/name/name
 

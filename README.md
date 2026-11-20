@@ -81,6 +81,7 @@ This is [examples/primes.mettle](examples/primes.mettle). Name another machine a
 | Places | A job goes to a core, the GPU or another machine, whichever alph has timed as finishing it first. A job stays where its data is. A kind can be done at most once, for work that must never happen twice | [src/place](src/place/place.mettle) |
 | Polls | A socket sends a message when it is ready, so no handler waits. TCP calls that go with it, and other programs: start one and get a message when it ends | [src/poll](src/poll/poll.mettle) |
 | Lives | Watch an actor to be told when it ends and why. Keep one, and a crash restarts it in place with the same pid | [src/life](src/life/life.mettle) |
+| Record | The last messages each core ran, with their times, kept in memory or in a file. After a crash, or after the program was killed, they say what it was doing | [src/record](src/record/record.mettle) |
 | Links | Other machines over UDP. Messages arrive once and in order, can carry bytes (1,024 in a parcel, more as a long message put together at the other end), and a lost machine is noticed in half a second | [src/link](src/link/link.mettle) |
 | Names and the door | Find an actor on another machine by name, and watch it | [src/name](src/name/name.mettle), [src/door](src/door/door.mettle) |
 | Seals | A link only the holders of one key can read or speak on | [src/seal](src/seal/seal.mettle) |
@@ -100,6 +101,7 @@ Measured on one 16-CPU x86-64 laptop with an RTX 4070, release builds, with othe
 | A message between two actors on one core | 23 to 25 ns |
 | A message to another core | 100 to 250 ns, 56 to 135 with lanes on |
 | Setting and cancelling a timer, 10,000 waiting | 222 ns |
+| Keeping a record of every message a core runs | 4 ns a message, 9 with its time |
 | A request and its reply between two machines | 15 to 18 µs |
 | Short messages to another machine | 1.1 to 1.25 million a second |
 | Messages of 64 KB to another machine | 123 to 133 MB a second, 64 to 80 with one datagram in a hundred lost |
@@ -240,6 +242,7 @@ mettle --release examples/mcu/two_b.mettle --target riscv32-none --board qemu-vi
 - A sealed link has one key for the whole network: any holder can speak as any machine, and someone who gets the key later can read what they recorded before.
 - A job for another machine carries at most 1,024 bytes and gives back at most 1,016, unless the machines are given long buffers. Then the most is what one buffer holds.
 - Sockets are Linux only, and there is no file IO.
+- A board keeps no record of its last messages.
 - A message between two cores costs 150 to 300 ns against about 20 ns inside a node. Lanes bring a stream of them down to about 70 ns, but a single request and its reply are no quicker.
 - A microcontroller joins through a serial line to one machine, and a machine has at most four such lines. What is lost on that line is sent again only when both ends make the line sure, which costs a board about 1.1 KB.
 - A board's jobs are one word in and one word out, one at a time.
@@ -271,6 +274,7 @@ src/time/wheel.mettle       a timer wheel, for thousands of timers
 src/place/place.mettle      places: a job goes to a core, the GPU or another machine
 src/poll/poll.mettle        polls: a socket sends a message when it is ready
 src/life/life.mettle        lives: watching and keeping actors
+src/record/record.mettle    a record: the last messages a node ran, for after a crash
 src/link/link.mettle        links: other machines, over UDP
 src/name/name.mettle        names: a number for a pid
 src/door/door.mettle        the door: find and watch actors on other machines

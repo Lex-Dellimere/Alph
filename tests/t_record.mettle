@@ -1,0 +1,215 @@
+// A record of what a node ran (src/record): the last messages in order,
+// the oldest forgotten, the message that crashed an actor, a record read
+// again from its memory and from a file, entries with times, and the
+// records of a machine's cores read as one.
+
+import "std/io";
+import "port/sys";
+import "alph/actor/actor";
+import "alph/cores/cores";
+import "alph/machine/machine";
+import "alph/record/record";
+import "alph/record/file";
+import "alph/record/show";
+
+const NOTE: Word = 1;
+const CRASH: Word = 2;
+const QUIT: Word = 3;
+const BALL: Word = 4;
+const HOPS: Word = 2000;
+
+var g_node: AlphNode;
+var g_actors: AlphActor[4];
+var g_mail: AlphMsg[64];
+var g_record: AlphRecord;
+var g_memory: uint8[500];
+var g_again: AlphRecord;
+var g_three: AlphRecord[3];
+var g_three_memory: uint8[1024];
+var g_read: AlphRecord[4];
+var g_m: AlphMachine;
+var g_m_memory: uint8[147648];
+var g_failures: int32 = 0;
+var g_ticks: Word = 0;
+var g_ended: Word = 0;
+var g_other: Word = 0;
+
+fn expect(ok: bool, what: string) {
+  if (!ok) {
+    println("FAIL {what}");
+    g_failures = g_failures + 1;
+  }
+}
+
+fn tick() -> Word {
+  g_ticks = g_ticks + 1000;
+  return g_ticks;
+}
+
+fn taker(a: AlphActor*, m: AlphMsg*) -> Word {
+  if (m->tag == CRASH) {
+    var nowhere: Word* = (Word*)a->state;
+    nowhere = (Word*)((int64)nowhere - (int64)nowhere);
+    *nowhere = m->arg;
+  }
+  if (m->tag == QUIT) {
+    a->node->stop();
+  }
+  return 0;
+}
+
+fn ended(n: AlphNode*, a: AlphActor*, reason: Word) -> Word {
+  g_ended = reason;
+  n->stop();
+  return 0;
+}
+
+// The ball goes between two cores, its arg one more each time.
+fn player(a: AlphActor*, m: AlphMsg*) -> Word {
+  if (m->arg == HOPS) {
+    a->cores()->stop();
+    return 0;
+  }
+  a->send((Word)(g_other ^ a->pid), BALL, m->arg + 1);
+  return 0;
+}
+
+fn path(to: uint8*) {
+  var base: cstring = "/tmp/alph_t_record_";
+  var n: int32 = 0;
+  while (base[n] != 0) {
+    to[n] = (uint8)base[n];
+    n = n + 1;
+  }
+  var pid: int64 = syscall(ALPH_NR_GETPID);
+  var digits: int32 = 0;
+  var p: int64 = pid;
+  while (p > 0) {
+    digits = digits + 1;
+    p = p / 10;
+  }
+  for i in 0..digits {
+    to[n + digits - 1 - i] = (uint8)(48 + pid % 10);
+    pid = pid / 10;
+  }
+  to[n + digits] = 0;
+}
+
+fn main() -> int32 {
+  // Room for eight: 64 bytes, then 48 a message.
+  g_node.init(&g_actors[0], 4, &g_mail[0], 16);
+  var who: Word = g_node.spawn(&taker, 0);
+  expect(g_record.init(&g_memory[0], 500) == 8, "500 bytes hold eight messages");
+  expect(g_record.init(&g_memory[0], 100) == 0, "100 bytes hold none");
+  g_record.on(&g_node);
+  expect(g_node.seen == 0, "and a record that holds none is not put on a node");
+  g_record.init(&g_memory[0], 500);
+  g_record.on(&g_node);
+  for i in 0..3 {
+    g_node.send(who, NOTE, (Word)i);
+  }
+  expect(g_node.turn() == 3 && g_record.held() == 3 && g_record.count() == 3, "three messages run, three held");
+  expect(g_record.back(0)->arg == 2 && g_record.back(2)->arg == 0 && g_record.back(0)->to == who && g_record.back(0)->tag == NOTE && g_record.back(0)->from == 0,
+         "the last one is first, and each says who it was for");
+
+  // The oldest are forgotten.
+  for i in 3..23 {
+    g_node.send(who, NOTE, (Word)i);
+    g_node.turn();
+  }
+  var in_order: bool = g_record.held() == 8 && g_record.count() == 23;
+  for i in 0..8 {
+    if (g_record.back((Word)i)->arg != 22 - i) {
+      in_order = false;
+    }
+  }
+  expect(in_order, "after 23 messages the record holds the last eight in order");
+
+  // The message that crashes an actor is the last one in the record.
+  g_node.on_end(&ended, 0);
+  g_node.send(who, NOTE, 100);
+  g_node.send(who, CRASH, 77);
+  g_node.run();
+  expect(g_ended == ALPH_CRASHED && g_record.back(0)->tag == CRASH && g_record.back(0)->arg == 77 && g_record.back(1)->arg == 100,
+         "the message that crashed the actor is the last one held");
+
+  // The memory says how to read itself.
+  expect(g_again.open(&g_memory[0], 500) == 8 && g_again.back(0)->arg == 77 && g_again.count() == 25, "a record is read again from its memory");
+  expect(g_again.open(&g_three_memory[0], 1024) == -1, "memory that is no record is not read as one");
+  expect(g_again.open(&g_memory[0], 400) == -1, "nor a record cut short");
+
+  // Times: this clock goes 1,000 a message and 1,000 a millisecond.
+  g_node.on_end(0, 0);
+  who = g_node.spawn(&taker, 0);
+  g_record.init(&g_memory[0], 500);
+  g_record.timed(&tick, 1000);
+  g_record.at(0, 5000000);
+  g_record.on(&g_node);
+  for i in 0..4 {
+    g_node.send(who, NOTE, (Word)i);
+  }
+  g_node.turn();
+  expect(g_record.when(g_record.back(0)) == 9000000 && g_record.when(g_record.back(3)) == 6000000, "each message says when it ran");
+
+  // Several records one after another.
+  expect(alph_records_init(&g_three[0], 3, &g_three_memory[0], 1024) == 4 && g_three[0].bytes() == 256, "three records share 1,024 bytes, four messages each");
+  expect(alph_records_open(&g_read[0], 4, &g_three_memory[0], 1024) == 3, "and are found there again");
+
+  // A file keeps the record.
+  var name: uint8[64];
+  path(&name[0]);
+  var length: Word = 0;
+  var file: uint8* = alph_record_file((cstring)&name[0], 500, &length);
+  expect(file != 0 && length == 500, "a file is opened as memory");
+  if (file != 0) {
+    g_record.init(file, 500);
+    g_record.on(&g_node);
+    for i in 0..5 {
+      g_node.send(who, NOTE, (Word)(40 + i));
+    }
+    g_node.turn();
+    length = 0;
+    var there: uint8* = alph_record_file((cstring)&name[0], 0, &length);
+    expect(there != 0 && length == 500 && g_again.open(there, length) == 5 && g_again.back(0)->arg == 44, "what the record holds is in the file");
+    alph_sys_unlink((cstring)&name[0]);
+  }
+
+  // A machine: the ball goes between two cores, and the two records read
+  // as one have every hop after the one before.
+  g_m.init(3, 0, false);
+  expect(g_m.record(&g_m_memory[0], 147648) == 1024, "a machine keeps 1,024 messages a core in 147,648 bytes");
+  var one: Word = g_m.cores.spawn_on(1, &player, 0);
+  var two: Word = g_m.cores.spawn_on(2, &player, 0);
+  g_other = (Word)(one ^ two);
+  g_m.cores.send(one, BALL, 0);
+  g_m.run();
+  g_m.shut();
+  var before: Word = 0;
+  var hops: Word = 0;
+  var late: Word = 0;
+  for back in 0..500 {
+    var hop: Word = HOPS - back;
+    var r: AlphRecord* = &g_m.records[1];
+    if (hop % 2 == 1) {
+      r = &g_m.records[2];
+    }
+    var s: AlphSeen* = r->back((Word)(back / 2));
+    if (s->tag == BALL && s->arg == hop) {
+      hops = hops + 1;
+    }
+    var at: Word = r->when(s);
+    if (back > 0 && at >= before) {
+      late = late + 1;
+    }
+    before = at;
+  }
+  expect(hops == 500 && late == 0, "the last 500 hops are in the two cores' records, each before the next ({hops} found, {late} out of order)");
+  expect(g_m.records[1].head->place == 1 && g_m.records[2].head->place == 2, "each record says which place it is of");
+  alph_record_show(&g_m.records[0], g_m.recorded, 6);
+
+  if (g_failures == 0) {
+    println("ok");
+    return 0;
+  }
+  return 1;
+}
