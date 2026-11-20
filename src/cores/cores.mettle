@@ -156,6 +156,21 @@ export fn AlphCores_run__ptr(c: AlphCores*) {
   }
 }
 
+// Says how long a core with nothing to run looks for new mail before it
+// sleeps: at most this many microseconds. A core learns how long is worth
+// it, up to this. Looking saves the sleep and the wake when mail comes
+// soon, so it is quicker, and it keeps the CPU busy meanwhile. The most is
+// 32 to begin with. 0 makes a core sleep at once: the least CPU, and each
+// message that finds it asleep waits for it to wake. Linux only. Call it
+// before run.
+export fn AlphCores_look__ptr(c: AlphCores*, microseconds: Word) {
+  if (ALPH_GATHER != 0) {
+    for i in 0..c->count {
+      alph_gate_look(&c->cores[i].node.gate, (int32)microseconds);
+    }
+  }
+}
+
 // Stops every core, so run returns. Any actor or thread may call it.
 export fn AlphCores_stop__ptr(c: AlphCores*) {
   for i in 0..c->count {

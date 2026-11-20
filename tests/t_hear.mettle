@@ -1,0 +1,242 @@
+// A node that waits on its own descriptors (src/poll init_own and hear):
+// eight connections each send 200,000 bytes and get every one back, through
+// a server that is one actor with no thread between it and the kernel; a
+// message from another thread reaches the node while it sleeps on its
+// sockets; and a core told not to look before it sleeps still does all of
+// it.
+
+import "std/io";
+import "std/thread";
+import "port/sys";
+import "port/net";
+import "alph/actor/actor";
+import "alph/cores/cores";
+import "alph/poll/poll";
+
+const READY: Word = 1;     // from the poll: a connection is ready
+const KNOCK: Word = 2;     // from the poll: the listener is ready
+const NOTE: Word = 3;      // from another thread
+const CONNS: int32 = 8;
+const EACH: int64 = 200000;
+const HOLD: int64 = 65536;
+
+struct Echo {
+  open: int32;
+  held: int64;        // bytes read and not yet written back
+  bytes: uint8[65536];
+}
+
+var g_cores: AlphCores;
+var g_core: AlphCore[2];
+var g_actors: AlphActor[8];
+var g_mail: AlphMsg[128];
+var g_poll: AlphPoll;
+var g_ears: AlphEar[64];
+var g_echo: Echo[64];
+var g_listener: int64 = 0;
+var g_server: Word = 0;
+var g_notes: int32 = 0;
+var g_taken: Word = 0;
+var g_failures: int32 = 0;
+
+fn expect(ok: bool, what: string) {
+  if (!ok) {
+    println("FAIL {what}");
+    g_failures = g_failures + 1;
+  }
+}
+
+// Writes back what is held, then reads more while there is room: until the
+// socket has no more to give or takes no more, as hear asks.
+fn serve(fd: int64) {
+  var e: Echo* = &g_echo[fd];
+  while (e->open != 0) {
+    if (e->held > 0) {
+      var put: int64 = alph_write(fd, &e->bytes[0], e->held);
+      if (put == ALPH_BROKEN) {
+        e->open = 0;
+        break;
+      }
+      if (put <= 0) {
+        return;  // full: the poll says when it can be written again
+      }
+      for i in 0..e->held - put {
+        e->bytes[i] = e->bytes[i + put];
+      }
+      e->held = e->held - put;
+      continue;
+    }
+    var got: int64 = alph_read(fd, &e->bytes[0], HOLD);
+    if (got == ALPH_LATER) {
+      return;  // empty: the poll says when more arrives
+    }
+    if (got <= 0) {
+      e->open = 0;
+      break;
+    }
+    e->held = got;
+  }
+  g_poll.forget(fd);
+  alph_close(fd);
+}
+
+fn server(a: AlphActor*, m: AlphMsg*) -> Word {
+  if (m->tag == KNOCK) {
+    while (true) {
+      var fd: int64 = alph_tcp_accept(g_listener);
+      if (fd < 0) {
+        break;
+      }
+      g_taken = g_taken + 1;
+      if (fd < 64) {
+        g_echo[fd].open = 1;
+        g_echo[fd].held = 0;
+        g_poll.hear(fd, (Word)(ALPH_READ | ALPH_WRITE), a->pid, READY);
+      } else {
+        alph_close(fd);
+      }
+    }
+    g_poll.want(g_listener, ALPH_READ, a->pid, KNOCK);
+  } else if (m->tag == READY) {
+    if (m->arg >= 0 && m->arg < 64 && g_echo[m->arg].open != 0) {
+      serve((int64)m->arg);
+    }
+  } else if (m->tag == NOTE) {
+    mettle_atomic_inc_i32(&g_notes);
+  }
+  return 0;
+}
+
+extern fn mettle_atomic_inc_i32(target: int32*) -> int32 with none = "mettle_atomic_inc_i32";
+extern fn mettle_atomic_compare_exchange_i32(target: int32*, exchange: int32, comparand: int32) -> int32 with none = "mettle_atomic_compare_exchange_i32";
+
+fn cores_main(arg: cstring) -> uint32 {
+  g_cores.run();
+  return 0;
+}
+
+// A socket of the plain kind, which waits: the test's own side.
+fn client(port: int64) -> int64 {
+  var address: uint8[16];
+  for i in 0..16 {
+    address[i] = 0;
+  }
+  address[0] = 2;
+  address[2] = (uint8)((port >> 8) & 255);
+  address[3] = (uint8)(port & 255);
+  address[4] = 127;
+  address[7] = 1;
+  var fd: int64 = syscall(ALPH_NR_SOCKET, 2, 1, 0);
+  if (fd < 0 || syscall(ALPH_NR_CONNECT, fd, (int64)&address[0], 16) < 0) {
+    return -1;
+  }
+  return fd;
+}
+
+fn byte_of(conn: int64, at: int64) -> uint8 {
+  return (uint8)((conn * 31 + at * 7 + (at >> 8)) & 255);
+}
+
+// Sends EACH bytes on every connection, 4,000 at a time, and reads each
+// lot back before the next. Returns how many bytes came back wrong.
+fn talk(fds: int64*) -> int64 {
+  var out: uint8[4000];
+  var back: uint8[4000];
+  var wrong: int64 = 0;
+  var at: int64 = 0;
+  while (at < EACH) {
+    for c in 0..CONNS {
+      for i in 0..4000 {
+        out[i] = byte_of((int64)c, at + i);
+      }
+      var sent: int64 = 0;
+      while (sent < 4000) {
+        var n: int64 = syscall(ALPH_NR_WRITE, fds[c], (int64)&out[sent], 4000 - sent);
+        if (n <= 0) {
+          return 1000000;
+        }
+        sent = sent + n;
+      }
+    }
+    for c in 0..CONNS {
+      var got: int64 = 0;
+      while (got < 4000) {
+        var n: int64 = syscall(ALPH_NR_READ, fds[c], (int64)&back[got], 4000 - got);
+        if (n <= 0) {
+          return 1000000;
+        }
+        got = got + n;
+      }
+      for i in 0..4000 {
+        if (back[i] != byte_of((int64)c, at + i)) {
+          wrong = wrong + 1;
+        }
+      }
+    }
+    at = at + 4000;
+  }
+  return wrong;
+}
+
+// One whole run: the server on core 0, which waits on its own descriptors.
+fn run(look: Word) {
+  g_cores.init(&g_core[0], 2, &g_actors[0], 4, &g_mail[0], 16);
+  if (look >= 0) {
+    g_cores.look(look);
+  }
+  expect(g_poll.init_own(&g_core[0].node, &g_ears[0], 64) == ALPH_OK, "the node's own poll starts");
+  g_listener = alph_tcp_listen_on(0, 0, 64);
+  var port: int64 = alph_tcp_port(g_listener);
+  expect(g_listener >= 0 && port > 0, "a listener on any free port says which it has ({port})");
+  g_server = g_cores.spawn_on(0, &server, 0);
+  g_poll.want(g_listener, ALPH_READ, g_server, KNOCK);
+  g_notes = 0;
+  g_taken = 0;
+  var runner: int64 = CreateThread(0, 0, &cores_main, 0, 0, 0);
+
+  var fds: int64[8];
+  var connected: int32 = 0;
+  for c in 0..CONNS {
+    fds[c] = client(port);
+    if (fds[c] >= 0) {
+      connected = connected + 1;
+    }
+  }
+  expect(connected == CONNS, "eight connections are made ({connected})");
+  var wrong: int64 = talk(&fds[0]);
+  expect(wrong == 0, "every byte of 200,000 on each of eight connections comes back ({wrong} wrong)");
+
+  // The node is asleep on its sockets now: a message from here wakes it.
+  Sleep(20);
+  for i in 0..5 {
+    g_cores.send(g_server, NOTE, 0);
+    var waited: int32 = 0;
+    while (mettle_atomic_compare_exchange_i32(&g_notes, 0, 0) != i + 1 && waited < 2000) {
+      Sleep(1);
+      waited = waited + 1;
+    }
+    Sleep(5);
+  }
+  expect(g_notes == 5, "a message from another thread reaches a node that sleeps on its sockets ({g_notes} of 5)");
+
+  for c in 0..CONNS {
+    syscall(ALPH_NR_CLOSE, fds[c]);
+  }
+  Sleep(20);
+  g_cores.stop();
+  thread_join_infinite(runner);
+  thread_close(runner);
+  g_poll.stop();
+  alph_close(g_listener);
+  expect(g_taken == (Word)CONNS, "the server took each connection once ({g_taken})");
+}
+
+fn main() -> int32 {
+  run(-1);
+  run(0);  // a core that sleeps at once
+  if (g_failures != 0) {
+    return 1;
+  }
+  println("hear ok: 1,600,000 bytes echoed twice by a node that waits on its own sockets");
+  return 0;
+}

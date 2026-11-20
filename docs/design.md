@@ -186,6 +186,10 @@ A timer sends a message later, so it is a layer (`src/time`), not part of the co
 
 ## Sockets and other programs
 
+A server that holds many connections does not need an actor for each. A connection is a descriptor and a little state, and one actor on each core can hold all of that core's: a door. For that the poll has three things. An ear is found by its descriptor's own number, so asking costs the same for a hundred thousand descriptors as for ten. A descriptor can be heard for good (`hear`), with a message each time it becomes ready and no asking again. And a node can wait on its descriptors itself (`init_own`): with nothing to run it sleeps in the kernel on them, and a ready descriptor or a message from another core ends the sleep, so there is no thread between the kernel and the actor.
+
+A core with nothing to run looks for mail a little before it sleeps, because a sleep and its wake cost a few system calls. How long is learnt, by the clock and not by a count of looks: twice as long after a sleep that lasted under 30 µs, half as long after one over 200 µs, and never more than 32 µs unless the program says so (`AlphCores_look`). It was a count before, up to 32,000 looks, which on six cores with lanes was over a tenth of a millisecond: a server with a request every few hundred microseconds on each core then never slept, and the first run of the sim's world on this alph used 5.4 cores to answer 20,000 requests a second. With the look bounded by time it used 0.8.
+
 `src/poll` is how a socket, or any file descriptor, sends a message when it is ready. Handlers never wait. They read and write what can be done now, and ask to be told when there is more. One thread sleeps in the kernel until something is ready and sends the messages. Each asking is for one message, so a busy socket cannot flood a mailbox. The host port has TCP calls that never wait: `examples/talk.mettle` is an echo server with an actor for each connection, and the test runs twenty clients against one at once. The host port can also start another program and give back a descriptor that is ready when it has ended, so its end is a message too.
 
 ## Names and the door

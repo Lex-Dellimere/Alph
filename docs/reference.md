@@ -1211,6 +1211,22 @@ own. On Linux a core keeps its thread from one run to the next, so what
 belongs to a thread (a GPU a handler opened) lasts, and running again
 costs a wake and not a new thread.
 
+### `AlphCores_look__ptr`
+
+```mettle
+export fn AlphCores_look__ptr(c: AlphCores*, microseconds: Word)
+```
+
+Call it as `c->look(microseconds)`, or `c.look(microseconds)` on a value.
+
+Says how long a core with nothing to run looks for new mail before it
+sleeps: at most this many microseconds. A core learns how long is worth
+it, up to this. Looking saves the sleep and the wake when mail comes
+soon, so it is quicker, and it keeps the CPU busy meanwhile. The most is
+32 to begin with. 0 makes a core sleep at once: the least CPU, and each
+message that finds it asleep waits for it to wake. Linux only. Call it
+before run.
+
 ### `AlphCores_stop__ptr`
 
 ```mettle
@@ -3086,7 +3102,20 @@ messages. Each asking is for one message: an actor asks again when it
 wants the next. So a busy socket cannot flood a mailbox, and an actor
 that is not ready for more is not told.
 
-x86-64 Linux (epoll).
+A descriptor's ear is the one with its own number when that one is free,
+so asking and forgetting take the same time however many descriptors
+there are, as long as there are more ears than the highest descriptor.
+With fewer, a descriptor takes any free ear and is found by looking
+through them. Ears are set up as they are first reached, so a large array
+costs memory only as far as the descriptors go.
+
+A node whose own actors hold many sockets can wait on the descriptors
+itself (init_own). Then there is no thread between the kernel and the
+node: when it has nothing to run it sleeps in the kernel on its
+descriptors, and a ready one or a message from elsewhere ends the sleep.
+While it is busy it looks at them between messages.
+
+Linux (epoll).
 
 ```mettle
 export const ALPH_READ: Word = 1;    // ready for reading, or the other side closed
@@ -3101,8 +3130,9 @@ export struct AlphEar {
   fd: int64;     // -1 while the slot is free
   to: Word;
   tag: Word;
-  owed: Word;    // what was ready when its actor's mailbox was full
+  owed: Word;    // what was ready when its actor had no room for the word
   turn: uint32;  // goes up each time the slot is given to a descriptor or taken back
+  after: int32;  // the next ear with word owed, -1 for the last, -2 when this one is not among them
 }
 ```
 
@@ -3119,6 +3149,14 @@ export struct AlphPoll {
   epoll: int64;
   thread: int64;
   stopping: int32;
+  born: Word;    // ears set up so far: the ones from here on were never used
+  strays: Word;  // ears that hold a descriptor other than their own number
+  owing: int32;  // the first ear with word its actor had no room for, -1 for none,
+  owing_last: int32;  // and the last
+  own: Word;     // the node waits on the descriptors itself (init_own)
+  rouser: int64; // written to end the node's sleep
+  got: int64;    // events the node's sleep ended with, not yet told
+  events: AlphEpollEvent[256];
 }
 ```
 
@@ -3136,6 +3174,32 @@ ears holds room ears: one for each descriptor asked about at a time.
 Messages go out through node. Returns ALPH_GONE when the kernel gave no
 epoll.
 
+### `AlphPoll_init_wide__ptr`
+
+```mettle
+export fn AlphPoll_init_wide__ptr(p: AlphPoll*, node: AlphNode*, ears: AlphEar*, room: Word) -> Word
+```
+
+Call it as `p->init_wide(node, ears, room)`, or `p.init_wide(node, ears, room)` on a value.
+
+As init, for a great many descriptors: an ear is set up when it is first
+reached, so the array costs memory only as far as the descriptors go. An
+ear past those has no meaning yet, not even that it is free.
+
+### `AlphPoll_init_own__ptr`
+
+```mettle
+export fn AlphPoll_init_own__ptr(p: AlphPoll*, node: AlphNode*, ears: AlphEar*, room: Word) -> Word
+```
+
+Call it as `p->init_own(node, ears, room)`, or `p.init_own(node, ears, room)` on a value.
+
+As init_wide, with no thread: the node waits on the descriptors itself.
+When it has nothing to run it sleeps on them, and it looks at them
+between messages while it is busy. Only this node's own actors can be
+told, and want and forget are for its handlers. Call it before the node
+runs, and stop after it has stopped.
+
 ### `AlphPoll_want__ptr`
 
 ```mettle
@@ -3149,6 +3213,21 @@ for writing (ALPH_WRITE) or either (both). The message has the tag given,
 the descriptor in arg, and in ref what it is ready for, with ALPH_ERROR
 if it failed. Ask again for the next. Returns ALPH_FULL when every ear is
 in use, ALPH_GONE when the kernel refuses the descriptor.
+
+### `AlphPoll_hear__ptr`
+
+```mettle
+export fn AlphPoll_hear__ptr(p: AlphPoll*, fd: int64, what: Word, to: Word, tag: Word) -> Word
+```
+
+Call it as `p->hear(fd, what, to, tag)`, or `p.hear(fd, what, to, tag)` on a value.
+
+Asks once for a message every time a descriptor becomes ready: when
+bytes arrive on one that had none, and when one that was full can be
+written again. There is no asking again, which saves a system call for
+every message. The actor must then take all there is each time: read
+until a read gives fewer bytes than it had room for, write until a write
+takes fewer than it was given. Otherwise as want.
 
 ### `AlphPoll_forget__ptr`
 
@@ -3187,6 +3266,24 @@ export fn alph_tcp_listen(port: int64) -> int64
 
 A socket that takes connections on a port. Returns it, or ALPH_BROKEN
 when the port cannot be had.
+
+### `alph_tcp_listen_on`
+
+```mettle
+export fn alph_tcp_listen_on(ip: uint32, port: int64, waiting: int64) -> int64
+```
+
+The same on one address of this machine (a.b.c.d as one number, 0 for
+all of them), with room for `waiting` connections not yet accepted. Port
+0 takes any free port: alph_tcp_port says which.
+
+### `alph_tcp_port`
+
+```mettle
+export fn alph_tcp_port(fd: int64) -> int64
+```
+
+The port a socket is on, or ALPH_BROKEN.
 
 ### `alph_tcp_accept`
 

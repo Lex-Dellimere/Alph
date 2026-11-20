@@ -88,3 +88,7 @@ export fn AlphGate_pass__ptr(g: AlphGate*, was: int32, hold: bool) -> int32 {
 @interrupt fn mettle_trap_software() {
   alph_hart_poke((int32)mettle_csr_mhartid(), 0);
 }
+
+// A board's node does not look before it sleeps.
+export fn alph_gate_look(g: AlphGate*, most: int32) {
+}
