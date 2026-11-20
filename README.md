@@ -91,6 +91,25 @@ This is [examples/primes.mettle](examples/primes.mettle). Name another machine a
 
 [docs/start.md](docs/start.md) shows how to use each of these. [docs/design.md](docs/design.md) explains why they are built this way, what was measured, and what is not built yet. Every struct, constant and function of these layers is listed in [docs/reference.md](docs/reference.md).
 
+## How fast
+
+Measured on one 16-CPU x86-64 laptop with an RTX 4070, release builds, with other work running on it. "Two machines" is two links in one process over loopback. Nothing here is measured on a real board or on ARM.
+
+| What | How fast |
+|---|---|
+| A message between two actors on one core | 23 to 25 ns |
+| A message to another core | 100 to 250 ns, 56 to 135 with lanes on |
+| Setting and cancelling a timer, 10,000 waiting | 222 ns |
+| A request and its reply between two machines | 15 to 18 µs |
+| Short messages to another machine | 1.1 to 1.25 million a second |
+| Messages of 64 KB to another machine | 123 to 133 MB a second, 64 to 80 with one datagram in a hundred lost |
+| Handing out a piece of work that is a number in and a number out | 20 ns a piece |
+| Handing out a job | about 500 ns |
+| 4,000 jobs of 2 ms on three helpers of 15 cores | 181 ms, where every core busy all the time would take 173 |
+| 200 camera frames worked on by another machine's GPU | 182 ms, against about 950 on this machine's two cores |
+
+On a board the core and timers are 3,048 bytes, and a message on its serial line is 12 to 15 bytes.
+
 ## Try it
 
 Map alph in your program's `mettle.deps`, then pick a port when you build:
