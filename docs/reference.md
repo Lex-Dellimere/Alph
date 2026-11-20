@@ -2237,6 +2237,8 @@ export struct AlphPeer {
   owed: Word;         // messages taken since it was last told so
   waiting_since: Word;
   missed: uint32;     // the message last said to be missing: said once, then left to the sender's clock
+  hurry: Word;        // when, in ns, to send again what found a mailbox full, 0 for not waiting
+  hurry_wait: Word;   // how long that wait is now
   stuck: uint32;      // the message being refused because its actor has no room,
   stuck_at: Word;     // and since when
   again_ms: Word;     // how long its word is waited for before sending again
@@ -2840,6 +2842,17 @@ Call it as `w->recv(bytes, room, ip, port)`, or `w.recv(bytes, room, ip, port)` 
 
 The next datagram, and who sent it. Returns its length, or 0 when none
 came in time.
+
+### `AlphWire_recv_now__ptr`
+
+```mettle
+export fn AlphWire_recv_now__ptr(w: AlphWire*, bytes: uint8*, room: int64, ip: uint32*, port: int64*) -> int64
+```
+
+Call it as `w->recv_now(bytes, room, ip, port)`, or `w.recv_now(bytes, room, ip, port)` on a value.
+
+The next datagram if one is here already, without waiting. Returns its
+length, or 0 for none.
 
 ### `AlphWire_close__ptr`
 

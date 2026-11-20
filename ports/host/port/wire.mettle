@@ -72,6 +72,20 @@ export fn AlphWire_recv__ptr(w: AlphWire*, bytes: uint8*, room: int64, ip: uint3
   return got;
 }
 
+// The next datagram if one is here already, without waiting. Returns its
+// length, or 0 for none.
+export fn AlphWire_recv_now__ptr(w: AlphWire*, bytes: uint8*, room: int64, ip: uint32*, port: int64*) -> int64 {
+  var address: uint8[16];
+  var size: int32 = 16;
+  var got: int64 = syscall(ALPH_NR_RECVFROM, w->fd, (int64)bytes, room, 64, (int64)&address[0], (int64)&size);  // 64: do not wait
+  if (got <= 0) {
+    return 0;
+  }
+  *port = ((int64)address[2] << 8) | (int64)address[3];
+  *ip = alph_ip4((int64)address[4], (int64)address[5], (int64)address[6], (int64)address[7]);
+  return got;
+}
+
 // Closes the socket.
 export fn AlphWire_close__ptr(w: AlphWire*) {
   syscall(ALPH_NR_CLOSE, w->fd);

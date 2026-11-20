@@ -58,6 +58,8 @@ const LONG: uint32 = 6;     // the mail that ends a long message: arg says how m
 const MISSED: uint32 = 7;   // a beat that says a message did not arrive: send again from the one after ack, now
 const VOID: uint32 = 8;     // what is left of a piece of a long message that was given up: taken, and nothing done
 const SOON_MS: Word = 5;
+const HURRY_NS: Word = 100000;    // the first wait before sending again what found a mailbox full,
+const HURRY_MOST: Word = 4000000; // and the longest, each wait twice the one before
 const BEAT_MS: Word = 50;
 const DOWN_MS: Word = 500;
 const BEAT_BYTES: int64 = 24;
@@ -136,6 +138,8 @@ export struct AlphPeer {
   owed: Word;         // messages taken since it was last told so
   waiting_since: Word;
   missed: uint32;     // the message last said to be missing: said once, then left to the sender's clock
+  hurry: Word;        // when, in ns, to send again what found a mailbox full, 0 for not waiting
+  hurry_wait: Word;   // how long that wait is now
   stuck: uint32;      // the message being refused because its actor has no room,
   stuck_at: Word;     // and since when
   again_ms: Word;     // how long its word is waited for before sending again
@@ -185,6 +189,12 @@ export struct AlphLink {
   longs: AlphLong*;
   long_room: Word;
   skipped: Word;  // long messages that arrived with no long buffer big enough here
+}
+
+fn alph_link_ns() -> Word {
+  var ts: int64[2];
+  syscall(ALPH_NR_CLOCK_GETTIME, 1, (int64)&ts[0]);
+  return (Word)(ts[0] * 1000000000 + ts[1]);
 }
 
 // Sends a datagram to a peer, sealed if the link is.
@@ -360,6 +370,8 @@ fn alph_link_fresh(l: AlphLink*, p: AlphPeer*, life: uint32) {
   p->got = 0;
   p->owed = 0;
   p->missed = 0;
+  p->hurry = 0;
+  p->hurry_wait = HURRY_NS;
   p->again_ms = AGAIN_MS;
   for i in 0..64 {
     if (p->held[i] != 0) {
@@ -544,6 +556,20 @@ fn alph_link_tell(l: AlphLink*, p: AlphPeer*) {
   }
 }
 
+// Sends again everything a peer has not said it has. Called inside its gate.
+fn alph_link_again(l: AlphLink*, p: AlphPeer*) {
+  var seq: uint32 = p->acked + 1;
+  while ((int32)(p->sent - seq) >= 0) {
+    var k: AlphPacket* = &p->window[seq % WINDOW];
+    k->ack = p->got;
+    k->to_life = p->life;
+    alph_link_post(l, p, k, p->held[seq % WINDOW]);
+    l->resent = l->resent + 1;
+    seq = seq + 1;
+  }
+  p->waiting_since = alph_now();
+}
+
 // On a sealed link, born is when the sender's run began and count is which
 // datagram of that run this is.
 fn alph_link_heard(l: AlphLink*, k: AlphPacket*, got: int64, born: Word, count: Word) {
@@ -599,22 +625,25 @@ fn alph_link_heard(l: AlphLink*, k: AlphPacket*, got: int64, born: Word, count: 
     }
     p->waiting_since = alph_now();
     p->again_ms = AGAIN_MS;
+    p->hurry = 0;
+    p->hurry_wait = HURRY_NS;
     alph_link_push(l, p);
   }
   if (k->kind == MISSED && k->ack == p->acked && p->sent != p->acked) {
     // A message after the last one it has did not arrive, and it has
     // dropped what came behind: all of it is sent again now, not when the
     // clock says so.
-    var seq: uint32 = p->acked + 1;
-    while ((int32)(p->sent - seq) >= 0) {
-      var again: AlphPacket* = &p->window[seq % WINDOW];
-      again->ack = p->got;
-      again->to_life = p->life;
-      alph_link_post(l, p, again, p->held[seq % WINDOW]);
-      l->resent = l->resent + 1;
-      seq = seq + 1;
+    alph_link_again(l, p);
+  }
+  if (k->kind == WAIT && p->hurry == 0 && p->sent != p->acked) {
+    // The next message found its actor's mailbox full, most often for a
+    // moment: the actor was asleep and is awake now. It is sent again a
+    // tenth of a millisecond on, and if it is refused again each wait is
+    // twice the one before.
+    p->hurry = alph_link_ns() + p->hurry_wait;
+    if (p->hurry_wait < HURRY_MOST) {
+      p->hurry_wait = (Word)(p->hurry_wait * 2);
     }
-    p->waiting_since = alph_now();
   }
   if (k->kind == WAIT && p->again_ms == AGAIN_MS) {
     // The next message found its actor's mailbox full. It is sent again
@@ -940,10 +969,46 @@ fn alph_link_main(arg: cstring) -> uint32 {
     var got: int64 = 0;
     var count: Word = 0;
     var born: Word = 0;
-    if (l->open == 0) {
+    // With a message waiting to be sent again in a moment, nothing is
+    // waited for here: what has come is taken, and if nothing has, the
+    // link naps a twentieth of a millisecond at most.
+    var hurry: Word = 0;
+    for i in 0..l->count {
+      if (l->peers[i].hurry != 0 && (hurry == 0 || l->peers[i].hurry < hurry)) {
+        hurry = l->peers[i].hurry;
+      }
+    }
+    if (hurry != 0) {
+      if (l->open == 0) {
+        got = l->wire.recv_now(whole, ALPH_DATAGRAM, &ip, &port);
+      } else {
+        got = l->wire.recv_now(&raw[0], 1200, &ip, &port);
+      }
+      if (got == 0) {
+        var now_ns: Word = alph_link_ns();
+        for i in 0..l->count {
+          var late: AlphPeer* = &l->peers[i];
+          var was: int32 = late->gate.enter();
+          if (late->hurry != 0 && now_ns >= late->hurry) {
+            late->hurry = 0;
+            if (late->alive != 0 && late->sent != late->acked) {
+              alph_link_again(l, late);
+            }
+          }
+          late->gate.leave(was);
+        }
+        var nap: int64[2];
+        nap[0] = 0;
+        nap[1] = 50000;
+        syscall(ALPH_NR_NANOSLEEP, (int64)&nap[0], 0);
+        count = -1;  // not a quiet moment: the chase keeps its own pace
+      }
+    } else if (l->open == 0) {
       got = l->wire.recv(whole, ALPH_DATAGRAM, &ip, &port);
     } else {
       got = l->wire.recv(&raw[0], 1200, &ip, &port);
+    }
+    if (l->open != 0) {
       if (got > 0) {
         var place: uint32 = 0;
         got = l->open(l->sealer, whole, &raw[0], got, &place, &born, &count);
