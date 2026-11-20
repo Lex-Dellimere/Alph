@@ -77,6 +77,10 @@ A lost datagram used to cost the wait of a clock: 40 ms before the sender sent a
 
 A message that finds its actor's mailbox full is not taken, and the sender is told. Most often the mailbox is full for a moment only: its actor was asleep and is awake now. The sender used to wait 5 ms before sending again. It now waits a tenth of a millisecond, and twice as long each time it is refused again, up to 4 ms. A stream of a million short messages to one actor, which fills its mailbox several hundred times on the way, went from about 140,000 a second to about 200,000. Plain datagrams between two threads on the same computer go at 256,000 a second, so one message a datagram cannot do much better.
 
+So a datagram carries several. A short message that an actor sends is not put on the wire at once. It waits until its node next looks for mail, which is when the handler has returned and the node has nothing more to run, or a twentieth of a millisecond while it has. Whatever the node's actors sent meanwhile goes with it, thirteen to a datagram. A message sent alone leaves as soon as its handler returns, so a request and its reply still take 24 µs. A burst does not pay for a datagram each: the same million messages now cross at about 1.2 million a second, six times faster and nearly five times what one datagram a message could ever do. What is sent again after a loss goes the same way, so a window of 64 is five datagrams, not 64.
+
+Two things keep this from costing anything elsewhere. The link must know whether the thread that sends is one that runs a node, since only such a thread comes back to send what it held. It knows by where the thread's stack is, which costs no system call. And a node asks whether mail is held with one load of a word, so a node with no link, and every board, runs as before. A message from a thread that runs no node goes at once. One held by a handler that then works for a long time is sent by the link's own thread within a few milliseconds, or at once if the handler calls `flush`.
+
 A long message on its way to a machine that goes down is given up, and so is one arriving from it. Their buffers are free again at once, where a short message waits for the machine to come back. Otherwise one lost machine would hold the buffers that the others' work needs.
 
 **Sealing.** A link is in the clear unless sealed. `src/seal` encrypts and signs every datagram (XChaCha20-Poly1305) with one key the whole network shares. A datagram made without the key, changed or played again is dropped, and so is everything from a run earlier than the latest heard, so a recording of an old run cannot make a dead machine look alive. It is its own layer, so a program that does not seal needs no crypto package.
@@ -204,7 +208,7 @@ The measurements that decide a choice are in the section for that choice: the re
 
 - Restart limits counted over time rather than in all, and groups that restart together.
 - Dropping a watch across machines.
-- A crossing that carries everything waiting in the link, where every message is still a datagram of its own.
+- A crossing that carries everything waiting between the cores of one machine without lanes, and for messages with bytes, which still take a datagram each.
 - A sealed link has one key for all, so any holder can speak as any machine and there is no forward secrecy. Peers are listed by hand.
 - A board on the UDP link itself. A board joins through a serial line to one machine.
 - A board that sends its work to the best of several places. It asks the machine at the other end of its line.

@@ -26,6 +26,11 @@ export struct AlphGate {
   collect: fn(rawptr) -> void;  // brings in mail that came another way (src/cores/lanes)
   look: fn(rawptr, bool) -> bool;  // whether such mail is waiting; with true, before a sleep
   near: rawptr;  // whoever set them
+  send: fn(rawptr) -> void;  // sends what was held back for this node's next look (src/link)
+  sender: rawptr;
+  unsent: int32*;    // not 0: something is held back,
+  unsent_at: Word*;  // since this many ns
+  stack: int64;      // about where the stack of the thread that runs this node is
 }
 
 export fn AlphGate_init__ptr(g: AlphGate*) {
@@ -36,10 +41,56 @@ export fn AlphGate_init__ptr(g: AlphGate*) {
   g->collect = 0;
   g->look = 0;
   g->near = 0;
+  g->send = 0;
+  g->sender = 0;
+  g->unsent = 0;
+  g->unsent_at = 0;
+  g->stack = 0;
 }
 
-// Called inside the gate by the node that sleeps on it.
+// Called by the node between two messages when mail is held back (the
+// node's held), inside the gate, and returns inside it. Mail for other
+// machines that was held back, to go several to
+// a datagram, is sent here: at once when the node has nothing more to run
+// (hold is false), and while it has, once the oldest has waited a
+// twentieth of a millisecond. The gate is open while it is sent.
+export fn AlphGate_pass__ptr(g: AlphGate*, was: int32, hold: bool) -> int32 {
+  if (g->send == 0 || *g->unsent == 0) {
+    return was;
+  }
+  if (hold) {
+    var ts: int64[2];
+    syscall(ALPH_NR_CLOCK_GETTIME, 1, (int64)&ts[0]);
+    if ((Word)(ts[0] * 1000000000 + ts[1]) - *g->unsent_at < 50000) {
+      return was;
+    }
+  }
+  g->leave(was);
+  g->send(g->sender);
+  return g->enter();
+}
+
+// The node's thread has stopped running it: no thread is its runner now.
+export fn AlphGate_done__ptr(g: AlphGate*) {
+  g->stack = 0;
+}
+
+// Whether the calling thread is the one that runs this gate's node: its
+// stack is where that thread's was when it last passed.
+export fn AlphGate_mine__ptr(g: AlphGate*) -> bool {
+  var here: int32 = 0;
+  var apart: int64 = (int64)&here - g->stack;
+  return g->stack != 0 && apart > -65536 && apart < 65536;
+}
+
+// Called inside the gate by the node that sleeps on it. It also notes about
+// where that thread's stack is (mine), written only when it changes:
+// senders read this line of memory.
 export fn AlphGate_gather__ptr(g: AlphGate*) {
+  var here: int32 = 0;
+  if (g->stack != (int64)&here) {
+    g->stack = (int64)&here;
+  }
   if (g->collect != 0) {
     g->collect(g->near);
   }

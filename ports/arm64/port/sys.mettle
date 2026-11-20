@@ -10,6 +10,7 @@ export const ALPH_NR_IOCTL: int64 = 29;
 export const ALPH_NR_SCHED_YIELD: int64 = 124;
 export const ALPH_NR_GETPID: int64 = 172;
 export const ALPH_NR_NANOSLEEP: int64 = 101;
+export const ALPH_NR_PPOLL: int64 = 73;
 export const ALPH_NR_SOCKET: int64 = 198;
 export const ALPH_NR_CONNECT: int64 = 203;
 export const ALPH_NR_SENDTO: int64 = 206;

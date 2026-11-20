@@ -704,6 +704,7 @@ export struct AlphNode {
   life: rawptr;   // whoever set ended
   guard: AlphGuard;
   running: AlphActor*;  // the actor whose handler is running
+  held: int32*;  // not 0 and not at 0: mail for other machines waits for this node to send it (src/link)
 }
 ```
 
@@ -2236,6 +2237,7 @@ export struct AlphPeer {
   got: uint32;        // every message from it up to this one was taken
   owed: Word;         // messages taken since it was last told so
   waiting_since: Word;
+  wired: uint32;      // the last message put on the wire: later ones are held back for a moment
   missed: uint32;     // the message last said to be missing: said once, then left to the sender's clock
   hurry: Word;        // when, in ns, to send again what found a mailbox full, 0 for not waiting
   hurry_wait: Word;   // how long that wait is now
@@ -2294,6 +2296,9 @@ export struct AlphLink {
   longs: AlphLong*;
   long_room: Word;
   skipped: Word;  // long messages that arrived with no long buffer big enough here
+  unsent: int32;  // not 0: short messages are held back, to go several to a datagram
+  unsent_at: Word;  // since this many ns
+  shared: Word;   // messages that went in a datagram with others
 }
 ```
 
@@ -2324,6 +2329,19 @@ Call it as `l->free(buffer)`, or `l.free(buffer)` on a value.
 Gives a long buffer back to the pool. The actor a long message was sent
 to calls it when it has read the bytes, and so does a program that took
 a buffer (long) and did not send it.
+
+### `AlphLink_flush__ptr`
+
+```mettle
+export fn AlphLink_flush__ptr(l: AlphLink*)
+```
+
+Call it as `l->flush()`, or `l.flush()` on a value.
+
+Sends what is held back for every peer. A node calls it when it next
+looks for mail, and the link's own thread within a few milliseconds if
+no node did. A handler that runs long and wants what it sent to leave
+before it returns calls it itself.
 
 ### `AlphLink_init__ptr`
 
@@ -2853,6 +2871,16 @@ Call it as `w->recv_now(bytes, room, ip, port)`, or `w.recv_now(bytes, room, ip,
 
 The next datagram if one is here already, without waiting. Returns its
 length, or 0 for none.
+
+### `AlphWire_wait__ptr`
+
+```mettle
+export fn AlphWire_wait__ptr(w: AlphWire*, ns: int64)
+```
+
+Call it as `w->wait(ns)`, or `w.wait(ns)` on a value.
+
+Waits until a datagram is here, and no longer than `ns` nanoseconds.
 
 ### `AlphWire_close__ptr`
 

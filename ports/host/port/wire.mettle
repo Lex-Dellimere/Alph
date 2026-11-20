@@ -86,6 +86,17 @@ export fn AlphWire_recv_now__ptr(w: AlphWire*, bytes: uint8*, room: int64, ip: u
   return got;
 }
 
+// Waits until a datagram is here, and no longer than `ns` nanoseconds.
+export fn AlphWire_wait__ptr(w: AlphWire*, ns: int64) {
+  var fd: int32[2];    // the kernel's pollfd: the descriptor, then what is asked and what is so
+  var most: int64[2];
+  fd[0] = (int32)w->fd;
+  fd[1] = 1;           // data to read
+  most[0] = ns / 1000000000;
+  most[1] = ns % 1000000000;
+  syscall(ALPH_NR_PPOLL, (int64)&fd[0], 1, (int64)&most[0], 0, 0);
+}
+
 // Closes the socket.
 export fn AlphWire_close__ptr(w: AlphWire*) {
   syscall(ALPH_NR_CLOSE, w->fd);

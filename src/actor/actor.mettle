@@ -65,6 +65,7 @@ export struct AlphNode {
   life: rawptr;   // whoever set ended
   guard: AlphGuard;
   running: AlphActor*;  // the actor whose handler is running
+  held: int32*;  // not 0 and not at 0: mail for other machines waits for this node to send it (src/link)
 }
 
 // Puts a slot at the back of the free list, so its pids are reused last.
@@ -95,6 +96,7 @@ export fn AlphNode_init__ptr(n: AlphNode*, actors: AlphActor*, slots: Word, mail
   n->world = 0;
   n->ended = 0;
   n->life = 0;
+  n->held = 0;
   n->gate.init();
   for i in 0..slots {
     var a: AlphActor* = &actors[i];
@@ -310,6 +312,9 @@ fn alph_run(n: AlphNode*, wait: Word) -> Word {
   var since: Word = 0;
   var was: int32 = n->gate.enter();
   while (n->stopped == 0) {
+    if (ALPH_GATHER != 0 && n->held != 0 && *n->held != 0) {
+      was = n->gate.pass(was, n->first != 0 && since < ALPH_GATHER);
+    }
     var a: AlphActor* = n->first;
     if (ALPH_GATHER != 0 && (a == 0 || since >= ALPH_GATHER)) {
       n->gate.gather();
@@ -369,6 +374,12 @@ fn alph_run(n: AlphNode*, wait: Word) -> Word {
   }
   if (wait != 0) {
     n->stopped = 0;
+  }
+  if (ALPH_GATHER != 0) {
+    if (n->held != 0 && *n->held != 0) {
+      was = n->gate.pass(was, false);  // what the last handlers sent leaves before the node stops
+    }
+    n->gate.done();
   }
   n->gate.leave(was);
   n->guard.close();

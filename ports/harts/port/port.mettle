@@ -74,6 +74,14 @@ export fn AlphGate_wake__ptr(g: AlphGate*) {
 export fn AlphGate_gather__ptr(g: AlphGate*) {
 }
 
+export fn AlphGate_done__ptr(g: AlphGate*) {
+}
+
+// Nothing is held back on a board.
+export fn AlphGate_pass__ptr(g: AlphGate*, was: int32, hold: bool) -> int32 {
+  return was;
+}
+
 // A wake that arrives while its hart is awake with interrupts on: nothing
 // to do but take it back.
 @interrupt fn mettle_trap_software() {

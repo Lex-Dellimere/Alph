@@ -537,6 +537,8 @@ g_places.ask(a, fetch);
 
 Between two machines that are both up, messages arrive once and in order. What a machine has not got in 40 ms is sent again. Every machine tells its peers it is alive 20 times a second, and one that stays quiet for half a second is down. A send to a machine that is down, or not heard yet, returns `ALPH_GONE`. A send returns `ALPH_FULL` when too many messages to that machine are still waiting for its word. A machine that was only out of reach carries on where it was. A machine that was restarted counts as a new one, so mail meant for the old one is not handed to the new. A message for an actor whose mailbox is full is not dropped: it is sent again until there is room, and the messages behind it wait with it. That lasts half a second at most. An actor with no room for that long is not reading, and its message is then dropped so the rest can pass.
 
+**Several messages to a datagram.** A short message an actor sends to another machine waits until its node next looks for mail, a moment later, and leaves with whatever else the node's actors sent meanwhile: up to thirteen in one datagram. Nothing needs to be done for this, and a message sent alone is not slower for it. A handler that sends and then works for a long time can call `link.flush()` to send what it has sent so far at once. Without that the link sends it within a few milliseconds.
+
 **Bytes with a message.** A message between machines can carry up to 1,024 bytes in a parcel. Give the link a pool of parcels with `parcels(pool, room)` before `start`, then send with `send_bytes(from, to, tag, ref, bytes, count)`. The actor it is for gets the message with the parcel in `arg`, reads it, and gives it back to its own machine's link with `release`. This is from `tests/t_parcel.mettle`:
 
 ```mettle
@@ -958,5 +960,5 @@ These are not built yet.
 - A watch cannot be dropped across machines.
 - Restart limits are counted in all, not over time, and there are no groups that restart together.
 - A crash in a handler ends only its actor on Linux, in a program built with `-s`. On a microcontroller a crash is still the board's trap.
-- A crossing does not yet carry everything that is waiting: one lock, one launch or one datagram for a batch is not built into the cores or the link, where every message still crosses alone.
+- Short messages to another machine go several to a datagram. Messages with bytes still take one each, and between the cores of one machine every message crosses alone unless lanes are on.
 - alph predicts a job's time from its size, so work whose time depends on something else, such as where in a picture a Mandelbrot tile is, is placed less well.

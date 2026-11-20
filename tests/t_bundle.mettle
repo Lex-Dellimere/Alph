@@ -1,0 +1,203 @@
+// Short messages to another machine go several to a datagram (src/link):
+// an actor's burst of twenty thousand arrives whole and in order, most of
+// them sharing a datagram; with messages lost on the way they still do; a
+// message from an actor that then works for a long time is not kept back
+// until it is done; and flush sends at once.
+
+import "std/io";
+import "std/thread";
+import "alph/actor/actor";
+import "alph/cores/cores";
+import "alph/link/link";
+import "port/sys";
+import "port/alarm";
+
+const GO: Word = 1;
+const DATA: Word = 2;
+const MORE: Word = 3;
+const DONE: Word = 4;
+const SLOW: Word = 5;   // send one message, then work for 300 ms
+const NOTE: Word = 6;
+const BURST: Word = 20000;
+
+var g_a: AlphCores;
+var g_a_core: AlphCore[2];
+var g_a_actors: AlphActor[4];
+var g_a_mail: AlphMsg[128];
+var g_a_link: AlphLink;
+var g_a_peers: AlphPeer[1];
+var g_b: AlphCores;
+var g_b_core: AlphCore[2];
+var g_b_actors: AlphActor[4];
+var g_b_mail: AlphMsg[128];
+var g_b_link: AlphLink;
+var g_b_peers: AlphPeer[1];
+
+var g_sink: Word = 0;
+var g_source: Word = 0;
+var g_failures: int32 = 0;
+
+fn expect(ok: bool, what: string) {
+  if (!ok) {
+    println("FAIL {what}");
+    g_failures = g_failures + 1;
+  }
+}
+
+// On machine B: counts what arrives and checks its order.
+struct Sink {
+  next: Word;
+  bad: Word;
+  total: Word;
+  note_at: Word;  // when the last note came, in ms
+}
+
+var g_s: Sink;
+
+fn sink(a: AlphActor*, m: AlphMsg*) -> Word {
+  if (m->tag == NOTE) {
+    g_s.note_at = alph_now();
+    return 0;
+  }
+  if (m->arg != g_s.next) {
+    g_s.bad = g_s.bad + 1;
+  }
+  g_s.next = m->arg + 1;
+  if (g_s.next == g_s.total) {
+    a->send(g_source, DONE, 0);
+  }
+  return 0;
+}
+
+// On machine A: sends the burst as fast as the link takes it.
+struct Source {
+  sent: Word;
+  total: Word;
+  flush: Word;     // with SLOW: send what is held back before working
+  sent_at: Word;   // when the note went, in ms
+  ended_at: Word;  // and when the work after it was over
+}
+
+var g_src: Source;
+
+fn source(a: AlphActor*, m: AlphMsg*) -> Word {
+  if (m->tag == DONE) {
+    a->cores()->stop();
+    return 0;
+  }
+  if (m->tag == SLOW) {
+    g_src.sent_at = alph_now();
+    a->send(g_sink, NOTE, 0);
+    if (g_src.flush != 0) {
+      g_a_link.flush();
+    }
+    Sleep(300);
+    g_src.ended_at = alph_now();
+    a->cores()->stop();
+    return 0;
+  }
+  var burst: Word = 0;
+  while (g_src.sent < g_src.total && burst < 256) {
+    if (a->send(g_sink, DATA, g_src.sent) != ALPH_OK) {
+      break;
+    }
+    g_src.sent = g_src.sent + 1;
+    burst = burst + 1;
+  }
+  if (g_src.sent < g_src.total) {
+    a->send(a->pid, MORE, 0);
+  }
+  return 0;
+}
+
+fn b_main(arg: cstring) -> uint32 {
+  g_b.run();
+  return 0;
+}
+
+fn burst(total: Word) {
+  g_s.next = 0;
+  g_s.bad = 0;
+  g_s.total = total;
+  g_src.sent = 0;
+  g_src.total = total;
+  g_a.send(g_source, GO, 0);
+  g_a.run();
+}
+
+fn main() -> int32 {
+  var port_a: int64 = 28000 + (syscall(ALPH_NR_GETPID) % 1500) * 2;
+  var here: uint32 = alph_ip4(127, 0, 0, 1);
+  g_a.init(&g_a_core[0], 2, &g_a_actors[0], 2, &g_a_mail[0], 32);
+  g_a_link.init(&g_a, 0, &g_a_peers[0], 1);
+  g_a_link.peer(2, 2, here, port_a + 1);
+  g_source = g_a.spawn_on(0, &source, 0);
+  g_b.init(&g_b_core[0], 2, &g_b_actors[0], 2, &g_b_mail[0], 32);
+  g_b_link.init(&g_b, 2, &g_b_peers[0], 1);
+  g_b_link.peer(0, 2, here, port_a);
+  g_sink = g_b.spawn_on(1, &sink, 0);
+  expect(g_a_link.start(port_a) == ALPH_OK && g_b_link.start(port_a + 1) == ALPH_OK, "both machines listen");
+  var b_thread: int64 = CreateThread(0, 0, &b_main, 0, 0, 0);
+  var waited: int32 = 0;
+  while (!g_a_link.reaches(2) && waited < 3000) {
+    Sleep(1);
+    waited = waited + 1;
+  }
+  expect(g_a_link.reaches(2), "A hears B");
+
+  // A burst from one actor: all of it arrives in order, most of it several
+  // to a datagram.
+  burst(BURST);
+  var shared: Word = g_a_link.shared;
+  expect(g_s.next == BURST && g_s.bad == 0, "a burst of short messages arrives whole and in order ({g_s.next} of {BURST}, {g_s.bad} out of place)");
+  expect(shared > BURST / 2, "most of them sharing a datagram ({shared} of {BURST})");
+
+  // The same with one message in nine lost each way.
+  g_a_link.lose = 9;
+  g_b_link.lose = 9;
+  burst(BURST);
+  g_a_link.lose = 0;
+  g_b_link.lose = 0;
+  expect(g_s.next == BURST && g_s.bad == 0, "and with messages lost on the way ({g_s.next} of {BURST}, {g_s.bad} out of place, {g_a_link.resent} sent again)");
+
+  // An actor sends one message and then works for 300 ms. The message is
+  // held back for the node's next look, which is far off: the link's own
+  // thread sends it within a few milliseconds.
+  g_src.flush = 0;
+  g_s.note_at = 0;
+  g_a.send(g_source, SLOW, 0);
+  g_a.run();
+  waited = 0;
+  while (g_s.note_at == 0 && waited < 1000) {
+    Sleep(1);
+    waited = waited + 1;
+  }
+  var kept: Word = g_s.note_at - g_src.sent_at;
+  expect(g_s.note_at != 0 && g_s.note_at < g_src.ended_at && kept < 150, "a message from an actor that then works for long is not kept back until it is done ({kept} ms)");
+
+  // With flush it leaves at once.
+  g_src.flush = 1;
+  g_s.note_at = 0;
+  g_a.send(g_source, SLOW, 0);
+  g_a.run();
+  waited = 0;
+  while (g_s.note_at == 0 && waited < 1000) {
+    Sleep(1);
+    waited = waited + 1;
+  }
+  var flushed: Word = g_s.note_at - g_src.sent_at;
+  expect(g_s.note_at != 0 && flushed < 150, "and with flush it leaves at once ({flushed} ms)");
+
+  g_b_link.stop();
+  g_b.stop();
+  thread_join_infinite(b_thread);
+  thread_close(b_thread);
+  g_b_link.close();
+  g_a_link.stop();
+  g_a_link.close();
+  if (g_failures != 0) {
+    return 1;
+  }
+  println("bundle ok: {BURST} short messages in order, {shared} of them sharing a datagram; one sent before 300 ms of work arrived after {kept} ms, and after {flushed} ms with flush");
+  return 0;
+}

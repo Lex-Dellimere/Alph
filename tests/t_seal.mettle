@@ -207,6 +207,11 @@ fn main() -> int32 {
   g_a.run();
   expect(d.sum == want, "and arrive whole ({d.sum} for {want})");
 
+  // The link counts a message as taken a moment after it hands it to its
+  // actor, and the driver may be here before that: wait, so that the
+  // number given to the note below is the next one.
+  thread_sleep_ms(20);
+
   // From the third socket: a note for the driver, made as B would make it.
   g_other_link.cores = &g_b;
   g_other_link.sealer = 0;
