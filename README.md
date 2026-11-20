@@ -48,29 +48,28 @@ fn main() -> int32 {
 
 This is [examples/count.mettle](examples/count.mettle). The node owns no memory: the program hands it the actor slots and the mailboxes, which is why the same code fits a microcontroller.
 
-On a computer most programs want work done on whatever cores, GPU and other machines there are. That takes a function for the work, one for each answer, and one call:
+On a computer most programs want work done on whatever cores and other machines there are. That takes a function for one piece of the work, one for each answer, and one call:
 
 ```mettle
-fn count_primes(job: AlphJob*) -> Word {
-  ...                       // the primes in chunk job->in
-  job->out = found;
-  return 0;
+fn primes_in(chunk: Word) -> Word {
+  ...                        // the primes in this chunk
+  return found;
 }
 
-fn counted(b: AlphBatch*, job: AlphJob*, chunk: Word) {
-  g_primes = g_primes + job->out;
+fn counted(chunk: Word, found: Word, ctx: rawptr) {
+  g_primes = g_primes + found;
 }
 
 fn main() -> int32 {
-  g_m.init(4, 0, false);               // four cores
-  g_m.kind(PRIMES, &count_primes, 0);  // how the work is done on a core
-  g_m.work(PRIMES, 200, 0, &counted, 0);
+  g_m.init(4, 0, false);             // four cores
+  g_m.piece(PRIMES, &primes_in);     // how one piece is done
+  g_m.pieces(PRIMES, 200, &counted, 0);
   g_m.shut();
   return 0;
 }
 ```
 
-This is [examples/primes.mettle](examples/primes.mettle). Give `kind` a second function and the work also runs on the GPU. Name another machine and share the kind, and it also runs there. The program never says where a piece goes.
+This is [examples/primes.mettle](examples/primes.mettle). Name another machine and share the kind, and the pieces also run there. A board shares the same kind of function. The program never says where a piece goes, and pieces of little work are handed out several at a time, so even a piece of a microsecond is worth handing out. Work that carries data or runs on the GPU is a job (`kind` and `work`), shown below.
 
 ## What is here
 

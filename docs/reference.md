@@ -76,6 +76,15 @@ export struct AlphMachine {
   work_fill: fn(AlphBatch*, AlphJob*, Word) -> void;
   work_took: fn(AlphBatch*, AlphJob*, Word) -> void;
   work_ctx: rawptr;
+  run: Word;              // pieces: how many go in one job,
+  run_first: Word;        // the piece the jobs of this batch start from,
+  run_total: Word;        // how many pieces there are in all,
+  run_least: Word;        // the least time one piece took when tried alone here, in ns,
+  run_least_far: Word;    // and on another machine, the way there and back included,
+  run_undone: Word;       // pieces not done,
+  run_took: fn(Word, Word, rawptr) -> void;  // and the program's function for each answer,
+  run_ctx: rawptr;        // with its own
+  outs: uint8[73728];     // what each job of several pieces gives back: 512 bytes a slot
   slots: AlphBatchSlot[128];  // room for the batches tied to this machine (batch)
   slots_used: Word;
   far_times: AlphTimes[96];  // each other machine's and board's own times, eight kinds each
@@ -272,6 +281,37 @@ call it from the program's main thread, after kind, the peers and start,
 and not from an actor. It can be called again for more work. Returns
 how many pieces were not done: those no place could run and those lost
 with their worker. m->worked is the batch, for its counts by way.
+
+### `AlphMachine_piece__ptr`
+
+```mettle
+export fn AlphMachine_piece__ptr(m: AlphMachine*, kind: Word, run: fn(Word) -> Word)
+```
+
+Call it as `m->piece(kind, run)`, or `m.piece(kind, run)` on a value.
+
+Says how one piece of a kind (0 to 7) is done: a function from a number
+to a number, with nothing else going in or out, so it can run on any
+core of any machine. It takes the place of kind for such work, and
+pieces then hands the work out. A board shares the same function with
+AlphBoard_share. Call it on every machine, then share.
+
+### `AlphMachine_pieces__ptr`
+
+```mettle
+export fn AlphMachine_pieces__ptr(m: AlphMachine*, kind: Word, total: Word,
+                                  took: fn(Word, Word, rawptr) -> void, ctx: rawptr) -> Word
+```
+
+Call it as `m->pieces(kind, total, took, ctx)`, or `m.pieces(kind, total, took, ctx)` on a value.
+
+Does pieces 0 to total - 1 of a kind set up with piece, and returns when
+all are answered. took is called with each piece's number, what it gave,
+and ctx. Pieces of little work are handed out several to a job, so that
+handing out costs little beside the work: the first few are done alone
+to time one, and the rest go in jobs of about a quarter of a millisecond
+of work, up to 64 pieces. Call it as work is called. Returns how many
+pieces were not done.
 
 ### `AlphMachine_run__ptr`
 

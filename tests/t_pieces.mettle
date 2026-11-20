@@ -1,0 +1,190 @@
+// Pieces (src/machine piece and pieces): a kind of work that is a function
+// from a number to a number, handed out several pieces to a job when a
+// piece is little work. Every piece is answered once and rightly, on one
+// machine and with a helper; pieces that take long go one to a job; and
+// the edges of the count hold.
+
+import "std/io";
+import "std/thread";
+import "alph/actor/actor";
+import "alph/machine/machine";
+import "alph/batch/batch";
+import "port/sys";
+
+const SQUARE: Word = 0;  // little work: many to a job
+const SLOW: Word = 1;    // a millisecond each: one to a job
+const NONE: Word = 2;    // no way to do it
+const ONCE: Word = 3;    // done at most once: one to a job
+const THERE: Word = 4;   // only the other machine has a way to do it
+const MANY: Word = 50000;
+
+var g_m: AlphMachine[2];
+var g_seen: uint8[50000];
+var g_twice: Word = 0;
+var g_wrong: Word = 0;
+var g_answers: Word = 0;
+var g_failures: int32 = 0;
+
+fn expect(ok: bool, what: string) {
+  if (!ok) {
+    println("FAIL {what}");
+    g_failures = g_failures + 1;
+  }
+}
+
+fn square(n: Word) -> Word {
+  return (Word)(n * n + 7);
+}
+
+fn slow(n: Word) -> Word {
+  var rest: int64[2];
+  rest[0] = 0;
+  rest[1] = 1000000;
+  syscall(ALPH_NR_NANOSLEEP, (int64)&rest[0], 0);
+  return (Word)(0 - n - 3);
+}
+
+fn took_square(piece: Word, out: Word, ctx: rawptr) {
+  g_answers = g_answers + 1;
+  if (piece < 0 || piece >= MANY || out != (Word)(piece * piece + 7)) {
+    g_wrong = g_wrong + 1;
+    return;
+  }
+  if (g_seen[piece] != 0) {
+    g_twice = g_twice + 1;
+  }
+  g_seen[piece] = 1;
+}
+
+fn took_slow(piece: Word, out: Word, ctx: rawptr) {
+  g_answers = g_answers + 1;
+  if (out != (Word)(0 - piece - 3)) {
+    g_wrong = g_wrong + 1;
+  }
+}
+
+fn clear() {
+  for i in 0..50000 {
+    g_seen[i] = 0;
+  }
+  g_twice = 0;
+  g_wrong = 0;
+  g_answers = 0;
+}
+
+fn seen() -> Word {
+  var n: Word = 0;
+  for i in 0..50000 {
+    n = n + (Word)g_seen[i];
+  }
+  return n;
+}
+
+fn helper_main(arg: cstring) -> uint32 {
+  g_m[1].run();
+  return 0;
+}
+
+fn main() -> int32 {
+  var port: int64 = 24000 + (syscall(ALPH_NR_GETPID) % 2000) * 2;
+  var here: uint32 = alph_ip4(127, 0, 0, 1);
+  g_m[0].init(4, 0, false);
+  g_m[0].peer(16, 5, here, port + 1);
+  g_m[1].init(5, 16, false);
+  g_m[1].peer(0, 4, here, port);
+  for i in 0..2 {
+    g_m[i].piece(SQUARE, &square);
+    g_m[i].piece(SLOW, &slow);
+    g_m[i].piece(ONCE, &square);
+    g_m[i].once(ONCE);
+    g_m[i].kind(NONE, 0, 0);
+    if (i == 0) {
+      g_m[i].kind(THERE, 0, 0);
+    } else {
+      g_m[i].piece(THERE, &square);
+    }
+    expect(g_m[i].share(THERE) == ALPH_OK, "the machine shares the kind only one of them does");
+    expect(g_m[i].share(SQUARE) == ALPH_OK && g_m[i].share(SLOW) == ALPH_OK && g_m[i].share(ONCE) == ALPH_OK, "the machine shares the kinds");
+  }
+
+  // On one machine, before the other is there.
+  clear();
+  var undone: Word = g_m[0].pieces(SQUARE, MANY, &took_square, 0);
+  expect(undone == 0 && seen() == MANY && g_twice == 0 && g_wrong == 0, "every piece is answered once and rightly on one machine ({seen()} of {MANY}, {g_twice} twice, {g_wrong} wrong)");
+  expect(g_m[0].run > 1, "pieces of little work go several to a job ({g_m[0].run})");
+  expect(g_m[0].worked.total < (Word)(MANY / 2), "so there are far fewer jobs than pieces ({g_m[0].worked.total})");
+
+  // The edges of the count: none, fewer than are tried alone, and one more.
+  clear();
+  expect(g_m[0].pieces(SQUARE, 0, &took_square, 0) == 0 && g_answers == 0, "no pieces is no work");
+  clear();
+  expect(g_m[0].pieces(SQUARE, 10, &took_square, 0) == 0 && seen() == 10 && g_wrong == 0, "ten pieces are ten answers ({seen()})");
+  clear();
+  expect(g_m[0].pieces(SQUARE, 33, &took_square, 0) == 0 && seen() == 33 && g_wrong == 0 && g_twice == 0, "thirty-three pieces are thirty-three answers ({seen()})");
+  clear();
+  expect(g_m[0].pieces(SQUARE, 229, &took_square, 0) == 0 && seen() == 229 && g_wrong == 0 && g_twice == 0, "a last job that is not full is answered too ({seen()})");
+
+  // A kind no place can do: every piece is told as not done.
+  clear();
+  expect(g_m[0].pieces(NONE, 40, &took_square, 0) == 40 && g_answers == 0, "pieces no place can do are counted as not done");
+
+  // With the other machine.
+  for i in 0..2 {
+    expect(g_m[i].start(port + (int64)i) == ALPH_OK, "the machine listens");
+  }
+  var helper: int64 = CreateThread(0, 0, &helper_main, 0, 0, 0);
+  var waited: int32 = 0;
+  while ((g_m[0].seats[3].workers[SQUARE] == 0 || g_m[0].seats[3].workers[SLOW] == 0 || g_m[0].seats[3].workers[ONCE] == 0 || g_m[0].seats[3].workers[THERE] == 0) && waited < 3000) {
+    g_m[0].core[0].node.turn();
+    Sleep(1);
+    waited = waited + 1;
+  }
+  expect(g_m[0].seats[3].workers[SQUARE] != 0, "the first machine finds the other's worker");
+
+  // Pieces of a millisecond: one to a job, and the helper takes its part.
+  clear();
+  undone = g_m[0].pieces(SLOW, 400, &took_slow, 0);
+  var far_slow: Word = g_m[0].worked.by_way[ALPH_FAR];
+  expect(undone == 0 && g_answers == 400 && g_wrong == 0, "pieces that take long are all answered rightly ({g_answers} of 400, {g_wrong} wrong)");
+  expect(g_m[0].run == 1, "one to a job ({g_m[0].run})");
+  expect(far_slow > 50, "and the other machine does a good part of them ({far_slow})");
+
+  // Pieces of little work again, with jobs of several going to the other
+  // machine and their answers coming back as bytes.
+  clear();
+  g_m[0].link.lose = 11;
+  g_m[1].link.lose = 13;
+  undone = g_m[0].pieces(SQUARE, MANY, &took_square, 0);
+  g_m[0].link.lose = 0;
+  g_m[1].link.lose = 0;
+  expect(undone == 0 && seen() == MANY && g_twice == 0 && g_wrong == 0, "with a helper, and messages lost on the way, every piece is answered once and rightly ({seen()} of {MANY}, {g_twice} twice, {g_wrong} wrong)");
+
+  // A kind only the other machine does: every job crosses, several pieces
+  // to a job when the way there and back allows, with messages lost.
+  clear();
+  g_m[0].link.lose = 11;
+  g_m[1].link.lose = 13;
+  undone = g_m[0].pieces(THERE, 6000, &took_square, 0);
+  g_m[0].link.lose = 0;
+  g_m[1].link.lose = 0;
+  var there_run: Word = g_m[0].run;
+  expect(undone == 0 && seen() == 6000 && g_twice == 0 && g_wrong == 0, "pieces only the other machine can do are all answered once and rightly ({seen()} of 6000, {g_twice} twice, {g_wrong} wrong)");
+  expect(g_m[0].worked.by_way[ALPH_CPU] == 0 && g_m[0].worked.by_way[ALPH_FAR] == g_m[0].worked.total, "all of them there ({g_m[0].worked.by_way[ALPH_FAR]} jobs of {there_run})");
+
+  // A kind done at most once gives no bytes back: one piece to a job.
+  clear();
+  undone = g_m[0].pieces(ONCE, 200, &took_square, 0);
+  expect(undone == 0 && seen() == 200 && g_wrong == 0 && g_twice == 0 && g_m[0].run == 1, "a kind done at most once goes one piece to a job ({seen()} of 200, {g_m[0].run} to a job)");
+
+  g_m[1].stop();
+  thread_join_infinite(helper);
+  thread_close(helper);
+  for i in 0..2 {
+    g_m[i].shut();
+  }
+  if (g_failures != 0) {
+    return 1;
+  }
+  println("pieces ok: {MANY} pieces of little work answered once each, several to a job; 400 of a millisecond one to a job, {far_slow} of them on the other machine; 6000 only the other machine can do, {there_run} to a job");
+  return 0;
+}

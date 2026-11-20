@@ -123,6 +123,15 @@ export struct AlphMachine {
   work_fill: fn(AlphBatch*, AlphJob*, Word) -> void;
   work_took: fn(AlphBatch*, AlphJob*, Word) -> void;
   work_ctx: rawptr;
+  run: Word;              // pieces: how many go in one job,
+  run_first: Word;        // the piece the jobs of this batch start from,
+  run_total: Word;        // how many pieces there are in all,
+  run_least: Word;        // the least time one piece took when tried alone here, in ns,
+  run_least_far: Word;    // and on another machine, the way there and back included,
+  run_undone: Word;       // pieces not done,
+  run_took: fn(Word, Word, rawptr) -> void;  // and the program's function for each answer,
+  run_ctx: rawptr;        // with its own
+  outs: uint8[73728];     // what each job of several pieces gives back: 512 bytes a slot
   slots: AlphBatchSlot[128];  // room for the batches tied to this machine (batch)
   slots_used: Word;
   far_times: AlphTimes[96];  // each other machine's and board's own times, eight kinds each
@@ -782,6 +791,153 @@ export fn AlphMachine_work__ptr(m: AlphMachine*, kind: Word, total: Word,
   }
   m->cores.run();
   return m->worked.gone + m->worked.lost;
+}
+
+// How one piece of each kind is done, for piece and pieces. One table for
+// the process: every machine in it runs the same program.
+struct AlphPiece {
+  run: fn(Word) -> Word;
+}
+
+var g_piece: AlphPiece[8];
+
+const RUN_SHIFT: Word = 40;        // a job's in: the first piece below this bit, how many above it
+const RUN_MOST: Word = 64;         // the most pieces in one job: their answers are 8 bytes each
+const RUN_NS: Word = 250000;       // the work a job should hold, so that handing it out costs little
+const RUN_TRIED: Word = 32;        // pieces done alone first, to time one
+
+// The job behind piece: one piece when the in is its number alone, which
+// is also what a board is asked, and a run of them when a count is above
+// it. A run's answers go back as bytes, 8 a piece.
+fn alph_machine_pieces(job: AlphJob*) -> Word {
+  var f: fn(Word) -> Word = g_piece[job->kind].run;
+  var count: Word = (Word)(job->in >> RUN_SHIFT);
+  var first: Word = (Word)(job->in - (count << RUN_SHIFT));
+  if (f == 0) {
+    return 1;
+  }
+  if (count <= 0) {
+    job->out = f(job->in);
+    return 0;
+  }
+  if (job->back == 0 || job->back_room < (Word)(count * 8)) {
+    return 1;
+  }
+  for i in 0..count {
+    var out: int64 = (int64)f(first + (Word)i);
+    for b in 0..8 {
+      job->back[(Word)i * 8 + (Word)b] = (uint8)((out >> ((int64)b * 8)) & 255);
+    }
+  }
+  job->back_count = (Word)(count * 8);
+  job->out = count;
+  return 0;
+}
+
+// Says how one piece of a kind (0 to 7) is done: a function from a number
+// to a number, with nothing else going in or out, so it can run on any
+// core of any machine. It takes the place of kind for such work, and
+// pieces then hands the work out. A board shares the same function with
+// AlphBoard_share. Call it on every machine, then share.
+export fn AlphMachine_piece__ptr(m: AlphMachine*, kind: Word, run: fn(Word) -> Word) {
+  if (kind >= 0 && kind < 8) {
+    g_piece[kind].run = run;
+    m->places.kind(kind, &alph_machine_pieces, 0);
+  }
+}
+
+fn alph_machine_run_slot(m: AlphMachine*, job: AlphJob*) -> Word {
+  return (Word)(((int64)job - (int64)m->worked.slots) / (int64)sizeof(AlphBatchSlot));
+}
+
+fn alph_machine_run_fill(b: AlphBatch*, job: AlphJob*, at: Word) {
+  var m: AlphMachine* = (AlphMachine*)b->ctx;
+  var first: Word = m->run_first + (Word)(at * m->run);
+  var count: Word = m->run_total - first;
+  if (count > m->run) {
+    count = m->run;
+  }
+  job->in = first;
+  job->size = count;
+  if (m->run > 1) {
+    job->in = (Word)(first + (count << RUN_SHIFT));
+    job->back = &m->outs[alph_machine_run_slot(m, job) * 512];
+    job->back_room = 512;
+  }
+}
+
+fn alph_machine_run_took(b: AlphBatch*, job: AlphJob*, at: Word) {
+  var m: AlphMachine* = (AlphMachine*)b->ctx;
+  var first: Word = m->run_first + (Word)(at * m->run);
+  var count: Word = m->run_total - first;
+  if (count > m->run) {
+    count = m->run;
+  }
+  if (job->status != ALPH_OK || (m->run > 1 && job->back_count != (Word)(count * 8))) {
+    m->run_undone = m->run_undone + count;
+    return;
+  }
+  if (m->run == 1) {
+    if (job->way != ALPH_FAR && (m->run_least == 0 || job->ns < m->run_least)) {
+      m->run_least = job->ns;
+    }
+    if (job->way == ALPH_FAR && (m->run_least_far == 0 || job->ns < m->run_least_far)) {
+      m->run_least_far = job->ns;
+    }
+    m->run_took(first, job->out, m->run_ctx);
+    return;
+  }
+  for i in 0..count {
+    var out: int64 = 0;
+    for byte in 0..8 {
+      out = out | ((int64)job->back[(Word)i * 8 + (Word)byte] << ((int64)byte * 8));
+    }
+    m->run_took(first + (Word)i, (Word)out, m->run_ctx);
+  }
+}
+
+// Does pieces 0 to total - 1 of a kind set up with piece, and returns when
+// all are answered. took is called with each piece's number, what it gave,
+// and ctx. Pieces of little work are handed out several to a job, so that
+// handing out costs little beside the work: the first few are done alone
+// to time one, and the rest go in jobs of about a quarter of a millisecond
+// of work, up to 64 pieces. Call it as work is called. Returns how many
+// pieces were not done.
+export fn AlphMachine_pieces__ptr(m: AlphMachine*, kind: Word, total: Word,
+                                  took: fn(Word, Word, rawptr) -> void, ctx: rawptr) -> Word {
+  var tried: Word = total;
+  if (tried > RUN_TRIED) {
+    tried = RUN_TRIED;
+  }
+  m->run_took = took;
+  m->run_ctx = ctx;
+  m->run_total = total;
+  m->run_undone = 0;
+  m->run_least = 0;
+  m->run_least_far = 0;
+  m->run_first = 0;
+  m->run = 1;
+  m->work(kind, tried, &alph_machine_run_fill, &alph_machine_run_took, (rawptr)m);
+  if (tried == total) {
+    return m->run_undone;
+  }
+  // A board takes one piece at a time, and a job done at most once gives
+  // no bytes back: with either, a job stays one piece.
+  if (m->run_least == 0) {
+    m->run_least = m->run_least_far;  // no way here: timed with the way to another machine
+  }
+  if (m->run_least > 0 && m->board_count == 0 && kind >= 0 && kind < 8 && m->kinds[kind].once == 0) {
+    m->run = (Word)(RUN_NS / m->run_least);
+    if (m->run > RUN_MOST) {
+      m->run = RUN_MOST;
+    }
+    if (m->run < 1) {
+      m->run = 1;
+    }
+  }
+  m->run_first = tried;
+  m->work(kind, (Word)((total - tried + m->run - 1) / m->run), &alph_machine_run_fill, &alph_machine_run_took, (rawptr)m);
+  return m->run_undone;
 }
 
 // Runs the cores until stop, the first on this thread.

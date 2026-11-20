@@ -26,41 +26,44 @@ Build with `-s`. Without it the compiler turns a failed check (a bad index, a di
 
 Most programs on Linux want the same thing: some work, done on whatever cores, GPU and other machines there are. Two layers give that in a few lines. `AlphMachine` is all the layers below set up in one call. `AlphBatch` hands out one kind of work in pieces and gathers the answers.
 
-The shortest program is [examples/primes.mettle](../examples/primes.mettle). It says how a piece of the work is done and what to do with each answer, and one call does the rest:
+The shortest program is [examples/primes.mettle](../examples/primes.mettle). It says how one piece of the work is done and what to do with each answer, and one call does the rest:
 
 ```mettle
 import "alph/actor/actor";
 import "alph/machine/machine";
-import "alph/batch/batch";
 
-const PRIMES: Word = 0;    // the kind of job: in is a chunk's number, out the primes in it
+const PRIMES: Word = 0;    // the kind of work
 const CHUNKS: Word = 200;
 
 var g_m: AlphMachine;
 var g_primes: Word = 0;
 
-// The work: a function that takes a job and fills in its out.
-fn count_primes(job: AlphJob*) -> Word {
+// One piece: a number in, a number out.
+fn primes_in(chunk: Word) -> Word {
   ...
-  job->out = found;
-  return 0;
+  return found;
 }
 
 // Called with each answer.
-fn counted(b: AlphBatch*, job: AlphJob*, chunk: Word) {
-  g_primes = g_primes + job->out;
+fn counted(chunk: Word, found: Word, ctx: rawptr) {
+  g_primes = g_primes + found;
 }
 
 fn main() -> int32 {
-  g_m.init(4, 0, false);               // four cores: one hands out, three work
-  g_m.kind(PRIMES, &count_primes, 0);  // how the work is done on a core; it has no GPU way
-  var undone: Word = g_m.work(PRIMES, CHUNKS, 0, &counted, 0);
+  g_m.init(4, 0, false);            // four cores: one hands out, three work
+  g_m.piece(PRIMES, &primes_in);    // how one piece of the work is done
+  var undone: Word = g_m.pieces(PRIMES, CHUNKS, &counted, 0);
   g_m.shut();
   return 0;
 }
 ```
 
-`work(kind, total, fill, took, ctx)` does `total` pieces and returns when every one is answered, with how many were not done. Each piece is a job whose `in` is the piece's number. `fill`, 0 here, is called before a piece goes out when it needs more than that. `g_m.worked` is the batch, for its counts: `g_m.worked.by_way[ALPH_GPU]`, say. Call `work` from the program's main thread. A program that does other things while the work runs has an actor own the batch, as below.
+- `piece(kind, f)` says how one piece of a kind is done: a function from a number to a number, with nothing else going in or out, so it can run on any core of any machine. A board shares the same kind of function.
+- `pieces(kind, total, took, ctx)` does pieces 0 to `total - 1` and returns when every one is answered, with how many were not done. `took(piece, out, ctx)` is called with each answer.
+- Pieces of little work go several to a job. The first 32 are done alone to time one, and the rest go in jobs of about a quarter of a millisecond of work, up to 64 pieces. So a piece that takes a microsecond is still worth handing out: 200,000 of them take 25 to 40 ms on eight cores, where one job a piece took 100.
+- Call it from the program's main thread. With other machines, `share` the kind on each as below.
+
+Work that carries data, gives bytes back or has a GPU way is a job. `kind(kind, cpu, gpu)` says how it is done, and `work(kind, total, fill, took, ctx)` does `total` jobs and returns when every one is answered, with how many were not done. `fill`, which may be 0, is called before a job goes out to set what it needs, and `took` with each finished job. `g_m.worked` is the batch behind both calls, for its counts: `g_m.worked.by_way[ALPH_GPU]`, say. A program that does other things while the work runs has an actor own the batch, as below.
 
 With other machines the program is the same on each, and each also says who the others are and that the kind is shared. This is [examples/share.mettle](../examples/share.mettle) without its `main`, with an actor that owns the batch:
 
@@ -117,6 +120,7 @@ Every machine runs the same program. Each says how a kind of job is done (`kind`
 - `kind(kind, cpu, gpu)` says how a kind of job (0 to 7) is done: a function for a core and one for the GPU, 0 for a way it does not have.
 - `share(kind)` shares a kind with the other machines, both ways. With several, a job goes to whichever should finish it first: the machine keeps a time for each of the others. Only a job with no home leaves a machine: one word in, or bytes.
 - `board(first, count)` adds a microcontroller on this machine's serial line that takes work too. See "A board that shares work" under A microcontroller.
+- `piece(kind, f)` and `pieces(kind, total, took, ctx)` are the same for work that is a number in and a number out.
 - `work(kind, total, fill, took, ctx)` does a whole batch and returns when it is over.
 - `batch(&batch)` ties a batch to the machine. See The batch below.
 - `longs(memory, each, count)` gives the machine long buffers, so a job for another machine can carry more than 1,024 bytes. `gives(kind, bytes)` says a job of a kind gives back up to that many, when that is more than 1,016. Call both on every machine. See Jobs on other machines.
