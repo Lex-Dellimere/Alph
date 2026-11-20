@@ -1,0 +1,263 @@
+// Shows what a board says on its serial line, for the first day with a real
+// board: is anything coming, is it whole, does the board answer. It opens
+// the line as the computer's side, prints every message that arrives with
+// its parts, and once a second asks the board's door who does kinds 0 to 2,
+// which a board running alph's AlphBoard answers.
+//
+//   mettle --build -s --release examples/mcu/line_watch.mettle -I ports/host -o line_watch
+//   ./line_watch /dev/ttyUSB0            the board is place 8, watch for 10 seconds
+//   ./line_watch /dev/ttyUSB0 1 30       the board is place 1, watch for 30
+//
+// It ends with 0 when at least one whole message came. Bytes that are not
+// a message are counted and shown: a wrong speed or swapped wires look
+// like that.
+
+import "std/io";
+import "std/thread";
+import "port/serial";
+import "port/sys";
+
+const END: int64 = 192;
+const ESC: int64 = 219;
+const SHARED: int64 = 1073741824;
+
+var g_fd: int64 = -1;
+var g_whole: int64 = 0;
+var g_damaged: int64 = 0;
+var g_bytes: int64 = 0;
+
+fn small(out: uint8*, value: int64) -> int64 {
+  var v: int64 = value & 4294967295;
+  var n: int64 = 0;
+  while (v >= 128) {
+    out[n] = (uint8)((v & 127) | 128);
+    v = v >> 7;
+    n = n + 1;
+  }
+  out[n] = (uint8)v;
+  return n + 1;
+}
+
+fn fold(value: int64) -> int64 {
+  if (value < 0) {
+    return (-value - 1) * 2 + 1;
+  }
+  return value * 2;
+}
+
+fn unfold(z: int64) -> int64 {
+  if ((z & 1) != 0) {
+    return -(z >> 1) - 1;
+  }
+  return z >> 1;
+}
+
+fn sum_of(f: uint8*, count: int64) -> int64 {
+  var s: int64 = 0;
+  for i in 0..count {
+    s = (s + (int64)f[i] * ((int64)i + 1)) & 65535;
+  }
+  return s;
+}
+
+fn big(f: uint8*, at: int64*, end: int64) -> int64 {
+  var v: int64 = 0;
+  var shift: int64 = 0;
+  while (*at < end) {
+    var b: int64 = (int64)f[*at];
+    *at = *at + 1;
+    v = v | ((b & 127) << shift);
+    shift = shift + 7;
+    if (b < 128) {
+      return v;
+    }
+  }
+  return -1;
+}
+
+// Asks the door of the board at `place` who does a kind there.
+fn ask(place: int64, kind: int64) {
+  var f: uint8[48];
+  var out: uint8[100];
+  var n: int64 = small(&f[0], place);
+  n = n + small(&f[n], 1);
+  n = n + small(&f[n], 0);
+  n = n + small(&f[n], 0);
+  n = n + small(&f[n], 1);
+  n = n + small(&f[n], 5);
+  n = n + small(&f[n], fold(-10));
+  n = n + small(&f[n], fold(SHARED + kind));
+  n = n + small(&f[n], fold(kind + 1));
+  var s: int64 = sum_of(&f[0], n);
+  f[n] = (uint8)(s & 255);
+  f[n + 1] = (uint8)(s >> 8);
+  var m: int64 = 0;
+  for i in 0..(n + 2) {
+    var b: int64 = (int64)f[i];
+    if (b == END) {
+      out[m] = (uint8)ESC;
+      out[m + 1] = 220;
+      m = m + 2;
+    } else if (b == ESC) {
+      out[m] = (uint8)ESC;
+      out[m + 1] = 221;
+      m = m + 2;
+    } else {
+      out[m] = (uint8)b;
+      m = m + 1;
+    }
+  }
+  out[m] = (uint8)END;
+  syscall(ALPH_NR_WRITE, g_fd, (int64)&out[0], m + 1);
+}
+
+fn name_of(tag: int64) -> string {
+  if (tag == -10) {
+    return "where";
+  }
+  if (tag == -11) {
+    return "here";
+  }
+  if (tag == -13) {
+    return "work";
+  }
+  if (tag == -14) {
+    return "worked";
+  }
+  if (tag == -18) {
+    return "refused";
+  }
+  if (tag == -21) {
+    return "work once";
+  }
+  if (tag == -22) {
+    return "hello";
+  }
+  return "the program's own";
+}
+
+// One frame off the line, without its escapes.
+fn show(f: uint8*, n: int64) {
+  var end: int64 = n - 2;
+  var at: int64 = 0;
+  var parts: int64[9];
+  if (n == 7) {
+    println("<- a sure line's header: kind {f[0]}, number {f[1]}, has up to {f[2]}");
+    g_whole = g_whole + 1;
+    return;
+  }
+  var sound: bool = n >= 11 && n <= 47 && (int64)f[end] + (int64)f[end + 1] * 256 == sum_of(f, end);
+  if (sound) {
+    for k in 0..9 {
+      parts[k] = big(f, &at, end);
+    }
+  }
+  if (!sound || at != end) {
+    g_damaged = g_damaged + 1;
+    print("<- {n} bytes that are not a whole message:");
+    for i in 0..n {
+      if (i < 24) {
+        print(" {f[i]}");
+      }
+    }
+    println("");
+    return;
+  }
+  g_whole = g_whole + 1;
+  var tag: int64 = unfold(parts[6]);
+  println("<- to place {parts[0]} slot {parts[2]}, from place {parts[3]} slot {parts[5]}: tag {tag} ({name_of(tag)}), arg {unfold(parts[7])}, ref {unfold(parts[8])}");
+}
+
+fn number(text: cstring) -> int64 {
+  var n: int64 = 0;
+  var i: int32 = 0;
+  while (text[i] >= 48 && text[i] <= 57) {
+    n = n * 10 + (int64)(text[i] - 48);
+    i = i + 1;
+  }
+  return n;
+}
+
+fn now_ms() -> int64 {
+  var ts: int64[2];
+  syscall(ALPH_NR_CLOCK_GETTIME, 1, (int64)&ts[0]);
+  return ts[0] * 1000 + ts[1] / 1000000;
+}
+
+fn main(argc: int32, argv: cstring*) -> int32 {
+  if (argc < 2) {
+    println("line_watch <serial device> [the board's place, 8] [seconds, 10]");
+    return 2;
+  }
+  var place: int64 = 8;
+  var seconds: int64 = 10;
+  if (argc > 2) {
+    place = number(argv[2]);
+  }
+  if (argc > 3) {
+    seconds = number(argv[3]);
+  }
+  g_fd = alph_serial_open(argv[1], 115200);
+  if (g_fd < 0) {
+    println("the serial device cannot be opened");
+    return 2;
+  }
+  syscall(ALPH_NR_FCNTL, g_fd, 4, 2048);  // reads do not wait
+  var f: uint8[64];
+  var n: int64 = 0;
+  var escaped: bool = false;
+  var buffer: uint8[256];
+  var began: int64 = now_ms();
+  var asked: int64 = began - 1000;
+  var kind: int64 = 0;
+  while (now_ms() - began < seconds * 1000) {
+    if (now_ms() - asked >= 1000) {
+      asked = now_ms();
+      println("-> asking the door of place {place} who does kind {kind}");
+      ask(place, kind);
+      kind = (kind + 1) % 3;
+    }
+    var got: int64 = syscall(ALPH_NR_READ, g_fd, (int64)&buffer[0], 256);
+    if (got <= 0) {
+      Sleep(2);
+      continue;
+    }
+    g_bytes = g_bytes + got;
+    for i in 0..got {
+      var b: int64 = (int64)buffer[i];
+      if (b == END) {
+        if (n > 0) {
+          show(&f[0], n);
+        }
+        n = 0;
+        escaped = false;
+        continue;
+      }
+      if (escaped) {
+        escaped = false;
+        if (b == 220) {
+          b = END;
+        } else {
+          b = ESC;
+        }
+      } else if (b == ESC) {
+        escaped = true;
+        continue;
+      }
+      if (n < 64) {
+        f[n] = (uint8)b;
+      }
+      n = n + 1;
+    }
+  }
+  println("{g_bytes} bytes came in {seconds} seconds: {g_whole} whole messages, {g_damaged} that were not");
+  if (g_bytes == 0) {
+    println("nothing came: is the board powered and running, are its GP0 and GP1 wired to the adapter's RX and TX, is this the right device");
+  } else if (g_whole == 0) {
+    println("bytes came but no whole message: the speed may differ (the board's UART is 115200 baud), or the board is not running alph's tether");
+  }
+  if (g_whole == 0) {
+    return 1;
+  }
+  return 0;
+}

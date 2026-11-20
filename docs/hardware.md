@@ -12,6 +12,15 @@ UART0 on GP0 and GP1 at 115200 baud is the board's line. The USB cable only powe
 
 To load a program, hold BOOTSEL while plugging the board in and copy the `.uf2` file onto the `RP2350` drive.
 
+## When a step fails: look at the line
+
+```bash
+mettle --build -s --release examples/mcu/line_watch.mettle -I ports/host -o line_watch
+./line_watch /dev/ttyUSB0 8 10
+```
+
+`line_watch` opens the line as the computer's side, prints every message the board sends with its parts, and once a second asks the board who does kinds 0 to 2, which any board running `AlphBoard` answers. The two numbers after the device are the board's place (8 in the arm example, 1 in the tether example) and how many seconds to watch. If nothing comes, the board is not running or the wires are wrong. If bytes come that are not whole messages, it shows them: a wrong speed looks like that. If answers come, the line is good and the fault is further up.
+
 ## Step 1: the board runs alph
 
 ```bash

@@ -293,6 +293,7 @@ build_board() {
       "$METTLE" --release tests/mcu/second_board.mettle --target riscv32-none --board qemu-virt \
         --emit-flat "$OUT/second_board.bin" -I ports/mcu >> "$log" 2>&1 &&
       "$METTLE" --build -s --release examples/mcu/arm_host.mettle -I ports/host -o "$OUT/arm_host" >> "$log" 2>&1 &&
+      "$METTLE" --build -s --release examples/mcu/line_watch.mettle -I ports/host -o "$OUT/line_watch" >> "$log" 2>&1 &&
       "$METTLE" --build -s --release tests/mcu/arm_test.mettle -I ports/host -o "$OUT/arm_test" >> "$log" 2>&1 || status=1
       ;;
     harts)
@@ -606,6 +607,28 @@ step_device() {
     echo "ok    mcu/device [the arm example with the board on a serial device, not a TCP port]"
   else
     echo "FAIL  mcu/device: host exit $code, board exit $board, device '$dev' (see $log)"
+    fails=$((fails + 1))
+  fi
+  # The tool for the first day with a real board: it asks the board's door
+  # three questions over the same kind of device and shows the answers.
+  timeout 30 qemu-system-riscv32 -M virt -bios none -display none -monitor none \
+    -serial pty -device loader,file="$OUT/arm.bin",addr=0x80000000,force-raw=on > "$log.watch" 2>&1 &
+  board_pid=$!
+  n=0
+  until grep -q '/dev/pts/' "$log.watch" || [ "$n" -ge 50 ]; do
+    sleep 0.1
+    n=$((n + 1))
+  done
+  dev=$(grep -o '/dev/pts/[0-9]*' "$log.watch" | head -n 1)
+  timeout 20 "$OUT/line_watch" "$dev" 8 3 > "$log.host" 2>&1
+  code=$?
+  kill "$board_pid" 2> /dev/null
+  wait "$board_pid" 2> /dev/null
+  cat "$log.host" >> "$log"
+  if [ "$code" -eq 0 ] && [ "$(grep -c '(here), arg 1' "$log.host")" -eq 3 ]; then
+    echo "ok    mcu/watch [line_watch shows a board's three answers on a serial device]"
+  else
+    echo "FAIL  mcu/watch: exit $code (see $log)"
     fails=$((fails + 1))
   fi
 }

@@ -179,9 +179,17 @@ fn main() -> int32 {
   both(LENGTH, pid_a, pid_b);
   expect(g_sides[0].batch.over() && g_sides[1].batch.over(), "batches of jobs with bytes are answered in full");
   expect(g_sides[0].wrong == 0 && g_sides[1].wrong == 0, "and rightly ({g_sides[0].wrong} and {g_sides[1].wrong} wrong)");
-  var used: Word = 0;
-  for i in 0..16 {
-    used = used + g_a.parcels[i].used + g_b.parcels[i].used;
+  // A machine keeps a parcel until the other says it has it, and that word
+  // can come a moment after the answer: wait for it.
+  var used: Word = 1;
+  var settled: int32 = 0;
+  while (used != 0 && settled < 2000) {
+    used = 0;
+    for i in 0..16 {
+      used = used + g_a.parcels[i].used + g_b.parcels[i].used;
+    }
+    Sleep(1);
+    settled = settled + 1;
   }
   expect(used == 0, "every parcel is back in its pool ({used} are not)");
 

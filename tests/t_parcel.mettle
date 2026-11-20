@@ -214,12 +214,20 @@ fn main() -> int32 {
   expect(s.back == TOTAL && s.bad == 0, "every parcel is answered with the right sum, in order ({s.back} of {TOTAL}, {s.bad} bad)");
   expect(c.bad == 0, "each arrived once, whole and in its turn ({c.bad} did not)");
   expect(g_a_link.resent > 0, "though some were sent again ({g_a_link.resent})");
-  var used: Word = 0;
-  for i in 0..8 {
-    used = used + g_a_parcels[i].used;
-  }
-  for i in 0..4 {
-    used = used + g_b_parcels[i].used;
+  // A parcel is kept until the other machine says it has it, and that
+  // word can come a moment after the answer: wait for it.
+  var used: Word = 1;
+  waited = 0;
+  while (used != 0 && waited < 2000) {
+    used = 0;
+    for i in 0..8 {
+      used = used + g_a_parcels[i].used;
+    }
+    for i in 0..4 {
+      used = used + g_b_parcels[i].used;
+    }
+    Sleep(1);
+    waited = waited + 1;
   }
   expect(used == 0, "every parcel is back in its pool ({used} are not)");
 
