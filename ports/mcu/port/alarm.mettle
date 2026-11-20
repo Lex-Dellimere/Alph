@@ -12,8 +12,10 @@ export struct AlphAlarm {
 
 // Time in ticks of 1,024 microseconds: a shift, where milliseconds would be
 // a 64-bit division on a 32-bit CPU. A 32-bit count goes round every 50
-// days, so times are compared by their difference.
-export fn alph_now() -> Word {
+// days, so times are compared by their difference. Kept out of line: the
+// 64-bit shift is many instructions on a 32-bit CPU, and it is called from
+// many places.
+@noinline export fn alph_now() -> Word {
   return (Word)(mettle_board_time_us() >> 10);
 }
 

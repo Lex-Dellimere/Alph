@@ -43,7 +43,7 @@ export fn AlphOnce_init__ptr(o: AlphOnce*) {
   }
 }
 
-fn alph_once_row(o: AlphOnce*, from: Word) -> Word {
+@noinline fn alph_once_row(o: AlphOnce*, from: Word) -> Word {
   for i in 0..8 {
     if (o->asker[i] == from) {
       o->clock = o->clock + 1;

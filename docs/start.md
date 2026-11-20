@@ -741,7 +741,7 @@ mettle --release examples/mcu/blink.mettle --target riscv32-none --board qemu-vi
 qemu-system-riscv32 -M virt -bios none -nographic -device loader,file=blink.bin,addr=0x80000000,force-raw=on
 ```
 
-The whole image of this program, board startup included, is 3,256 bytes: about 1.3 KB of core, 1.1 KB of timers and alarm, and the rest the board and the program. `check.sh` fails the build above 5 KB.
+The whole image of this program, board startup included, is 3,048 bytes: about 1.3 KB of core, 0.9 KB of timers and alarm, and the rest the board and the program. `check.sh` fails the build above 5 KB.
 
 **A Raspberry Pi Pico 2.** The examples in `examples/mcu` are the same source for a Pico 2, on its RISC-V cores. Build with the Pico's port in front of the one-hart port. A program calls `alph_board_start()` first in `main`, which does what each board needs:
 
@@ -880,7 +880,7 @@ g_board.share_once(MOVE, &move, &g_moves);
 - A job that was refused before it was ever sent a second time was not done, and is placed again as usual.
 - Such a job carries a word and gives a word back, no bytes. At most four are out to one worker at once.
 - Without the short way: `g_places.once(kind)` on the asking side, and the worker uses `AlphOnce` from `alph/place/once`, as `src/board/once.mettle` does.
-- A board that shares no such kind pays nothing for this. With one, the arm example's image goes from 4,176 to 5,280 bytes.
+- A board that shares no such kind pays nothing for this. With one, the arm example's image goes from 4,176 to 5,152 bytes.
 
 A board asks for such work too, of a computer or of another board. One `AlphBoardAsks` is one kind, asked by one actor:
 
