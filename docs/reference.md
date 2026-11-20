@@ -88,6 +88,22 @@ export struct AlphMachine {
   run_ctx: rawptr;        // with its own
   run_bytes: uint8*;      // pieces with bytes: every piece's bytes one after another, 0 for none,
   run_each: Word;         // and how many a piece has
+  rows_actor: Word;       // the actor that hands the runs out
+  rows_on: Word;          // it is at work
+  rows_out: Word;         // jobs out
+  rows_free: Word;        // slots not in use
+  rows_nudged: Word;
+  rows_from: Word[128];   // by slot: the first piece of the job it carries,
+  rows_len: Word[128];    // how many pieces,
+  rows_half: Word[128];   // and which half of the GPU's answers it has, plus one: 0 for none
+  rows_again: Word;       // runs not done, to hand out again:
+  rows_again_from: Word[130];
+  rows_again_len: Word[130];
+  rows_by: Word[3];       // pieces done each way: ALPH_CPU, ALPH_GPU, ALPH_FAR
+  gpu_outs: Word*[8];     // by kind: the program's memory for the answers of the GPU's jobs (piece_gpu),
+  gpu_room: Word[8];      // and how many fit there
+  gpu_used: Word[2];      // which half of it a job out has
+  gpu_run: Word;          // pieces the GPU's next job takes
   outs: uint8[73728];     // what each job of several pieces gives back: 512 bytes a slot
   timekeeper: Word;       // the actor that keeps this machine's time in step with the others' (now)
   time_off: Word;         // what is added to this machine's own clock to give that time, in ns
@@ -383,6 +399,27 @@ how many they are, and returns a number. It must read nothing else, so
 it can run on any core of any machine. pieces_of then hands the work
 out. Call it on every machine, then share.
 
+### `AlphMachine_piece_gpu__ptr`
+
+```mettle
+export fn AlphMachine_piece_gpu__ptr(m: AlphMachine*, kind: Word, run: fn(Word, uint8*, Word, Word, Word*) -> Word,
+                                     outs: Word*, room: Word)
+```
+
+Call it as `m->piece_gpu(kind, run, outs, room)`, or `m.piece_gpu(kind, run, outs, room)` on a value.
+
+Says how pieces of a kind set up with piece or piece_of are done on the
+GPU, many at once: run(first, bytes, each, count, outs) does pieces
+first to first + count - 1 and puts what each gives in outs. bytes is
+the first one's and each how many a piece has, both 0 for a kind with no
+bytes. It returns 0, or non-zero when there is no GPU, after which the
+GPU is not tried again. It runs on the GPU's own core, which the machine
+has when init was told so. outs is the program's memory for the answers
+of the GPU's jobs, with room for `room` of them: two jobs share it, so
+one job is at most half of it. The GPU is given much bigger jobs than a
+core, since starting one costs it the same for one piece as for
+thousands. Call it after piece or piece_of.
+
 ### `AlphMachine_pieces__ptr`
 
 ```mettle
@@ -397,8 +434,10 @@ all are answered. took is called with each piece's number, what it gave,
 and ctx. Pieces of little work are handed out several to a job, so that
 handing out costs little beside the work: the first few are done alone
 to time one, and the rest go in jobs of about a quarter of a millisecond
-of work, up to 64 pieces. Call it as work is called. Returns how many
-pieces were not done.
+of work, up to 64 pieces. A GPU set up with piece_gpu gets much bigger
+jobs. Call it as work is called. Returns how many pieces were not done.
+Afterwards m->rows_by says how many pieces each way did (ALPH_CPU,
+ALPH_GPU, ALPH_FAR), the first few aside.
 
 ### `AlphMachine_pieces_of__ptr`
 
@@ -1168,8 +1207,9 @@ export fn AlphCores_run__ptr(c: AlphCores*)
 Call it as `c->run()`, or `c.run()` on a value.
 
 Runs every core until stop: the first on this thread, the rest on their
-own. Every run starts new threads, so what belongs to a thread (a GPU a
-handler opened) does not last from one run to the next.
+own. On Linux a core keeps its thread from one run to the next, so what
+belongs to a thread (a GPU a handler opened) lasts, and running again
+costs a wake and not a new thread.
 
 ### `AlphCores_stop__ptr`
 
@@ -1519,6 +1559,8 @@ export struct AlphKind {
   cpu: fn(AlphJob*) -> Word;
   gpu: fn(AlphJob*) -> Word;
   bring: fn(AlphJob*) -> Word;
+  fit: fn(AlphJob*, Word, rawptr) -> void;  // called when a job's place is picked, 0 for none (fit)
+  fit_ctx: rawptr;
   once: Word;      // a job of this kind is never done twice
   far: Word;       // an actor on another machine that does this kind's work, 0 when no machine does
   off: Word[3];    // this way cannot run the kind
@@ -1661,6 +1703,20 @@ Says how a kind's data on the GPU is brought to the host. It runs on the
 GPU's place and returns 0, or non-zero when it could not, after which it
 is not tried again. Without it, a job whose data is on the GPU runs only
 there. Call it after kind.
+
+### `AlphPlaces_fit__ptr`
+
+```mettle
+export fn AlphPlaces_fit__ptr(p: AlphPlaces*, kind: Word, fit: fn(AlphJob*, Word, rawptr) -> void, ctx: rawptr)
+```
+
+Call it as `p->fit(kind, fit, ctx)`, or `p.fit(kind, fit, ctx)` on a value.
+
+Has fit called whenever a place is picked for a job of this kind, with
+the job, the place's way (ALPH_CPU, ALPH_GPU or ALPH_FAR) and ctx, on
+the thread that asked, before the job is sent there. It may change what
+the job carries to suit the way: more work for a GPU, say. Call it after
+kind.
 
 ### `AlphPlaces_far_at__ptr`
 

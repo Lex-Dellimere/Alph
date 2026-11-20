@@ -143,8 +143,9 @@ fn alph_core_main(arg: cstring) -> uint32 {
 }
 
 // Runs every core until stop: the first on this thread, the rest on their
-// own. Every run starts new threads, so what belongs to a thread (a GPU a
-// handler opened) does not last from one run to the next.
+// own. On Linux a core keeps its thread from one run to the next, so what
+// belongs to a thread (a GPU a handler opened) lasts, and running again
+// costs a wake and not a new thread.
 export fn AlphCores_run__ptr(c: AlphCores*) {
   for i in 1..c->count {
     c->cores[i].thread = alph_cpu_start(i, &alph_core_main, (cstring)&c->cores[i]);

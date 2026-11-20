@@ -100,6 +100,8 @@ export struct AlphKind {
   cpu: fn(AlphJob*) -> Word;
   gpu: fn(AlphJob*) -> Word;
   bring: fn(AlphJob*) -> Word;
+  fit: fn(AlphJob*, Word, rawptr) -> void;  // called when a job's place is picked, 0 for none (fit)
+  fit_ctx: rawptr;
   once: Word;      // a job of this kind is never done twice
   far: Word;       // an actor on another machine that does this kind's work, 0 when no machine does
   off: Word[3];    // this way cannot run the kind
@@ -236,6 +238,7 @@ export fn AlphPlaces_init__ptr(p: AlphPlaces*, places: AlphPlace*, room: Word, k
   for i in 0..count {
     kinds[i].off[0] = 1;
     kinds[i].off[1] = 1;
+    kinds[i].fit = 0;
   }
 }
 
@@ -258,6 +261,7 @@ export fn AlphPlaces_kind__ptr(p: AlphPlaces*, kind: Word, cpu: fn(AlphJob*) -> 
   k->cpu = cpu;
   k->gpu = gpu;
   k->bring = 0;
+  k->fit = 0;
   k->once = 0;
   k->off[ALPH_CPU] = 0;
   k->far = 0;
@@ -306,6 +310,16 @@ export fn AlphPlaces_once__ptr(p: AlphPlaces*, kind: Word) {
 // there. Call it after kind.
 export fn AlphPlaces_bring__ptr(p: AlphPlaces*, kind: Word, bring: fn(AlphJob*) -> Word) {
   p->kinds[kind].bring = bring;
+}
+
+// Has fit called whenever a place is picked for a job of this kind, with
+// the job, the place's way (ALPH_CPU, ALPH_GPU or ALPH_FAR) and ctx, on
+// the thread that asked, before the job is sent there. It may change what
+// the job carries to suit the way: more work for a GPU, say. Call it after
+// kind.
+export fn AlphPlaces_fit__ptr(p: AlphPlaces*, kind: Word, fit: fn(AlphJob*, Word, rawptr) -> void, ctx: rawptr) {
+  p->kinds[kind].fit = fit;
+  p->kinds[kind].fit_ctx = ctx;
 }
 
 // A far way is open for a kind while some far place has a worker for it.
@@ -716,6 +730,9 @@ fn alph_place_ask(p: AlphPlaces*, a: AlphActor*, job: AlphJob*, soon: bool) -> W
   var x: AlphPlace* = alph_place_pick(p, job, soon);
   if (x == 0) {
     return job->status;
+  }
+  if (p->kinds[job->kind].fit != 0) {
+    p->kinds[job->kind].fit(job, x->way, p->kinds[job->kind].fit_ctx);
   }
   var pid: Word = 0;
   var tag: Word = 0;

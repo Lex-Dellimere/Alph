@@ -1,0 +1,146 @@
+// The short way with a GPU: which of 100,000 poses brings an arm's tip
+// closest to a point. A pose is six joint angles, a byte each. One function,
+// reach, tries a pose and 63 small changes to its last two joints and says
+// how far the best of them misses. A core calls it for one pose at a time.
+// The GPU runs it for thousands at once, through a kernel of three lines.
+//
+// The program says how one pose is tried, how a run of them is done on the
+// GPU, and what to do with each answer. alph hands the poses out: small
+// jobs to the cores, much bigger ones to the GPU, since starting a job
+// costs a GPU the same for one pose as for thousands. On a machine with no
+// GPU the cores do them all.
+//
+//   mettle --build -s --release examples/reach.mettle -I ports/host -o reach
+
+import "std/io";
+import "std/gpu";
+import "alph/actor/actor";
+import "alph/machine/machine";
+
+const REACH: Word = 0;      // the kind of work
+const POSES: Word = 100000;
+const EACH: Word = 8;       // bytes in a pose: six angles and two to spare
+const TARGET_X: Word = 40;  // the point the tip should reach
+const TARGET_Y: Word = 55;
+const AT_ONCE: Word = 65536;  // answers of the GPU's jobs that fit the memory given for them
+
+var g_m: AlphMachine;
+var g_poses: uint8[800000];
+var g_answers: Word[65536];
+var g_best: Word = -1;      // the least miss so far,
+var g_best_pose: Word = 0;  // and the pose that gave it
+var g_sum: Word = 0;
+var g_on_gpu: int64 = 0;    // the poses on the GPU,
+var g_from_gpu: int64 = 0;  // and their answers there
+var g_gpu_state: int32 = 0;  // 0 not tried, 1 ready, 2 none
+
+// The sine of an angle of which 256 are a full turn, times 16,384: a
+// parabola, in whole numbers, so a core and the GPU get the same.
+fn sine(angle: Word) -> Word {
+  var a: Word = (Word)(angle & 255);
+  if (a < 128) {
+    return (Word)(4 * a * (128 - a));
+  }
+  a = a - 128;
+  return (Word)(0 - 4 * a * (128 - a));
+}
+
+// One piece: how far the tip misses the point, squared, for the best of
+// this pose and 63 small changes to its last two joints. Which change it
+// was is in the low six bits.
+fn reach(pose: Word, bytes: uint8*, count: Word) -> Word {
+  var best: Word = 0;
+  var change: Word = 0;
+  while (change < 64) {
+    var angle: Word = 0;
+    var x: Word = 0;
+    var y: Word = 0;
+    var link: Word = 30;
+    var joint: Word = 0;
+    while (joint < 6) {
+      angle = angle + (Word)bytes[joint];
+      if (joint == 4) {
+        angle = angle + (Word)(change & 7) - 4;
+      }
+      if (joint == 5) {
+        angle = angle + (Word)((change >> 3) & 7) - 4;
+      }
+      x = x + link * sine(angle + 64);
+      y = y + link * sine(angle);
+      link = link - 5;
+      joint = joint + 1;
+    }
+    var dx: Word = (Word)(x / 16384) - TARGET_X;
+    var dy: Word = (Word)(y / 16384) - TARGET_Y;
+    var miss: Word = (Word)((dx * dx + dy * dy) * 64 + change);
+    if (change == 0 || miss < best) {
+      best = miss;
+    }
+    change = change + 1;
+  }
+  return best;
+}
+
+kernel(block = 256) reach_kernel(poses: uint8*, answers: int64*, first: int64, count: int32) {
+  var i: int32 = block.x * block_dim.x + thread.x;
+  if (i < count) {
+    answers[i] = (int64)reach((Word)(first + (int64)i), poses + i * 8, 8);
+  }
+}
+
+// A run of poses on the GPU. It runs on the GPU's own core, which is the
+// thread that opens the GPU.
+fn reach_gpu(first: Word, bytes: uint8*, each: Word, count: Word, answers: Word*) -> Word {
+  if (g_gpu_state == 0) {
+    g_gpu_state = 2;
+    if (gpu_init() != 0) {
+      g_on_gpu = gpu_malloc((int64)(AT_ONCE * EACH));
+      g_from_gpu = gpu_malloc((int64)(AT_ONCE * 8));
+      if (g_on_gpu != 0 && g_from_gpu != 0) {
+        g_gpu_state = 1;
+      }
+    }
+  }
+  if (g_gpu_state != 1 || gpu_to_device(g_on_gpu, bytes, (int64)(count * each)) != 0) {
+    return 1;  // no GPU: the cores do the poses, and this is not tried again
+  }
+  dispatch reach_kernel[work: (int32)count](g_on_gpu, g_from_gpu, (int64)first, (int32)count);
+  if (gpu_sync() != 0 || gpu_to_host((uint8*)answers, g_from_gpu, (int64)(count * 8)) != 0) {
+    return 1;
+  }
+  return 0;
+}
+
+// Called with each answer.
+fn tried(pose: Word, miss: Word, ctx: rawptr) {
+  g_sum = g_sum + miss;
+  if (g_best < 0 || miss < g_best) {
+    g_best = miss;
+    g_best_pose = pose;
+  }
+}
+
+fn main() -> int32 {
+  var seed: Word = 12345;
+  for i in 0..800000 {
+    seed = (Word)((seed * 1103515245 + 12345) & 2147483647);
+    g_poses[i] = (uint8)((seed >> 16) & 255);
+  }
+
+  g_m.init(4, 0, true);              // four cores: one hands out, two work, one is the GPU's
+  g_m.piece_of(REACH, &reach);       // how one pose is tried
+  g_m.piece_gpu(REACH, &reach_gpu, &g_answers[0], AT_ONCE);  // and a run of them on the GPU
+  var undone: Word = g_m.pieces_of(REACH, POSES, &g_poses[0], EACH, &tried, 0);
+  g_m.shut();
+
+  // The same poses one after another, to check every answer.
+  var sum: Word = 0;
+  for i in 0..POSES {
+    sum = sum + reach((Word)i, &g_poses[(Word)i * EACH], EACH);
+  }
+  println("pose {g_best_pose} misses the point by {g_best / 64} squared: {POSES} poses tried, {g_m.rows_by[ALPH_GPU]} on the GPU in {g_m.worked.by_way[ALPH_GPU]} jobs and {g_m.rows_by[ALPH_CPU]} on this machine's cores");
+  if (undone != 0 || g_sum != sum) {
+    return 1;
+  }
+  return 0;
+}

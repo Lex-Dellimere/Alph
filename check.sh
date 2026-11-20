@@ -60,7 +60,7 @@ PORTS="t_door:8000 t_poll:8000 t_link:12000 t_parcel:12000 t_machine:12000
   far:7401 talk:7411 run:7441 share:7451 picture:7471 frames:7481 record:record"
 # --quick: the new layers only, for use between small edits.
 QUICK_TESTS="t_actor t_cores t_time t_wheel t_places t_life t_link t_seal t_door t_far t_parcel t_poll t_proc t_tether t_batch t_machine t_three t_own t_cross t_back t_once t_serial t_tether_sure t_wide t_long t_big t_bundle t_pieces t_clock t_record"
-QUICK_EXAMPLES="count primes readings spread render far run share picture frames tiles talk record"
+QUICK_EXAMPLES="count primes readings reach spread render far run share picture frames tiles talk record"
 mkdir -p "$OUT"
 
 # Any exit, Ctrl-C included, stops every process this script started and
@@ -353,7 +353,7 @@ build_board() {
       for src in tests/t_actor tests/t_cores tests/t_cross tests/t_time tests/t_wheel tests/t_places \
           tests/t_life tests/t_link tests/t_seal tests/t_door tests/t_far tests/t_parcel tests/t_poll \
           tests/t_proc tests/t_tether tests/t_batch tests/t_machine tests/t_three tests/t_own \
-          tests/t_serial tests/t_back tests/t_once tests/t_wide tests/t_long tests/t_big tests/t_bundle tests/t_pieces tests/t_clock tests/t_record examples/record examples/readings examples/tiles examples/render examples/share \
+          tests/t_serial tests/t_back tests/t_once tests/t_wide tests/t_long tests/t_big tests/t_bundle tests/t_pieces tests/t_clock tests/t_record examples/record examples/readings examples/reach examples/tiles examples/render examples/share \
           examples/picture examples/frames examples/primes examples/run examples/count examples/spread examples/far examples/talk \
           examples/mcu/arm_host examples/mcu/tether_host examples/mcu/relay_host tests/mcu/arm_test; do
         name=$(basename "$src")

@@ -146,6 +146,22 @@ export struct AlphMachine {
   run_ctx: rawptr;        // with its own
   run_bytes: uint8*;      // pieces with bytes: every piece's bytes one after another, 0 for none,
   run_each: Word;         // and how many a piece has
+  rows_actor: Word;       // the actor that hands the runs out
+  rows_on: Word;          // it is at work
+  rows_out: Word;         // jobs out
+  rows_free: Word;        // slots not in use
+  rows_nudged: Word;
+  rows_from: Word[128];   // by slot: the first piece of the job it carries,
+  rows_len: Word[128];    // how many pieces,
+  rows_half: Word[128];   // and which half of the GPU's answers it has, plus one: 0 for none
+  rows_again: Word;       // runs not done, to hand out again:
+  rows_again_from: Word[130];
+  rows_again_len: Word[130];
+  rows_by: Word[3];       // pieces done each way: ALPH_CPU, ALPH_GPU, ALPH_FAR
+  gpu_outs: Word*[8];     // by kind: the program's memory for the answers of the GPU's jobs (piece_gpu),
+  gpu_room: Word[8];      // and how many fit there
+  gpu_used: Word[2];      // which half of it a job out has
+  gpu_run: Word;          // pieces the GPU's next job takes
   outs: uint8[73728];     // what each job of several pieces gives back: 512 bytes a slot
   timekeeper: Word;       // the actor that keeps this machine's time in step with the others' (now)
   time_off: Word;         // what is added to this machine's own clock to give that time, in ns
@@ -559,6 +575,12 @@ export fn AlphMachine_init__ptr(m: AlphMachine*, cores: Word, first: Word, gpu: 
   }
   m->told = 0;
   m->served = 0;
+  m->rows_actor = 0;
+  m->rows_on = 0;
+  for k in 0..8 {
+    m->gpu_outs[k] = 0;
+    m->gpu_room[k] = 0;
+  }
   m->recorded = 0;
   m->slots_used = 0;
   m->work_actor = 0;
@@ -1032,6 +1054,7 @@ export fn AlphMachine_work__ptr(m: AlphMachine*, kind: Word, total: Word,
 struct AlphPiece {
   run: fn(Word) -> Word;
   with: fn(Word, uint8*, Word) -> Word;  // when every piece has bytes of its own
+  gpu: fn(Word, uint8*, Word, Word, Word*) -> Word;  // a run of them on the GPU, 0 for none
 }
 
 var g_piece: AlphPiece[8];
@@ -1040,6 +1063,9 @@ const RUN_SHIFT: Word = 40;        // a job's in: the first piece below this bit
 const RUN_MOST: Word = 64;         // the most pieces in one job: their answers are 8 bytes each
 const RUN_NS: Word = 250000;       // the work a job should hold, so that handing it out costs little
 const RUN_TRIED: Word = 32;        // pieces done alone first, to time one
+const GPU_FIRST: Word = 256;       // pieces in the GPU's first job,
+const GPU_NS: Word = 1000000;      // doubled while a job takes it less than this
+const ROWS_MORE: Word = 2;         // to the actor that hands the runs out: try again
 
 // The same for pieces with bytes: the job's bytes are its pieces' bytes one
 // after another, the same number for each.
@@ -1060,6 +1086,34 @@ fn alph_machine_pieces_of(job: AlphJob*, with: fn(Word, uint8*, Word) -> Word, f
     for b in 0..8 {
       job->back[(Word)i * 8 + (Word)b] = (uint8)((out >> ((int64)b * 8)) & 255);
     }
+  }
+  job->back_count = (Word)(count * 8);
+  job->out = count;
+  return 0;
+}
+
+// The job behind piece_gpu: the same pieces, done all at once by the
+// program's function for the GPU.
+fn alph_machine_pieces_gpu(job: AlphJob*) -> Word {
+  var f: fn(Word, uint8*, Word, Word, Word*) -> Word = g_piece[job->kind].gpu;
+  var count: Word = (Word)(job->in >> RUN_SHIFT);
+  var first: Word = (Word)(job->in - (count << RUN_SHIFT));
+  if (f == 0) {
+    return 1;
+  }
+  if (count <= 0) {
+    var one: Word = 0;
+    if (f(first, job->bytes, job->count, 1, &one) != 0) {
+      return 1;
+    }
+    job->out = one;
+    return 0;
+  }
+  if (job->back == 0 || job->back_room < (Word)(count * 8)) {
+    return 1;
+  }
+  if (f(first, job->bytes, (Word)(job->count / count), count, (Word*)job->back) != 0) {
+    return 1;
   }
   job->back_count = (Word)(count * 8);
   job->out = count;
@@ -1107,6 +1161,7 @@ export fn AlphMachine_piece__ptr(m: AlphMachine*, kind: Word, run: fn(Word) -> W
   if (kind >= 0 && kind < 8) {
     g_piece[kind].run = run;
     g_piece[kind].with = 0;
+    g_piece[kind].gpu = 0;
     m->places.kind(kind, &alph_machine_pieces, 0);
   }
 }
@@ -1120,62 +1175,284 @@ export fn AlphMachine_piece_of__ptr(m: AlphMachine*, kind: Word, run: fn(Word, u
   if (kind >= 0 && kind < 8) {
     g_piece[kind].run = 0;
     g_piece[kind].with = run;
+    g_piece[kind].gpu = 0;
     m->places.kind(kind, &alph_machine_pieces, 0);
   }
+}
+
+// Says how pieces of a kind set up with piece or piece_of are done on the
+// GPU, many at once: run(first, bytes, each, count, outs) does pieces
+// first to first + count - 1 and puts what each gives in outs. bytes is
+// the first one's and each how many a piece has, both 0 for a kind with no
+// bytes. It returns 0, or non-zero when there is no GPU, after which the
+// GPU is not tried again. It runs on the GPU's own core, which the machine
+// has when init was told so. outs is the program's memory for the answers
+// of the GPU's jobs, with room for `room` of them: two jobs share it, so
+// one job is at most half of it. The GPU is given much bigger jobs than a
+// core, since starting one costs it the same for one piece as for
+// thousands. Call it after piece or piece_of.
+export fn AlphMachine_piece_gpu__ptr(m: AlphMachine*, kind: Word, run: fn(Word, uint8*, Word, Word, Word*) -> Word,
+                                     outs: Word*, room: Word) {
+  if (kind >= 0 && kind < 8) {
+    g_piece[kind].gpu = run;
+    m->gpu_outs[kind] = outs;
+    m->gpu_room[kind] = room;
+    m->places.kind(kind, &alph_machine_pieces, &alph_machine_pieces_gpu);
+    m->places.fit(kind, &alph_machine_rows_fit, (rawptr)m);
+  }
+}
+
+// A place was picked for a job of pieces. When it is the GPU, the job
+// takes the pieces after its own too, as many as the GPU's jobs now hold,
+// and its answers go into the program's memory.
+fn alph_machine_rows_fit(job: AlphJob*, way: Word, ctx: rawptr) {
+  var m: AlphMachine* = (AlphMachine*)ctx;
+  var off: int64 = (int64)job - (int64)m->worked.slots;
+  if (way != ALPH_GPU || m->rows_on == 0 || off < 0 || off >= (int64)m->worked.room * (int64)sizeof(AlphBatchSlot)) {
+    return;
+  }
+  var slot: Word = (Word)(off / (int64)sizeof(AlphBatchSlot));
+  var room: Word = (Word)(m->gpu_room[job->kind] / 2);
+  var from: Word = m->rows_from[slot];
+  var len: Word = m->rows_len[slot];
+  var half: Word = 0;
+  if (m->gpu_used[0] != 0) {
+    half = 1;
+  }
+  if (m->gpu_outs[job->kind] == 0 || len > room || m->gpu_used[half] != 0) {
+    return;
+  }
+  var want: Word = m->gpu_run;
+  if (want > room) {
+    want = room;
+  }
+  if (want > m->run_total - from) {
+    want = m->run_total - from;
+  }
+  if (from + len == m->run_first && want > len) {
+    m->run_first = from + want;  // its pieces were the last handed out: it takes the ones after them
+    len = want;
+  }
+  m->gpu_used[half] = 1;
+  m->rows_half[slot] = half + 1;
+  m->rows_len[slot] = len;
+  job->in = (Word)(from + (len << RUN_SHIFT));
+  if (m->run_bytes != 0) {
+    job->count = (Word)(len * m->run_each);
+  }
+  job->back = (uint8*)(m->gpu_outs[job->kind] + (Word)(half * room));
+  job->back_room = (Word)(room * 8);
+}
+
+// Hands out runs of pieces while there are slots and places for them: the
+// runs not done first, then the next pieces.
+fn alph_machine_rows_more(a: AlphActor*, m: AlphMachine*) {
+  var b: AlphBatch* = &m->worked;
+  while (m->rows_free > 0) {
+    var from: Word = 0;
+    var len: Word = 0;
+    if (m->rows_again > 0) {
+      var top: Word = m->rows_again - 1;
+      from = m->rows_again_from[top];
+      len = m->rows_again_len[top];
+      if (len > m->run) {
+        // A job of the GPU's that was not done: back in runs a core takes.
+        m->rows_again_from[top] = from + m->run;
+        m->rows_again_len[top] = len - m->run;
+        len = m->run;
+      } else {
+        m->rows_again = top;
+      }
+    } else if (m->run_first < m->run_total) {
+      from = m->run_first;
+      len = m->run_total - from;
+      if (len > m->run) {
+        len = m->run;
+      }
+      m->run_first = from + len;
+    } else {
+      break;
+    }
+    var slot: Word = b->slots[m->rows_free - 1].free;
+    var job: AlphJob* = &b->slots[slot].job;
+    job->kind = m->work_kind;
+    job->size = len;
+    job->home = ALPH_NOWHERE;
+    job->data = 0;
+    job->stay = 0;
+    job->in = from;
+    job->bytes = 0;
+    job->count = 0;
+    job->back = 0;
+    job->back_room = 0;
+    job->back_count = 0;
+    if (m->run_bytes != 0) {
+      job->bytes = m->run_bytes + (Word)(from * m->run_each);
+      job->count = (Word)(len * m->run_each);
+    }
+    if (m->run > 1) {
+      job->in = (Word)(from + (len << RUN_SHIFT));
+      job->back = &m->outs[slot * 512];
+      job->back_room = 512;
+    }
+    m->rows_from[slot] = from;
+    m->rows_len[slot] = len;
+    m->rows_half[slot] = 0;
+    var asked: Word = m->places.offer(a, job);
+    if (asked > 0) {
+      m->rows_free = m->rows_free - 1;
+      m->rows_out = m->rows_out + 1;
+      continue;
+    }
+    if (m->rows_half[slot] != 0) {
+      m->gpu_used[m->rows_half[slot] - 1] = 0;
+    }
+    if (asked == ALPH_GONE) {
+      m->run_undone = m->run_undone + m->rows_len[slot];  // no place can do the kind
+      b->gone = b->gone + 1;
+      continue;
+    }
+    // No place has room now: the run waits. With jobs out, the next answer
+    // tries again. With none out the actor is sent a word to, two
+    // milliseconds on, so it does not spin.
+    m->rows_again_from[m->rows_again] = m->rows_from[slot];
+    m->rows_again_len[m->rows_again] = m->rows_len[slot];
+    m->rows_again = m->rows_again + 1;
+    if (m->rows_out == 0 && m->rows_nudged == 0) {
+      if (m->time.after(2, a->pid, ROWS_MORE, 0) > 0 || a->send(a->pid, ROWS_MORE, 0) == ALPH_OK) {
+        m->rows_nudged = 1;
+      }
+    }
+    return;
+  }
+}
+
+// A job of pieces is back: each piece's answer goes to the program, or the
+// run is handed out again.
+fn alph_machine_rows_took(m: AlphMachine*, job: AlphJob*) {
+  var b: AlphBatch* = &m->worked;
+  var slot: Word = alph_machine_run_slot(m, job);
+  var from: Word = m->rows_from[slot];
+  var len: Word = m->rows_len[slot];
+  var count: Word = (Word)(job->in >> RUN_SHIFT);
+  m->rows_out = m->rows_out - 1;
+  b->slots[m->rows_free].free = slot;
+  m->rows_free = m->rows_free + 1;
+  if (job->status == ALPH_LOST || (job->status == ALPH_OK && count > 0 && job->back_count != (Word)(len * 8))) {
+    m->run_undone = m->run_undone + len;
+    b->lost = b->lost + 1;
+  } else if (job->status != ALPH_OK) {
+    m->rows_again_from[m->rows_again] = from;
+    m->rows_again_len[m->rows_again] = len;
+    m->rows_again = m->rows_again + 1;
+  } else {
+    b->by_way[job->way] = b->by_way[job->way] + 1;
+    b->total = b->total + 1;
+    m->rows_by[job->way] = m->rows_by[job->way] + len;
+    if (count <= 0) {
+      m->run_took(from, job->out, m->run_ctx);
+    }
+    for i in 0..count {
+      var out: int64 = 0;
+      for byte in 0..8 {
+        out = out | ((int64)job->back[(Word)i * 8 + (Word)byte] << ((int64)byte * 8));
+      }
+      m->run_took(from + (Word)i, (Word)out, m->run_ctx);
+    }
+    // The GPU's jobs grow while one is done quickly: starting one costs
+    // the same however many pieces it holds.
+    if (job->way == ALPH_GPU && len >= m->gpu_run && job->ns < GPU_NS && m->gpu_run < m->gpu_room[job->kind]) {
+      m->gpu_run = m->gpu_run * 2;
+    }
+  }
+  if (m->rows_half[slot] != 0) {
+    m->gpu_used[m->rows_half[slot] - 1] = 0;
+    m->rows_half[slot] = 0;
+  }
+}
+
+// The actor that hands out runs of pieces: it begins, takes each job
+// back, and stops the cores when every piece is answered.
+fn alph_machine_rows(a: AlphActor*, msg: AlphMsg*) -> Word {
+  var m: AlphMachine* = (AlphMachine*)a->state;
+  if (msg->tag == ALPH_DONE) {
+    alph_machine_rows_took(m, (AlphJob*)msg->arg);
+  } else if (msg->tag == ROWS_MORE) {
+    m->rows_nudged = 0;
+  } else if (msg->tag != WORK_BEGIN) {
+    return 0;
+  }
+  alph_machine_rows_more(a, m);
+  if (m->rows_out == 0 && m->rows_again == 0 && m->run_first >= m->run_total) {
+    a->cores()->stop();
+  }
+  return 0;
+}
+
+// Hands out the pieces from run_first on, in runs, and returns when all
+// are answered.
+fn alph_machine_rows_all(m: AlphMachine*, kind: Word) {
+  var b: AlphBatch* = &m->worked;
+  if (m->rows_actor == 0) {
+    m->rows_actor = m->cores.spawn_on(0, &alph_machine_rows, (rawptr)m);
+  }
+  if (m->rows_actor == 0 || b->room > 128) {
+    m->run_undone = m->run_undone + m->run_total - m->run_first;
+    return;
+  }
+  m->work_kind = kind;
+  m->rows_out = 0;
+  m->rows_again = 0;
+  m->rows_nudged = 0;
+  m->rows_free = b->room;
+  for i in 0..b->room {
+    b->slots[i].free = (Word)i;
+  }
+  m->gpu_used[0] = 0;
+  m->gpu_used[1] = 0;
+  m->gpu_run = GPU_FIRST;
+  for i in 0..3 {
+    b->by_way[i] = 0;
+    m->rows_by[i] = 0;
+  }
+  b->total = 0;
+  b->gone = 0;
+  b->lost = 0;
+  m->rows_on = 1;
+  if (m->cores.send(m->rows_actor, WORK_BEGIN, 0) != ALPH_OK) {
+    m->run_undone = m->run_undone + m->run_total - m->run_first;
+  } else {
+    m->cores.run();
+  }
+  m->rows_on = 0;
 }
 
 fn alph_machine_run_slot(m: AlphMachine*, job: AlphJob*) -> Word {
   return (Word)(((int64)job - (int64)m->worked.slots) / (int64)sizeof(AlphBatchSlot));
 }
 
+// The first pieces go one to a job, through a batch, to time one.
 fn alph_machine_run_fill(b: AlphBatch*, job: AlphJob*, at: Word) {
   var m: AlphMachine* = (AlphMachine*)b->ctx;
-  var first: Word = m->run_first + (Word)(at * m->run);
-  var count: Word = m->run_total - first;
-  if (count > m->run) {
-    count = m->run;
-  }
-  job->in = first;
-  job->size = count;
   if (m->run_bytes != 0) {
-    job->bytes = m->run_bytes + (Word)(first * m->run_each);
-    job->count = (Word)(count * m->run_each);
-  }
-  if (m->run > 1) {
-    job->in = (Word)(first + (count << RUN_SHIFT));
-    job->back = &m->outs[alph_machine_run_slot(m, job) * 512];
-    job->back_room = 512;
+    job->bytes = m->run_bytes + (Word)(at * m->run_each);
+    job->count = m->run_each;
   }
 }
 
 fn alph_machine_run_took(b: AlphBatch*, job: AlphJob*, at: Word) {
   var m: AlphMachine* = (AlphMachine*)b->ctx;
-  var first: Word = m->run_first + (Word)(at * m->run);
-  var count: Word = m->run_total - first;
-  if (count > m->run) {
-    count = m->run;
-  }
-  if (job->status != ALPH_OK || (m->run > 1 && job->back_count != (Word)(count * 8))) {
-    m->run_undone = m->run_undone + count;
+  if (job->status != ALPH_OK) {
+    m->run_undone = m->run_undone + 1;
     return;
   }
-  if (m->run == 1) {
-    if (job->way != ALPH_FAR && (m->run_least == 0 || job->ns < m->run_least)) {
-      m->run_least = job->ns;
-    }
-    if (job->way == ALPH_FAR && (m->run_least_far == 0 || job->ns < m->run_least_far)) {
-      m->run_least_far = job->ns;
-    }
-    m->run_took(first, job->out, m->run_ctx);
-    return;
+  if (job->way == ALPH_CPU && (m->run_least == 0 || job->ns < m->run_least)) {
+    m->run_least = job->ns;
   }
-  for i in 0..count {
-    var out: int64 = 0;
-    for byte in 0..8 {
-      out = out | ((int64)job->back[(Word)i * 8 + (Word)byte] << ((int64)byte * 8));
-    }
-    m->run_took(first + (Word)i, (Word)out, m->run_ctx);
+  if (job->way == ALPH_FAR && (m->run_least_far == 0 || job->ns < m->run_least_far)) {
+    m->run_least_far = job->ns;
   }
+  m->run_took(at, job->out, m->run_ctx);
 }
 
 // Does pieces 0 to total - 1 of a kind set up with piece, and returns when
@@ -1183,8 +1460,10 @@ fn alph_machine_run_took(b: AlphBatch*, job: AlphJob*, at: Word) {
 // and ctx. Pieces of little work are handed out several to a job, so that
 // handing out costs little beside the work: the first few are done alone
 // to time one, and the rest go in jobs of about a quarter of a millisecond
-// of work, up to 64 pieces. Call it as work is called. Returns how many
-// pieces were not done.
+// of work, up to 64 pieces. A GPU set up with piece_gpu gets much bigger
+// jobs. Call it as work is called. Returns how many pieces were not done.
+// Afterwards m->rows_by says how many pieces each way did (ALPH_CPU,
+// ALPH_GPU, ALPH_FAR), the first few aside.
 export fn AlphMachine_pieces__ptr(m: AlphMachine*, kind: Word, total: Word,
                                   took: fn(Word, Word, rawptr) -> void, ctx: rawptr) -> Word {
   m->run_bytes = 0;
@@ -1245,7 +1524,7 @@ fn alph_machine_run_all(m: AlphMachine*, kind: Word, total: Word,
     }
   }
   m->run_first = tried;
-  m->work(kind, (Word)((total - tried + m->run - 1) / m->run), &alph_machine_run_fill, &alph_machine_run_took, (rawptr)m);
+  alph_machine_rows_all(m, kind);
   return m->run_undone;
 }
 

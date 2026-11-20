@@ -1,11 +1,13 @@
 // Nodes on several threads (src/cores): a token round a ring of cores, three
 // cores sending to one, requests and replies between cores, a timer for an
-// actor on another core, where spawn puts actors, and pids that name no core.
+// actor on another core, where spawn puts actors, pids that name no core, and
+// a core's thread kept from one run to the next.
 
 import "std/io";
 import "alph/actor/actor";
 import "alph/cores/cores";
 import "alph/time/time";
+import "port/cpu";
 
 const CORES: Word = 4;
 const SLOTS: Word = 8;
@@ -146,6 +148,14 @@ fn idle(a: AlphActor*, m: AlphMsg*) -> Word {
   return 1;
 }
 
+// Says which thread it runs on, and stops the cores.
+fn whose(a: AlphActor*, m: AlphMsg*) -> Word {
+  var thread: int32* = (int32*)a->state;
+  *thread = alph_cpu_self();
+  a->cores()->stop();
+  return 0;
+}
+
 fn main() -> int32 {
   g_cores.init(&g_core[0], CORES, &g_actors[0], SLOTS, &g_mail[0], ROOM);
 
@@ -230,6 +240,18 @@ fn main() -> int32 {
   var nowhere: Word = (Word)((CORES << ALPH_PLACE_SHIFT) | ((Word)1 << ALPH_INDEX_BITS));
   expect(g_cores.send(nowhere, NOTE, 0) == ALPH_GONE, "a core that does not exist is gone");
   expect(g_cores.send(-5, NOTE, 0) == ALPH_GONE, "a negative pid is gone");
+
+  // What belongs to a thread, such as a GPU a handler opened, must last
+  // from one run to the next: a core keeps its thread.
+  var thread: int32 = 0;
+  var asked: Word = g_cores.spawn_on(2, &whose, (rawptr)&thread);
+  g_cores.send(asked, GO, 0);
+  g_cores.run();
+  var first_thread: int32 = thread;
+  thread = 0;
+  g_cores.send(asked, GO, 0);
+  g_cores.run();
+  expect(first_thread != 0 && thread == first_thread, "a core runs on the same thread in the next run");
 
   if (g_failures != 0) {
     return 1;

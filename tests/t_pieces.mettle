@@ -5,7 +5,9 @@
 // the edges of the count hold. Then pieces with bytes of their own
 // (piece_of and pieces_of): rows of 24 bytes several to a job, here and on
 // the other machine, and rows of 2,000 bytes, which cross one to a job in
-// long buffers.
+// long buffers. And pieces with a way for the GPU (piece_gpu), which is
+// given much bigger jobs: the way here is a function on a core that does
+// what a kernel would, so the test needs no GPU.
 
 import "std/io";
 import "std/thread";
@@ -37,6 +39,11 @@ var g_failures: int32 = 0;
 var g_rows: uint8[480000];
 var g_big: uint8[80000];
 var g_longs: uint8[131072];
+var g_g: AlphMachine;          // a machine with a core for the GPU
+var g_gpu_outs: Word[4096];
+var g_gpu_jobs: Word = 0;
+var g_gpu_most: Word = 0;      // the most pieces one job for the GPU had
+var g_gpu_asked: Word = 0;
 
 fn expect(ok: bool, what: string) {
   if (!ok) {
@@ -99,6 +106,28 @@ fn took_row(piece: Word, out: Word, ctx: rawptr) {
     g_twice = g_twice + 1;
   }
   g_seen[piece] = 1;
+}
+
+// What a kernel would do: every piece of the run, into outs.
+fn rows_gpu(first: Word, bytes: uint8*, each: Word, count: Word, outs: Word*) -> Word {
+  g_gpu_jobs = g_gpu_jobs + 1;
+  if (count > g_gpu_most) {
+    g_gpu_most = count;
+  }
+  for i in 0..count {
+    if (each > 0) {
+      outs[i] = row_sum(first + (Word)i, bytes + (Word)((Word)i * each), each);
+    } else {
+      outs[i] = square(first + (Word)i);
+    }
+  }
+  return 0;
+}
+
+// A machine with no GPU after all.
+fn no_gpu(first: Word, bytes: uint8*, each: Word, count: Word, outs: Word*) -> Word {
+  g_gpu_asked = g_gpu_asked + 1;
+  return 1;
 }
 
 fn took_slow(piece: Word, out: Word, ctx: rawptr) {
@@ -206,6 +235,38 @@ fn main() -> int32 {
   clear();
   expect(g_m[0].pieces_of(ROWS, 50, 0, ROW, &took_row, (rawptr)(int64)ROW) == 50 && g_answers == 0, "rows with no bytes are not done");
 
+  // A machine with a GPU: its jobs are much bigger than a core's, their
+  // answers come back through the program's memory, and every piece is
+  // still answered once and rightly. Twice, since the GPU's core must be
+  // the same thread the second time.
+  g_g.init(4, 40, true);
+  g_g.piece_of(ROWS, &row_sum);
+  g_g.piece_gpu(ROWS, &rows_gpu, &g_gpu_outs[0], 4096);
+  g_g.piece(SQUARE, &square);
+  g_g.piece_gpu(SQUARE, &rows_gpu, &g_gpu_outs[0], 4096);
+  g_g.piece(NONE, &square);  // the table of pieces is the process's: a kind the other machines have no way for
+  g_g.piece_gpu(NONE, &no_gpu, &g_gpu_outs[0], 4096);
+  for again in 0..2 {
+    clear();
+    g_gpu_jobs = 0;
+    g_gpu_most = 0;
+    undone = g_g.pieces_of(ROWS, ROW_COUNT, &g_rows[0], ROW, &took_row, (rawptr)(int64)ROW);
+    expect(undone == 0 && seen() == ROW_COUNT && g_twice == 0 && g_wrong == 0, "with a GPU every row is answered once and rightly ({seen()} of {ROW_COUNT}, {g_twice} twice, {g_wrong} wrong)");
+    expect(g_g.rows_by[ALPH_GPU] > 0 && g_g.rows_by[ALPH_GPU] + g_g.rows_by[ALPH_CPU] == ROW_COUNT - 32, "the GPU and the cores did them between them ({g_g.rows_by[ALPH_GPU]} and {g_g.rows_by[ALPH_CPU]})");
+    expect(g_gpu_most > g_g.run && g_gpu_most <= 2048, "a job for the GPU holds more rows than a core's, and no more than half its room ({g_gpu_most} against {g_g.run})");
+  }
+  var gpu_rows: Word = g_g.rows_by[ALPH_GPU];
+  var gpu_most: Word = g_gpu_most;
+  clear();
+  g_gpu_jobs = 0;
+  undone = g_g.pieces(SQUARE, MANY, &took_square, 0);
+  expect(undone == 0 && seen() == MANY && g_twice == 0 && g_wrong == 0 && g_g.rows_by[ALPH_GPU] > 0, "pieces that are numbers go to the GPU the same way ({seen()} of {MANY}, {g_g.rows_by[ALPH_GPU]} there)");
+  clear();
+  undone = g_g.pieces(NONE, 5000, &took_square, 0);
+  expect(undone == 0 && seen() == 5000 && g_twice == 0 && g_wrong == 0, "when there is no GPU after all the cores do every piece ({seen()} of 5000, {g_wrong} wrong)");
+  expect(g_gpu_asked > 0 && g_gpu_asked <= 2 && g_g.rows_by[ALPH_GPU] == 0, "and the GPU is asked no more ({g_gpu_asked} times)");
+  g_g.shut();
+
   // With the other machine.
   for i in 0..2 {
     expect(g_m[i].start(port + (int64)i) == ALPH_OK, "the machine listens");
@@ -284,6 +345,6 @@ fn main() -> int32 {
   if (g_failures != 0) {
     return 1;
   }
-  println("pieces ok: {MANY} pieces of little work answered once each, several to a job; 400 of a millisecond one to a job, {far_slow} of them on the other machine; 6000 only the other machine can do, {there_run} to a job; {ROW_COUNT} rows of {ROW} bytes {rows_run} to a job, and {rows_there} to a job on the other machine");
+  println("pieces ok: {MANY} pieces of little work answered once each, several to a job; 400 of a millisecond one to a job, {far_slow} of them on the other machine; 6000 only the other machine can do, {there_run} to a job; {ROW_COUNT} rows of {ROW} bytes {rows_run} to a job, and {rows_there} to a job on the other machine; with a GPU, {gpu_rows} of {ROW_COUNT} rows in jobs of up to {gpu_most}");
   return 0;
 }
