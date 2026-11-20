@@ -491,7 +491,7 @@ step_pico2() {
   elif built pico2; then
     got=$(timeout 30 "$OUT/rvsim" --machine rp2350 --load "$OUT/pico2_blink.bin" --until-ms 3000 2>> "$log" | tr -d '\r\n')
     if [ "$got" = "12345" ]; then
-      echo "ok    pico2/blink [on the chip's model, $(stat -c %s "$OUT/pico2_blink.bin") bytes; asker, arm and two build]"
+      echo "ok    pico2/blink [on the chip's model, $(stat -c %s "$OUT/pico2_blink.bin") bytes; asker and two build]"
     else
       echo "FAIL  pico2/blink printed '$got' on the model"
       fails=$((fails + 1))
@@ -507,6 +507,18 @@ step_pico2() {
       echo "ok    pico2/tether [on the chip's model, $(stat -c %s "$OUT/pico2_tether.bin") bytes: $got, at 115,200 baud]"
     else
       echo "FAIL  pico2/tether on the model: '$got' (see $log)"
+      fails=$((fails + 1))
+    fi
+    # The arm image the same way: the computer's side asks who does each
+    # kind, then for six angles, four chunks of primes, and moves that must
+    # not be made twice, one of them sent a second time.
+    "$OUT/model_line" arm > "$OUT/pico2_arm.script"
+    got=$(timeout 60 "$OUT/rvsim" --machine rp2350 --load "$OUT/pico2_arm.bin" --until-ms 400 --strict-fatal \
+      --uart-script "$OUT/pico2_arm.script" 2>> "$log" | "$OUT/model_line" armcheck | tail -n 1)
+    if [ "$got" = "18 answers over the board's UART, 0 wrong" ]; then
+      echo "ok    pico2/arm [on the chip's model, $(stat -c %s "$OUT/pico2_arm.bin") bytes: angles, primes and a move made once though asked for twice]"
+    else
+      echo "FAIL  pico2/arm on the model: '$got' (see $log)"
       fails=$((fails + 1))
     fi
   else
