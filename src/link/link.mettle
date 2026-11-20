@@ -61,6 +61,7 @@ const MISSED: uint32 = 7;   // a beat that says a message did not arrive: send a
 const VOID: uint32 = 8;     // what is left of a piece of a long message that was given up: taken, and nothing done
 const SOON_MS: Word = 5;
 const BUNDLE: uint32 = 13;        // messages without bytes that fit one datagram
+const WARM_NS: Word = 50000;      // how long after a datagram the next is looked for without sleeping
 const HURRY_NS: Word = 100000;    // the first wait before sending again what found a mailbox full,
 const HURRY_MOST: Word = 4000000; // and the longest, each wait twice the one before
 const BEAT_MS: Word = 50;
@@ -1056,6 +1057,7 @@ fn alph_link_main(arg: cstring) -> uint32 {
   var port: int64 = 0;
   var beat: Word = alph_now() - alph_ms(BEAT_MS);
   var chase: Word = alph_now();
+  var warm: Word = 0;  // when the last datagram came, in ns
   while (l->stopping == 0) {
     var got: int64 = 0;
     var count: Word = 0;
@@ -1101,10 +1103,25 @@ fn alph_link_main(arg: cstring) -> uint32 {
         }
         count = -1;  // not a quiet moment: the chase keeps its own pace
       }
+    } else if ((Word)(alph_link_ns() - warm) < WARM_NS) {
+      // A datagram came a moment ago, and the next most often follows at
+      // once: an answer to what was just sent, or the rest of a burst.
+      // Looking for it costs less than sleeping and being woken.
+      if (l->open == 0) {
+        got = l->wire.recv_now(whole, ALPH_DATAGRAM, &ip, &port);
+      } else {
+        got = l->wire.recv_now(&raw[0], 1200, &ip, &port);
+      }
+      if (got == 0) {
+        count = -1;
+      }
     } else if (l->open == 0) {
       got = l->wire.recv(whole, ALPH_DATAGRAM, &ip, &port);
     } else {
       got = l->wire.recv(&raw[0], 1200, &ip, &port);
+    }
+    if (got > 0) {
+      warm = alph_link_ns();
     }
     if (l->open != 0) {
       if (got > 0) {

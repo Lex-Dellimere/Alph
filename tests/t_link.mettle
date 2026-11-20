@@ -324,6 +324,10 @@ fn main() -> int32 {
   var here: uint32 = alph_ip4(127, 0, 0, 1);
   var f: Forged;
   expect(third.open(port_a + 2, 10), "a third socket");
+  // The link counts a message as taken a moment after it hands it to its
+  // actor, and B may still have one on its way: wait, so that the number
+  // given to the notes below is the next one.
+  Sleep(30);
   var b_life: uint32 = g_a_peers[0].life;
   f.magic = 1095520328;
   f.kind = 2;

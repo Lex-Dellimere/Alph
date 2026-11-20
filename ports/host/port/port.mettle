@@ -10,7 +10,10 @@ export const ALPH_GATHER: Word = 16;  // messages a node runs between gathers wh
 const FUTEX_WAIT: int64 = 128;  // private
 const FUTEX_WAKE: int64 = 129;
 const SPINS: int32 = 100;      // tries at the lock before giving up the CPU
-const IDLE_SPINS: int32 = 2000;  // looks for new mail before sleeping
+const IDLE_SPINS: int32 = 2000;  // looks for new mail before sleeping, to begin with
+const MOST_SPINS: int32 = 32000; // and at most, for a node whose mail keeps coming just after it sleeps
+const SOON_NS: int64 = 100000;   // a sleep shorter than this was not worth its two system calls,
+const LONG_NS: int64 = 2000000;  // and one longer than this was
 const AWAKE: int32 = 0;
 const LOOKING: int32 = 1;  // spinning: a wake only has to change wakes
 const ASLEEP: int32 = 2;   // in the kernel: a wake is a system call
@@ -31,6 +34,7 @@ export struct AlphGate {
   unsent: int32*;    // not 0: something is held back,
   unsent_at: Word*;  // since this many ns
   stack: int64;      // about where the stack of the thread that runs this node is
+  spins: int32;      // how long this node looks for mail before it sleeps
 }
 
 export fn AlphGate_init__ptr(g: AlphGate*) {
@@ -46,6 +50,7 @@ export fn AlphGate_init__ptr(g: AlphGate*) {
   g->unsent = 0;
   g->unsent_at = 0;
   g->stack = 0;
+  g->spins = IDLE_SPINS;
 }
 
 // Called by the node between two messages when mail is held back (the
@@ -129,11 +134,18 @@ export fn AlphGate_leave__ptr(g: AlphGate*, was: int32) {
 // the wait changes wakes, so the wait returns. Mail that comes without a
 // wake (src/cores' lanes) is found by look, and look(true) tells its sender
 // to wake this from here on.
+//
+// How long to look is learnt. A node that was woken a moment after it went
+// to sleep should have looked longer: it looks twice as long next time, up
+// to a limit. So a node that waits for answers from another machine, which
+// take tens of microseconds, stops sleeping between them. One that slept
+// long looks half as long next time, down to where it began, so a node
+// with nothing to do does not keep a CPU busy.
 export fn AlphGate_sleep__ptr(g: AlphGate*, was: int32) {
   var seen: int32 = g->wakes;
   g->state = LOOKING;
   alph_unlock(g);
-  for i in 0..IDLE_SPINS {
+  for i in 0..g->spins {
     if (mettle_atomic_compare_exchange_i32(&g->wakes, seen, seen) != seen) {
       return;
     }
@@ -148,7 +160,17 @@ export fn AlphGate_sleep__ptr(g: AlphGate*, was: int32) {
   }
   g->state = ASLEEP;
   alph_unlock(g);
+  var ts: int64[2];
+  syscall(ALPH_NR_CLOCK_GETTIME, 1, (int64)&ts[0]);
+  var began: int64 = ts[0] * 1000000000 + ts[1];
   syscall(ALPH_NR_FUTEX, (int64)&g->wakes, FUTEX_WAIT, (int64)seen, 0);
+  syscall(ALPH_NR_CLOCK_GETTIME, 1, (int64)&ts[0]);
+  var slept: int64 = ts[0] * 1000000000 + ts[1] - began;
+  if (slept < SOON_NS && g->spins < MOST_SPINS) {
+    g->spins = g->spins * 2;
+  } else if (slept > LONG_NS && g->spins > IDLE_SPINS) {
+    g->spins = g->spins / 2;
+  }
 }
 
 // Called inside the gate. Costs nothing while the node is running.
