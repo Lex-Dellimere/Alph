@@ -69,7 +69,7 @@ fn main() -> int32 {
 }
 ```
 
-This is [examples/primes.mettle](examples/primes.mettle). Name another machine and share the kind, and the pieces also run there. A board shares the same kind of function. The program never says where a piece goes, and pieces of little work are handed out several at a time, so even a piece of a microsecond is worth handing out. Work that carries data or runs on the GPU is a job (`kind` and `work`), shown below.
+This is [examples/primes.mettle](examples/primes.mettle). Name another machine and share the kind, and the pieces also run there. A board shares the same kind of function. The program never says where a piece goes, and pieces of little work are handed out several at a time, so even a piece of a microsecond is worth handing out. Rows of data are handed out the same way with `piece_of` and `pieces_of` ([examples/readings.mettle](examples/readings.mettle)). Work that runs on the GPU or gives data back is a job (`kind` and `work`), shown below.
 
 ## What is here
 
@@ -107,6 +107,7 @@ Measured on one 16-CPU x86-64 laptop with an RTX 4070, release builds, with othe
 | Messages of 64 KB to another machine | 123 to 133 MB a second, 64 to 80 with one datagram in a hundred lost |
 | Handing out a piece of work that is a number in and a number out | 20 ns a piece |
 | Handing out a job | about 500 ns |
+| 100,000 rows of 64 bytes, 12 µs of work each, sent to a helper of four cores | 425,000 to 446,000 rows a second, 216,000 to 220,000 as one job a row |
 | 4,000 jobs of 2 ms on three helpers of 15 cores | 181 ms, where every core busy all the time would take 173 |
 | 200 camera frames worked on by another machine's GPU | 182 ms, against about 950 on this machine's two cores |
 

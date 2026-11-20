@@ -2,7 +2,10 @@
 // from a number to a number, handed out several pieces to a job when a
 // piece is little work. Every piece is answered once and rightly, on one
 // machine and with a helper; pieces that take long go one to a job; and
-// the edges of the count hold.
+// the edges of the count hold. Then pieces with bytes of their own
+// (piece_of and pieces_of): rows of 24 bytes several to a job, here and on
+// the other machine, and rows of 2,000 bytes, which cross one to a job in
+// long buffers.
 
 import "std/io";
 import "std/thread";
@@ -16,7 +19,14 @@ const SLOW: Word = 1;    // a millisecond each: one to a job
 const NONE: Word = 2;    // no way to do it
 const ONCE: Word = 3;    // done at most once: one to a job
 const THERE: Word = 4;   // only the other machine has a way to do it
+const ROWS: Word = 5;    // pieces with bytes
+const ROWS_THERE: Word = 6;  // the same, with a way only on the other machine
+const BIG_THERE: Word = 7;   // rows of more bytes than a parcel holds, a way only on the other machine
 const MANY: Word = 50000;
+const ROW: Word = 24;
+const ROW_COUNT: Word = 20000;
+const BIG: Word = 2000;
+const BIG_COUNT: Word = 40;
 
 var g_m: AlphMachine[2];
 var g_seen: uint8[50000];
@@ -24,6 +34,9 @@ var g_twice: Word = 0;
 var g_wrong: Word = 0;
 var g_answers: Word = 0;
 var g_failures: int32 = 0;
+var g_rows: uint8[480000];
+var g_big: uint8[80000];
+var g_longs: uint8[131072];
 
 fn expect(ok: bool, what: string) {
   if (!ok) {
@@ -47,6 +60,38 @@ fn slow(n: Word) -> Word {
 fn took_square(piece: Word, out: Word, ctx: rawptr) {
   g_answers = g_answers + 1;
   if (piece < 0 || piece >= MANY || out != (Word)(piece * piece + 7)) {
+    g_wrong = g_wrong + 1;
+    return;
+  }
+  if (g_seen[piece] != 0) {
+    g_twice = g_twice + 1;
+  }
+  g_seen[piece] = 1;
+}
+
+// What a row gives: every byte counts, and so do its place in the row, the
+// row's number and how many bytes it was given.
+fn row_sum(piece: Word, bytes: uint8*, count: Word) -> Word {
+  var sum: Word = (Word)(piece * 31 + count);
+  for i in 0..count {
+    sum = sum + (Word)bytes[i] * (Word)(i + 1);
+  }
+  return sum;
+}
+
+fn row_byte(piece: Word, i: Word) -> uint8 {
+  return (uint8)((Word)(piece * 7 + i * 13 + 5) & 255);
+}
+
+// ctx is how many bytes a row has.
+fn took_row(piece: Word, out: Word, ctx: rawptr) {
+  var each: Word = (Word)(int64)ctx;
+  var want: Word = (Word)(piece * 31 + each);
+  for i in 0..each {
+    want = want + (Word)row_byte(piece, (Word)i) * (Word)(i + 1);
+  }
+  g_answers = g_answers + 1;
+  if (piece < 0 || piece >= MANY || out != want) {
     g_wrong = g_wrong + 1;
     return;
   }
@@ -92,7 +137,27 @@ fn main() -> int32 {
   g_m[0].peer(16, 5, here, port + 1);
   g_m[1].init(5, 16, false);
   g_m[1].peer(0, 4, here, port);
+  for i in 0..ROW_COUNT {
+    for at in 0..ROW {
+      g_rows[(Word)i * ROW + (Word)at] = row_byte((Word)i, (Word)at);
+    }
+  }
+  for i in 0..BIG_COUNT {
+    for at in 0..BIG {
+      g_big[(Word)i * BIG + (Word)at] = row_byte((Word)i, (Word)at);
+    }
+  }
   for i in 0..2 {
+    g_m[i].longs(&g_longs[(Word)i * 65536], 4096, 16);
+    g_m[i].piece_of(ROWS, &row_sum);
+    if (i == 0) {
+      g_m[i].kind(ROWS_THERE, 0, 0);
+      g_m[i].kind(BIG_THERE, 0, 0);
+    } else {
+      g_m[i].piece_of(ROWS_THERE, &row_sum);
+      g_m[i].piece_of(BIG_THERE, &row_sum);
+    }
+    expect(g_m[i].share(ROWS) == ALPH_OK && g_m[i].share(ROWS_THERE) == ALPH_OK && g_m[i].share(BIG_THERE) == ALPH_OK, "the machine shares the kinds with bytes");
     g_m[i].piece(SQUARE, &square);
     g_m[i].piece(SLOW, &slow);
     g_m[i].piece(ONCE, &square);
@@ -127,6 +192,19 @@ fn main() -> int32 {
   // A kind no place can do: every piece is told as not done.
   clear();
   expect(g_m[0].pieces(NONE, 40, &took_square, 0) == 40 && g_answers == 0, "pieces no place can do are counted as not done");
+
+  // Pieces with bytes, on one machine.
+  clear();
+  undone = g_m[0].pieces_of(ROWS, ROW_COUNT, &g_rows[0], ROW, &took_row, (rawptr)(int64)ROW);
+  var rows_run: Word = g_m[0].run;
+  expect(undone == 0 && seen() == ROW_COUNT && g_twice == 0 && g_wrong == 0, "every row is answered once and rightly on one machine ({seen()} of {ROW_COUNT}, {g_twice} twice, {g_wrong} wrong)");
+  expect(rows_run > 1 && (Word)(rows_run * ROW) <= ALPH_PARCEL_BYTES, "rows go several to a job, no more than fit a message ({rows_run})");
+  clear();
+  expect(g_m[0].pieces_of(ROWS, 0, &g_rows[0], ROW, &took_row, (rawptr)(int64)ROW) == 0 && g_answers == 0, "no rows is no work");
+  clear();
+  expect(g_m[0].pieces_of(ROWS, 33, &g_rows[0], ROW, &took_row, (rawptr)(int64)ROW) == 0 && seen() == 33 && g_wrong == 0 && g_twice == 0, "thirty-three rows are thirty-three answers ({seen()})");
+  clear();
+  expect(g_m[0].pieces_of(ROWS, 50, 0, ROW, &took_row, (rawptr)(int64)ROW) == 50 && g_answers == 0, "rows with no bytes are not done");
 
   // With the other machine.
   for i in 0..2 {
@@ -171,6 +249,27 @@ fn main() -> int32 {
   expect(undone == 0 && seen() == 6000 && g_twice == 0 && g_wrong == 0, "pieces only the other machine can do are all answered once and rightly ({seen()} of 6000, {g_twice} twice, {g_wrong} wrong)");
   expect(g_m[0].worked.by_way[ALPH_CPU] == 0 && g_m[0].worked.by_way[ALPH_FAR] == g_m[0].worked.total, "all of them there ({g_m[0].worked.by_way[ALPH_FAR]} jobs of {there_run})");
 
+  // Rows with a helper, and rows only the helper can do: a job's bytes
+  // and the number of its first row cross together, several rows to a job
+  // when the way there and back allows.
+  clear();
+  g_m[0].link.lose = 11;
+  g_m[1].link.lose = 13;
+  undone = g_m[0].pieces_of(ROWS, ROW_COUNT, &g_rows[0], ROW, &took_row, (rawptr)(int64)ROW);
+  expect(undone == 0 && seen() == ROW_COUNT && g_twice == 0 && g_wrong == 0, "with a helper, and messages lost, every row is answered once and rightly ({seen()} of {ROW_COUNT}, {g_twice} twice, {g_wrong} wrong)");
+  clear();
+  undone = g_m[0].pieces_of(ROWS_THERE, 6000, &g_rows[0], ROW, &took_row, (rawptr)(int64)ROW);
+  g_m[0].link.lose = 0;
+  g_m[1].link.lose = 0;
+  var rows_there: Word = g_m[0].run;
+  expect(undone == 0 && seen() == 6000 && g_twice == 0 && g_wrong == 0, "rows only the other machine can do are all answered once and rightly ({seen()} of 6000, {g_twice} twice, {g_wrong} wrong)");
+  expect(g_m[0].worked.by_way[ALPH_FAR] == g_m[0].worked.total, "all of them there ({g_m[0].worked.by_way[ALPH_FAR]} jobs of {rows_there})");
+
+  // Rows of 2,000 bytes: one to a job, each in a long buffer.
+  clear();
+  undone = g_m[0].pieces_of(BIG_THERE, BIG_COUNT, &g_big[0], BIG, &took_row, (rawptr)(int64)BIG);
+  expect(undone == 0 && seen() == BIG_COUNT && g_twice == 0 && g_wrong == 0 && g_m[0].run == 1, "rows of 2,000 bytes cross one to a job and are answered rightly ({seen()} of {BIG_COUNT}, {g_wrong} wrong)");
+
   // A kind done at most once gives no bytes back: one piece to a job.
   clear();
   undone = g_m[0].pieces(ONCE, 200, &took_square, 0);
@@ -185,6 +284,6 @@ fn main() -> int32 {
   if (g_failures != 0) {
     return 1;
   }
-  println("pieces ok: {MANY} pieces of little work answered once each, several to a job; 400 of a millisecond one to a job, {far_slow} of them on the other machine; 6000 only the other machine can do, {there_run} to a job");
+  println("pieces ok: {MANY} pieces of little work answered once each, several to a job; 400 of a millisecond one to a job, {far_slow} of them on the other machine; 6000 only the other machine can do, {there_run} to a job; {ROW_COUNT} rows of {ROW} bytes {rows_run} to a job, and {rows_there} to a job on the other machine");
   return 0;
 }

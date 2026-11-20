@@ -119,7 +119,7 @@ export struct AlphMachine {
   actors: AlphActor[512];
   mail: AlphMsg[8192];
   peers: AlphPeer[8];
-  parcels: AlphParcel[16];
+  parcels: AlphParcel[128];
   name_slots: AlphName[32];
   watches: AlphWatch[64];
   keeps: AlphKeep[32];
@@ -144,6 +144,8 @@ export struct AlphMachine {
   run_undone: Word;       // pieces not done,
   run_took: fn(Word, Word, rawptr) -> void;  // and the program's function for each answer,
   run_ctx: rawptr;        // with its own
+  run_bytes: uint8*;      // pieces with bytes: every piece's bytes one after another, 0 for none,
+  run_each: Word;         // and how many a piece has
   outs: uint8[73728];     // what each job of several pieces gives back: 512 bytes a slot
   timekeeper: Word;       // the actor that keeps this machine's time in step with the others' (now)
   time_off: Word;         // what is added to this machine's own clock to give that time, in ns
@@ -494,13 +496,13 @@ fn alph_machine_serve(a: AlphActor*, msg: AlphMsg*) -> Word {
         for at in 0..parcel->count {
           t->bytes[at] = parcel->bytes[at];
         }
-        t->job.in = 0;
+        t->job.in = parcel->word;
         t->job.data = (rawptr)&t->bytes[0];
         t->job.bytes = &t->bytes[0];
         t->job.count = parcel->count;
       }
       if (whole != 0) {
-        t->job.in = 0;
+        t->job.in = whole->word;
         t->job.data = (rawptr)whole->bytes;
         t->job.bytes = whole->bytes;
         t->job.count = whole->count;
@@ -585,7 +587,7 @@ export fn AlphMachine_init__ptr(m: AlphMachine*, cores: Word, first: Word, gpu: 
   }
   m->cores.init(&m->core[0], n, &m->actors[0], SLOTS, &m->mail[0], ROOM);
   m->link.init(&m->cores, first, &m->peers[0], 8);
-  m->link.parcels(&m->parcels[0], 16);
+  m->link.parcels(&m->parcels[0], 128);
   m->names.init(&m->name_slots[0], 32);
   m->life.init(&m->cores, &m->watches[0], 64, &m->keeps[0], 32);
   m->door.init(&m->cores, &m->link, &m->names, &m->life);
@@ -1029,6 +1031,7 @@ export fn AlphMachine_work__ptr(m: AlphMachine*, kind: Word, total: Word,
 // the process: every machine in it runs the same program.
 struct AlphPiece {
   run: fn(Word) -> Word;
+  with: fn(Word, uint8*, Word) -> Word;  // when every piece has bytes of its own
 }
 
 var g_piece: AlphPiece[8];
@@ -1038,13 +1041,42 @@ const RUN_MOST: Word = 64;         // the most pieces in one job: their answers 
 const RUN_NS: Word = 250000;       // the work a job should hold, so that handing it out costs little
 const RUN_TRIED: Word = 32;        // pieces done alone first, to time one
 
+// The same for pieces with bytes: the job's bytes are its pieces' bytes one
+// after another, the same number for each.
+fn alph_machine_pieces_of(job: AlphJob*, with: fn(Word, uint8*, Word) -> Word, first: Word, count: Word) -> Word {
+  if (job->bytes == 0 || job->count <= 0) {
+    return 1;
+  }
+  if (count <= 0) {
+    job->out = with(first, job->bytes, job->count);
+    return 0;
+  }
+  var each: Word = (Word)(job->count / count);
+  if (job->back == 0 || job->back_room < (Word)(count * 8) || (Word)(each * count) != job->count) {
+    return 1;
+  }
+  for i in 0..count {
+    var out: int64 = (int64)with(first + (Word)i, job->bytes + (Word)((Word)i * each), each);
+    for b in 0..8 {
+      job->back[(Word)i * 8 + (Word)b] = (uint8)((out >> ((int64)b * 8)) & 255);
+    }
+  }
+  job->back_count = (Word)(count * 8);
+  job->out = count;
+  return 0;
+}
+
 // The job behind piece: one piece when the in is its number alone, which
 // is also what a board is asked, and a run of them when a count is above
 // it. A run's answers go back as bytes, 8 a piece.
 fn alph_machine_pieces(job: AlphJob*) -> Word {
   var f: fn(Word) -> Word = g_piece[job->kind].run;
+  var with: fn(Word, uint8*, Word) -> Word = g_piece[job->kind].with;
   var count: Word = (Word)(job->in >> RUN_SHIFT);
   var first: Word = (Word)(job->in - (count << RUN_SHIFT));
+  if (with != 0) {
+    return alph_machine_pieces_of(job, with, first, count);
+  }
   if (f == 0) {
     return 1;
   }
@@ -1074,6 +1106,20 @@ fn alph_machine_pieces(job: AlphJob*) -> Word {
 export fn AlphMachine_piece__ptr(m: AlphMachine*, kind: Word, run: fn(Word) -> Word) {
   if (kind >= 0 && kind < 8) {
     g_piece[kind].run = run;
+    g_piece[kind].with = 0;
+    m->places.kind(kind, &alph_machine_pieces, 0);
+  }
+}
+
+// As piece, for work where every piece has bytes of its own: a record, a
+// packet, a row. The function is given the piece's number, its bytes and
+// how many they are, and returns a number. It must read nothing else, so
+// it can run on any core of any machine. pieces_of then hands the work
+// out. Call it on every machine, then share.
+export fn AlphMachine_piece_of__ptr(m: AlphMachine*, kind: Word, run: fn(Word, uint8*, Word) -> Word) {
+  if (kind >= 0 && kind < 8) {
+    g_piece[kind].run = 0;
+    g_piece[kind].with = run;
     m->places.kind(kind, &alph_machine_pieces, 0);
   }
 }
@@ -1091,6 +1137,10 @@ fn alph_machine_run_fill(b: AlphBatch*, job: AlphJob*, at: Word) {
   }
   job->in = first;
   job->size = count;
+  if (m->run_bytes != 0) {
+    job->bytes = m->run_bytes + (Word)(first * m->run_each);
+    job->count = (Word)(count * m->run_each);
+  }
   if (m->run > 1) {
     job->in = (Word)(first + (count << RUN_SHIFT));
     job->back = &m->outs[alph_machine_run_slot(m, job) * 512];
@@ -1137,6 +1187,30 @@ fn alph_machine_run_took(b: AlphBatch*, job: AlphJob*, at: Word) {
 // pieces were not done.
 export fn AlphMachine_pieces__ptr(m: AlphMachine*, kind: Word, total: Word,
                                   took: fn(Word, Word, rawptr) -> void, ctx: rawptr) -> Word {
+  m->run_bytes = 0;
+  m->run_each = 0;
+  return alph_machine_run_all(m, kind, total, took, ctx);
+}
+
+// As pieces, for a kind set up with piece_of. bytes holds every piece's
+// bytes one after another, `each` of them for a piece: piece i's start at
+// i times each. They must stay as they are until this returns. Pieces go
+// several to a job as with pieces, and a job for another machine holds no
+// more of them than fit one message with bytes (ALPH_PARCEL_BYTES), so
+// pieces of more bytes than that go one to a job and need long buffers
+// (longs) to leave this machine.
+export fn AlphMachine_pieces_of__ptr(m: AlphMachine*, kind: Word, total: Word, bytes: uint8*, each: Word,
+                                     took: fn(Word, Word, rawptr) -> void, ctx: rawptr) -> Word {
+  if (bytes == 0 || each <= 0) {
+    return total;
+  }
+  m->run_bytes = bytes;
+  m->run_each = each;
+  return alph_machine_run_all(m, kind, total, took, ctx);
+}
+
+fn alph_machine_run_all(m: AlphMachine*, kind: Word, total: Word,
+                        took: fn(Word, Word, rawptr) -> void, ctx: rawptr) -> Word {
   var tried: Word = total;
   if (tried > RUN_TRIED) {
     tried = RUN_TRIED;
@@ -1162,6 +1236,9 @@ export fn AlphMachine_pieces__ptr(m: AlphMachine*, kind: Word, total: Word,
     m->run = (Word)(RUN_NS / m->run_least);
     if (m->run > RUN_MOST) {
       m->run = RUN_MOST;
+    }
+    if (m->run_each > 0 && m->peer_count > 0 && (Word)(m->run * m->run_each) > ALPH_PARCEL_BYTES) {
+      m->run = (Word)(ALPH_PARCEL_BYTES / m->run_each);
     }
     if (m->run < 1) {
       m->run = 1;

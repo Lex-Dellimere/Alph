@@ -69,7 +69,7 @@ export struct AlphJob {
   data: rawptr;
   in: Word;      // what a job that can go to another machine is given,
   out: Word;     // and what it gives back
-  bytes: uint8*; // bytes that go with it to another machine, up to ALPH_PARCEL_BYTES,
+  bytes: uint8*; // bytes that go with it to another machine, with its in, up to ALPH_PARCEL_BYTES,
   count: Word;   // and how many: 0 for none
   back: uint8*;  // where bytes the job gives back are put, 0 for none,
   back_room: Word;   // how many fit there (from another machine at most ALPH_BACK_BYTES),
@@ -1312,7 +1312,7 @@ export fn alph_place_run(a: AlphActor*, m: AlphMsg*) -> Word {
         if (job->count > ALPH_PARCEL_BYTES) {
           with = ALPH_WORK_LONG;
         }
-        out = p->link->send_much(a->pid, job->far_to, with, job->far_ref, job->bytes, job->count);
+        out = p->link->send_with(a->pid, job->far_to, with, job->far_ref, job->in, job->bytes, job->count);
       } else {
         out = a->node->put(job->far_to, &ask);
       }

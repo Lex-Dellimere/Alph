@@ -63,6 +63,7 @@ struct Checker {
   hoard: Word;
   kept: AlphParcel*[4];
   keeping: Word;
+  word: Word;  // the word that came with the last parcel
 }
 
 fn checker(a: AlphActor*, m: AlphMsg*) -> Word {
@@ -78,6 +79,7 @@ fn checker(a: AlphActor*, m: AlphMsg*) -> Word {
   var p: AlphParcel* = (AlphParcel*)m->arg;
   var n: Word = m->ref;
   var sum: Word = 0;
+  c->word = p->word;
   if (n != c->next || p->count != size_of(n)) {
     c->bad = c->bad + 1;
   }
@@ -170,6 +172,8 @@ fn main() -> int32 {
   c.bad = 0;
   c.hoard = 0;
   c.keeping = 0;
+  c.word = 0;
+  local.word = 0;
   local.next = 0;
   local.bad = 0;
   local.hoard = 0;
@@ -280,6 +284,13 @@ fn main() -> int32 {
     used = used + g_a_parcels[i].used;
   }
   expect(used == 0, "and its parcel is back in A's pool ({used} are not)");
+  expect(local.word == 0 && c.word == 0, "bytes sent with no word arrive with none");
+  for i in 0..size_of(1) {
+    bytes[i] = byte_of(1, (Word)i);
+  }
+  expect(g_a_link.send_with(sender_pid, near, DATA, 1, 777, &bytes[0], size_of(1)) == ALPH_OK, "bytes are sent with a word");
+  g_a_core[1].node.turn();
+  expect(local.next == 2 && local.bad == 0 && local.word == 777, "and the word arrives with them ({local.word})");
 
   // Half the pool is kept for what arrives: with eight parcels and B not
   // answering, the fifth is refused.

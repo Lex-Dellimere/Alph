@@ -1,0 +1,72 @@
+// The short way for rows of data: 40,000 readings of a joint, 32 bytes
+// each, checked on every core of this machine. The program says how one
+// reading is checked, its bytes in and a number out, and what to do with
+// each answer. alph hands the readings out, several to a job, and comes
+// back when all are answered. Name another machine and share the kind, and
+// the readings are checked there too: a job's bytes cross with it.
+//
+//   mettle --build -s --release examples/readings.mettle -I ports/host -o readings
+
+import "std/io";
+import "alph/actor/actor";
+import "alph/machine/machine";
+
+const CHECK: Word = 0;       // the kind of work
+const READINGS: Word = 40000;
+const EACH: Word = 32;       // bytes in a reading: 16 samples of two bytes
+const LIMIT: Word = 1000;    // a step bigger than this between two samples is a jolt
+
+var g_m: AlphMachine;
+var g_readings: uint8[1280000];
+var g_jolts: Word = 0;
+
+// One piece: the biggest step between two samples of one reading.
+fn biggest_step(reading: Word, bytes: uint8*, count: Word) -> Word {
+  var most: Word = 0;
+  var before: Word = (Word)bytes[0] + (Word)bytes[1] * 256;
+  var i: Word = 2;
+  while (i + 1 < count) {
+    var sample: Word = (Word)bytes[i] + (Word)bytes[i + 1] * 256;
+    var step: Word = sample - before;
+    if (step < 0) {
+      step = 0 - step;
+    }
+    if (step > most) {
+      most = step;
+    }
+    before = sample;
+    i = i + 2;
+  }
+  return most;
+}
+
+// Called with each answer.
+fn checked(reading: Word, step: Word, ctx: rawptr) {
+  if (step > LIMIT) {
+    g_jolts = g_jolts + 1;
+  }
+}
+
+fn main() -> int32 {
+  // A joint that moves a little, and jolts in every 97th reading.
+  for r in 0..READINGS {
+    for s in 0..16 {
+      var sample: Word = 20000 + (Word)(((Word)r * 37 + (Word)s * 91) % 400);
+      if (r % 97 == 0 && s == 7) {
+        sample = sample + 5000;
+      }
+      g_readings[(Word)r * EACH + (Word)s * 2] = (uint8)(sample % 256);
+      g_readings[(Word)r * EACH + (Word)s * 2 + 1] = (uint8)(sample / 256);
+    }
+  }
+
+  g_m.init(4, 0, false);                // four cores: one hands out, three work
+  g_m.piece_of(CHECK, &biggest_step);   // how one reading is checked
+  var undone: Word = g_m.pieces_of(CHECK, READINGS, &g_readings[0], EACH, &checked, 0);
+  g_m.shut();
+  println("{g_jolts} jolts in {READINGS} readings, checked {g_m.run} to a job on this machine's cores");
+  if (undone != 0 || g_jolts != 413) {
+    return 1;
+  }
+  return 0;
+}

@@ -121,6 +121,7 @@ Every machine runs the same program. Each says how a kind of job is done (`kind`
 - `share(kind)` shares a kind with the other machines, both ways. With several, a job goes to whichever should finish it first: the machine keeps a time for each of the others. Only a job with no home leaves a machine: one word in, or bytes.
 - `board(first, count)` adds a microcontroller on this machine's serial line that takes work too. See "A board that shares work" under A microcontroller.
 - `piece(kind, f)` and `pieces(kind, total, took, ctx)` are the same for work that is a number in and a number out.
+- `piece_of(kind, f)` and `pieces_of(kind, total, bytes, each, took, ctx)` are for rows of data: every piece has `each` bytes of its own, one row after another in `bytes`. `f(piece, bytes, count)` is given the piece's number and its bytes and returns a number. Rows go several to a job like other pieces, and a job that goes to another machine takes its rows with it, so the function reads nothing but what it is given. A job for another machine holds no more rows than fit 1,024 bytes. `examples/readings.mettle` checks 40,000 readings of 32 bytes this way.
 - `work(kind, total, fill, took, ctx)` does a whole batch and returns when it is over.
 - `batch(&batch)` ties a batch to the machine. See The batch below.
 - `longs(memory, each, count)` gives the machine long buffers, so a job for another machine can carry more than 1,024 bytes. `gives(kind, bytes)` says a job of a kind gives back up to that many, when that is more than 1,016. Call both on every machine. See Jobs on other machines.
@@ -638,6 +639,8 @@ var g_memory: uint8[400000];
 g_link.longs(&g_longs[0], 4, &g_memory[0], 100000);  // four buffers of 100,000 bytes
 ```
 
+`send_with(from, to, tag, ref, word, bytes, count)` is `send_much` with a word that goes with the bytes: the actor reads it from the parcel's or the long buffer's `word`.
+
 `send_much(from, to, tag, ref, bytes, count)` then sends any number of bytes: in a parcel when they fit one, and if not, cut into pieces of 1,024 bytes that cross like other messages and are put together again in a long buffer of the other machine. The actor gets the message with that buffer in `arg`: it reads `count` bytes at `bytes` and gives the buffer back with `free`.
 
 ```mettle
@@ -1024,7 +1027,7 @@ fn asker(a: AlphActor*, m: AlphMsg*) -> Word {
 These are not built yet.
 
 - A sealed link has one key for the whole network: any holder can speak as any machine, and someone who gets the key later can read what they recorded before.
-- A job for another machine carries at most 1,024 bytes and gives back at most 1,016, unless the machines are given long buffers. Then the most is what one buffer holds, and each job in flight holds a buffer at each end.
+- A job for another machine carries at most 1,024 bytes and gives back at most 1,016, unless the machines are given long buffers. Then the most is what one buffer holds, and each job in flight holds a buffer at each end. A job's `in` crosses with its bytes.
 - A job of a kind done at most once carries no bytes.
 - Sockets are Linux only, and there is no file IO.
 - A board keeps no record of its last messages, and a record cannot be played again.

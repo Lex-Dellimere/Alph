@@ -61,7 +61,7 @@ export struct AlphMachine {
   actors: AlphActor[512];
   mail: AlphMsg[8192];
   peers: AlphPeer[8];
-  parcels: AlphParcel[16];
+  parcels: AlphParcel[128];
   name_slots: AlphName[32];
   watches: AlphWatch[64];
   keeps: AlphKeep[32];
@@ -86,6 +86,8 @@ export struct AlphMachine {
   run_undone: Word;       // pieces not done,
   run_took: fn(Word, Word, rawptr) -> void;  // and the program's function for each answer,
   run_ctx: rawptr;        // with its own
+  run_bytes: uint8*;      // pieces with bytes: every piece's bytes one after another, 0 for none,
+  run_each: Word;         // and how many a piece has
   outs: uint8[73728];     // what each job of several pieces gives back: 512 bytes a slot
   timekeeper: Word;       // the actor that keeps this machine's time in step with the others' (now)
   time_off: Word;         // what is added to this machine's own clock to give that time, in ns
@@ -367,6 +369,20 @@ core of any machine. It takes the place of kind for such work, and
 pieces then hands the work out. A board shares the same function with
 AlphBoard_share. Call it on every machine, then share.
 
+### `AlphMachine_piece_of__ptr`
+
+```mettle
+export fn AlphMachine_piece_of__ptr(m: AlphMachine*, kind: Word, run: fn(Word, uint8*, Word) -> Word)
+```
+
+Call it as `m->piece_of(kind, run)`, or `m.piece_of(kind, run)` on a value.
+
+As piece, for work where every piece has bytes of its own: a record, a
+packet, a row. The function is given the piece's number, its bytes and
+how many they are, and returns a number. It must read nothing else, so
+it can run on any core of any machine. pieces_of then hands the work
+out. Call it on every machine, then share.
+
 ### `AlphMachine_pieces__ptr`
 
 ```mettle
@@ -383,6 +399,23 @@ handing out costs little beside the work: the first few are done alone
 to time one, and the rest go in jobs of about a quarter of a millisecond
 of work, up to 64 pieces. Call it as work is called. Returns how many
 pieces were not done.
+
+### `AlphMachine_pieces_of__ptr`
+
+```mettle
+export fn AlphMachine_pieces_of__ptr(m: AlphMachine*, kind: Word, total: Word, bytes: uint8*, each: Word,
+                                     took: fn(Word, Word, rawptr) -> void, ctx: rawptr) -> Word
+```
+
+Call it as `m->pieces_of(kind, total, bytes, each, took, ctx)`, or `m.pieces_of(kind, total, bytes, each, took, ctx)` on a value.
+
+As pieces, for a kind set up with piece_of. bytes holds every piece's
+bytes one after another, `each` of them for a piece: piece i's start at
+i times each. They must stay as they are until this returns. Pieces go
+several to a job as with pieces, and a job for another machine holds no
+more of them than fit one message with bytes (ALPH_PARCEL_BYTES), so
+pieces of more bytes than that go one to a job and need long buffers
+(longs) to leave this machine.
 
 ### `AlphMachine_run__ptr`
 
@@ -1449,7 +1482,7 @@ export struct AlphJob {
   data: rawptr;
   in: Word;      // what a job that can go to another machine is given,
   out: Word;     // and what it gives back
-  bytes: uint8*; // bytes that go with it to another machine, up to ALPH_PARCEL_BYTES,
+  bytes: uint8*; // bytes that go with it to another machine, with its in, up to ALPH_PARCEL_BYTES,
   count: Word;   // and how many: 0 for none
   back: uint8*;  // where bytes the job gives back are put, 0 for none,
   back_room: Word;   // how many fit there (from another machine at most ALPH_BACK_BYTES),
@@ -2570,6 +2603,7 @@ export struct AlphParcel {
   count: Word;  // how many of the bytes are in use
   used: Word;   // taken from the pool
   bytes: uint8[1024];
+  word: Word;   // a word that came with the bytes (send_with), 0 for none
 }
 ```
 
@@ -2589,6 +2623,7 @@ export struct AlphLong {
   ref: Word;
   at: Word;      // how many bytes have gone
   next: AlphLong*;
+  word: Word;    // a word that goes with the bytes: set it before send_long, read it at the other end
 }
 ```
 
@@ -2672,6 +2707,8 @@ export struct AlphLink {
   beyond_ctx: rawptr;
   parcels: AlphParcel*;
   parcel_room: Word;
+  parcel_free: Word;  // how many are free,
+  parcel_next: Word;  // and where the search for one starts
   parcel_gate: AlphGate;
   longs: AlphLong*;
   long_room: Word;
@@ -2826,6 +2863,17 @@ Sends a message with any number of bytes: in a parcel when they fit one
 (send_bytes), in a long buffer when not, into which they are copied
 here. Returns as send_bytes does, and ALPH_BIG when this machine has no
 long buffer that holds them.
+
+### `AlphLink_send_with__ptr`
+
+```mettle
+export fn AlphLink_send_with__ptr(l: AlphLink*, from: Word, to: Word, tag: Word, ref: Word, word: Word, bytes: uint8*, count: Word) -> Word
+```
+
+Call it as `l->send_with(from, to, tag, ref, word, bytes, count)`, or `l.send_with(from, to, tag, ref, word, bytes, count)` on a value.
+
+As send_much, with a word that goes with the bytes: the actor reads it
+from the parcel's or the long buffer's ->word.
 
 ### `AlphLink_through__ptr`
 

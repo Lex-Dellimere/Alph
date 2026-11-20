@@ -56,7 +56,7 @@ const MAIL: uint32 = 2;
 const PARCEL: uint32 = 3;   // mail with bytes after it: `unused` says how many
 const WAIT: uint32 = 4;     // a beat that says the next message found no room: send it again soon
 const PART: uint32 = 5;     // bytes of a long message: `unused` says how many, arg where they go, ref how many in all
-const LONG: uint32 = 6;     // the mail that ends a long message: arg says how many bytes it had
+const LONG: uint32 = 6;     // the mail that ends a long message: `unused` says how many bytes it had, arg is the word that goes with them
 const MISSED: uint32 = 7;   // a beat that says a message did not arrive: send again from the one after ack, now
 const VOID: uint32 = 8;     // what is left of a piece of a long message that was given up: taken, and nothing done
 const SOON_MS: Word = 5;
@@ -81,6 +81,7 @@ export struct AlphParcel {
   count: Word;  // how many of the bytes are in use
   used: Word;   // taken from the pool
   bytes: uint8[1024];
+  word: Word;   // a word that came with the bytes (send_with), 0 for none
 }
 
 // The bytes of a long message, and while it is on its way out, the message.
@@ -95,6 +96,7 @@ export struct AlphLong {
   ref: Word;
   at: Word;      // how many bytes have gone
   next: AlphLong*;
+  word: Word;    // a word that goes with the bytes: set it before send_long, read it at the other end
 }
 
 // A pid on the wire is its three parts, because machines of different word
@@ -190,6 +192,8 @@ export struct AlphLink {
   beyond_ctx: rawptr;
   parcels: AlphParcel*;
   parcel_room: Word;
+  parcel_free: Word;  // how many are free,
+  parcel_next: Word;  // and where the search for one starts
   parcel_gate: AlphGate;
   longs: AlphLong*;
   long_room: Word;
@@ -224,21 +228,27 @@ fn alph_link_out(l: AlphLink*, p: AlphPeer*, bytes: uint8*, count: int64) {
 // other's, and so never answer.
 fn alph_link_parcel(l: AlphLink*, keep: Word) -> AlphParcel* {
   var mine: AlphParcel* = 0;
-  var free: Word = 0;
   var was: int32 = l->parcel_gate.enter();
-  for i in 0..l->parcel_room {
-    if (l->parcels[i].used == 0) {
-      free = free + 1;
-      if (mine == 0) {
-        mine = &l->parcels[i];
+  if (l->parcel_free > keep) {
+    // The search starts after the one taken last, so it is short while
+    // some are free.
+    var at: Word = l->parcel_next;
+    for i in 0..l->parcel_room {
+      if (at >= l->parcel_room) {
+        at = 0;
       }
+      if (l->parcels[at].used == 0) {
+        mine = &l->parcels[at];
+        break;
+      }
+      at = at + 1;
     }
-  }
-  if (free <= keep) {
-    mine = 0;
-  }
-  if (mine != 0) {
-    mine->used = 1;
+    if (mine != 0) {
+      mine->used = 1;
+      mine->word = 0;
+      l->parcel_free = l->parcel_free - 1;
+      l->parcel_next = at + 1;
+    }
   }
   l->parcel_gate.leave(was);
   return mine;
@@ -251,7 +261,10 @@ fn alph_link_parcel(l: AlphLink*, keep: Word) -> AlphParcel* {
 // back.
 export fn AlphLink_release__ptr(l: AlphLink*, parcel: AlphParcel*) {
   var was: int32 = l->parcel_gate.enter();
-  parcel->used = 0;
+  if (parcel->used != 0) {
+    parcel->used = 0;
+    l->parcel_free = l->parcel_free + 1;
+  }
   l->parcel_gate.leave(was);
 }
 
@@ -274,6 +287,7 @@ fn alph_link_long(l: AlphLink*, keep: Word) -> AlphLong* {
   if (mine != 0) {
     mine->used = 1;
     mine->count = 0;
+    mine->word = 0;
   }
   l->parcel_gate.leave(was);
   return mine;
@@ -397,8 +411,8 @@ fn alph_link_push(l: AlphLink*, p: AlphPeer*) {
       g->at = g->at + n;
     } else {
       k->kind = LONG;
-      k->unused = 0;
-      k->arg = (int64)g->count;
+      k->unused = (uint32)g->count;
+      k->arg = (int64)g->word;
       k->ref = (int64)g->ref;
       p->ends[at] = g;
       p->longs = g->next;
@@ -841,7 +855,7 @@ fn alph_link_heard(l: AlphLink*, k: AlphPacket*, got: int64) {
   var whole_long: AlphLong* = 0;
   if (k->kind == LONG) {
     whole_long = p->filling;
-    if (whole_long != 0 && whole_long->count != (Word)k->arg) {
+    if (whole_long != 0 && whole_long->count != (Word)(int64)k->unused) {
       l->free(whole_long);
       p->filling = 0;
       whole_long = 0;
@@ -867,6 +881,7 @@ fn alph_link_heard(l: AlphLink*, k: AlphPacket*, got: int64) {
       return;
     }
     var payload: uint8* = (uint8*)k + MAIL_BYTES;
+    parcel->word = (Word)k->arg;
     parcel->count = (Word)(int64)k->unused;
     for i in 0..parcel->count {
       parcel->bytes[i] = payload[i];
@@ -889,6 +904,9 @@ fn alph_link_heard(l: AlphLink*, k: AlphPacket*, got: int64) {
     }
     if (k->kind == LONG) {
       m.arg = (Word)(int64)whole_long;  // the same with a long buffer, or 0: it was too long for this machine
+      if (whole_long != 0) {
+        whole_long->word = (Word)k->arg;
+      }
     }
     if (core >= 0 && core < l->cores->count) {
       var put: Word = l->cores->cores[core].node.put(to, &m);
@@ -1198,6 +1216,8 @@ export fn AlphLink_init__ptr(l: AlphLink*, cores: AlphCores*, first: Word, peers
   l->beyond_ctx = 0;
   l->parcels = 0;
   l->parcel_room = 0;
+  l->parcel_free = 0;
+  l->parcel_next = 0;
   l->longs = 0;
   l->long_room = 0;
   l->skipped = 0;
@@ -1254,6 +1274,8 @@ export fn AlphLink_peer__ptr(l: AlphLink*, first: Word, count: Word, ip: uint32,
 export fn AlphLink_parcels__ptr(l: AlphLink*, parcels: AlphParcel*, room: Word) {
   l->parcels = parcels;
   l->parcel_room = room;
+  l->parcel_free = room;
+  l->parcel_next = 0;
   for i in 0..room {
     parcels[i].used = 0;
   }
@@ -1267,7 +1289,11 @@ export fn AlphLink_parcels__ptr(l: AlphLink*, parcels: AlphParcel*, room: Word) 
 // arrives) or too much is waiting for that machine, ALPH_GONE when the
 // actor or its machine cannot be reached or the bytes are too many.
 export fn AlphLink_send_bytes__ptr(l: AlphLink*, from: Word, to: Word, tag: Word, ref: Word, bytes: uint8*, count: Word) -> Word {
-  var m: AlphMsg = { tag: tag, from: from, arg: 0, ref: ref };
+  return alph_link_bytes(l, from, to, tag, ref, 0, bytes, count);
+}
+
+fn alph_link_bytes(l: AlphLink*, from: Word, to: Word, tag: Word, ref: Word, word: Word, bytes: uint8*, count: Word) -> Word {
+  var m: AlphMsg = { tag: tag, from: from, arg: word, ref: ref };
   var place: Word = (Word)(to >> ALPH_PLACE_SHIFT);
   var core: Word = place - l->cores->first;
   if (count <= 0 || count > ALPH_PARCEL_BYTES) {
@@ -1279,6 +1305,7 @@ export fn AlphLink_send_bytes__ptr(l: AlphLink*, from: Word, to: Word, tag: Word
       return ALPH_FULL;
     }
     parcel->count = count;
+    parcel->word = word;
     for i in 0..count {
       parcel->bytes[i] = bytes[i];
     }
@@ -1359,8 +1386,14 @@ export fn AlphLink_send_long__ptr(l: AlphLink*, from: Word, to: Word, tag: Word,
 // here. Returns as send_bytes does, and ALPH_BIG when this machine has no
 // long buffer that holds them.
 export fn AlphLink_send_much__ptr(l: AlphLink*, from: Word, to: Word, tag: Word, ref: Word, bytes: uint8*, count: Word) -> Word {
+  return l->send_with(from, to, tag, ref, 0, bytes, count);
+}
+
+// As send_much, with a word that goes with the bytes: the actor reads it
+// from the parcel's or the long buffer's ->word.
+export fn AlphLink_send_with__ptr(l: AlphLink*, from: Word, to: Word, tag: Word, ref: Word, word: Word, bytes: uint8*, count: Word) -> Word {
   if (count <= ALPH_PARCEL_BYTES) {
-    return l->send_bytes(from, to, tag, ref, bytes, count);
+    return alph_link_bytes(l, from, to, tag, ref, word, bytes, count);
   }
   if (l->long_room == 0 || count > l->longs[0].room) {
     return ALPH_BIG;
@@ -1373,6 +1406,7 @@ export fn AlphLink_send_much__ptr(l: AlphLink*, from: Word, to: Word, tag: Word,
     buffer->bytes[i] = bytes[i];
   }
   buffer->count = count;
+  buffer->word = word;
   var out: Word = l->send_long(from, to, tag, ref, buffer);
   if (out != ALPH_OK) {
     l->free(buffer);
