@@ -2996,14 +2996,20 @@ place among bigger machines: no numbering, no beats, nothing sent again.
 A message goes over once, and a byte lost on the line loses it, unless
 both ends make the line sure (see sure below).
 
-A message is 34 bytes on the line, then a byte that marks its end. The
-pids in it are their three parts, because a 32-bit board and a 64-bit
-server pack them differently. A pid too big for this machine's word
-cannot be held here, so its message is dropped: an actor on a bigger
-machine talks to a board if its place is below 256, its slot below 1,024
-and its generation below 8,192, which holds for actors spawned at the
-start. A message's tag, arg and ref cross as 32 bits each, so a bigger
-machine's larger numbers are cut short.
+A message is nine numbers on the line, a sum of two bytes, then a byte
+that marks its end. The numbers are the three parts of the pid it is
+for, the three of the pid it is from, and its tag, arg and ref. Each
+goes in as few bytes as it needs, seven bits to a byte, so a message is
+most often 11 to 14 bytes and at most 47: a serial line is slow, and
+most of these numbers are small. tag, arg and ref cross as 32 bits each,
+so a bigger machine's larger numbers are cut short, and a number below 0
+is as short as one above it.
+
+The pids go as their parts because a 32-bit board and a 64-bit server
+pack them differently. A pid too big for this machine's word cannot be
+held here, so its message is dropped: an actor on a bigger machine talks
+to a board if its place is below 256, its slot below 1,024 and its
+generation below 8,192, which holds for actors spawned at the start.
 
 A board has one line, and so one tether. A Linux process has up to four
 lines (see the host port's line file), each with a tether of its own.
@@ -3033,7 +3039,7 @@ export struct AlphTether {
   line: Word;     // which of the port's lines this is: 0 on a board
   full: Word;     // the last message off the line found its actor's mailbox full
   sure: AlphSure*;  // what makes the line sure, 0 when it is not
-  frame: uint8[34];
+  frame: uint8[48];
 }
 ```
 

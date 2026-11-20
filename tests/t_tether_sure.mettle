@@ -63,18 +63,37 @@ fn sum(f: uint8*, count: int64) -> int64 {
   return s;
 }
 
-// A message for the sink, from place 1, before the escapes.
-fn message(out: uint8*, arg: int64) {
-  put(&out[0], 5, 2);
-  put(&out[2], 1, 2);
-  put(&out[4], g_gen, 4);
-  put(&out[8], 0, 4);
-  put(&out[12], 3, 4);
-  put(&out[16], 7, 4);
-  put(&out[20], (int64)NOTE, 4);
-  put(&out[24], arg, 4);
-  put(&out[28], 0, 4);
-  put(&out[32], sum(&out[0], 32), 2);
+// A number as the line carries it: seven bits to a byte, the least first,
+// every byte but the last with its top bit set. Returns how many bytes.
+fn small(out: uint8*, value: int64) -> int64 {
+  var v: int64 = value & 4294967295;
+  var n: int64 = 0;
+  while (v >= 128) {
+    out[n] = (uint8)((v & 127) | 128);
+    v = v >> 7;
+    n = n + 1;
+  }
+  out[n] = (uint8)v;
+  return n + 1;
+}
+
+// A message for the sink, from place 1, before the escapes. Returns its
+// length. The tag and the arg are not below 0, so each goes as twice
+// itself.
+fn message(out: uint8*, arg: int64) -> int64 {
+  var n: int64 = small(&out[0], 5);
+  n = n + small(&out[n], g_gen);
+  n = n + small(&out[n], 0);
+  n = n + small(&out[n], 1);
+  n = n + small(&out[n], 3);
+  n = n + small(&out[n], 7);
+  n = n + small(&out[n], (int64)NOTE * 2);
+  n = n + small(&out[n], arg * 2);
+  n = n + small(&out[n], 0);
+  var s: int64 = sum(&out[0], n);
+  out[n] = (uint8)(s & 255);
+  out[n + 1] = (uint8)(s >> 8);
+  return n + 2;
 }
 
 fn speak(plain: uint8*, count: int64) {
@@ -112,10 +131,9 @@ fn header(kind: int64, seq: int64, ack: int64, from: int64, to: int64) {
 
 // A message with its header: seq, and life 9 speaking to life 1.
 fn speak_message(seq: int64, ack: int64, arg: int64) {
-  var f: uint8[34];
+  var f: uint8[48];
   header(MSG, seq, ack, 9, 1);
-  message(&f[0], arg);
-  speak(&f[0], 34);
+  speak(&f[0], message(&f[0], arg));
 }
 
 // The next frame off the line with something in it, without its escapes.
@@ -166,8 +184,24 @@ fn hear_header(h: uint8*, what: string) -> bool {
 fn hear_message(what: string) -> int64 {
   var f: uint8[64];
   var n: int64 = hear(&f[0]);
-  expect(n == 34 && (int64)f[32] + (int64)f[33] * 256 == sum(&f[0], 32), what);
-  return (int64)f[24] + (int64)f[25] * 256;
+  expect(n >= 11 && n <= 47 && (int64)f[n - 2] + (int64)f[n - 1] * 256 == sum(&f[0], n - 2), what);
+  // The arg is the eighth of its nine numbers, and twice itself.
+  var at: int64 = 0;
+  var value: int64 = 0;
+  for number in 0..8 {
+    var shift: int64 = 0;
+    value = 0;
+    while (at < n - 2) {
+      var b: int64 = (int64)f[at];
+      at = at + 1;
+      value = value | ((b & 127) << shift);
+      shift = shift + 7;
+      if (b < 128) {
+        break;
+      }
+    }
+  }
+  return value / 2;
 }
 
 // Runs what has arrived, the tether's helper too.
@@ -254,10 +288,10 @@ fn main() -> int32 {
 
   // A message with no header, one whose header is damaged, and one that is
   // damaged itself: none arrives.
-  var f: uint8[34];
+  var f: uint8[48];
   var dropped: Word = g_tether.dropped;
-  message(&f[0], 104);
-  speak(&f[0], 34);
+  var len: int64 = message(&f[0], 104);
+  speak(&f[0], len);
   var bad: uint8[7];
   bad[0] = (uint8)MSG;
   bad[1] = 4;
@@ -267,10 +301,10 @@ fn main() -> int32 {
   bad[5] = (uint8)((sum(&bad[0], 5) + 1) & 127);
   bad[6] = (uint8)(sum(&bad[0], 5) >> 7);
   speak(&bad[0], 7);
-  speak(&f[0], 34);
+  speak(&f[0], len);
   header(MSG, 4, 2, 9, 1);
-  f[25] = f[25] + 1;
-  speak(&f[0], 34);
+  f[len - 3] = f[len - 3] + 1;
+  speak(&f[0], len);
   settle();
   expect(s.notes == 3, "no false message arrives ({s.notes})");
   expect(g_tether.dropped - dropped == 4, "four frames are dropped ({g_tether.dropped - dropped})");
@@ -324,10 +358,9 @@ fn main() -> int32 {
     expect(h[1] == 1 && h[4] == 2, "numbered 1 again, for life 2 ({h[1]}, {h[4]})");
   }
   hear_message("the message for the new run");
-  var f2: uint8[34];
+  var f2: uint8[48];
   header(MSG, 1, 1, 2, 1);
-  message(&f2[0], 105);
-  speak(&f2[0], 34);
+  speak(&f2[0], message(&f2[0], 105));
   settle();
   expect(s.notes == 4 && s.args[3] == 105, "the new run's first message arrives");
 
@@ -338,16 +371,14 @@ fn main() -> int32 {
   }
   for i in 2..11 {
     header(MSG, (int64)i, 1, 2, 1);
-    message(&f2[0], 200 + (int64)i);
-    speak(&f2[0], 34);
+    speak(&f2[0], message(&f2[0], 200 + (int64)i));
   }
   Sleep(100);
   expect(g_sure.got == 9, "a message for a full mailbox is not said to be had (had up to {g_sure.got})");
   settle();
   expect(s.notes == 12, "the eight that fitted arrive ({s.notes - 4})");
   header(MSG, 10, 1, 2, 1);
-  message(&f2[0], 210);
-  speak(&f2[0], 34);
+  speak(&f2[0], message(&f2[0], 210));
   settle();
   expect(s.notes == 13 && g_sure.got == 10, "and the ninth, sent again, arrives too ({s.notes - 4} of 9)");
 

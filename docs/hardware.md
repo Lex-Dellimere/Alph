@@ -57,7 +57,7 @@ Join the two boards: ground to ground, each board's GP0 to the other's GP1. Load
 
 ## What is most likely to differ from the emulators
 
-- Timing. QEMU's serial line is instant and loses nothing. A real UART at 115200 baud carries about 11 bytes a millisecond, and a message is 34 bytes, so a round trip is at least 6 ms. The examples' timers allow for that, but it is the first thing to check when answers come late.
+- Timing. QEMU's serial line is instant and loses nothing. A real UART at 115200 baud carries about 11 bytes a millisecond, and a message is 12 to 15 bytes, so a round trip is at least 2.5 ms. The examples' timers allow for that, but it is the first thing to check when answers come late.
 - Lost bytes. The board takes each byte in an interrupt as it arrives, also while a job runs. But a plain line repairs nothing: a damaged frame is dropped, and so is a message for a mailbox that is full (a board's mailbox holds 8). A sure line sends again what was lost.
 - The random bits a board uses to number work done at most once (`alph_board_fresh`) come from the chip's ring oscillator, which the model does not have.
 

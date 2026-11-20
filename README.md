@@ -173,7 +173,7 @@ mettle --release examples/mcu/blink.mettle --target riscv32-none --board qemu-vi
 qemu-system-riscv32 -M virt -bios none -nographic -device loader,file=blink.bin,addr=0x80000000,force-raw=on
 ```
 
-A board and a Linux process on its serial line, [examples/mcu/tether.mettle](examples/mcu/tether.mettle) and [examples/mcu/tether_host.mettle](examples/mcu/tether_host.mettle). The board's image is 3.8 KB:
+A board and a Linux process on its serial line, [examples/mcu/tether.mettle](examples/mcu/tether.mettle) and [examples/mcu/tether_host.mettle](examples/mcu/tether_host.mettle). The board's image is 3.5 KB, and a message is 12 to 15 bytes on the line:
 
 ```bash
 mettle --release examples/mcu/tether.mettle --target riscv32-none --board qemu-virt --emit-flat tether.bin -I ports/mcu

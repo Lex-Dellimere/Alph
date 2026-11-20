@@ -880,7 +880,7 @@ g_board.share_once(MOVE, &move, &g_moves);
 - A job that was refused before it was ever sent a second time was not done, and is placed again as usual.
 - Such a job carries a word and gives a word back, no bytes. At most four are out to one worker at once.
 - Without the short way: `g_places.once(kind)` on the asking side, and the worker uses `AlphOnce` from `alph/place/once`, as `src/board/once.mettle` does.
-- A board that shares no such kind pays nothing for this. With one, the arm example's image goes from 4,544 to 5,520 bytes.
+- A board that shares no such kind pays nothing for this. With one, the arm example's image goes from 4,176 to 5,280 bytes.
 
 A board asks for such work too, of a computer or of another board. One `AlphBoardAsks` is one kind, asked by one actor:
 
